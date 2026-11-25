@@ -7,7 +7,7 @@ A personal collaboration system for an individual developer managing multiple AI
 
 Hive supports long-running development work, preserves useful context across sessions, and helps developers and agents exchange reports, briefings and discussion records. It manages directives, tasks, artifacts, Bot identities and curated memory.
 
-It is independent of agent runtimes and Git hosting providers. It is not a real-time inter-session messaging system or a multi-user collaboration platform.
+Hive is independent of IDEs, coding-agent runtimes and vendors, model providers, and Git hosting providers. It does not require changes to external projects. It is not a real-time inter-session messaging system or a multi-user collaboration platform.
 
 This repository owns the system and reusable assets. Actual records belong in a separate, user-controlled workspace.
 
