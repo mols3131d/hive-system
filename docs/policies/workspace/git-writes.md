@@ -8,14 +8,15 @@ A Git-backed Hive data workspace has **two write paths**. The public Hive system
 
 | Change | Path |
 | --- | --- |
-| Ordinary `tasks/` work bundles and their artifacts, independent `artifacts/` records | **Direct commit/push to `main` permitted** |
+| Ordinary `tasks/` work bundles and their artifacts, independent `artifacts/` records | **Direct commit/push to `main` permitted**, subject to current ownership and coordination rules |
+| Ticket issuance, selection, claim changes, closure and reopening under the adopted coordination contract | **Conditional update of the configured authoritative `main` ref required** |
 | Ordinary `bots/` routing metadata that does not change identity, agent behavior or permissions | **Direct commit/push to `main` permitted** |
 | [Project directive records](directives.md) creation, changes, supersession and withdrawal | **Topic branch and PR required** |
 | [Bot identity (`SOUL.md`) and curated memory](bots.md) creation, changes and consolidation | **Topic branch and PR required** |
 | Hive operating guides under `docs/`, scripts, code, tests, workflow files, configuration and templates in `assets/templates/` | **Topic branch and PR required** |
 | Root or directory-level *governing* `README.md`, every `AGENTS.md`, runtime instructions, conventions, schemas, tooling or validation changes | **Topic branch and PR required** |
 
-Files such as `docs/INDEX.tsv`, `scripts/`, `tests/`, `.github/`, `mise.toml`, `rulesync.jsonc`, `package.json` and all repository-level tooling/configuration are repository-maintained changes, **not ordinary records**. A Markdown file is not direct-push eligible just because it ends in `.md`. A work or artifact bundle `README.md` that only indexes ordinary work records may be committed directly to `main`; one defining repository or directory-wide instructions requires a PR. Creating or editing an agent's actual definition, privileges, automation or execution contract is a PR change even if placed under `bots/`. When a change mixes both categories, use a PR for the entire change or split independent records from maintained changes.
+Files such as `docs/INDEX.tsv`, `scripts/`, `tests/`, `.github/`, `mise.toml`, `rulesync.jsonc`, `package.json` including the tracked `hive.yml` coordination contract, and all repository-level tooling/configuration are repository-maintained changes, **not ordinary records**. A Markdown file is not direct-push eligible just because it ends in `.md`. A work or artifact bundle `README.md` that only indexes ordinary work records may be committed directly to `main`; one defining repository or directory-wide instructions requires a PR. Creating or editing an agent's actual definition, privileges, automation or execution contract is a PR change even if placed under `bots/`. When a change mixes both categories, use a PR for the entire change or split independent records from maintained changes.
 
 ## Direct-to-main working records
 
@@ -25,6 +26,12 @@ Direct commits are permitted only for ordinary work records within the explicitl
 - Read the current `main` ref and check concurrent work before publishing. Re-resolve the project, current management area and revision before writing or moving a bundle; do not overwrite another writer's artifact; handle a non-fast-forward or conflicting update by re-reading current state and retrying safely, never with a forced push.
 - Use small, reviewable commits; confirm that writes reached the intended account/repository/ref. Do not infer message receipt or bot execution from Git commit success.
 - Follow [lifecycle](lifecycle.md) and project authority boundaries before removing or substantially rewriting existing records.
+
+## Coordinated task changes
+
+The adopted [task contract](tasks.md#git-backed-issuance-and-claims) requires atomic expected-revision updates of the authoritative Git ref for ticket issuance and ownership/lifecycle changes. The tracked workspace `hive.yml` selects one local shared repository or one explicitly authorized remote; its changes require review. Follow the [technical coordination design](../../architecture/system-design.md#safe-changes-and-task-coordination). A draft or local commit in remote mode is not confirmation. Do not start from a stale clone, silently fall back, overwrite a competing claim, or retry an uncertain result without inspecting the actual authority. Ordinary record publishing must also preserve the current claim and respect its holder and lifecycle; a clean merge is not sufficient evidence of validity.
+
+Use the actual Hive repository's Git identity, signing and credentials. Do not reuse an external project's Git context or switch accounts on failure. GitHub and other hosting providers are optional; the coordination contract is Git-based, not a provider API. Direct file/Git or connector clients must be capable of the same guarded update and result verification before performing coordinated writes. Existing policy pins remain valid until explicit reviewed adoption.
 
 ## PR-required repository changes
 

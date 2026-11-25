@@ -26,7 +26,7 @@ Common fields apply in every row. A dash means no additional metadata is require
 | --- | --- | --- |
 | Area README; project or reserved-scope README | — | — |
 | `tasks/<project-id>/backlog/<work-id>/README.md` | — | `priority` |
-| `tasks/<project-id>/active/<work-id>/README.md` | `status` | `priority` |
+| `tasks/<project-id>/active/<work-id>/README.md` | `status`; `claim` for `in-progress` under the adopted coordination contract | `priority`, `claim` on eligible `todo` or `review` under that contract |
 | `tasks/<project-id>/archive/<work-id>/README.md` | `status` | — |
 | `directives/<project-id>/<slug>.md` or `<slug>/README.md` | `status` | — |
 | Supporting Markdown within a directive bundle | — | — |
@@ -54,6 +54,27 @@ tags:
   - "domain:identity:tokens"
 ---
 ```
+
+The adopted [Git-backed coordination contract](tasks.md#git-backed-issuance-and-claims) uses an optional active-task `claim` mapping with exactly two required nonempty string fields:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Fresh opaque identifier for this assignment, distinct from any earlier assignment of this task; generated on acquisition or transfer |
+| `holder` | Authorized task-scoped execution responsibility reference; a stable label for the assignment, not a Git email, credential, mandatory Bot or device ID |
+
+Omit `claim` for unclaimed work, backlog, archived work and active `done`. An active `in-progress` record requires a claim under the adopted contract. Example:
+
+```yaml
+---
+description: "Continue API authentication improvements."
+status: in-progress
+claim:
+  id: "5d9eb872-8b4e-4cba-97bf-83df96eab245"
+  holder: "worker-a"
+---
+```
+
+The mapping records only current assignment; Git history retains prior assignments. Keep recovery, transfer or closure evidence in the task body when needed. Do not add claim timestamps, expiry, credentials, raw runtime context or a separate session registry. Structural validation does not establish holder authority or runtime termination. Earlier pinned workspaces need no claim fields until reviewed adoption.
 
 ### Directives
 
