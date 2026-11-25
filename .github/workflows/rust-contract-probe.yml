@@ -1,0 +1,60 @@
+name: Rust contract probe
+
+on:
+  pull_request:
+    paths:
+      - "tests/rust-contract-probe/**"
+      - ".github/workflows/rust-contract-probe.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-contract-probe-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rust-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    defaults:
+      run:
+        working-directory: tests/rust-contract-probe
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustc +stable --version --verbose
+          cargo +stable --version
+      - name: Resolve dependencies
+        run: |
+          cargo +stable generate-lockfile
+          cargo +stable tree --locked > dependency-tree.txt
+          cargo +stable metadata --locked --format-version 1 --no-deps > metadata.json
+          rustc +stable --version --verbose > rust-version.txt
+      - name: Test contract
+        run: cargo +stable test --locked --all-targets
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Check lints
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Build and install in isolated directory
+        run: |
+          cargo +stable build --locked
+          cargo +stable install --locked --path . --root "$RUNNER_TEMP/hive-probe"
+          "$RUNNER_TEMP/hive-probe/bin/hive-contract-probe" --version
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-contract-evidence
+          path: |
+            tests/rust-contract-probe/Cargo.lock
+            tests/rust-contract-probe/dependency-tree.txt
+            tests/rust-contract-probe/metadata.json
+            tests/rust-contract-probe/rust-version.txt
+          retention-days: 7
+          if-no-files-found: warn
