@@ -1,5 +1,6 @@
 ---
 description: "[Purpose of this working note]"
+kind: work-note
 ---
 
 <!-- Optional scaffold. Replace placeholders and remove unused sections and this comment before saving. -->

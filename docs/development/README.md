@@ -4,7 +4,7 @@ description: "Use for contributor setup, development practices, agent guidance a
 
 # Development
 
-Use this area for how contributors understand, change and verify a project. The template does not preselect an application language, build system or test runner.
+Use this area for how contributors understand, change and verify Hive system software. Rust is the chosen application language; the [system design](../architecture/system-design.md) is a proposal, and no Cargo build or application tests exist yet. Keep the inherited development tooling independent of the application. Never use private workspace records as development fixtures.
 
 ## Current setup
 

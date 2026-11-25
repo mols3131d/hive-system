@@ -1,5 +1,6 @@
 ---
 description: "[Research question and scope]"
+kind: research
 ---
 
 <!-- Optional scaffold. Replace description and content placeholders; remove unused sections and this comment. Use tables or diagrams only when they clarify the evidence. -->

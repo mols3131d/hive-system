@@ -14,6 +14,7 @@ Ordinary documentation uses YAML `description` metadata to support document sele
 | Repository root [`README.md`](../../README.md) | No frontmatter required |
 | [`scripts/README.md`](../../scripts/README.md) | Required; describes the scripts directory |
 | [GitHub template documentation](../../.github/templates/README.md) | Required; describes the collection of authoring templates |
+| [Hive workspace templates](../../assets/templates/README.md) | Required description; placeholder record fields follow the workspace contract |
 | Runtime-owned agent assets and GitHub issue/PR templates | Follow their own metadata contracts |
 
 When another document outside `docs/` uses this metadata contract, add it to the standalone validation command. File extension alone does not define the contract.

@@ -1,5 +1,6 @@
 ---
 description: "[Review scope and criteria]"
+kind: review
 ---
 
 <!-- Optional scaffold. Replace description and content placeholders; remove unused sections and this comment. Use the findings table only for comparable issues; otherwise use prose or a verified no-findings statement. -->

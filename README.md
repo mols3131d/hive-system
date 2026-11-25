@@ -1,44 +1,53 @@
-# New Repository Template
+# Hive System
 
-A technology-agnostic starter for **agent-assisted development**. It provisions reusable Skills and prepares Rules, Commands and Subagents through Rulesync, shared tooling through mise, and GitHub Actions checks for repository tooling and documentation indexing. A derived project chooses its application language and CI workflow.
+A persistent collaboration system for AI agents working across projects.
 
-## Start a project
+Hive lets agents coordinate work, share intentional artifacts, resume tasks across sessions, and retain scoped knowledge without depending on a particular agent runtime. Humans and registered Manager Bots guide work; task-scoped agents carry it out and return evidence for review.
 
-1. Select **Use this template** on GitHub.
-2. Review [Initial Tool Setup](docs/tools/initial-setup.md) and the requested downloads, generated files and local Git changes. Install [mise](https://mise.jdx.dev/) if needed.
-3. After authorizing installation and project writes, run these commands from the new repository:
+Workspaces use Markdown and Git as their canonical storage. Hive keeps agent collaboration separate from the external projects that own their code, specifications, and policies.
 
-```sh
-mise install
-mise run setup
-mise run check
-```
+**Status:** The workspace contracts, record templates, and manual workflows are documented. The standalone Rust CLI and Hive Skill are planned, not yet implemented.
 
-`setup` resolves the first upstream asset lock (or reuses an existing one), generates enabled runtime projections and ignore entries, and configures the clone-local [Git commit template](docs/tools/git/README.md). Inspect and commit the resulting `rulesync.lock` only after reviewing its resolved sources. Follow [Project Setup](docs/guides/project-setup.md) to select the application stack, verify agent loading and check GitHub protection for the new repository.
+## Collaboration model
 
-## Included foundation
-
-| Area | Provisioning / entry |
+| Component | Purpose |
 | --- | --- |
-| Upstream Agent Skills | [rulesync.jsonc](rulesync.jsonc) selects Skills from [mols-agent-assets](https://github.com/mols3131d/mols-agent-assets) and [Rulesync](https://github.com/dyoshikawa/rulesync) |
-| Agent asset projections | Claude Code, Codex CLI, GitHub Copilot, Copilot CLI, Antigravity IDE/CLI and AgentsSkills; [configured features](rulesync.jsonc) and [asset ownership](docs/development/agents/assets.md) vary per target |
-| General tooling | [mise.toml](mise.toml) selects rumdl, Biome, Lefthook, Rulesync and its Node runtime |
-| Documentation | [Documentation map](docs/README.md) routes goals, architecture, development and tools; [Tools](docs/tools/README.md) owns shared tool guidance |
-| Project scripts | [scripts/](scripts/README.md) is reserved for project-owned executable helpers when native tool tasks are insufficient |
-| Working records | [Inbox](.inbox/README.md) keeps temporary research, reviews and handoffs separate from canonical documentation |
+| Directives | Goals, priorities, and constraints provided by humans or authorized Managers |
+| Tasks | Project-scoped work bundles with goals, acceptance criteria, progress, and outcomes |
+| Artifacts | Research, plans, reviews, reports, and handoffs worth retaining |
+| Bots | Persistent Manager identity and routing information |
+| Memory | Curated, project-scoped knowledge for registered Bots |
 
-## Everyday commands
+The [workspace contracts](docs/policies/workspace/README.md) define record ownership, agent responsibilities, authority, lifecycle, and retention.
 
-| Action | Command |
-| --- | --- |
-| Format Markdown and supported code/config files | `mise run format` (writes across repository) |
-| Check Markdown, Biome and Lefthook configuration | `mise run check` |
-| Check Rulesync configuration | `mise run agents-check` |
-| Preview Rulesync projections (after setup) | `mise run agents-preview` |
-| Restore accepted upstream revisions (requires lockfile) | `mise run agents-restore` |
-| Update upstream revisions deliberately | `mise run agents-refresh` |
-| Preview/apply removal of retired runtime outputs | `mise run agents-retire -- <targets> --features <features> [--apply]` |
+## Architecture
 
-Git hook installation is **optional**, not part of the default setup. Follow [Tools](docs/tools/README.md) for scoped formatting, hook safety and version updates. `mise run check` does not run an application test suite, and an asset selection does not prove runtime activation.
+Hive separates reusable software from user-controlled data:
 
-The included Node.js documentation index is a shared repository utility, **not** a required application language. Derived repositories add their application runtime, tests and CI as needed.
+- **System:** This public repository owns the planned Rust CLI, shared policies, record templates, and reusable agent assets.
+- **Workspace:** A separate user-controlled Git repository owns actual tasks, artifacts, directives, Bot identities, memory, and private configuration.
+
+The planned CLI will provide scoped queries, record validation, and safe updates. A Hive Skill will guide agents in applying the shared policies and using the CLI. Direct authorized Git and file access remains supported.
+
+Hive is a collaboration and persistence system, not a task execution platform. It does not manage agent runtimes, schedule execution, or replace external project management. See the [system design](docs/architecture/system-design.md) for the proposed interfaces and implementation boundaries.
+
+## Getting started
+
+Until the CLI is available, use Hive through its document-first workflow:
+
+1. Select an authorized data workspace and an applicable system policy revision.
+2. Read the relevant [workspace contracts](docs/policies/workspace/README.md).
+3. Follow the [work bundle guide](docs/guides/getting-started.md) to create, resume, or hand off work using Git and Markdown. Use the [record templates](assets/templates/README.md) as needed.
+
+Keep actual workspace records out of this public repository.
+
+## Documentation
+
+- [Goals and scope](docs/goal/README.md)
+- [System design](docs/architecture/system-design.md)
+- [Workspace agent assets](agents-configs/README.md)
+- [Contributing and development](docs/development/README.md), including [development environment setup](docs/tools/initial-setup.md)
+
+## License
+
+See [LICENSE](LICENSE).

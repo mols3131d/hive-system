@@ -10,7 +10,7 @@
     "docs:index:check": "node scripts/generate-docs-index.ts --check",
     "test:docs": "node --test tests/scripts/generate-docs-index.test.ts",
     "typecheck:scripts": "tsc --project tsconfig.scripts.json",
-    "docs:frontmatter:check": "node scripts/generate-docs-index.ts --validate scripts/README.md .github/templates/README.md"
+    "docs:frontmatter:check": "node scripts/generate-docs-index.ts --validate scripts/README.md .github/templates/README.md agents-configs/README.md assets/templates/README.md assets/templates/artifact-manifest.md assets/templates/bot.md assets/templates/bundle-readme.md assets/templates/directive.md assets/templates/handoff.md assets/templates/memory.md assets/templates/message.md assets/templates/report.md assets/templates/research.md assets/templates/review.md assets/templates/scope-readme.md assets/templates/session-context.md assets/templates/task.md assets/templates/work-note.md"
   },
   "devDependencies": {
     "@types/node": "26.6.6",
