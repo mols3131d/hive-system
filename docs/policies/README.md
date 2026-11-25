@@ -1,5 +1,5 @@
 ---
-description: "Use when recording adopted project-wide policies and their enforcement boundaries."
+description: "Find shared Hive workspace operating contracts and system-wide policy boundaries."
 ---
 
 # Policies

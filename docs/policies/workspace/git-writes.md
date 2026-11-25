@@ -28,7 +28,7 @@ Direct commits are permitted only for ordinary work records within the explicitl
 
 ## PR-required repository changes
 
-For documentation, scripts, configurations, templates or changes to how Hive operates, create a dedicated topic branch from the intended base, submit a PR and inspect its diff and **actual verification evidence** before integration. For Hive data repositories, keep repository automation manual-only when configured; use relevant local checks or explicitly authorized manual runs, and do not assume an absent CI result is a pass. This restriction does not redefine the separate system repository's development CI. **Do not write these changes directly to `main`**, even if GitHub technically accepts the push.
+For documentation, scripts, configurations, templates or changes to how Hive operates, create a dedicated topic branch from the intended base, submit a PR and inspect its diff and **actual verification evidence** before integration. For Hive data repositories, any GitHub Actions workflows are manual-dispatch only; use relevant local checks or explicitly authorized manual runs, and do not assume an absent CI result is a pass. This restriction does not redefine the separate system repository's development CI. **Do not write these changes directly to `main`**, even if GitHub technically accepts the push.
 
 - Inspect local `git status --short` and current branch before switching; preserve unrelated changes.
 - Use a descriptive branch name, such as `docs/git-workflow` or `fix/index-validation`.

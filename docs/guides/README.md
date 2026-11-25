@@ -1,5 +1,5 @@
 ---
-description: "Start here when adapting the repository template to a project and choosing which example automation to retain."
+description: "Choose manual Hive workspace guidance or inherited system development setup."
 ---
 
 # Guides

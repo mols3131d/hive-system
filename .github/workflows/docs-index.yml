@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "docs/**"
+      - "assets/templates/**"
       - "scripts/generate-docs-index.ts"
       - "tests/scripts/generate-docs-index.test.ts"
       - "package.json"
@@ -16,6 +17,7 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "assets/templates/**"
       - "scripts/generate-docs-index.ts"
       - "tests/scripts/generate-docs-index.test.ts"
       - "package.json"
