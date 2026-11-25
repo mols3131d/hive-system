@@ -80,7 +80,10 @@ fn main() -> std::process::ExitCode {
     let (code, message) = match &conflict {
         Some(OptionConflict::Output) => ("INVALID_ARGUMENT", "Conflicting output options"),
         Some(OptionConflict::View) => ("INVALID_ARGUMENT", "Conflicting read views"),
-        None => ("INTERNAL_ERROR", "Design probe only; no workspace operation"),
+        None => (
+            "INTERNAL_ERROR",
+            "Design probe only; no workspace operation",
+        ),
     };
     if cli.json || cli.format == Some(Format::Json) {
         let failure = Failure {
