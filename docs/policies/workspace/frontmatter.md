@@ -26,7 +26,7 @@ Common fields apply in every row. A dash means no additional metadata is require
 | --- | --- | --- |
 | Area README; project or reserved-scope README | — | — |
 | `tasks/<project-id>/backlog/<work-id>/README.md` | — | `priority` |
-| `tasks/<project-id>/active/<work-id>/README.md` | `status` | `priority` |
+| `tasks/<project-id>/active/<work-id>/README.md` | `status`; `claim` for `in-progress` under the adopted coordination contract | `priority`, `claim` on eligible `todo` or `review` under that contract |
 | `tasks/<project-id>/archive/<work-id>/README.md` | `status` | — |
 | `directives/<project-id>/<slug>.md` or `<slug>/README.md` | `status` | — |
 | Supporting Markdown within a directive bundle | — | — |
@@ -45,6 +45,8 @@ A directory README's description identifies the purpose and scope of its directo
 
 Optional `priority` is one of `low`, `normal`, `high` for backlog or active work. Omission means unspecified, not normal. Priority is relative to the scope and does not establish scheduling, readiness or authority. Omit priority when archiving; retain relevant historical context in the body if needed. Record blockers, goals, acceptance criteria, dependencies and assignments in the body when needed. See [task lifecycle](tasks.md).
 
+This `in-progress` example applies to workspaces pinned to a policy revision before Git-backed coordination.
+
 ```yaml
 ---
 description: "Continue API authentication improvements."
@@ -54,6 +56,27 @@ tags:
   - "domain:identity:tokens"
 ---
 ```
+
+The adopted [Git-backed coordination contract](tasks.md#git-backed-issuance-and-claims) uses an optional active-task `claim` mapping with exactly two required nonempty string fields:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Fresh opaque identifier for this assignment, distinct from any earlier assignment of this task; generated on acquisition or transfer |
+| `holder` | Authorized task-scoped execution responsibility reference; a stable label for the assignment, not a Git email, credential, mandatory Bot or device ID |
+
+Omit `claim` for unclaimed work, backlog, archived work and active `done`. An active `in-progress` record requires a claim under the adopted contract. Example:
+
+```yaml
+---
+description: "Continue API authentication improvements."
+status: in-progress
+claim:
+  id: "5d9eb872-8b4e-4cba-97bf-83df96eab245"
+  holder: "worker-a"
+---
+```
+
+The mapping records only current assignment; Git history retains prior assignments. Keep recovery, transfer or closure evidence in the task body when needed. Do not add claim timestamps, expiry, credentials, raw runtime context or a separate session registry. Structural validation does not establish holder authority or runtime termination. Earlier pinned workspaces need no claim fields until reviewed adoption.
 
 ### Directives
 

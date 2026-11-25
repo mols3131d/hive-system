@@ -6,4 +6,4 @@ Resolve the explicitly authorized Hive data workspace, account and ref, independ
 
 Read its README and relevant intentional artifacts if present. Revalidate current source refs and progress. Summarize the project-qualified work ID, goal, verified progress and checks, blockers and next action with links; distinguish unverified information and delivery. Do not assume a checkpoint or message exists.
 
-Do not modify files, activate agents, deliver messages or merge without separate authorization.
+Report recorded claim and authority freshness when present; a local read does not confirm current execution ownership. Do not acquire a claim, modify files, activate agents, deliver messages or merge without separate authorization.
