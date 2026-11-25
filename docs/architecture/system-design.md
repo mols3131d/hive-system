@@ -57,7 +57,26 @@ Start with one Cargo package and one executable. Separate CLI argument and outpu
 | Storage | Read local files and Git snapshots; safely prepare changes and conditionally publish critical task changes |
 | Verification | Test observable contracts with synthetic records and isolated repositories |
 
-Candidate libraries include `clap`, `serde`, `serde_json`, a maintained YAML parser, and, where required, a Markdown parser, date library and native Git integration. `thiserror`, `anyhow`, `assert_cmd` and `tempfile` are candidates for errors and tests. Select and review actual dependencies when needed; no versions, licenses, compatibility or performance claims are established here. Prefer existing native Git integration over reimplementing Git or credential handling. No Git hosting provider or network access is required for local operation.
+### Initial implementation choices
+
+Use Rust edition 2024 and a tested stable toolchain, one package and one binary named `hive`. Bootstrap records the tested toolchain and minimum supported Rust version in the package/toolchain configuration after resolving actual dependencies. Commit `Cargo.lock` for repeatable application builds. The following are selected dependency families for the MVP proposal, added only when their functionality is implemented; the exact resolved versions, feature set, licenses, advisories and toolchain compatibility must be checked at Bootstrap before accepting the build.
+
+| Dependency | First use | Decision |
+| --- | --- | --- |
+| [clap](https://docs.rs/clap/latest/clap/_derive/) 4, derive | CLI | Typed argument and subcommand parsing |
+| [serde](https://docs.rs/serde/latest/serde/) 1, derive; [serde_json](https://docs.rs/serde_json/latest/serde_json/) 1 | CLI | Typed results and JSON v1 |
+| [thiserror](https://docs.rs/thiserror/latest/thiserror/) 2 | CLI | Typed domain errors; one error-code mapping |
+| [serde-saphyr](https://docs.rs/serde-saphyr/2.2.0/serde_saphyr/) 2 | Configuration | Maintained Serde YAML parser with duplicate-key rejection and resource limits; verify strict scalar types and required feature support |
+| [sha2](https://docs.rs/sha2/latest/sha2/) | Read and mutation | SHA-256 content token over exact bytes |
+| [tempfile](https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html) 3 | Mutation and tests | Same-directory temporary files and isolated synthetic repositories; not a concurrency or durability guarantee |
+| [uuid](https://docs.rs/uuid/latest/uuid/) 1, v4 | Coordination | Fresh assignment ID, not a credential |
+| [time](https://docs.rs/time/latest/time/) 0.3 | Coordination | Closure date in documented UTC convention |
+
+Do not add an HTTP client, Git library, async runtime, database, generic error framework or dedicated Markdown renderer. Use `std::process::Command` with explicit arguments for native Git and `std::fs` for scoped file operations. Standard Rust test harness and process invocation suffice initially; add a test library only if demonstrated necessary. Frontmatter is a delimited YAML mapping with an opaque Markdown body, not a Markdown AST rewriting task. The selected YAML parser can coerce values when targeting Rust strings directly; validate the actual scalar types and keys before typed conversion, reject duplicates, non-mapping documents and unsupported shapes, and use bounded parsing without interpolation or include features. Test strict types, malformed input and metadata preservation; do not silently round-trip unknown or unsupported content through a lossy serializer.
+
+Keep the initial source layout small: root Cargo manifest, `src/main.rs`, `src/cli.rs`, `src/output.rs` and `src/error.rs` at Bootstrap; add `config`, `workspace`, `record`, `validation`, `task`, `context`, `artifact`, `directive`, `bot`, `memory`, `storage`, `git` and `coordination` modules when their responsibilities become executable. Split files only as necessary. Use one internal application boundary rather than a public SDK or a workspace of crates. The [CLI contract](cli-contract.md) owns operation signatures and failure semantics.
+
+Use the standard Cargo build, format, lint and test path, plus the existing repository checks; synthetic fixtures contain no real workspace records. Validate a minimal installation from a reviewed checkout with [Cargo install](https://doc.rust-lang.org/cargo/commands/cargo-install.html) using `cargo install --locked --path . --root <isolated-install-root>`, then exercise the installed binary. No forced replacement, public registry publication or user-environment install is needed for MVP acceptance. Native Git must be present for Git operations; confirm supported versions by actual tests, not by the version observed in one environment. No Git hosting provider or network access is required for local operation.
 
 The existing TypeScript scripts and verification commands are not replaced by this design. Evaluate any migration of development tooling independently against existing callers, tests and maintenance cost. Development Agent Assets under `.rulesync/` remain separate from the [distributable Hive Agent Assets](../../agents-configs/README.md). Product releases must select only product sources, not the development harness; distribution mechanics remain to be designed.
 
@@ -199,7 +218,7 @@ Use the existing Markdown layout and stable identifiers. The new coordination me
 - Review the proposed [CLI and domain contract](cli-contract.md), implement platform path resolution and verify exact command/error behavior. Finalize safe Git compare-and-update mechanics and recovery evidence through actual Git tests before enabling writes.
 - Specify non-invasive optional asset installation and test repository/credential isolation, including differing project and Hive Git authors and remotes.
 - Finalize compatibility signaling and the reviewed adoption/rollback procedure for the new coordination contract. Preserve stable scope and work IDs and one record owner across migration.
-- Review the smallest initial command set, Rust dependency and distribution choices, and the relationship to current TypeScript development tooling.
+- Review the selected dependency families, source layout and installation approach above; at Bootstrap resolve and review the actual lockfile/toolchain, run Cargo checks and preserve the existing TypeScript development tooling.
 - Confirm implementation acceptance and authorization before implementation, data migration, privileged automation or release.
 
 The design preserves the collaboration backend and agent policy boundaries. It does not assert that the proposed CLI, Skill or data-workspace compatibility has been implemented or tested.
