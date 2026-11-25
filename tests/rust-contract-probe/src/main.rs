@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -10,27 +11,33 @@ enum Format {
 #[derive(Debug, Parser)]
 #[command(name = "hive", version, about = "Synthetic Hive CLI contract probe")]
 struct Cli {
-    #[arg(long, global = true)]
-    workspace: Option<std::path::PathBuf>,
-    #[arg(long, global = true)]
-    project: Option<String>,
-    #[arg(long, global = true)]
-    project_root: Option<std::path::PathBuf>,
-    #[arg(long, global = true)]
-    format: Option<Format>,
-    #[arg(long, global = true)]
-    json: bool,
-    #[arg(long, global = true)]
-    at: Option<String>,
-    #[arg(long, global = true)]
-    authority: bool,
+    #[command(flatten)]
+    before: Common,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Context,
+    Context(Common),
+}
+
+#[derive(Debug, Args)]
+struct Common {
+    #[arg(long)]
+    workspace: Vec<PathBuf>,
+    #[arg(long)]
+    project: Vec<String>,
+    #[arg(long)]
+    project_root: Vec<PathBuf>,
+    #[arg(long)]
+    format: Vec<Format>,
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    at: Vec<String>,
+    #[arg(long)]
+    authority: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +46,23 @@ enum OptionConflict {
     Output,
     #[error("Conflicting read views")]
     View,
+    #[error("Repeated conflicting values for {0}")]
+    Repeated(&'static str),
+}
+
+fn unique<'a, T: Eq>(
+    before: &'a [T],
+    after: &'a [T],
+    option: &'static str,
+) -> Result<Option<&'a T>, OptionConflict> {
+    let mut values = before.iter().chain(after);
+    let first = values.next();
+    if let Some(first) = first
+        && values.any(|value| value != first)
+    {
+        return Err(OptionConflict::Repeated(option));
+    }
+    Ok(first)
 }
 
 #[derive(Serialize)]
@@ -57,17 +81,43 @@ struct ErrorDetail<'a> {
 }
 
 impl Cli {
+    fn after(&self) -> &Common {
+        match &self.command {
+            Command::Context(common) => common,
+        }
+    }
+
+    fn json_requested(&self) -> bool {
+        self.before.json
+            || self.after().json
+            || self.before.format.contains(&Format::Json)
+            || self.after().format.contains(&Format::Json)
+    }
+
     fn output_format(&self) -> Result<Format, OptionConflict> {
-        match (self.json, self.format) {
+        let explicit = unique(&self.before.format, &self.after().format, "--format")?;
+        match (self.before.json || self.after().json, explicit) {
             (true, Some(Format::Text)) => Err(OptionConflict::Output),
             (true, _) => Ok(Format::Json),
-            (false, value) => Ok(value.unwrap_or(Format::Text)),
+            (false, value) => Ok(value.copied().unwrap_or(Format::Text)),
         }
+    }
+
+    fn project(&self) -> Result<Option<&String>, OptionConflict> {
+        unique(&self.before.project, &self.after().project, "--project")
     }
 
     fn validate_options(&self) -> Result<(), OptionConflict> {
         self.output_format()?;
-        if self.at.is_some() && self.authority {
+        self.project()?;
+        unique(&self.before.workspace, &self.after().workspace, "--workspace")?;
+        unique(
+            &self.before.project_root,
+            &self.after().project_root,
+            "--project-root",
+        )?;
+        let at = unique(&self.before.at, &self.after().at, "--at")?;
+        if at.is_some() && (self.before.authority || self.after().authority) {
             return Err(OptionConflict::View);
         }
         Ok(())
@@ -78,19 +128,21 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let conflict = cli.validate_options().err();
     let (code, message) = match &conflict {
-        Some(OptionConflict::Output) => ("INVALID_ARGUMENT", "Conflicting output options"),
-        Some(OptionConflict::View) => ("INVALID_ARGUMENT", "Conflicting read views"),
+        Some(error) => ("INVALID_ARGUMENT", error.to_string()),
         None => (
             "INTERNAL_ERROR",
-            "Design probe only; no workspace operation",
+            "Design probe only; no workspace operation".to_owned(),
         ),
     };
-    if cli.json || cli.format == Some(Format::Json) {
+    if cli.json_requested() {
         let failure = Failure {
             schema_version: 1,
             ok: false,
             command: "context",
-            error: ErrorDetail { code, message },
+            error: ErrorDetail {
+                code,
+                message: &message,
+            },
             warnings: vec![],
         };
         println!(
@@ -134,7 +186,7 @@ mod tests {
             ["hive", "--json", "context", "--project", "example"],
         ] {
             let cli = Cli::try_parse_from(args).unwrap();
-            assert_eq!(cli.project.as_deref(), Some("example"));
+            assert_eq!(cli.project().unwrap().map(String::as_str), Some("example"));
             assert_eq!(cli.output_format().unwrap(), Format::Json);
         }
     }
@@ -155,6 +207,51 @@ mod tests {
     fn conflicting_format_is_rejected() {
         let cli = Cli::try_parse_from(["hive", "context", "--json", "--format", "text"]).unwrap();
         assert!(cli.output_format().is_err());
+    }
+
+    #[test]
+    fn conflicting_repeated_values_are_not_overwritten() {
+        for option in ["--workspace", "--project", "--project-root", "--at"] {
+            for args in [
+                ["hive", option, "a", "context", option, "b"],
+                ["hive", "context", option, "a", option, "b"],
+                ["hive", option, "a", option, "b", "context"],
+            ] {
+                let cli = Cli::try_parse_from(args).unwrap();
+                assert!(matches!(
+                    cli.validate_options(),
+                    Err(OptionConflict::Repeated(name)) if name == option
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn identical_repeated_values_remain_valid() {
+        let cli = Cli::try_parse_from([
+            "hive",
+            "--project",
+            "example",
+            "context",
+            "--project",
+            "example",
+        ])
+        .unwrap();
+        assert!(cli.validate_options().is_ok());
+    }
+
+    #[test]
+    fn repeated_formats_conflict_in_both_orders() {
+        for (first, second) in [("text", "json"), ("json", "text")] {
+            let cli =
+                Cli::try_parse_from(["hive", "--format", first, "context", "--format", second])
+                    .unwrap();
+            assert!(cli.json_requested());
+            assert!(matches!(
+                cli.validate_options(),
+                Err(OptionConflict::Repeated("--format"))
+            ));
+        }
     }
 
     #[test]

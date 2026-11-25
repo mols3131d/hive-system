@@ -49,3 +49,26 @@ fn conflicting_read_views_return_one_json_failure() {
     assert_eq!(value["error"]["code"], "INVALID_ARGUMENT");
     assert!(result.stderr.is_empty());
 }
+
+#[test]
+fn conflicting_project_selection_is_rejected_without_echoing_values() {
+    let result = Command::new(env!("CARGO_BIN_EXE_hive-contract-probe"))
+        .args([
+            "--project",
+            "first-example",
+            "context",
+            "--project",
+            "second-example",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "INVALID_ARGUMENT");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("--project"));
+    assert!(!message.contains("first-example"));
+    assert!(!message.contains("second-example"));
+    assert!(result.stderr.is_empty());
+}
