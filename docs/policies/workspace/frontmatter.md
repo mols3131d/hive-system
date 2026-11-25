@@ -45,6 +45,8 @@ A directory README's description identifies the purpose and scope of its directo
 
 Optional `priority` is one of `low`, `normal`, `high` for backlog or active work. Omission means unspecified, not normal. Priority is relative to the scope and does not establish scheduling, readiness or authority. Omit priority when archiving; retain relevant historical context in the body if needed. Record blockers, goals, acceptance criteria, dependencies and assignments in the body when needed. See [task lifecycle](tasks.md).
 
+This `in-progress` example applies to workspaces pinned to a policy revision before Git-backed coordination.
+
 ```yaml
 ---
 description: "Continue API authentication improvements."

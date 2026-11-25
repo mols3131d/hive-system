@@ -184,16 +184,22 @@ Keep discovery progressive: resolve the authorized workspace and collaboration s
 
 The [CLI and domain contract](cli-contract.md) defines the proposed MVP command grammar, configuration resolution, typed in-process API, options, outputs, preconditions and errors. It does not introduce an HTTP API or public SDK. Keep the executable name `hive`; name collisions and alias management are outside MVP.
 
-Read and ordinary local-write commands remain separate from explicitly coordinated task mutations. A short task ID requires a verified project scope; use configuration to avoid repeated scope arguments. The following examples assume an applicable project binding and an adopted coordination contract where needed; they are not currently executable.
+These proposed examples assume an applicable project binding. A short task ID requires a verified project scope. The read examples use a task already present in the local checkout.
 
 ```sh
 hive context --json
 hive config show
 hive task list
 hive task context fix-auth --json
-hive task create fix-auth --file task.md
-hive task claim fix-auth --holder worker-a --expected-revision "$BASE_REVISION"
 hive validate --task fix-auth
+```
+
+To issue and claim a new task under an adopted coordination contract, set `ISSUED_REVISION` to the confirmed revision returned by `task create`. Set `SELECTED_REVISION` to the confirmed revision returned by `task select`. Run each command after the preceding operation is confirmed.
+
+```sh
+hive task create add-auth-tests --file task.md
+hive task select add-auth-tests --expected-revision "$ISSUED_REVISION"
+hive task claim add-auth-tests --holder worker-a --expected-revision "$SELECTED_REVISION"
 ```
 
 The exact commands, required guards and failure semantics are owned by the linked contract. Ordinary status/record changes do not implicitly acquire a claim, accept work or publish to Git.
