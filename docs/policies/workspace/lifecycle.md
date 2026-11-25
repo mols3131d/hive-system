@@ -15,7 +15,7 @@ Work bundles and standalone artifacts support execution, review, delivery and in
 
 [Project directives](directives.md) follow their own validity and supersession rules; retain currently applicable direction and required traceability. They are not retired merely because a related task closes.
 
-[Bot identity and curated memory](bots.md) and private configuration are durable sources outside temporary cleanup. Repository operating docs and reusable assets are likewise not temporary records.
+[Bot identity and curated memory](bots.md) are durable sources outside temporary cleanup. Repository operating docs and reusable assets are likewise not temporary records.
 
 ## Cleanup
 

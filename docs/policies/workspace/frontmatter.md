@@ -8,7 +8,7 @@ This document owns metadata for Hive Markdown records and entrypoints. Use the r
 
 ## Common fields
 
-All new or updated workspace Markdown entrypoints and records under `tasks/`, `directives/`, `bots/` and `artifacts/` use the following common fields. This includes every directory README, even historical directory entrypoints. Retained historical non-README evidence need not be migrated solely for metadata. The repository root README is exempt under the [documentation contract](../../documentation/frontmatter.md). The maintained private-configs README uses description metadata; private source assets retain their own native formats.
+All new or updated workspace Markdown entrypoints and records under `tasks/`, `directives/`, `bots/` and `artifacts/` use the following common fields. This includes every directory README, even historical directory entrypoints. Retained historical non-README evidence need not be migrated solely for metadata. The repository root README is exempt under the [documentation contract](../../documentation/frontmatter.md).
 
 | Field | Requirement | Type and meaning |
 | --- | --- | --- |

@@ -11,11 +11,11 @@ Hive provides a persistent, user-controlled collaboration workspace for human-fa
 - Preserve Markdown and Git as the canonical workspace data and revision history.
 - Define durable, scoped Task, Artifact, Directive, Bot and Memory contracts and clear responsibility for delegation, handoff, authorization and acceptance.
 - Deliver an independent Rust CLI and Hive Skill for repeatable, safe workspace operations. Keep direct authorized Git and document use possible.
-- Separate reusable system software and policies from user data and personal configuration. Use synthetic fixtures; no private workspace contents or history belong in the public system.
+- Separate reusable system software and policies from user collaboration data. Use synthetic fixtures; no private workspace contents or history belong in the public system.
 
 ## Non-goals
 
-Hive is not an agent execution platform, another project specification owner, a backend router or an automatic synchronization service. It does not implement scheduling, session control, distributed claims or automatic retention cleanup. Initial CLI development does not include MCP or a separate service/database. See [workspace policies](../policies/workspace/README.md) for the current semantic boundaries.
+Hive is not an agent execution platform, another project specification owner, a backend router, a personal or environment-specific configuration manager, or an automatic synchronization service. It does not implement scheduling, session control, distributed claims or automatic retention cleanup. Initial CLI development does not include MCP or a separate service/database. See [workspace policies](../policies/workspace/README.md) for the current semantic boundaries.
 
 ## Acceptance
 
