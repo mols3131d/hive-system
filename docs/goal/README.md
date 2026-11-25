@@ -4,8 +4,21 @@ description: "Use when defining project outcomes, requirements, scope, non-goals
 
 # Goals
 
-Use this area to define **what the derived project should achieve** and the evidence needed to call it successful.
+Hive provides a persistent, user-controlled collaboration workspace for human-facing Manager Bots and task-scoped agents operating across projects. It separates agent-internal collaboration from external project ownership and keeps only intentional, useful records.
 
-Document the user or stakeholder problem, intended outcomes, scope and non-goals, requirements, and observable acceptance criteria as they become known. Keep each decision in one authoritative place; split into focused files such as `requirements.md` or `scope.md` only when their content and readers justify separate ownership.
+## Outcomes
 
-[Architecture](../architecture/README.md) owns technical design and tradeoffs. [Development](../development/README.md) owns how changes are implemented and verified. Plans, tests and PRs may reference goals without redefining their acceptance conditions.
+- Preserve Markdown and Git as the canonical workspace data and revision history.
+- Define durable, scoped Task, Artifact, Directive, Bot and Memory contracts and clear responsibility for delegation, handoff, authorization and acceptance.
+- Deliver an independent Rust CLI and Hive Skill for repeatable, safe workspace operations. Keep direct authorized Git and document use possible.
+- Separate reusable system software and policies from user data and personal configuration. Use synthetic fixtures; no private workspace contents or history belong in the public system.
+
+## Non-goals
+
+Hive is not an agent execution platform, another project specification owner, a backend router or an automatic synchronization service. It does not implement scheduling, session control, distributed claims or automatic retention cleanup. Initial CLI development does not include MCP or a separate service/database. See [workspace policies](../policies/workspace/README.md) for the current semantic boundaries.
+
+## Acceptance
+
+A usable system should demonstrate scoped read and validation operations, machine-readable output with distinct failure meanings, safe eligible record mutations with revision conflict handling, compatibility with the existing Markdown contract, and representative authorized agent use. Verify these with synthetic records and actual tests; a proposal or passing documentation check is not implemented behavior.
+
+[Architecture](../architecture/system-design.md) owns technical choices and incremental implementation; [Development](../development/README.md) owns implementation and verification procedures.
