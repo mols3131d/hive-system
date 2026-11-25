@@ -25,16 +25,50 @@ struct Envelope<'a> {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Outcome<'a> {
-    #[allow(
-        dead_code,
-        reason = "Success envelope is part of v1; executable operations follow Bootstrap"
-    )]
-    Success {
-        data: &'a Value,
-    },
-    Failure {
-        error: &'a HiveError,
-    },
+    Success { data: &'a Value },
+    Failure { error: &'a HiveError },
+}
+
+pub(crate) fn success(
+    format: Format,
+    command: &str,
+    context: Option<&Value>,
+    data: &Value,
+) -> ExitCode {
+    let mut stdout = io::stdout().lock();
+    let written = match format {
+        Format::Text => {
+            let scope = context.map(serde_json::to_string_pretty).transpose();
+            let text = serde_json::to_string_pretty(data);
+            match (scope, text) {
+                (Ok(Some(scope)), Ok(text)) => {
+                    writeln!(stdout, "{command}\n\nContext\n{scope}\n\nResult\n{text}").is_ok()
+                }
+                (Ok(None), Ok(text)) => writeln!(stdout, "{command}\n{text}").is_ok(),
+                _ => false,
+            }
+        }
+        Format::Json => write_json(
+            &mut stdout,
+            &Envelope {
+                schema_version: SCHEMA_VERSION,
+                ok: true,
+                command: Some(command),
+                context,
+                outcome: Outcome::Success { data },
+                warnings: &[],
+            },
+        ),
+    };
+    if written && stdout.flush().is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn write_json(output: &mut impl Write, envelope: &Envelope<'_>) -> bool {
+    serde_json::to_writer(&mut *output, envelope).is_ok() && writeln!(output).is_ok()
 }
 
 pub(crate) fn failure(format: Format, command: Option<&str>, error: HiveError) -> ExitCode {
@@ -50,9 +84,7 @@ pub(crate) fn failure(format: Format, command: Option<&str>, error: HiveError) -
                 warnings: &[],
             };
             let mut stdout = io::stdout().lock();
-            serde_json::to_writer(&mut stdout, &envelope).is_ok()
-                && writeln!(stdout).is_ok()
-                && stdout.flush().is_ok()
+            write_json(&mut stdout, &envelope) && stdout.flush().is_ok()
         }
     };
     if written {

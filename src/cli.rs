@@ -40,6 +40,15 @@ pub(crate) enum Format {
     Json,
 }
 
+impl Format {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
 #[derive(Args)]
 struct CommonArgs {
     /// Select the Hive workspace.
@@ -68,10 +77,6 @@ struct CommonArgs {
 pub(crate) struct CommonOptions {
     pub(crate) workspace: Option<PathBuf>,
     pub(crate) project: Option<ProjectId>,
-    #[allow(
-        dead_code,
-        reason = "Project root resolution follows the CLI bootstrap"
-    )]
     pub(crate) project_root: Option<PathBuf>,
     pub(crate) format: Option<Format>,
     pub(crate) view: View,
@@ -79,7 +84,7 @@ pub(crate) struct CommonOptions {
 
 pub(crate) enum View {
     WorkingTree,
-    Commit(#[allow(dead_code, reason = "Snapshot reads follow the CLI bootstrap")] CommitOid),
+    Commit(CommitOid),
     Authority,
 }
 
@@ -88,6 +93,16 @@ pub(crate) enum ProjectId {
     Ordinary(String),
     HiveUserdata,
     General,
+}
+
+impl ProjectId {
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Ordinary(id) => id,
+            Self::HiveUserdata => "_hive-userdata",
+            Self::General => "_general",
+        }
+    }
 }
 
 impl FromStr for ProjectId {
@@ -139,6 +154,12 @@ fn parse_slug(value: &str) -> Result<String, &'static str> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitOid(String);
+
+impl CommitOid {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 impl FromStr for CommitOid {
     type Err = &'static str;
@@ -221,7 +242,7 @@ pub(crate) struct ConfigScopeArgs {
     pub(crate) scope: ConfigScope,
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum ConfigScope {
     User,
     Project,

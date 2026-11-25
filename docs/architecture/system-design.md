@@ -4,7 +4,7 @@ description: "Read when designing or implementing the standalone Rust Hive CLI a
 
 # Hive System Design
 
-**Status: CLI bootstrap.** Hive is an independent Rust system, separate from user-controlled data repositories. The initial executable handles help, version, arguments and result formatting. Workspace operations and the Hive-owned Skill remain proposed. The foundation is the local filesystem and native Git.
+**Status: read-only configuration and local context.** Hive is an independent Rust system, separate from user-controlled data repositories. The executable handles configuration resolution and local inspection. Record operations and the Hive-owned Skill remain proposed. The foundation is the local filesystem and native Git.
 
 Hive is a personal collaboration workspace for one developer working across multiple AI agent sessions and projects, not a multi-user collaboration service, general project management application or agent execution platform. Optimize for long-running development, selective context persistence, low setup and maintenance cost, simple local operation and durable developer-agent communication. Reports, briefings, discussion outcomes and handoffs are records for later reading, not live messages between agent sessions. See [communication](../policies/workspace/communication.md) for the record and delivery boundary. One project has one active development environment (device, VM, container or equivalent); multiple agent sessions may work within it and multiple projects may share an environment. Sequential environment moves are supported after stopping or safely handing off work and preserving source and Hive state. Simultaneous development of the same project from multiple independent environments is outside initial support. Different projects may still share a Hive data repository, so preserve scoped write safety and explicit Git-backed ticket issuance and execution claims without device registration, enterprise identity management or distributed orchestration. Preserve the [workspace operating contracts](../policies/workspace/README.md), including project-owned specifications, human and agent authority, selective retention and non-interference with external developers. Existing records and workflows remain valid until a reviewed change explicitly replaces them.
 
@@ -82,7 +82,7 @@ The existing TypeScript scripts and verification commands are not replaced by th
 
 ## Configuration and identity
 
-Use YAML with the `.yml` extension for Hive configuration. Only expose values that vary between environments; do not turn safety rules into settings. These are proposed version-one contracts, not installed configuration or implemented commands.
+Use YAML with the `.yml` extension for Hive configuration. Only expose values that vary between environments; do not turn safety rules into settings. The CLI reads the version-one configuration files described below without creating or editing them.
 
 | Source | Ownership and purpose |
 | --- | --- |

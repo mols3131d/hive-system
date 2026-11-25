@@ -59,10 +59,26 @@ impl ErrorCode {
     }
 }
 
-#[derive(Debug, Error, Serialize)]
+#[derive(Clone, Debug, Error, Serialize)]
 #[error("{message}")]
 pub(crate) struct HiveError {
     pub(crate) code: ErrorCode,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<ErrorDetails>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ErrorDetails {
+    diagnostics: [Diagnostic; 1],
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct Diagnostic {
+    code: ErrorCode,
+    severity: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
     message: String,
 }
 
@@ -71,7 +87,22 @@ impl HiveError {
         Self {
             code,
             message: message.into(),
+            details: None,
         }
+    }
+
+    pub(crate) fn diagnostic(mut self, path: Option<&str>) -> Self {
+        if self.details.is_none() {
+            self.details = Some(ErrorDetails {
+                diagnostics: [Diagnostic {
+                    code: self.code,
+                    severity: "error",
+                    path: path.map(str::to_owned),
+                    message: self.message.clone(),
+                }],
+            });
+        }
+        self
     }
 }
 

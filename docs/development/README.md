@@ -32,7 +32,7 @@ cargo install --locked --path . --root "$hive_install_root"
 "$hive_install_root/bin/hive" --version
 ```
 
-The Bootstrap executable validates arguments and reports unavailable workspace operations with `NOT_IMPLEMENTED`. Follow the [CLI contract](../architecture/cli-contract.md) for output and exit codes.
+Use an isolated synthetic workspace to test `config show`, `config validate`, `context` and local `doctor`. Git-backed inspection requires native Git with `--no-lazy-fetch` support and was tested on Linux with Git 2.53.0. Commands that are still pending return `NOT_IMPLEMENTED`. Follow the [CLI contract](../architecture/cli-contract.md) for configuration, output and exit codes.
 
 ## Agent-assisted development
 
