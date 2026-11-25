@@ -4,7 +4,7 @@ description: "Hive operating contracts for agent roles, directives, project-scop
 
 # Hive Workspace
 
-These contracts describe data held in an individual developer's Hive workspace for multiple agent sessions and projects, not records stored in the public system repository. See [Goals](../../goal/README.md) for product scope. Resolve the workspace and applicable reviewed system revision before use. The system owns shared contracts, reusable templates, distributed Agent Assets and tooling. Data workspaces own actual collaboration records and minimal record-management entrypoints, Git metadata and directly used agent configuration. A workspace may track selected Rulesync consumer copies and a minimal target configuration for data management; shared product definitions remain system-owned. They do not track system development tooling or generated runtime harnesses. Use authorized external tooling or direct Markdown and Git access to manage records.
+These contracts describe data held in an individual developer's Hive workspace for multiple agent sessions and projects, not records stored in the public system repository. Hive supports long-running work, selective context persistence and durable developer-agent communication. It does not provide immediate communication between agent sessions. See [Goals](../../goal/README.md) for product scope. Resolve the workspace and applicable reviewed system revision before use. The system owns shared contracts, reusable templates, distributed Agent Assets and tooling. Data workspaces own actual collaboration records and minimal record-management entrypoints, Git metadata and directly used agent configuration. A workspace may track selected Rulesync consumer copies and a minimal target configuration for data management; shared product definitions remain system-owned. They do not track system development tooling or generated runtime harnesses. Use authorized external tooling or direct Markdown and Git access to manage records.
 
 Before managing project or scope records, apply [collaboration backend and ownership rules](organization.md#collaboration-backend). Hive is the default; Notion is used only by explicit user designation. Hive's operating model is self-contained: external Skills and their compatibility are outside Hive's design scope. The surfaces below apply to Hive-managed work; registered Manager identity, curated memory and Hive's operating guidance retain their separate ownership. External project specifications and policies remain with their canonical owners. Personal and environment-specific configuration is outside Hive's responsibility and is not a workspace record area.
 
@@ -23,7 +23,7 @@ Read only the relevant guide:
 - [Directives](directives.md): project identity, direction, authority and maintenance.
 - [Tasks](tasks.md): work bundles, management lifecycle and progress.
 - [Organization](organization.md): backend selection, project-owned specifications, action authority, external repository boundaries and record organization.
-- [Communication](communication.md): runtime-independent handoffs, execution ownership, resumption and delivery evidence.
+- [Communication](communication.md): developer-agent reports, briefings and discussion outcomes, context continuity, handoffs and delivery boundaries.
 - [Frontmatter](frontmatter.md): record metadata.
 - [Lifecycle](lifecycle.md): retention and cleanup.
 - [Git change paths](git-writes.md): ordinary records versus PR-required changes.
