@@ -25,11 +25,11 @@ The [workspace contracts](docs/policies/workspace/README.md) define record owner
 Hive separates reusable software from user-controlled data:
 
 - **System:** This public repository owns the planned Rust CLI, shared policies, record templates, and reusable agent assets.
-- **Workspace:** A separate user-controlled Git repository owns actual tasks, artifacts, directives, Bot identities, memory, and private configuration.
+- **Workspace:** A separate user-controlled Git repository owns actual tasks, artifacts, directives, Bot identities, and memory.
 
 The planned CLI will provide scoped queries, record validation, and safe updates. A Hive Skill will guide agents in applying the shared policies and using the CLI. Direct authorized Git and file access remains supported.
 
-Hive is a collaboration and persistence system, not a task execution platform. It does not manage agent runtimes, schedule execution, or replace external project management. See the [system design](docs/architecture/system-design.md) for the proposed interfaces and implementation boundaries.
+Hive is a collaboration and persistence system, not a task execution platform or a personal configuration manager. It does not manage agent runtimes, schedule execution, or replace external project management. See the [system design](docs/architecture/system-design.md) for the proposed interfaces and implementation boundaries.
 
 ## Getting started
 
