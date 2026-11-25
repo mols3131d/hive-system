@@ -43,4 +43,5 @@ coverage/
 .DS_Store
 Thumbs.db
 
-# Add stack-specific build output patterns in derived repositories.
+# Rust build output
+/target/

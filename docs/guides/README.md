@@ -4,7 +4,7 @@ description: "Choose manual Hive workspace guidance or inherited system developm
 
 # Guides
 
-Use [Start a Work Bundle](getting-started.md) for manual Hive workspace use in an explicitly selected data repository. The system CLI is not implemented.
+Use [Start a Work Bundle](getting-started.md) for manual Hive workspace use in an explicitly selected data repository. CLI workspace operations are pending.
 
 For system contributors, retain [Project Setup](project-setup.md) as the inherited development-tool adoption guide. It covers project-specific choices and replacing example automation.
 

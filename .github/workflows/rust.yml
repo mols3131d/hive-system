@@ -1,0 +1,72 @@
+name: Rust checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SOURCE_SHA: ${{ github.event_name != 'pull_request' && github.sha || github.event.pull_request.head.sha }}
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify source revision
+        run: |
+          revision=$(git rev-parse HEAD)
+          printf 'Checked out %s (expected %s)\n' "$revision" "$SOURCE_SHA"
+          test "$revision" = "$SOURCE_SHA"
+      - name: Set up the pinned Rust toolchain
+        run: |
+          test -f rust-toolchain.toml
+          rustup toolchain install --no-self-update
+          rustc --version --verbose
+          cargo --version
+      - name: Test
+        run: cargo test --locked --all-targets
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check lints
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --locked
+      - name: Install and exercise Hive
+        run: |
+          install_root=$(mktemp -d "$RUNNER_TEMP/hive-install.XXXXXX")
+          cargo install --locked --path . --root "$install_root"
+          hive="$install_root/bin/hive"
+          cd "$install_root"
+          "$hive" --help
+          "$hive" --version
+
+          expect_error() {
+            local expected_status=$1 expected_code=$2 status=0 output
+            shift 2
+            output=$("$hive" "$@") || status=$?
+            printf '%s\n' "$output"
+            if [[ "$status" != "$expected_status" ]]; then
+              printf 'Expected exit %s, got %s\n' "$expected_status" "$status" >&2
+              return 1
+            fi
+            jq -e --arg code "$expected_code" \
+              '.schema_version == 1 and .ok == false and .error.code == $code' <<< "$output"
+          }
+          expect_error 2 INVALID_ARGUMENT --json --workspace first context --workspace second
+          expect_error 7 NOT_IMPLEMENTED context --json
