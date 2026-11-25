@@ -59,7 +59,7 @@ Start with one Cargo package and one executable. Separate CLI argument and outpu
 
 ### Initial implementation choices
 
-Use Rust edition 2024 and a tested stable toolchain, one package and one binary named `hive`. Bootstrap records the tested toolchain and minimum supported Rust version in the package/toolchain configuration after resolving actual dependencies. Commit `Cargo.lock` for repeatable application builds. The following are selected dependency families for the MVP proposal, added only when their functionality is implemented; the exact resolved versions, feature set, licenses, advisories and toolchain compatibility must be checked at Bootstrap before accepting the build.
+Use Rust edition 2024, one package and one binary named `hive`. The synthetic CLI/YAML probe passed on Rust/Cargo 1.100.0 with a generated lockfile; use that tested toolchain as the initial reproducible Bootstrap baseline. Record it in the toolchain configuration. The actual minimum supported Rust version must be established from the resolved product dependencies and tests, not inferred from this probe. Commit `Cargo.lock` for repeatable application builds. The following are selected dependency families for the MVP proposal, added only when their functionality is implemented; the exact resolved versions, feature set, licenses, advisories and toolchain compatibility must be checked at Bootstrap before accepting the build.
 
 | Dependency | First use | Decision |
 | --- | --- | --- |
