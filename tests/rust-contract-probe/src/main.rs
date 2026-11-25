@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use std::path::PathBuf;
 use serde::Serialize;
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Format {
@@ -110,7 +110,11 @@ impl Cli {
     fn validate_options(&self) -> Result<(), OptionConflict> {
         self.output_format()?;
         self.project()?;
-        unique(&self.before.workspace, &self.after().workspace, "--workspace")?;
+        unique(
+            &self.before.workspace,
+            &self.after().workspace,
+            "--workspace",
+        )?;
         unique(
             &self.before.project_root,
             &self.after().project_root,
