@@ -4,7 +4,7 @@ description: "Use when implementing Hive domain APIs, configuration resolution, 
 
 # Hive CLI and Domain Contract
 
-**Status: MVP proposal, not implemented.** This document owns the proposed command interface and internal Rust operation contracts. [System design](system-design.md) owns architecture; [workspace policies](../policies/workspace/README.md) own record semantics and authority. API means typed in-process operations called by the CLI, not HTTP, MCP, a public Rust SDK or a separate service. Keep the binary name `hive`; naming conflicts and aliases are deferred.
+**Status: CLI bootstrap.** Help, version, argument validation and the JSON v1 envelope are implemented. Workspace operations remain proposed. [System design](system-design.md) owns architecture and [workspace policies](../policies/workspace/README.md) own record semantics and authority. API means typed in-process operations called by the CLI, not HTTP, MCP, a public Rust SDK or a separate service. Keep the binary name `hive`; naming conflicts and aliases are deferred.
 
 ## Invocation and scope
 
@@ -228,10 +228,12 @@ The context also includes available workspace/source revision, dirty state and p
 | 4 | `INVALID_RECORD`, `INVALID_TRANSITION`, `INCOMPATIBLE_POLICY` | Record or policy contract not satisfied |
 | 5 | `ALREADY_EXISTS`, `ALREADY_CLAIMED`, `CLAIM_MISMATCH`, `STALE_REVISION`, `CONCURRENT_CHANGE`, `DIRTY_CONFLICT` | Conflict; re-read and reconcile, never blind retry |
 | 6 | `UNAUTHORIZED` | Verified permission/authority denied; no alternate account |
-| 7 | `AUTHORITY_UNAVAILABLE`, `OBJECT_UNAVAILABLE`, `POLICY_UNAVAILABLE`, `IO_ERROR` | Required source or operation unavailable |
+| 7 | `AUTHORITY_UNAVAILABLE`, `OBJECT_UNAVAILABLE`, `POLICY_UNAVAILABLE`, `IO_ERROR`, `NOT_IMPLEMENTED` | Required source or operation unavailable |
 | 8 | `UNKNOWN_WRITE_OUTCOME` | Write may have occurred; reconcile actual authority/local state before retry |
 
 Error details may include safe expected/observed IDs, affected relative paths, candidate revision and diagnostic array; never return secrets, credential URLs, unrelated repository state or raw session history. These are proposed stable v1 meanings; add codes only for materially distinct caller decisions. Tests must assert both exit and JSON contract, including absence, invalid data, conflicts, partial/unknown outcomes and valid empty results.
+
+`NOT_IMPLEMENTED` means the command and arguments are valid and the current build does not support the operation. Bootstrap returns this error without opening or changing a workspace.
 
 ## MVP implementation boundary
 

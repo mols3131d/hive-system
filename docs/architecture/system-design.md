@@ -4,7 +4,7 @@ description: "Read when designing or implementing the standalone Rust Hive CLI a
 
 # Hive System Design
 
-**Status: design proposal, not implemented.** Hive is an independent Rust system, separate from user-controlled data repositories. The proposed initial product is a local CLI with a Hive-owned Skill, operating on Markdown and Git workspaces. The foundation is the local filesystem and native Git; detailed storage semantics, command contracts and deployment details remain proposals pending review.
+**Status: CLI bootstrap.** Hive is an independent Rust system, separate from user-controlled data repositories. The initial executable handles help, version, arguments and result formatting. Workspace operations and the Hive-owned Skill remain proposed. The foundation is the local filesystem and native Git.
 
 Hive is a personal collaboration workspace for one developer working across multiple AI agent sessions and projects, not a multi-user collaboration service, general project management application or agent execution platform. Optimize for long-running development, selective context persistence, low setup and maintenance cost, simple local operation and durable developer-agent communication. Reports, briefings, discussion outcomes and handoffs are records for later reading, not live messages between agent sessions. See [communication](../policies/workspace/communication.md) for the record and delivery boundary. One project has one active development environment (device, VM, container or equivalent); multiple agent sessions may work within it and multiple projects may share an environment. Sequential environment moves are supported after stopping or safely handing off work and preserving source and Hive state. Simultaneous development of the same project from multiple independent environments is outside initial support. Different projects may still share a Hive data repository, so preserve scoped write safety and explicit Git-backed ticket issuance and execution claims without device registration, enterprise identity management or distributed orchestration. Preserve the [workspace operating contracts](../policies/workspace/README.md), including project-owned specifications, human and agent authority, selective retention and non-interference with external developers. Existing records and workflows remain valid until a reviewed change explicitly replaces them.
 
@@ -184,7 +184,7 @@ Keep discovery progressive: resolve the authorized workspace and collaboration s
 
 The [CLI and domain contract](cli-contract.md) defines the proposed MVP command grammar, configuration resolution, typed in-process API, options, outputs, preconditions and errors. It does not introduce an HTTP API or public SDK. Keep the executable name `hive`; name collisions and alias management are outside MVP.
 
-These proposed examples assume an applicable project binding. A short task ID requires a verified project scope. The read examples use a task already present in the local checkout.
+These examples describe workspace operations planned after Bootstrap. They assume an applicable project binding. A short task ID requires a verified project scope. The read examples use a task already present in the local checkout.
 
 ```sh
 hive context --json

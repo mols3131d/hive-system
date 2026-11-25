@@ -4,13 +4,35 @@ description: "Use for contributor setup, development practices, agent guidance a
 
 # Development
 
-Use this area for how contributors understand, change and verify Hive system software. Rust is the chosen application language; the [system design](../architecture/system-design.md) is a proposal, and no Cargo build or application tests exist yet. Keep the inherited development tooling independent of the application. Never use private workspace records as development fixtures.
+Use this area for how contributors understand, change and verify Hive system software. The [Rust CLI](../../Cargo.toml) and the TypeScript development scripts have separate build and test commands. Use synthetic workspace records for development fixtures.
 
 ## Current setup
 
 Shared tooling and setup are covered under [Tools](../tools/README.md).
 
 Find existing automation through the [scripts index](../../scripts/README.md). When implementing or modifying project-owned scripts, use [script maintenance](scripts.md); task declarations remain in [mise.toml](../../mise.toml).
+
+## Rust CLI
+
+Install Rust through Rustup. The [toolchain file](../../rust-toolchain.toml) selects the compiler, rustfmt and Clippy for the checkout. Run the same locked checks used by [Rust CI](../../.github/workflows/rust.yml).
+
+```sh
+cargo test --locked --all-targets
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked
+```
+
+To check installation without changing your usual executable directory, install into a temporary root.
+
+```sh
+hive_install_root=$(mktemp -d)
+cargo install --locked --path . --root "$hive_install_root"
+"$hive_install_root/bin/hive" --help
+"$hive_install_root/bin/hive" --version
+```
+
+The Bootstrap executable validates arguments and reports unavailable workspace operations with `NOT_IMPLEMENTED`. Follow the [CLI contract](../architecture/cli-contract.md) for output and exit codes.
 
 ## Agent-assisted development
 
