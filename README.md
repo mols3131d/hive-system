@@ -45,7 +45,7 @@ Keep actual workspace records out of this public repository.
 
 - [Goals and scope](docs/goal/README.md)
 - [System design](docs/architecture/system-design.md)
-- [Workspace agent assets](assets/agent/README.md)
+- [Workspace agent assets](agents-configs/README.md)
 - [Contributing and development](docs/development/README.md), including [development environment setup](docs/tools/initial-setup.md)
 
 ## License

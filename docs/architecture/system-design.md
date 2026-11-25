@@ -54,7 +54,7 @@ Start with one Cargo package and one executable. Separate CLI argument and outpu
 
 Candidate libraries include `clap`, `serde`, `serde_json`, a maintained YAML parser, and, where required, a Markdown parser, date library and Git or HTTP client. `thiserror`, `anyhow`, `assert_cmd` and `tempfile` are candidates for errors and tests. Select and review actual dependencies when needed; no versions, licenses, compatibility or performance claims are established here. Prefer existing Git or `gh` integration over reimplementing Git, credential handling or HTTP transport when sufficient.
 
-The existing TypeScript scripts and verification commands are not replaced by this design. Evaluate any migration of development tooling independently against existing callers, tests and maintenance cost. Development Agent Assets under `.rulesync/` remain separate from the [distributable Hive Agent Assets](../../assets/agent/README.md). Product releases must select only product sources, not the development harness; distribution mechanics remain to be designed.
+The existing TypeScript scripts and verification commands are not replaced by this design. Evaluate any migration of development tooling independently against existing callers, tests and maintenance cost. Development Agent Assets under `.rulesync/` remain separate from the [distributable Hive Agent Assets](../../agents-configs/README.md). Product releases must select only product sources, not the development harness; distribution mechanics remain to be designed.
 
 ## Repository access and writes
 

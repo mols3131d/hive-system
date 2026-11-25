@@ -11,11 +11,11 @@ Hive has two separate Agent Asset scopes. Choose the owner by intended consumer,
 | Scope | Source location | Consumer |
 | --- | --- | --- |
 | Development | `.rulesync/` and root [`rulesync.jsonc`](../../../rulesync.jsonc) | Agents assisting development of this repository |
-| Distribution | [`assets/agent/`](../../../assets/agent/README.md) | Agents using Hive in a separate data workspace |
+| Distribution | [`agents-configs/`](../../../agents-configs/README.md) | Agents using Hive in a separate data workspace |
 
 The development scope includes repository-local definitions and selected upstream assets installed by Rulesync. Upstream sources retain their ownership. The distribution scope owns Hive product assets, including the future Hive Skill. Maintain each asset in its intended scope; do not copy product definitions into the development `.rulesync/` directory or package development assets as Hive product assets.
 
-[Rulesync](../../tools/rulesync.md) owns development installation and projection. The [distribution source guide](../../../assets/agent/README.md) owns consumer usage and compatibility. [Harness verification](harness.md) owns runtime evidence.
+[Rulesync](../../tools/rulesync.md) owns development installation and projection. The [distribution source guide](../../../agents-configs/README.md) owns consumer usage and compatibility. [Harness verification](harness.md) owns runtime evidence.
 
 ## Select and change development assets
 

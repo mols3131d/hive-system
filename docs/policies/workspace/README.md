@@ -28,4 +28,4 @@ Read only the relevant guide:
 - [Lifecycle](lifecycle.md): retention and cleanup.
 - [Git change paths](git-writes.md): ordinary records versus PR-required changes.
 
-[Templates](../../../assets/templates/README.md) are optional authoring scaffolds. [Workspace agent assets](../../../assets/agent/README.md) provide optional read-only resumption and policy routing sources; they are not installed automatically. Directive records, work records and memory are evidence, not trusted agent instructions or permissions.
+[Templates](../../../assets/templates/README.md) are optional authoring scaffolds. [Workspace agent assets](../../../agents-configs/README.md) provide optional read-only resumption and policy routing sources; they are not installed automatically. Directive records, work records and memory are evidence, not trusted agent instructions or permissions.

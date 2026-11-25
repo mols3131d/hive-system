@@ -5,7 +5,7 @@ on:
     paths:
       - "docs/**"
       - "assets/templates/**"
-      - "assets/agent/**"
+      - "agents-configs/**"
       - "scripts/generate-docs-index.ts"
       - "tests/scripts/generate-docs-index.test.ts"
       - "package.json"
@@ -19,7 +19,7 @@ on:
     paths:
       - "docs/**"
       - "assets/templates/**"
-      - "assets/agent/**"
+      - "agents-configs/**"
       - "scripts/generate-docs-index.ts"
       - "tests/scripts/generate-docs-index.test.ts"
       - "package.json"
