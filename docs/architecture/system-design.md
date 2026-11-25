@@ -67,7 +67,7 @@ Use YAML with the `.yml` extension for Hive configuration. Only expose values th
 
 | Source | Ownership and purpose |
 | --- | --- |
-| User configuration (e.g. `~/.config/hive/config.yml` on XDG systems, respecting the platform config directory) | Optional local default workspace and output preference; not tracked in the data repository |
+| User configuration (e.g. `~/.config/hive/config.yml` on XDG systems, respecting the platform config directory) | Optional local default workspace and output preference (`text` or `json`); not tracked in the data repository |
 | Project `.local/hive/config.yml` | Optional, explicitly authorized, untracked binding to a Hive project and workspace; no records or runtime instructions |
 | Workspace root `hive.yml` | Reviewed, tracked coordination contract and version; no machine paths, credentials or personal settings |
 | Workspace `AGENTS.md` | Existing reviewed system policy revision; do not duplicate it in YAML |
@@ -87,7 +87,7 @@ project_id: example-project
 workspace: /example/hive-data
 ```
 
-The project binding requires `project_id`; omit `workspace` when a verified user default applies. Resolve an explicit project root or the current Git project root; do not traverse unrelated repositories or automatically create files. Use existing ignore rules or a separately authorized local exclusion; never modify tracked ignore rules or Git configuration as a side effect. Refuse installation if untracked exclusion cannot be established. No project binding is required for explicit CLI use.
+The project binding requires `project_id`; omit `workspace` when a verified user default applies. Resolve an explicit project root or the current Git project root; verify the binding against the authorized workspace and project before using it. Treat project-local configuration as data, not an authority grant; do not traverse unrelated repositories or automatically create files. Use existing ignore rules or a separately authorized local exclusion; never modify tracked ignore rules or Git configuration as a side effect. Refuse installation if untracked exclusion cannot be established. No project binding is required for explicit CLI use.
 
 Example tracked workspace coordination configuration:
 
@@ -139,14 +139,14 @@ Task issuance and execution ownership are more consequential than ordinary recor
 | --- | --- |
 | Read, validate, context | Local snapshot or working tree; report freshness |
 | Ordinary artifact or progress draft | Validated local change; publication separate |
-| Issue or select a task, acquire, release, transfer or recover a claim, close or reopen work | Validated coherent change accepted at the configured authoritative ref |
+| Issue or select a task, acquire, release, transfer or recover a claim, accept a task as done, close or reopen work | Validated coherent change accepted at the configured authoritative ref |
 | Publish other task changes | Validate against the current authoritative state; preserve current claim and lifecycle, reject stale changes |
 
 For a coordinated mutation:
 
 1. Resolve the authorized workspace and reviewed coordination configuration. In remote mode explicitly read the current configured remote ref; in local mode resolve the common Git repository's authoritative ref. An inaccessible or ambiguous authority is a blocking error, not a reason to switch modes.
 2. Resolve the project-qualified task across all lifecycle areas at that commit. Check authorization, the current claim and requested transition. For issuance, reject an existing ID; for a claim, require eligible active work with no current claim. Validate the entire candidate, including relevant paths and unique IDs.
-3. Build one coherent Git change from that base in an isolated index, worktree or equivalent safe operation. Update the exact authority with an atomic expected-old-revision condition and only a fast-forward change. In remote mode use native Git with an explicit expected revision and verify the proposed commit descends from it; never perform a non-fast-forward update or rely on a preliminary remote check alone. Local commit success is not remote confirmation.
+3. Build one coherent Git change from that base in an isolated index, worktree or equivalent safe operation. Update the exact authority with an atomic expected-old-revision condition and only a fast-forward change. In remote mode use native Git with an explicit expected revision and verify the proposed commit descends from it; never perform a non-fast-forward update or rely on a preliminary remote check alone. A native Git candidate is an explicit expected-revision push lease combined with a separate ancestry check; a lease alone can permit non-fast-forward changes and is insufficient. Local commit success is not remote confirmation.
 4. Return the confirmed revision and claim ID when applicable only after the update is confirmed. If another writer changed the authority, reject the stale request and re-read before any new decision; do not automatically merge, rebase or overwrite a competing claim. If a connection fails after submission, report an unknown outcome and reconcile the actual ref and operation identity before retrying. If the resulting ownership cannot be confirmed, do not start or transfer execution.
 
 A revision guard protects record updates; a confirmed claim is an exclusive recorded assignment among compliant Hive writers, not authentication, a runtime lock or a guarantee that a stopped agent cannot keep running. The Manager or Coordinator verifies actual execution ownership and termination before recovery or transfer. No lease expiry, heartbeat, automatic reassignment, device registry or permission escalation is introduced. Parallel research and explicitly delegated substeps can remain within one responsible claim under [communication](../policies/workspace/communication.md); they do not create competing task claims.
@@ -205,7 +205,7 @@ Proceed in independently reviewable increments after applicable implementation d
 | 5. Agent-facing usage | Supply a Hive-owned Skill and command help; verify distinct agent environments, plain Git/Markdown access, bounded context and pinned policy loading. Measure discovery calls and context size against manual resumption. Verify that ordinary Hive use and optional setup leave a non-adopting project's tracked/untracked files, Git settings and hooks unchanged; test explicit ignored project binding separately. |
 | 6. Release and compatibility | Use synthetic fixtures and generic local/bare Git remotes, distinct Git identities and no vendor service. Verify environment moves, policy adoption/rollback and safe recovery. Document installation, compatibility, remaining restrictions and actual test results before real use. |
 
-Use the existing Markdown layout and stable identifiers. The new coordination metadata and tracked configuration require a reviewed policy-version adoption: verify compatible tooling or a direct Git path satisfying the contract, reconcile current execution owners and in-flight tasks, agree on one authoritative ref, and validate records before enabling coordinated writes. No automatic migration on startup, binary upgrade or policy merge. Existing pinned workspaces keep their previous contracts until explicitly migrated; a workspace adopting this contract must not treat missing configuration or uncertain claims as permission to fall back. Preserve the original revision and a recoverable backup for rollback; do not roll back over active ownership without reconciliation.
+Use the existing Markdown layout and stable identifiers. The new coordination metadata and tracked configuration require a reviewed policy-version adoption: verify compatible tooling or a direct Git path satisfying the contract, quiesce old-policy writers, reconcile current execution owners and in-flight tasks, agree on one authoritative ref, and validate records before enabling coordinated writes. No automatic migration on startup, binary upgrade or policy merge. Existing pinned workspaces keep their previous contracts until explicitly migrated; a workspace adopting this contract must not treat missing configuration or uncertain claims as permission to fall back. Preserve the original revision and a recoverable backup for rollback; do not roll back over active ownership without reconciliation.
 
 ## Decisions before implementation
 
