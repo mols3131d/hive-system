@@ -29,3 +29,74 @@ jobs:
           git ls-files -z '*.md' | xargs -0 -r mise exec -- rumdl fmt --check
       - run: mise exec -- biome check .
       - run: mise exec -- lefthook validate
+      - name: Verify candidate workspace assets and non-adopting project isolation
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d)"
+          trap 'rm -rf -- "$scratch"' EXIT
+          workspace="$scratch/workspace"
+          project="$scratch/project"
+          mkdir -p "$workspace/.rulesync" "$workspace/tasks/example/active/sample" "$project"
+          cp -R agents-configs/rules agents-configs/commands agents-configs/subagents "$workspace/.rulesync/"
+          git -C "$project" init -q
+          printf '# External project instructions\n' > "$project/AGENTS.md"
+          printf 'tracked\n' > "$project/tracked.txt"
+          printf 'untracked\n' > "$project/untracked.txt"
+          git -C "$project" add AGENTS.md tracked.txt
+          git -C "$project" config user.name 'Synthetic Project'
+          git -C "$project" config user.email 'project@example.invalid'
+          printf '#!/bin/sh\nexit 0\n' > "$project/.git/hooks/pre-commit"
+          chmod +x "$project/.git/hooks/pre-commit"
+          snapshot() {
+            (cd "$project"; find . -type f -print0 | sort -z | xargs -0 sha256sum; find . -printf '%y %m %p\n' | sort)
+          }
+          snapshot > "$scratch/project.before"
+          cd "$workspace"
+          git init -q
+          printf '# Synthetic workspace instructions\n' > AGENTS.md
+          printf '%s\n' '---' 'description: "Synthetic sample task"' 'status: todo' '---' '' '# Synthetic task' > tasks/example/active/sample/README.md
+          printf '# Local ignore fixture\n' > .gitignore
+          cat > rulesync.jsonc <<'JSON'
+          {
+            "gitignoreDestination": "gitexclude",
+            "targets": {
+              "claudecode": {
+                "rules": { "includeRoot": false },
+                "commands": true,
+                "subagents": true
+              },
+              "codexcli": { "subagents": true },
+              "copilot": ["rules", "commands", "subagents"],
+              "copilotcli": ["rules", "subagents"],
+              "antigravity-ide": { "rules": true, "commands": true, "subagents": true },
+              "antigravity-cli": { "rules": true, "commands": true, "subagents": true }
+            },
+            "outputRoots": ["."],
+            "delete": false
+          }
+          JSON
+          git add -- AGENTS.md .gitignore .rulesync rulesync.jsonc tasks
+          mise exec -C "$GITHUB_WORKSPACE" -- rulesync --version
+          mise exec -C "$GITHUB_WORKSPACE" -- bash -c 'cd "$1"; rulesync generate --dry-run' -- "$workspace"
+          git diff --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
+          mise exec -C "$GITHUB_WORKSPACE" -- bash -c 'cd "$1"; rulesync generate' -- "$workspace"
+          git diff --exit-code
+          test -s .claude/rules/hive-records.md
+          test -s .claude/commands/hive-resume.md
+          test -s .claude/agents/hive-context-reader.md
+          grep -Fq 'tasks/**' .claude/rules/hive-records.md
+          grep -Fq 'current claim' .claude/rules/hive-records.md
+          grep -Fq 'Do not acquire a claim, modify files' .claude/commands/hive-resume.md
+          grep -Fq 'Do not write files' .claude/agents/hive-context-reader.md
+          grep -Fq 'authority freshness' .claude/commands/hive-resume.md
+          grep -Fq 'authority freshness' .claude/agents/hive-context-reader.md
+          printf 'Generated paths:\n'
+          git ls-files --others --exclude-standard
+          mise exec -C "$GITHUB_WORKSPACE" -- bash -c 'cd "$1"; rulesync gitignore' -- "$workspace"
+          git diff --exit-code
+          git check-ignore .claude/rules/hive-records.md .claude/commands/hive-resume.md .claude/agents/hive-context-reader.md
+          test -z "$(git ls-files --others --exclude-standard)"
+          snapshot > "$scratch/project.after"
+          cmp "$scratch/project.before" "$scratch/project.after"
+          printf 'Synthetic tracked workspace content and separate external project preserved. Projection only; no runtime activation.\n'
