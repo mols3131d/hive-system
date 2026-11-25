@@ -16,6 +16,8 @@ The root `.rulesync/` directory and root `rulesync.jsonc` are for agents develop
 
 ## Use in a data workspace
 
+Hive's core is independent of IDE, coding-agent vendor and model provider. Rulesync and runtime-specific projections are optional consumer conveniences, not product runtime requirements. Install or project Hive assets only into an explicitly authorized Hive workspace or appropriate user-local environment. Do not generate into an external project, change its instructions, settings or ignore files, or require it to adopt Hive merely because its developer uses Hive. See [external project boundaries](../docs/policies/workspace/organization.md#external-development-repositories).
+
 With a Rulesync version supporting separate input roots, select `agents-configs/` directly as an input root in the consuming agent environment's local Rulesync configuration. A data workspace may track a minimal `.rulesync/` source selection and `rulesync.jsonc` for direct record management. Keep generated projections and machine-specific settings untracked. For example, the following local configuration fragment assumes a reviewed system checkout next to the consumer working directory:
 
 ```jsonc

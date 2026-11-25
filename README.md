@@ -1,52 +1,29 @@
 # Hive System
 
-A persistent collaboration system for AI agents working across projects.
+A personal collaboration system for an individual developer managing multiple AI agent sessions across multiple projects, built on the filesystem, Markdown and Git.
 
-Hive lets agents coordinate work, share intentional artifacts, resume tasks across sessions, and retain scoped knowledge without depending on a particular agent runtime. Humans and registered Manager Bots guide work; task-scoped agents carry it out and return evidence for review.
+> [!WARNING]
+> Hive is still under active development and is not ready for real-world use. Do not use it for actual workflows. Dogfooding by Hive developers is the only exception.
 
-Workspaces use Markdown and Git as their canonical storage. Hive keeps agent collaboration separate from the external projects that own their code, specifications, and policies.
+Hive supports long-running development work, preserves useful context across sessions, and helps developers and agents exchange reports, briefings and discussion records. It manages directives, tasks, artifacts, Bot identities and curated memory.
 
-**Status:** The workspace contracts, record templates, and manual workflows are documented. The standalone Rust CLI and Hive Skill are planned, not yet implemented.
+Hive is independent of IDEs, coding-agent runtimes and vendors, model providers, and Git hosting providers. It does not require changes to external projects. It is not a real-time inter-session messaging system or a multi-user collaboration platform.
 
-## Collaboration model
+This repository owns the system and reusable assets. Actual records belong in a separate, user-controlled workspace.
 
-| Component | Purpose |
-| --- | --- |
-| Directives | Goals, priorities, and constraints provided by humans or authorized Managers |
-| Tasks | Project-scoped work bundles with goals, acceptance criteria, progress, and outcomes |
-| Artifacts | Research, plans, reviews, reports, and handoffs worth retaining |
-| Bots | Persistent Manager identity and routing information |
-| Memory | Curated, project-scoped knowledge for registered Bots |
+**Status:** Workspace contracts and manual workflows are documented. The Rust CLI and Hive Skill are planned, not implemented.
 
-The [workspace contracts](docs/policies/workspace/README.md) define record ownership, agent responsibilities, authority, lifecycle, and retention.
+## Developer dogfooding
 
-## Architecture
-
-Hive separates reusable software from user-controlled data:
-
-- **System:** This public repository owns the planned Rust CLI, shared policies, record templates, and reusable agent assets.
-- **Workspace:** A separate user-controlled Git repository owns actual tasks, artifacts, directives, Bot identities, and memory.
-
-The planned CLI will provide scoped queries, record validation, and safe updates. A Hive Skill will guide agents in applying the shared policies and using the CLI. Direct authorized Git and file access remains supported.
-
-Hive is a collaboration and persistence system, not a task execution platform or a personal configuration manager. It does not manage agent runtimes, schedule execution, or replace external project management. See the [system design](docs/architecture/system-design.md) for the proposed interfaces and implementation boundaries.
-
-## Getting started
-
-Until the CLI is available, use Hive through its document-first workflow:
-
-1. Select an authorized data workspace and an applicable system policy revision.
-2. Read the relevant [workspace contracts](docs/policies/workspace/README.md).
-3. Follow the [work bundle guide](docs/guides/getting-started.md) to create, resume, or hand off work using Git and Markdown. Use the [record templates](assets/templates/README.md) as needed.
-
-Keep actual workspace records out of this public repository.
+Use an authorized workspace and a reviewed system policy revision. Follow the [workspace contracts](docs/policies/workspace/README.md) and [getting-started guide](docs/guides/getting-started.md).
 
 ## Documentation
 
 - [Goals and scope](docs/goal/README.md)
 - [System design](docs/architecture/system-design.md)
-- [Workspace agent assets](agents-configs/README.md)
-- [Contributing and development](docs/development/README.md), including [development environment setup](docs/tools/initial-setup.md)
+- [Record templates](assets/templates/README.md)
+- [Agent assets](agents-configs/README.md)
+- [Development](docs/development/README.md)
 
 ## License
 

@@ -4,11 +4,17 @@ description: "Read when sharing a deliberate handoff or other artifact, resuming
 
 # Artifact Exchange and Handoffs
 
-Agents may communicate through their authorized runtime or integration. Hive retains selected artifacts only when a durable deliverable, useful handoff or evidence of an outcome is needed. It is not a general mailbox, session database or transcript archive.
+Hive supports long-running development through selective context persistence and durable communication between the developer and agents. It retains reports, briefings, material discussion outcomes, decisions and useful handoffs for later review or resumption. It is not an instant messaging system between agent sessions, a general mailbox, session database or transcript archive.
+
+## Developer-agent communication
+
+Use the existing work entrypoint or intentional artifacts to record what the developer needs to review, discuss or decide: progress, evidence, uncertainties, options, decisions, questions and next actions. Reports and briefings should point to relevant work and evidence. Record material outcomes of discussions rather than full conversation transcripts. An agent can resume a long-running work unit by reading the relevant records even when the earlier session is no longer available.
+
+Shared records support asynchronous reading and handoff. Hive does not deliver messages, notify or wake another session, require an immediate reply, or guarantee receipt. Use an authorized external runtime or integration for actual interactive communication when needed.
 
 ## Runtime and persistence
 
-Agents may use communication and delegation capabilities already available in their authorized execution environment. Those capabilities are not task or artifact ownership. Hive does not implement runtime adapters, session-control services, schedulers or automatic wakeups, and has no dependency on Paseo or any other specific runtime. Resolve the [selected collaboration backend](organization.md#collaboration-backend) before delegating or resuming a work unit. Keep task state and intentional artifacts there, independent of runtime session IDs. The following publishing procedure is for Hive-managed work; use the selected backend's native records for other work.
+Agents may use communication and delegation capabilities already available in their authorized execution environment. Those capabilities are not task or artifact ownership. Hive does not implement live inter-session messaging, runtime adapters, session-control services, schedulers or automatic wakeups, and has no dependency on Paseo or any other specific runtime. Resolve the [selected collaboration backend](organization.md#collaboration-backend) before delegating or resuming a work unit. Keep task state and intentional artifacts there, independent of runtime session IDs. The following publishing procedure is for Hive-managed work; use the selected backend's native records for other work.
 
 Prefer sending a concise goal, project-qualified work ID, artifact reference and source revision, expected action and authority boundary instead of copying the full context into messages. The receiver resolves current state and reads the relevant records. Use runtime delivery/status evidence to distinguish an actual handoff from a saved artifact. Confirm the recipient's assignment and acceptance of the execution responsibility before treating a handoff as transferred; delivery alone does not prove acceptance or authority. If runtime access is unavailable, retain only an intentional handoff in the selected backend and report delivery as unverified.
 
@@ -27,4 +33,4 @@ Recheck existing execution and current revisions before reassigning; if ownershi
 
 Retain material decisions, verification results, failed approaches that affect the next decision, and unresolved scope or authority boundaries only when useful for review or resumption. Reference actual evidence and distinguish verified, failed and inconclusive checks. Use the existing task or intentional artifact; no mandatory decision-log format, per-iteration log or checkpoint file is required. Apply the [artifact retention policy](lifecycle.md#artifact-retention).
 
-Keep routine communication and ephemeral context out of Hive. Do not retain raw private conversations, hidden reasoning, credentials, logs or unreviewed sensitive output. Memory and permanent project policy remain with their respective owners. See [organization](organization.md), [optional templates](../../../assets/templates/README.md) and [lifecycle](lifecycle.md).
+Keep routine communication and ephemeral context out of Hive. Preserve the minimum useful continuation context rather than a full session snapshot. Do not retain raw private conversations, hidden reasoning, credentials, logs or unreviewed sensitive output. Memory and permanent project policy remain with their respective owners. See [organization](organization.md), [optional templates](../../../assets/templates/README.md) and [lifecycle](lifecycle.md).
