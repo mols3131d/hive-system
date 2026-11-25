@@ -2,6 +2,9 @@
 
 A persistent collaboration system for AI agents working across projects.
 
+> [!WARNING]
+> Hive is still under active development and is not ready for real-world use. Do not use it for actual workflows. Dogfooding by Hive developers is the only exception.
+
 Hive lets agents coordinate work, share intentional artifacts, resume tasks across sessions, and retain scoped knowledge without depending on a particular agent runtime. Humans and registered Manager Bots guide work; task-scoped agents carry it out and return evidence for review.
 
 Workspaces use Markdown and Git as their canonical storage. Hive keeps agent collaboration separate from the external projects that own their code, specifications, and policies.
@@ -33,7 +36,7 @@ Hive is a collaboration and persistence system, not a task execution platform or
 
 ## Getting started
 
-Until the CLI is available, use Hive through its document-first workflow:
+For developer dogfooding before the CLI is available, use the document-first workflow:
 
 1. Select an authorized data workspace and an applicable system policy revision.
 2. Read the relevant [workspace contracts](docs/policies/workspace/README.md).
