@@ -18,7 +18,7 @@ directives/
     └── <directive-slug>.md
 ```
 
-Use the shared [project identity and reserved scopes](organization.md#project-identity) and the same ID as `tasks/` when present. Use `_hive` for Hive itself and `_general` for non-project direction. Create ordinary project directories only for actual directives. The scope README identifies the canonical project or non-project purpose and provides navigation only as useful.
+Use the shared [project identity and reserved scopes](organization.md#project-identity) and the same ID as `tasks/` when present. Use `_hive-userdata` for data-workspace direction, `hive-system` for product-specific direction and `_general` for non-project direction. Create ordinary project directories only for actual directives. The scope README identifies the canonical project or non-project purpose and provides navigation only as useful.
 
 A directive may be a single `directives/<project-id>/<slug>.md` file or, when genuinely needed, a `<slug>/README.md` bundle entrypoint in the same scope. Supporting Markdown is evidence or detail, not an independently applicable directive; keep applicability on the entrypoint. Follow [file naming](organization.md) and [frontmatter](frontmatter.md); give each directive a description, applicability status and a stable, descriptive name. Record the issuer, approval/source reference and date, applicable scope, intended direction, and material conditions or expiry when relevant in the body. Do not invent authority or retain private conversation transcripts.
 

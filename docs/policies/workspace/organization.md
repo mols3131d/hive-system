@@ -63,12 +63,12 @@ Use the same stable project ID under `tasks/`, `directives/` and each bot's `mem
 
 | ID | Scope |
 | --- | --- |
-| `_hive` | Hive itself, regardless of its GitHub repository name |
+| `_hive-userdata` | Operation and maintenance of the current Hive data workspace |
 | `_general` | Genuinely non-project-specific work, direction or bot learning |
 
 The leading underscore distinguishes reserved scope IDs from ordinary project IDs. These are the only reserved exceptions to kebab-case; `_general` is not a project or a fallback for an unresolved project. Verify ambiguous ownership before writing. Cross-project work with a clear owner stays in that project's scope; use `_general` only when no project owns it. General direction or memory does not automatically apply to every project.
 
-For `_hive`, identify the canonical Hive system project through the data workspace's verified project reference; preserve the existing scope ID on repository rename or separation. Do not assume the data repository itself is the system project. The project or scope entrypoint identifies its canonical project reference or non-project purpose: `README.md` for tasks and directives, scoped `MEMORY.md` for bot memory. Initialize the reserved scopes as needed and create ordinary project directories only when they have actual records. The surfaces do not have to contain identical sets of project directories. This convention applies to project-scoped workspace records, not the exact repository-name roots and eligibility rules of private configuration or the independent root `artifacts/` store.
+Use `_hive-userdata` for managing the data workspace itself, including its record organization and workspace-specific maintenance. Use `hive-system` as the ordinary repository-backed project ID for development of the Hive product, including shared contracts, CLI and distributable assets. Keep both scopes in the authorized data workspace; do not store live records in the public system repository. A split of the former `_hive` scope requires an explicit, reviewed migration of records by ownership, preserving work IDs, lifecycle, evidence and references. Historical references may remain at their original revisions; do not use the former scope as a current alias or fallback. The project or scope entrypoint identifies its canonical project reference or non-project purpose: `README.md` for tasks and directives, scoped `MEMORY.md` for bot memory. Initialize the reserved scopes as needed and create ordinary project directories only when they have actual records. The surfaces do not have to contain identical sets of project directories. This convention applies to project-scoped workspace records, not the exact repository-name roots and eligibility rules of private configuration or the independent root `artifacts/` store.
 
 ## IDs and file naming
 

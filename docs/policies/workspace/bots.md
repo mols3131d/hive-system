@@ -19,7 +19,7 @@ bots/
     └── memory/
         ├── _general/
         │   └── MEMORY.md
-        ├── _hive/
+        ├── _hive-userdata/
         │   └── MEMORY.md
         └── <project-id>/
             ├── MEMORY.md
@@ -34,7 +34,7 @@ bots/
 | `memory/<project-id>/MEMORY.md` | Scoped, curated cross-session knowledge and links to relevant topic notes |
 | `memory/<project-id>/<topic>.md` | Optional topic-specific learning within that scope |
 
-Use the shared [project identity and reserved scopes](organization.md#project-identity). All learned knowledge belongs to its project or reserved scope. `_hive` contains Hive-specific learning; `_general` contains verified non-project-specific learning, not copied project memories. The scoped entrypoint identifies the canonical project or non-project purpose. Create ordinary project directories and topic files only for actual reusable knowledge. Empty scoped memory means no retained knowledge, not an unavailable runtime. Use [workspace frontmatter](frontmatter.md) for bot records and the [bot template](../../../assets/templates/bot.md) for `SOUL.md`. Link to `SOUL.md` from the README rather than repeating identity there. Do not duplicate identity or instructions in memory.
+Use the shared [project identity and reserved scopes](organization.md#project-identity). All learned knowledge belongs to its project or reserved scope. `_hive-userdata` contains workspace-management learning; `hive-system` contains product-specific learning when retained. `_general` contains verified non-project-specific learning, not copied project memories. The scoped entrypoint identifies the canonical project or non-project purpose. Create ordinary project directories and topic files only for actual reusable knowledge. Empty scoped memory means no retained knowledge, not an unavailable runtime. Use [workspace frontmatter](frontmatter.md) for bot records and the [bot template](../../../assets/templates/bot.md) for `SOUL.md`. Link to `SOUL.md` from the README rather than repeating identity there. Do not duplicate identity or instructions in memory.
 
 A bot's registration is not provisioning, authentication, reachability, or a grant of permissions. Record actual runtime bindings only after verifying the target account, bot/profile, source owner and revision. Hive's `SOUL.md` is the canonical portable identity, not a runtime-specific instruction file or a grant of authority. Runtime execution definitions, tool configuration, credentials, native memory databases and session logs stay with their actual owners. Do not maintain competing identity sources or assume automatic loading. Recording a verified binding is descriptive only; Hive does not implement runtime integration.
 

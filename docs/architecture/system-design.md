@@ -26,7 +26,7 @@ No database, alternate state store, backend router, automatic synchronization, t
 
 ## Repository separation
 
-Separate reusable software in `hive-system` from the explicitly selected, user-controlled data repository. The proposed CLI binary name is `hive`. A data workspace can be named independently of the system; preserve existing repository identity, record paths, Git history and stable scope IDs during any authorized migration. Do not create a second workspace as an implicit replacement or discover one by routing.
+Separate reusable software in `hive-system` from the explicitly selected, user-controlled data repository. The proposed CLI binary name is `hive`. A data workspace can be named independently of the system; preserve existing repository identity, record contents, Git history and stable work IDs during any authorized migration. The data workspace uses the reserved `_hive-userdata` scope for its own management and the ordinary `hive-system` project scope for product development; migrate any former combined scope by ownership only through a reviewed change. Do not create a second workspace as an implicit replacement or discover one by routing.
 
 | Ownership | Hive system repository | User-controlled data repository |
 | --- | --- | --- |
@@ -115,7 +115,7 @@ Use the existing workspace schema first. Decide how compatibility is signaled be
 
 ## Decisions before implementation
 
-- Define how a user explicitly selects a data workspace and compatible system revision. Preserve stable scope IDs and a single owner for work records across any authorized migration.
+- Define how a user explicitly selects a data workspace and compatible system revision. Preserve stable scope and work IDs except for an explicitly authorized scope split; keep a single owner for each work record across migration.
 - Choose the initial storage approach, mutation publication semantics and credential mechanism. Establish how stale reads, write conflicts and uncertain results are reported.
 - Define compatibility and policy reference mechanics for data workspaces, including which common documents and templates move, and how existing direct Git consumers continue to work.
 - Review the smallest initial command set, Rust dependency and distribution choices, and the relationship to current TypeScript development tooling.
