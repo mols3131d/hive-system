@@ -2,12 +2,8 @@ name: Repository checks
 
 on:
   pull_request:
-    paths-ignore:
-      - ".inbox/**"
   push:
     branches: [main]
-    paths-ignore:
-      - ".inbox/**"
   workflow_dispatch:
 
 concurrency:
@@ -29,7 +25,7 @@ jobs:
       - run: mise run agents-check
       - run: mise exec -- node --test tests/scripts/manage-agent-assets.test.ts
       - run: |
-          git ls-files -z '*.md' ':!.inbox/**' | xargs -0 -r mise exec -- rumdl check
-          git ls-files -z '*.md' ':!.inbox/**' | xargs -0 -r mise exec -- rumdl fmt --check
+          git ls-files -z '*.md' | xargs -0 -r mise exec -- rumdl check
+          git ls-files -z '*.md' | xargs -0 -r mise exec -- rumdl fmt --check
       - run: mise exec -- biome check .
       - run: mise exec -- lefthook validate
