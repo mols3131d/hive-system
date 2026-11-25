@@ -36,3 +36,16 @@ fn unimplemented_operation_is_not_success() {
     let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(value["ok"], false);
 }
+
+#[test]
+fn conflicting_read_views_return_one_json_failure() {
+    let result = Command::new(env!("CARGO_BIN_EXE_hive-contract-probe"))
+        .args(["--at", "abc", "context", "--authority", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "INVALID_ARGUMENT");
+    assert!(result.stderr.is_empty());
+}

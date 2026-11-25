@@ -20,7 +20,7 @@ struct Cli {
     format: Option<Format>,
     #[arg(long, global = true)]
     json: bool,
-    #[arg(long, global = true, conflicts_with = "authority")]
+    #[arg(long, global = true)]
     at: Option<String>,
     #[arg(long, global = true)]
     authority: bool,
@@ -34,8 +34,12 @@ enum Command {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("Conflicting output options")]
-struct OutputConflict;
+enum OptionConflict {
+    #[error("Conflicting output options")]
+    Output,
+    #[error("Conflicting read views")]
+    View,
+}
 
 #[derive(Serialize)]
 struct Failure<'a> {
@@ -53,22 +57,30 @@ struct ErrorDetail<'a> {
 }
 
 impl Cli {
-    fn output_format(&self) -> Result<Format, OutputConflict> {
+    fn output_format(&self) -> Result<Format, OptionConflict> {
         match (self.json, self.format) {
-            (true, Some(Format::Text)) => Err(OutputConflict),
+            (true, Some(Format::Text)) => Err(OptionConflict::Output),
             (true, _) => Ok(Format::Json),
             (false, value) => Ok(value.unwrap_or(Format::Text)),
         }
+    }
+
+    fn validate_options(&self) -> Result<(), OptionConflict> {
+        self.output_format()?;
+        if self.at.is_some() && self.authority {
+            return Err(OptionConflict::View);
+        }
+        Ok(())
     }
 }
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    let conflict = cli.output_format().is_err();
-    let (code, message) = if conflict {
-        ("INVALID_ARGUMENT", "Conflicting output options")
-    } else {
-        ("INTERNAL_ERROR", "Design probe only; no workspace operation")
+    let conflict = cli.validate_options().err();
+    let (code, message) = match &conflict {
+        Some(OptionConflict::Output) => ("INVALID_ARGUMENT", "Conflicting output options"),
+        Some(OptionConflict::View) => ("INVALID_ARGUMENT", "Conflicting read views"),
+        None => ("INTERNAL_ERROR", "Design probe only; no workspace operation"),
     };
     if cli.json || cli.format == Some(Format::Json) {
         let failure = Failure {
@@ -85,7 +97,7 @@ fn main() -> std::process::ExitCode {
     } else {
         eprintln!("{message}");
     }
-    std::process::ExitCode::from(if conflict { 2 } else { 1 })
+    std::process::ExitCode::from(if conflict.is_some() { 2 } else { 1 })
 }
 
 #[cfg(test)]
@@ -126,7 +138,14 @@ mod tests {
 
     #[test]
     fn incompatible_views_are_rejected() {
-        assert!(Cli::try_parse_from(["hive", "--at", "abc", "context", "--authority"]).is_err());
+        for args in [
+            ["hive", "--at", "abc", "context", "--authority"],
+            ["hive", "--authority", "context", "--at", "abc"],
+            ["hive", "context", "--authority", "--at", "abc"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(cli.validate_options(), Err(OptionConflict::View)));
+        }
     }
 
     #[test]
