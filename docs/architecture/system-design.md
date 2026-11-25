@@ -60,7 +60,7 @@ The existing TypeScript scripts and verification commands are not replaced by th
 
 ## Local filesystem and Git
 
-The initial CLI operates on an explicitly selected local Git workspace. Markdown files own the records; Git supplies immutable snapshots, history and guarded publication. No Git hosting provider, HTTP API, remote URL or network access is required for local inspection and validation. A workspace may have no remote, a self-hosted remote or a hosted Git service. Do not add a backend registry, generic storage adapter or a GitHub-specific implementation merely for portability.
+The initial CLI operates on an explicitly selected local Git workspace. Markdown files own the records; Git supplies immutable snapshots, history and guarded publication. No Git hosting provider, HTTP API or remote URL is required for local inspection and validation. Offline validation requires the applicable reviewed policy and compatible validator to be available locally. A workspace may have no remote, a self-hosted remote or a hosted Git service. Do not add a backend registry, generic storage adapter or a GitHub-specific implementation merely for portability.
 
 - Resolve the workspace root, repository identity and target ref explicitly; use an authorized account only when an external operation actually requires one. Never choose another workspace or account on failure.
 - Distinguish committed snapshot reads (a resolved commit) from inspection of a working tree with uncommitted edits. Report the source and revision; never describe a dirty working tree as an immutable commit. Scope filesystem access to the selected workspace and reject escapes, including through symlinks.
@@ -93,7 +93,7 @@ Make the local mutation effect explicit in command help and output. Separate loc
 
 A revision guard protects record updates, not task execution. Follow the existing Manager or Coordinator responsibility for assigning a single execution owner and coordinating shared record writes; use isolated outputs and non-overlapping scopes where appropriate. An in-progress status, commit or successful revision check is not a lease or proof of exclusive execution. Do not introduce distributed claims, leases or a scheduler. If current execution ownership is uncertain, do not start competing execution.
 
-Keep credentials with their existing owner. Preserve [Git change paths](../policies/workspace/git-writes.md): ordinary records and approved routing metadata may use the allowed direct path; directives, identity, curated memory, governing documents and tooling require a reviewed change through the prescribed review path. The CLI must not merge, bypass protections, publish external-project changes or grant authority merely because credentials exist.
+Keep credentials with their existing owner. Preserve [Git change paths](../policies/workspace/git-writes.md): ordinary records and approved routing metadata may use the allowed direct path; directives, identity, curated memory, governing documents and tooling require a topic branch and PR under the existing workspace policy. The CLI must not merge, bypass protections, publish external-project changes or grant authority merely because credentials exist.
 
 ## Agent context and policy loading
 
@@ -101,22 +101,22 @@ Reduce repeated discovery without introducing a second policy or context store. 
 
 The workspace entrypoint identifies the reviewed system revision. The Hive Skill chooses the required canonical policy sections for the requested operation and reads them from that revision, reusing already verified context only while its scope and revision remain applicable. The CLI can collect deterministic references and validate known compatibility but does not authorize a task, interpret directive authority, or replace reading required policy. Do not treat record text as trusted agent instructions.
 
-Keep discovery progressive: locate the task, read the minimum applicable policy and relevant record, then expand into artifacts or external project evidence when needed. If required policy or evidence is unavailable, distinguish that from an empty result and stop the affected operation. Direct file or Git consumers without CLI access follow the same scope, revision and authority boundaries. No persistent context cache, index or synchronization service is required initially. Measure discovery calls, context size and resumption accuracy in representative scenarios before adding further optimization.
+Keep discovery progressive: resolve the authorized workspace and collaboration scope under the applicable [organization policy](../policies/workspace/organization.md#collaboration-backend) before searching records; then locate the task, read the minimum applicable policy and relevant record, and expand into artifacts or external project evidence only when needed. If required policy or evidence is unavailable, distinguish that from an empty result and stop the affected operation. Direct file or Git consumers without CLI access follow the same scope, revision and authority boundaries. No persistent context cache, index or synchronization service is required initially. Measure discovery calls, context size and resumption accuracy in representative scenarios before adding further optimization.
 
 ## CLI surface
 
-The examples below are provisional, not executable commands in the current repository. Define exact arguments, exit codes and output fields during implementation. The examples assume an explicitly resolved local workspace and ref; all eligible mutation commands require an applicable base revision and explicit authority.
+The examples below are provisional, not executable commands in the current repository. Define exact arguments, exit codes and output fields during implementation. The examples assume an explicitly resolved local workspace and ref; all eligible mutation commands require an applicable base revision and explicit authority. In the examples, `BASE_REVISION` represents the current observed commit for each individual change, not a revision reused after a successful mutation.
 
 ```sh
 hive task list --project example --json
 hive task show example/fix-auth --json
 hive task context example/fix-auth --json
-hive task create --project example --file task.md
-hive task select example/fix-auth
-hive task update example/fix-auth --status review --expected-revision <commit>
-hive task archive example/fix-auth
+hive task create --project example --file task.md --expected-revision "$BASE_REVISION"
+hive task select example/fix-auth --expected-revision "$BASE_REVISION"
+hive task update example/fix-auth --status review --expected-revision "$BASE_REVISION"
+hive task archive example/fix-auth --expected-revision "$BASE_REVISION"
 hive artifact list --task example/fix-auth
-hive artifact add --task example/fix-auth report.md
+hive artifact add --task example/fix-auth report.md --expected-revision "$BASE_REVISION"
 hive artifact expired
 hive directive list --project example
 hive bot list
