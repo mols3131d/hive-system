@@ -4,9 +4,20 @@ description: "Read when selecting, updating or retiring Agent Assets and validat
 
 # Agent Asset Lifecycle
 
-Use when selecting, updating or retiring reusable Agent Assets. [Rulesync](../../tools/rulesync.md) owns installation and projection; [Harness verification](harness.md) owns runtime evidence.
+Hive has two separate Agent Asset scopes. Choose the owner by intended consumer, not by file format.
 
-## Select and change
+## Ownership
+
+| Scope | Source location | Consumer |
+| --- | --- | --- |
+| Development | `.rulesync/` and root [`rulesync.jsonc`](../../../rulesync.jsonc) | Agents assisting development of this repository |
+| Distribution | [`assets/agent/`](../../../assets/agent/README.md) | Agents using Hive in a separate data workspace |
+
+The development scope includes repository-local definitions and selected upstream assets installed by Rulesync. Upstream sources retain their ownership. The distribution scope owns Hive product assets, including the future Hive Skill. Maintain each asset in its intended scope; do not copy product definitions into the development `.rulesync/` directory or package development assets as Hive product assets.
+
+[Rulesync](../../tools/rulesync.md) owns development installation and projection. The [distribution source guide](../../../assets/agent/README.md) owns consumer usage and compatibility. [Harness verification](harness.md) owns runtime evidence.
+
+## Select and change development assets
 
 1. Identify the needed behavior and runtime targets. Prefer a verified reusable asset over a local duplicate.
 2. Check the source's provenance, scope, compatibility and trust before changing the selection. [`rulesync.jsonc`](../../../rulesync.jsonc) owns external Skill sources and targets; the generated `rulesync.lock` records resolved revisions after an authorized install.

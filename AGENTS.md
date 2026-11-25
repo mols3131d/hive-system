@@ -4,7 +4,7 @@
 
 - Confirm repository, ref/branch, intended changes, relevant paths, and current working state before making edits.
 - For an unknown documentation topic, use [docs/INDEX.tsv](docs/INDEX.tsv) to find its owner; open a known document directly.
-- When adding, refreshing or removing selected Agent Assets, consult [asset lifecycle](docs/development/agents/assets.md); do not treat generated projections as the editable source.
+- Keep development Agent Assets under `.rulesync/` and distributable Hive Agent Assets under `assets/agent/`. Use [asset ownership and lifecycle](docs/development/agents/assets.md) to choose the correct source; do not edit generated projections or mix the two scopes.
 - For Hive product scope and technical decisions, read [Goals](docs/goal/README.md) and [Architecture](docs/architecture/README.md). For workspace semantics, select the relevant [workspace contract](docs/policies/workspace/README.md); those contracts apply to user data, not system development records.
 
 ## Work safely
