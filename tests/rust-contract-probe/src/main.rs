@@ -126,9 +126,7 @@ mod tests {
 
     #[test]
     fn incompatible_views_are_rejected() {
-        assert!(
-            Cli::try_parse_from(["hive", "--at", "abc", "context", "--authority"]).is_err()
-        );
+        assert!(Cli::try_parse_from(["hive", "--at", "abc", "context", "--authority"]).is_err());
     }
 
     #[test]

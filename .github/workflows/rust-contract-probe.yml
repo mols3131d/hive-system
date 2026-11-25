@@ -34,7 +34,9 @@ jobs:
         run: |
           cargo +stable generate-lockfile
           cargo +stable tree --locked > dependency-tree.txt
-          cargo +stable metadata --locked --format-version 1 --no-deps > metadata.json
+          cargo +stable metadata --locked --format-version 1 > metadata.json
+          jq -r '.packages[] | [.name, .version, (.license // "unspecified")] | @tsv' metadata.json | sort > licenses.tsv
+          cat licenses.tsv
           rustc +stable --version --verbose > rust-version.txt
       - name: Test contract
         run: cargo +stable test --locked --all-targets
@@ -56,5 +58,6 @@ jobs:
             tests/rust-contract-probe/dependency-tree.txt
             tests/rust-contract-probe/metadata.json
             tests/rust-contract-probe/rust-version.txt
+            tests/rust-contract-probe/licenses.tsv
           retention-days: 7
           if-no-files-found: warn
