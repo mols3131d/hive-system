@@ -4,7 +4,7 @@ description: "Use when implementing Hive domain APIs, configuration resolution, 
 
 # Hive CLI and Domain Contract
 
-**Status: CLI bootstrap.** Help, version, argument validation and the JSON v1 envelope are implemented. Workspace operations remain proposed. [System design](system-design.md) owns architecture and [workspace policies](../policies/workspace/README.md) own record semantics and authority. API means typed in-process operations called by the CLI, not HTTP, MCP, a public Rust SDK or a separate service. Keep the binary name `hive`; naming conflicts and aliases are deferred.
+**Status: read-only configuration and local context.** The CLI implements argument validation, the JSON v1 envelope, `config show`, `config validate`, `context` and local `doctor`. Record operations, configuration writes and authority observations follow in later increments. [System design](system-design.md) owns architecture and [workspace policies](../policies/workspace/README.md) own record semantics and authority. API means typed in-process operations called by the CLI, not HTTP, MCP, a public Rust SDK or a separate service. Keep the binary name `hive`; naming conflicts and aliases are deferred.
 
 ## Invocation and scope
 
@@ -41,6 +41,10 @@ Use the [three configuration owners](system-design.md#configuration-and-identity
 | Workspace `AGENTS.md` | Reviewed system policy reference | No implicit latest-policy fallback |
 
 Validate types, duplicate keys, unknown fields, required values, versions, path safety and selected project/workspace pairing. Existing invalid or unverified selection is not repaired or skipped by choosing a different target. CLI overrides may change the pair only with explicit verified selection; they do not overwrite files. Use the actual Git root, effective fetch/push targets and repository-local authentication, not the external project's Git configuration. Missing or incompatible policy blocks affected writes. Legacy workspaces without adopted coordination can be inspected with compatible policy support; coordinated commands fail with `INCOMPATIBLE_POLICY` until reviewed adoption. Never infer local mode from missing config.
+
+Local inspection verifies the workspace's `AGENTS.md`, `hive.yml` and selected scope entrypoints against the committed bytes. Pin the system policy with `hive-system@<full-commit>` in `AGENTS.md` or a full-commit Markdown link to the canonical workspace policy. The current binary recognizes the reviewed adopted policy from PR #6 and the preceding reviewed legacy policy. An unknown pin produces `INCOMPATIBLE_POLICY`. A historical view uses the selected commit's policy. Its coordination settings describe that snapshot only.
+
+An ordinary project scope can declare its canonical reference with a `Project: <reference>` line in `tasks/<project-id>/README.md` or `directives/<project-id>/README.md`. If both entrypoints exist, their references must agree. An applicable project binding must be ignored and untracked. Its canonical reference must match an effective Git fetch URL exactly, including the transport and path. An explicit workspace and project pair can select a verified existing scope from outside the external repository.
 
 ## Shared operation and data types
 

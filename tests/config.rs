@@ -1,0 +1,863 @@
+#![cfg(unix)]
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::Value;
+
+const POLICY: &str = "0e584830a7eff314d85b7af8c6f8cd69e735730a";
+const LEGACY_POLICY: &str = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
+const PROJECT: &str = "fixture-project";
+const PROJECT_URL: &str = "https://forge.example/fixture/project";
+const BINDING: &str = ".local/hive/config.yml";
+const LOCAL_CONFIG: &str = "version: 1\ncoordination:\n  mode: local\n";
+const USER_CONFIG: &str = "workspace: ../../workspace\noutput:\n  format: json\n";
+
+struct Sandbox(PathBuf);
+
+impl Sandbox {
+    fn new() -> Self {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hive-config-{}-{timestamp}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        for directory in ["home", "xdg", "invocation"] {
+            fs::create_dir(root.join(directory)).unwrap();
+        }
+        Self(root.canonicalize().unwrap())
+    }
+
+    fn command(&self, program: &str, cwd: &Path) -> Command {
+        let mut command = Command::new(program);
+        command
+            .env_clear()
+            .env("HOME", self.0.join("home"))
+            .env("XDG_CONFIG_HOME", self.0.join("xdg"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .current_dir(cwd);
+        command
+    }
+
+    fn hive(&self, cwd: &Path, args: &[&str]) -> Command {
+        let mut command = self.command(env!("CARGO_BIN_EXE_hive"), cwd);
+        command.args(args);
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.run_in(&self.0.join("invocation"), args)
+    }
+
+    fn run_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        self.hive(cwd, args).output().unwrap()
+    }
+
+    fn git(&self, cwd: &Path, args: &[&str]) -> String {
+        let output = self.command("git", cwd).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn init_repo(&self, name: &str) -> PathBuf {
+        let root = self.0.join(name);
+        fs::create_dir(&root).unwrap();
+        self.git(&root, &["init", "-q", "--initial-branch=main"]);
+        self.git(&root, &["config", "user.name", name]);
+        self.git(
+            &root,
+            &["config", "user.email", &format!("{name}@example.test")],
+        );
+        root
+    }
+
+    fn commit(&self, root: &Path) {
+        self.git(root, &["add", "."]);
+        self.git(root, &["commit", "-qm", "Fixture", "--allow-empty"]);
+    }
+
+    fn workspace(&self, name: &str, project_url: &str) -> PathBuf {
+        let root = self.init_repo(name);
+        write_policy(&root, POLICY);
+        write(&root.join("hive.yml"), LOCAL_CONFIG);
+        write(
+            &root.join("tasks").join(PROJECT).join("README.md"),
+            format!("# Project fixture\n\nProject: [Fixture repository]({project_url})\n"),
+        );
+        self.commit(&root);
+        root
+    }
+
+    fn project(&self, name: &str, origin: &str) -> PathBuf {
+        let root = self.init_repo(name);
+        self.git(&root, &["remote", "add", "origin", origin]);
+        write(&root.join("src/README.md"), "Tracked project file\n");
+        self.commit(&root);
+        root
+    }
+
+    fn binding(&self, root: &Path, yaml: &str) {
+        write(&root.join(".git/info/exclude"), format!("/{BINDING}\n"));
+        write(&root.join(BINDING), yaml);
+    }
+
+    fn user_config(&self, yaml: &str) {
+        write(&self.0.join("xdg/hive/config.yml"), yaml);
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn write(path: &Path, contents: impl AsRef<[u8]>) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, contents).unwrap();
+}
+
+fn write_policy(root: &Path, revision: &str) {
+    write(
+        &root.join("AGENTS.md"),
+        format!(
+            "# Workspace fixture\n\n[Workspace policy](https://github.com/mols3131d/hive-system/blob/{revision}/docs/policies/workspace/README.md)\n"
+        ),
+    );
+}
+
+fn json_result(output: &Output, command: &str, exit: i32) -> Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(exit),
+        "hive {command}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!("hive {command} printed invalid JSON: {error}\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["ok"], exit == 0);
+    assert_eq!(result["command"], command);
+    assert!(result["warnings"].is_array());
+    if exit == 0 {
+        assert!(result.get("error").is_none());
+        assert!(result["data"].is_object());
+    } else {
+        assert!(result.get("data").is_none());
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty())
+        );
+    }
+    result
+}
+
+fn assert_error(output: &Output, command: &str, code: &str, exit: i32) {
+    assert_eq!(json_result(output, command, exit)["error"]["code"], code);
+}
+
+fn assert_redacted(output: &Output, private_values: &[&str]) {
+    for stream in [&output.stdout, &output.stderr] {
+        let text = String::from_utf8_lossy(stream);
+        for value in private_values {
+            assert!(
+                !text.contains(value),
+                "diagnostic exposed a private fixture value"
+            );
+        }
+    }
+}
+
+fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, dir: &Path, entries: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, entries);
+            } else {
+                entries.insert(
+                    path.strip_prefix(root).unwrap().to_owned(),
+                    fs::read(&path).unwrap(),
+                );
+            }
+        }
+    }
+
+    let mut entries = BTreeMap::new();
+    visit(root, root, &mut entries);
+    entries
+}
+
+fn assert_unchanged(root: &Path, before: &BTreeMap<PathBuf, Vec<u8>>) {
+    let after = snapshot(root);
+    assert!(
+        before.keys().eq(after.keys()),
+        "file paths changed in {}",
+        root.display()
+    );
+    for (path, contents) in before {
+        assert!(
+            &after[path] == contents,
+            "contents changed in {}",
+            root.join(path).display()
+        );
+    }
+}
+
+#[test]
+fn user_defaults_use_absolute_xdg_or_home_and_relative_path_at_source() {
+    let fixture = Sandbox::new();
+    let workspace = fixture.workspace("workspace", PROJECT_URL);
+    let fallback = fixture.workspace("fallback-workspace", PROJECT_URL);
+    fixture.user_config(USER_CONFIG);
+    let fallback_source = fixture.0.join("home/.config/hive/config.yml");
+    write(
+        &fallback_source,
+        "workspace: ../../../fallback-workspace\noutput:\n  format: json\n",
+    );
+
+    let context = json_result(&fixture.run(&["context"]), "context", 0);
+    assert_eq!(
+        context["data"]["workspace_root"],
+        workspace.to_str().unwrap()
+    );
+    assert_eq!(context["data"]["policy_revision"], POLICY);
+    assert_eq!(context["data"]["output_format"], "json");
+    assert_eq!(context["context"]["view"], "working-tree");
+    assert_eq!(context["context"]["freshness"], "local");
+
+    let cwd = fixture.0.join("invocation");
+    write(&cwd.join("relative-xdg/hive/config.yml"), "malformed: [\n");
+    let output = fixture
+        .hive(&cwd, &["config", "show", "--scope", "user"])
+        .env("XDG_CONFIG_HOME", "relative-xdg")
+        .output()
+        .unwrap();
+    let user = json_result(&output, "config show", 0);
+    assert_eq!(user["data"]["source"], fallback_source.to_str().unwrap());
+    let declared_workspace = Path::new(user["data"]["workspace"].as_str().unwrap());
+    assert!(declared_workspace.is_absolute());
+    assert_eq!(declared_workspace.canonicalize().unwrap(), fallback);
+
+    let output = fixture.run(&["context", "--format", "text"]);
+    assert!(output.status.success());
+    assert!(serde_json::from_slice::<Value>(&output.stdout).is_err());
+    assert!(String::from_utf8_lossy(&output.stdout).contains(workspace.to_str().unwrap()));
+}
+
+#[test]
+fn absent_user_config_and_help_work_without_resolution() {
+    let fixture = Sandbox::new();
+    let output = fixture.run(&["config", "show", "--scope", "user", "--json"]);
+    let user = json_result(&output, "config show", 0);
+    assert_eq!(user["data"]["present"], false);
+    assert!(user["data"]["workspace"].is_null());
+
+    fixture.user_config("unsupported: !fixture broken\n");
+    for args in [
+        &["--json", "context", "--help"][..],
+        &["config", "show", "--json", "--help"],
+        &["--json", "--version"],
+    ] {
+        let output = fixture.run(args);
+        assert!(output.status.success(), "hive {args:?}");
+        assert!(output.stderr.is_empty(), "hive {args:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hive"));
+        assert!(serde_json::from_slice::<Value>(&output.stdout).is_err());
+    }
+}
+
+#[test]
+fn yaml_owners_reject_incorrect_or_unsupported_values() {
+    let fixture = Sandbox::new();
+    let workspace = fixture.workspace("workspace", PROJECT_URL);
+    let project = fixture.project("project", PROJECT_URL);
+    let invalid_user = [
+        "workspace: one\nworkspace: two\n",
+        "output:\n  format: json\n  format: text\n",
+        "workspace: true\n",
+        "workspace: null\n",
+        "output:\n  format: xml\n",
+        "output:\n  format: !fixture json\n",
+        "workspace: [unterminated\n",
+        "workspace: one\n---\nworkspace: two\n",
+        "credential: fixture-secret-canary\n",
+    ];
+    let user_validation = ["config", "validate", "--scope", "user", "--json"];
+    for yaml in invalid_user {
+        fixture.user_config(yaml);
+        let output = fixture.run(&user_validation);
+        let result = json_result(&output, "config validate", 2);
+        assert_eq!(result["error"]["code"], "INVALID_CONFIG");
+        let diagnostic = &result["error"]["details"]["diagnostics"][0];
+        assert_eq!(diagnostic["code"], "INVALID_CONFIG");
+        assert_eq!(diagnostic["severity"], "error");
+        assert_eq!(diagnostic["path"], "hive/config.yml");
+        assert!(diagnostic["message"].is_string());
+        assert_redacted(&output, &["fixture-secret-canary"]);
+    }
+
+    fixture.user_config(&"#\n".repeat(64 * 1024));
+    assert_error(
+        &fixture.run(&user_validation),
+        "config validate",
+        "INVALID_CONFIG",
+        2,
+    );
+    let user_source = fixture.0.join("xdg/hive/config.yml");
+    fs::remove_file(&user_source).unwrap();
+    symlink(fixture.0.join("absent.yml"), user_source).unwrap();
+    assert_error(
+        &fixture.run(&user_validation),
+        "config validate",
+        "INVALID_CONFIG",
+        2,
+    );
+
+    for yaml in [
+        "project_id: false\n",
+        "project_id: ../unsafe\n",
+        "workspace: ../../../workspace\n",
+    ] {
+        fixture.binding(&project, yaml);
+        let output = fixture.run(&[
+            "config",
+            "validate",
+            "--scope",
+            "project",
+            "--project-root",
+            "../project",
+            "--json",
+        ]);
+        assert_error(&output, "config validate", "INVALID_CONFIG", 2);
+    }
+
+    let workspace_validation = [
+        "config",
+        "validate",
+        "--scope",
+        "workspace",
+        "--workspace",
+        "../workspace",
+        "--json",
+    ];
+    for yaml in [
+        "version: '1'\ncoordination: {mode: local}\n",
+        "version: 1\ncoordination: {mode: local, remote: origin}\n",
+        "version: 1\ncoordination: {mode: remote}\n",
+        "version: 1\ncoordination: {mode: local, ref: refs/heads/other}\n",
+    ] {
+        write(&workspace.join("hive.yml"), yaml);
+        fixture.commit(&workspace);
+        let output = fixture.run(&workspace_validation);
+        assert_error(&output, "config validate", "INVALID_CONFIG", 2);
+    }
+
+    write(
+        &workspace.join("hive.yml"),
+        "version: 2\ncoordination: {mode: local}\n",
+    );
+    fixture.commit(&workspace);
+    assert_error(
+        &fixture.run(&workspace_validation),
+        "config validate",
+        "INCOMPATIBLE_POLICY",
+        4,
+    );
+}
+
+#[test]
+fn source_scopes_do_not_require_unrelated_valid_configurations() {
+    let fixture = Sandbox::new();
+    let workspace = fixture.workspace("workspace", PROJECT_URL);
+    let project = fixture.project("project", PROJECT_URL);
+    fixture.binding(&project, "project_id: [broken\n");
+    write(&workspace.join("hive.yml"), "coordination: [broken\n");
+    fixture.user_config(USER_CONFIG);
+
+    let output = fixture.run_in(
+        &project,
+        &["config", "validate", "--scope", "user", "--json"],
+    );
+    assert_eq!(
+        json_result(&output, "config validate", 0)["data"]["scope"],
+        "user"
+    );
+
+    fixture.user_config("workspace: [broken\n");
+    fixture.binding(
+        &project,
+        "project_id: fixture-project\nworkspace: ../../../workspace\n",
+    );
+    let output = fixture.run_in(
+        &project.join("src"),
+        &["config", "show", "--scope", "project", "--json"],
+    );
+    let selected = json_result(&output, "config show", 0);
+    assert_eq!(selected["data"]["scope"], "project");
+    assert_eq!(
+        selected["data"]["source"],
+        project.join(BINDING).to_str().unwrap()
+    );
+    assert_eq!(selected["data"]["project_id"], PROJECT);
+    let declared_workspace = Path::new(selected["data"]["workspace"].as_str().unwrap());
+    assert!(declared_workspace.is_absolute());
+    assert_eq!(declared_workspace.canonicalize().unwrap(), workspace);
+
+    fixture.binding(&project, "project_id: [broken\n");
+    write(&workspace.join("hive.yml"), LOCAL_CONFIG);
+    let output = fixture.run_in(
+        &project,
+        &[
+            "config",
+            "validate",
+            "--scope",
+            "workspace",
+            "--workspace",
+            "../workspace",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        json_result(&output, "config validate", 0)["data"]["scope"],
+        "workspace"
+    );
+}
+
+#[test]
+fn project_binding_resolves_only_a_verified_workspace_project_pair() {
+    let fixture = Sandbox::new();
+    let workspace = fixture.workspace("workspace", PROJECT_URL);
+    let alternate = fixture.workspace("alternate", "https://forge.example/fixture/other");
+    fixture.user_config(USER_CONFIG);
+    let project = fixture.project("project", PROJECT_URL);
+    fixture.git(&project, &["remote", "rename", "origin", "upstream"]);
+    fixture.binding(&project, "project_id: fixture-project\n");
+
+    let cwd = project.join("src");
+    let output = fixture.run_in(&cwd, &["context"]);
+    let context = json_result(&output, "context", 0);
+    assert_eq!(
+        context["data"]["workspace_root"],
+        workspace.to_str().unwrap()
+    );
+    assert_eq!(context["data"]["project_id"], PROJECT);
+    assert_eq!(context["data"]["project_root"], project.to_str().unwrap());
+    assert!(context["data"]["sources"].is_object());
+
+    let output = fixture.run_in(&cwd, &["context", "--workspace", "../../alternate"]);
+    assert_error(&output, "context", "AMBIGUOUS_SCOPE", 2);
+
+    let output = fixture.run_in(
+        &cwd,
+        &[
+            "context",
+            "--workspace",
+            "../../alternate",
+            "--project",
+            PROJECT,
+        ],
+    );
+    let context = json_result(&output, "context", 0);
+    assert_eq!(
+        context["data"]["workspace_root"],
+        alternate.to_str().unwrap()
+    );
+    assert_eq!(context["data"]["project_id"], PROJECT);
+    assert!(context["data"].get("project_root").is_none());
+
+    fixture.git(
+        &project,
+        &[
+            "remote",
+            "set-url",
+            "upstream",
+            "https://forge.example/fixture/unrelated",
+        ],
+    );
+    let output = fixture.run_in(&cwd, &["context"]);
+    assert_error(&output, "context", "AMBIGUOUS_SCOPE", 2);
+}
+
+#[test]
+fn an_existing_malformed_or_tracked_binding_cannot_be_bypassed() {
+    let fixture = Sandbox::new();
+    fixture.workspace("workspace", PROJECT_URL);
+    let project = fixture.project("project", PROJECT_URL);
+
+    let args = [
+        "context",
+        "--workspace",
+        "../workspace",
+        "--project",
+        PROJECT,
+        "--json",
+    ];
+    fixture.binding(&project, "project_id: fixture-project\n");
+    assert_error(
+        &fixture.run_in(&project, &args),
+        "context",
+        "INVALID_CONFIG",
+        2,
+    );
+    fixture.user_config(USER_CONFIG);
+    fixture.binding(&project, "project_id: !fixture fixture-project\n");
+    let output = fixture.run_in(&project, &args);
+    assert_error(&output, "context", "INVALID_CONFIG", 2);
+
+    let binding_contents = "project_id: fixture-project\nworkspace: ../../../workspace\n";
+    let outside_binding = fixture.0.join("outside-binding.yml");
+    write(&outside_binding, binding_contents);
+    let binding = project.join(BINDING);
+    fs::remove_file(&binding).unwrap();
+    symlink(outside_binding, &binding).unwrap();
+    assert_error(
+        &fixture.run_in(&project, &args),
+        "context",
+        "INVALID_CONFIG",
+        2,
+    );
+
+    fs::remove_file(&binding).unwrap();
+    write(&binding, binding_contents);
+    fixture.git(&project, &["add", "--force", BINDING]);
+    fixture.commit(&project);
+    let output = fixture.run_in(&project, &args);
+    assert_error(&output, "context", "INVALID_CONFIG", 2);
+}
+
+#[test]
+fn binding_canonical_references_preserve_git_address_distinctions() {
+    let fixture = Sandbox::new();
+    let reference = "git@forge.example:operators/project.git";
+    let workspace = fixture.workspace("workspace", reference);
+    let project = fixture.project("project", reference);
+    fixture.binding(
+        &project,
+        "project_id: fixture-project\nworkspace: ../../../workspace\n",
+    );
+    let output = fixture.run_in(&project, &["context", "--json"]);
+    assert_eq!(
+        json_result(&output, "context", 0)["data"]["workspace_root"],
+        workspace.to_str().unwrap()
+    );
+
+    for other in [
+        "other@forge.example:operators/project.git",
+        "git@forge.example:/operators/project.git",
+        "https://forge.example/operators/project.git",
+    ] {
+        fixture.git(&project, &["remote", "set-url", "origin", other]);
+        assert_error(
+            &fixture.run_in(&project, &["context", "--json"]),
+            "context",
+            "AMBIGUOUS_SCOPE",
+            2,
+        );
+    }
+    for (reference, different) in [
+        (
+            "https://forge.example/project.",
+            "https://forge.example/project",
+        ),
+        ("/example/project copy", "/example/project"),
+    ] {
+        write(
+            &workspace.join("tasks").join(PROJECT).join("README.md"),
+            format!("# Project fixture\n\nProject: [Repository]({reference})\n"),
+        );
+        fixture.commit(&workspace);
+        fixture.git(&project, &["remote", "set-url", "origin", different]);
+        assert_error(
+            &fixture.run_in(&project, &["context", "--json"]),
+            "context",
+            "AMBIGUOUS_SCOPE",
+            2,
+        );
+    }
+}
+
+#[test]
+fn project_binding_cannot_traverse_an_intermediate_symbolic_link() {
+    let fixture = Sandbox::new();
+    fixture.workspace("workspace", PROJECT_URL);
+    fixture.user_config(USER_CONFIG);
+    let project = fixture.project("project", PROJECT_URL);
+    write(&project.join(".git/info/exclude"), format!("/{BINDING}\n"));
+    let outside = fixture.0.join("outside");
+    write(
+        &outside.join("hive/config.yml"),
+        "project_id: fixture-project\n",
+    );
+    symlink(outside, project.join(".local")).unwrap();
+    assert_error(
+        &fixture.run_in(&project, &["context", "--json"]),
+        "context",
+        "INVALID_CONFIG",
+        2,
+    );
+}
+
+#[test]
+fn git_discovery_rejects_an_ancestor_with_a_different_git_directory() {
+    let fixture = Sandbox::new();
+    let parent = fixture.project("parent", PROJECT_URL);
+    let nested = fixture.init_repo("parent/child");
+    fixture.git(
+        &nested,
+        &["config", "core.worktree", parent.to_str().unwrap()],
+    );
+    assert_eq!(
+        fixture.git(&nested, &["rev-parse", "--show-toplevel"]),
+        parent.to_str().unwrap(),
+    );
+    assert_error(
+        &fixture.run_in(&nested, &["config", "show", "--scope", "project", "--json"]),
+        "config show",
+        "INVALID_CONFIG",
+        2,
+    );
+}
+
+#[test]
+fn native_git_resolution_isolated_from_inherited_overrides_and_project_writes() {
+    let fixture = Sandbox::new();
+    let workspace = fixture.workspace("workspace", PROJECT_URL);
+    let project = fixture.project("project", PROJECT_URL);
+    let unrelated = fixture.project("unrelated", "https://forge.example/fixture/unrelated");
+    write(&project.join("untracked.md"), "Keep user changes\n");
+    write(
+        &project.join("src/README.md"),
+        "Keep tracked user changes\n",
+    );
+    write(
+        &project.join("project-hooks/pre-commit"),
+        "#!/bin/sh\nexit 1\n",
+    );
+    fixture.git(&project, &["config", "core.hooksPath", "project-hooks"]);
+
+    let injected_config = fixture.0.join("injected.gitconfig");
+    write(
+        &injected_config,
+        "[url \"https://redirect.example/\"]\n  insteadOf = https://forge.example/\n",
+    );
+    let git_trace = fixture.0.join("inherited-git-trace");
+    let project_before = snapshot(&project);
+    let workspace_before = snapshot(&workspace);
+    let output = fixture
+        .hive(
+            &fixture.0.join("invocation"),
+            &[
+                "--json",
+                "context",
+                "--workspace",
+                "../workspace",
+                "--project",
+                PROJECT,
+                "--project-root",
+                "../project",
+            ],
+        )
+        .env("GIT_DIR", unrelated.join(".git"))
+        .env("GIT_WORK_TREE", &unrelated)
+        .env("GIT_COMMON_DIR", unrelated.join(".git"))
+        .env("GIT_CONFIG_GLOBAL", &injected_config)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "remote.origin.url")
+        .env(
+            "GIT_CONFIG_VALUE_0",
+            "https://unrelated.example/override-secret-canary",
+        )
+        .env("GIT_TRACE", &git_trace)
+        .output()
+        .unwrap();
+    let context = json_result(&output, "context", 0);
+    assert_eq!(
+        context["data"]["workspace_root"],
+        workspace.to_str().unwrap()
+    );
+    assert_eq!(context["data"]["project_root"], project.to_str().unwrap());
+    assert_eq!(context["data"]["project_id"], PROJECT);
+    assert_redacted(&output, &["override-secret-canary", "redirect.example"]);
+    assert!(!git_trace.exists());
+
+    let output = fixture.run(&[
+        "config",
+        "bind",
+        "--workspace",
+        "../workspace",
+        "--project",
+        PROJECT,
+        "--project-root",
+        "../project",
+        "--json",
+    ]);
+    assert_error(&output, "config bind", "NOT_IMPLEMENTED", 7);
+    assert_unchanged(&project, &project_before);
+    assert_unchanged(&workspace, &workspace_before);
+    assert!(!project.join(BINDING).exists());
+}
+
+#[test]
+fn workspace_policy_is_reviewed_and_resolved_at_the_selected_view() {
+    let fixture = Sandbox::new();
+    let workspace = fixture.workspace("workspace", PROJECT_URL);
+    let args = ["context", "--workspace", "../workspace", "--json"];
+
+    fs::remove_file(workspace.join("hive.yml")).unwrap();
+    write_policy(&workspace, LEGACY_POLICY);
+    fixture.commit(&workspace);
+    let legacy_revision = fixture.git(&workspace, &["rev-parse", "HEAD"]);
+    let report = json_result(&fixture.run(&args), "context", 0);
+    assert_eq!(report["data"]["policy_revision"], LEGACY_POLICY);
+    assert!(report["data"]["coordination"].is_null());
+
+    write_policy(&workspace, POLICY);
+    write(&workspace.join("hive.yml"), LOCAL_CONFIG);
+    fixture.commit(&workspace);
+    let report = json_result(&fixture.run(&args), "context", 0);
+    assert_eq!(report["data"]["policy_revision"], POLICY);
+    assert_eq!(report["data"]["coordination"]["ref"], "refs/heads/main");
+
+    let output = fixture.run(&[args.as_slice(), &["--at", &legacy_revision]].concat());
+    let historic = json_result(&output, "context", 0);
+    assert_eq!(historic["context"]["view"], "commit");
+    assert_eq!(historic["context"]["revision"], legacy_revision.as_str());
+    assert_eq!(historic["context"]["policy_revision"], LEGACY_POLICY);
+    let text = fixture.run(&[
+        "context",
+        "--workspace",
+        "../workspace",
+        "--at",
+        &legacy_revision,
+        "--format",
+        "text",
+    ]);
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains(&legacy_revision));
+    assert!(text.contains("\"view\": \"commit\""));
+    assert!(text.contains("\"freshness\": \"local\""));
+
+    write(
+        &workspace.join("hive.yml"),
+        format!("{LOCAL_CONFIG}# Unreviewed change\n"),
+    );
+    assert_error(&fixture.run(&args), "context", "INVALID_CONFIG", 2);
+    let project = fixture.project("project", PROJECT_URL);
+    fixture.binding(
+        &project,
+        "project_id: fixture-project\nworkspace: ../../../workspace\n",
+    );
+    let historic = json_result(
+        &fixture.run_in(&project, &["context", "--json", "--at", &legacy_revision]),
+        "context",
+        0,
+    );
+    assert_eq!(historic["context"]["policy_revision"], LEGACY_POLICY);
+    assert_eq!(historic["data"]["project_id"], PROJECT);
+    assert!(historic["data"]["coordination"].is_null());
+    write(&workspace.join("hive.yml"), LOCAL_CONFIG);
+    fixture.git(&workspace, &["rm", "--cached", "--", "hive.yml"]);
+    assert_error(&fixture.run(&args), "context", "INVALID_CONFIG", 2);
+    fixture.git(&workspace, &["add", "--", "hive.yml"]);
+
+    write_policy(&workspace, "main");
+    fixture.commit(&workspace);
+    assert_error(&fixture.run(&args), "context", "POLICY_UNAVAILABLE", 7);
+    write_policy(&workspace, "1111111111111111111111111111111111111111");
+    fixture.commit(&workspace);
+    assert_error(&fixture.run(&args), "context", "INCOMPATIBLE_POLICY", 4);
+}
+
+#[test]
+fn remote_coordination_checks_local_metadata_without_contacting_the_remote() {
+    let fixture = Sandbox::new();
+    let workspace = fixture.workspace("workspace", PROJECT_URL);
+    write(
+        &workspace.join("hive.yml"),
+        "version: 1\ncoordination:\n  mode: remote\n  remote: origin\n",
+    );
+    fixture.git(
+        &workspace,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "ssh://git@forge.example/fixture/workspace.git",
+        ],
+    );
+    let transport = workspace.join(".git/network-probe");
+    let marker = workspace.join(".git/network-probe.called");
+    write(&transport, "#!/bin/sh\n: > \"$0.called\"\nexit 1\n");
+    fs::set_permissions(&transport, fs::Permissions::from_mode(0o700)).unwrap();
+    let transport_command = format!("'{}'", transport.to_str().unwrap().replace('\'', "'\\''"));
+    fixture.git(
+        &workspace,
+        &["config", "core.sshCommand", &transport_command],
+    );
+    fixture.commit(&workspace);
+
+    let args = ["--workspace", "../workspace", "--json"];
+    let before = snapshot(&workspace);
+    for command in ["context", "doctor"] {
+        let output = fixture.run(&[&[command], args.as_slice()].concat());
+        let report = json_result(&output, command, 0);
+        assert_eq!(
+            report["data"]["workspace_root"],
+            workspace.to_str().unwrap()
+        );
+        assert_eq!(report["data"]["coordination"]["mode"], "remote");
+        assert_redacted(&output, &["git@forge.example/fixture/workspace.git"]);
+
+        let output = fixture.run(&[&[command, "--authority"], args.as_slice()].concat());
+        assert_error(&output, command, "NOT_IMPLEMENTED", 7);
+    }
+    assert!(!marker.exists(), "the remote transport was invoked");
+    assert_unchanged(&workspace, &before);
+
+    fixture.git(
+        &workspace,
+        &[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "https://fixture-secret-user:fixture-secret-password@forge.example/fixture/other.git",
+        ],
+    );
+    let output = fixture.run(&[&["context"], args.as_slice()].concat());
+    assert_error(&output, "context", "INVALID_CONFIG", 2);
+    assert_redacted(
+        &output,
+        &[
+            "fixture-secret-user",
+            "fixture-secret-password",
+            "forge.example",
+        ],
+    );
+    assert!(
+        !marker.exists(),
+        "the invalid remote caused a transport invocation"
+    );
+}

@@ -11,7 +11,7 @@ Hive is independent of IDEs, coding-agent runtimes and vendors, model providers,
 
 This repository owns the system and reusable assets. Actual records belong in a separate, user-controlled workspace.
 
-**Status:** The Rust CLI provides help, version information, argument validation and the JSON v1 output contract. Workspace operations and the Hive Skill are pending. See [development setup](docs/development/README.md) to build and test the CLI.
+**Status:** The Rust CLI provides argument validation, JSON v1 output and read-only configuration and context inspection. Record operations and the Hive Skill are pending. See [development setup](docs/development/README.md) to build and test the CLI.
 
 ## Developer dogfooding
 

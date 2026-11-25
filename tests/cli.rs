@@ -18,7 +18,7 @@ const CONTENT_TOKEN: &str =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
 const READ_COMMANDS: &[(&str, &[&str])] = &[
-    ("context", &["context"]),
+    ("validate", &["validate"]),
     ("task show", &["task", "show", TASK]),
 ];
 
@@ -120,11 +120,7 @@ fn top_level_help_and_version_run_without_a_workspace() {
 fn recognized_commands_accept_matching_globals_and_report_unavailable_operations() {
     let sandbox = Sandbox::new();
     let commands: &[(&str, &[&str])] = &[
-        ("context", &["context"]),
         ("validate", &["validate", "--all-projects"]),
-        ("doctor", &["doctor"]),
-        ("config show", &["config", "show", "--scope", "user"]),
-        ("config validate", &["config", "validate"]),
         ("config bind", &["config", "bind"]),
         ("project list", &["project", "list"]),
         ("project show", &["project", "show", PROJECT]),
@@ -496,8 +492,8 @@ fn a_recognized_json_selection_survives_leaf_argument_errors() {
 fn text_operation_failure_uses_stderr() {
     let sandbox = Sandbox::new();
     for args in [
-        ["context"].as_slice(),
-        &["--format", "text", "context", "--format=text"],
+        ["validate"].as_slice(),
+        &["--format", "text", "validate", "--format=text"],
     ] {
         let output = sandbox.run(args);
         assert_eq!(output.status.code(), Some(7), "hive {args:?}");
