@@ -110,7 +110,7 @@ Use the local filesystem and native Git as the initial access model. Markdown fi
 
 - Resolve the workspace root and target explicitly, independently of the project being edited. Scope file access to the selected workspace and reject traversal or symlink escapes.
 - Distinguish immutable commit reads from mutable working-tree inspection; report source, revision and freshness. A dirty checkout is not an immutable snapshot or proof of current authoritative state.
-- Reads never fetch, commit, push or synchronize. Ordinary local changes and explicit Git publication are distinct; coordination operations explicitly access the configured authority because their success depends on it.
+- Reads never fetch objects, commit, push or synchronize; an explicit authority observation may query the configured Git ref without modifying local state. Ordinary local changes and explicit Git publication are distinct; coordination operations explicitly access the configured authority because their success depends on it.
 - Authorized file or Git tools, including a hosting connector, remain valid access paths to the same records. They may perform coordination only if they can meet the same atomic preconditions and confirm the result; otherwise report the blocker.
 
 ## Deterministic validation
@@ -163,34 +163,21 @@ Keep discovery progressive: resolve the authorized workspace and collaboration s
 
 ## CLI surface
 
-The examples are provisional, not executable commands in the current repository. Resolve the workspace and project once from configuration or explicit selection, then keep commands focused on intent. A short work ID is valid only in a verified project scope; qualified IDs remain supported. An explicit cross-project query requires explicit scope.
+The [CLI and domain contract](cli-contract.md) defines the proposed MVP command grammar, configuration resolution, typed in-process API, options, outputs, preconditions and errors. It does not introduce an HTTP API or public SDK. Keep the executable name `hive`; name collisions and alias management are outside MVP.
+
+Read and ordinary local-write commands remain separate from explicitly coordinated task mutations. A short task ID requires a verified project scope; use configuration to avoid repeated scope arguments. The following examples assume an applicable project binding and an adopted coordination contract where needed; they are not currently executable.
 
 ```sh
 hive context --json
 hive config show
-hive config validate
-hive doctor
-hive task list --json
-hive task show fix-auth --json
+hive task list
 hive task context fix-auth --json
 hive task create fix-auth --file task.md
-hive task select fix-auth
-hive task claim fix-auth --holder worker-a
-hive task update fix-auth --status review --claim-id "$CLAIM_ID"
-hive task release fix-auth --claim-id "$CLAIM_ID"
-hive task transfer fix-auth --claim-id "$CLAIM_ID" --to worker-b
-hive task archive fix-auth
-hive artifact list --task fix-auth
+hive task claim fix-auth --holder worker-a --expected-revision "$BASE_REVISION"
 hive validate --task fix-auth
-hive --workspace /example/hive-data --project example-project task list
 ```
 
-Use a fresh authoritative base inside coordinated commands. When a caller acts on an earlier observation, require its expected revision or equivalent explicit precondition; never silently refresh an old intent against a newer state. Owner-sensitive changes require the current claim ID and verified holder authority; a claim ID is not a secret credential. Obtain the holder from verified assignment context or an explicit argument, not a shared user or project default. A new claim ID is generated per acquisition or transfer and returned only as confirmed on success. Exact argument names, recovery evidence input, exit codes and output schemas remain to be implemented.
-
-- Provide concise human output and stable JSON. Distinguish empty, absent, invalid, stale, unauthorized, already claimed, unavailable authority and unknown write outcomes; include relevant source, revision and diagnostics.
-- Preserve metadata and Markdown body outside the authorized change, re-resolve moved bundles, and retain relevant artifacts and references on closure. A task archive needs actual accepted outcome or authorized cancellation.
-- Keep artifact add/list/expiration, directive listing, Bot listing and scoped memory reads bounded by the existing policies. Expiration is a read-only eligibility report, never automatic deletion.
-- Do not expose unrelated memory, credentials or raw runtime context. A context read is not delivery, approval or a claim. Avoid generic Git wrappers and new session-state models.
+The exact commands, required guards and failure semantics are owned by the linked contract. Ordinary status/record changes do not implicitly acquire a claim, accept work or publish to Git.
 
 ## Implementation and verification
 
@@ -209,7 +196,7 @@ Use the existing Markdown layout and stable identifiers. The new coordination me
 
 ## Decisions before implementation
 
-- Specify platform config path resolution, exact CLI argument and diagnostic schemas, safe Git compare-and-update mechanics and recovery evidence. Verify these mechanisms with actual Git operations before enabling writes.
+- Review the proposed [CLI and domain contract](cli-contract.md), implement platform path resolution and verify exact command/error behavior. Finalize safe Git compare-and-update mechanics and recovery evidence through actual Git tests before enabling writes.
 - Specify non-invasive optional asset installation and test repository/credential isolation, including differing project and Hive Git authors and remotes.
 - Finalize compatibility signaling and the reviewed adoption/rollback procedure for the new coordination contract. Preserve stable scope and work IDs and one record owner across migration.
 - Review the smallest initial command set, Rust dependency and distribution choices, and the relationship to current TypeScript development tooling.
