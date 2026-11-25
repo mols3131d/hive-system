@@ -15,7 +15,7 @@ hive [GLOBAL OPTIONS] validate
 hive [GLOBAL OPTIONS] doctor
 ```
 
-Global options are accepted before the domain or after the leaf command; repeated conflicting values are errors. View options are read-only and rejected on mutations. All other options are command-specific unless explicitly listed as global. Help and version do not require a workspace. Unknown arguments, unknown options, missing required arguments and incompatible combinations fail before side effects.
+Global options are accepted before the domain or after the leaf command; repeated conflicting values are errors. Validate the common option values and mutually exclusive combinations across these positions before any side effect. A parser's local conflict annotation alone is insufficient: a synthetic `clap` 4.6.10 probe accepted `--at` before a subcommand together with `--authority` after it. Explicit post-parse validation rejected that combination in both orders. Also verify that repeated values across positions cannot be silently overwritten during parser propagation; use separate position-specific arguments if necessary. View options are read-only and rejected on mutations. All other options are command-specific unless explicitly listed as global. Help and version do not require a workspace. Unknown arguments, unknown options, missing required arguments and incompatible combinations fail before side effects.
 
 | Global option | Type | Default and boundary |
 | --- | --- | --- |
