@@ -16,7 +16,7 @@ The root `.rulesync/` directory and root `rulesync.jsonc` are for agents develop
 
 ## Use in a data workspace
 
-With a Rulesync version supporting separate input roots, select `agents-configs/` directly as an input root in the consuming agent environment's local Rulesync configuration. Keep the consumer configuration and generated projections outside the tracked data repository. For example, the following local configuration fragment assumes a reviewed system checkout next to the consumer working directory:
+With a Rulesync version supporting separate input roots, select `agents-configs/` directly as an input root in the consuming agent environment's local Rulesync configuration. A data workspace may track a minimal `.rulesync/` source selection and `rulesync.jsonc` for direct record management. Keep generated projections and machine-specific settings untracked. For example, the following local configuration fragment assumes a reviewed system checkout next to the consumer working directory:
 
 ```jsonc
 {
@@ -24,7 +24,7 @@ With a Rulesync version supporting separate input roots, select `agents-configs/
 }
 ```
 
-Keep the consumer's own target and feature selection; do not reuse the system development configuration. Rulesync's separate input roots apply to `generate`, not to every Rulesync command. If combining roots, review their order and name collisions, since later roots can override earlier assets. Preview generated writes and deletions before authorized generation; protect tracked workspace instructions and records from overwrite. Do not commit development tooling, duplicate product sources, Rulesync configuration or generated harness files to a data-only workspace.
+Keep the consumer's own target and feature selection; do not reuse the system development configuration. Rulesync's separate input roots apply to `generate`, not to every Rulesync command. If combining roots, review their order and name collisions, since later roots can override earlier assets. Preview generated writes and deletions before authorized generation; protect tracked workspace instructions and records from overwrite. Alternatively, a data workspace may retain only the selected product definitions as revision-pinned local consumer copies in `.rulesync/`, with a minimal native `rulesync.jsonc` for the relevant targets and features. Review copies against the selected system revision when updating; the system remains their canonical owner. Do not select both the source tree and its copies. Keep workspace-specific rules narrowly scoped to record management; do not commit system development tooling or generated harness files. Disable automatic deletion for this minimal consumer configuration and preserve its tracked `AGENTS.md` when projecting.
 
 Keep the data workspace's `AGENTS.md` as its entrypoint to the reviewed system policy revision; the paths named inside these assets are relative to that system revision, not to the data checkout. The agent must be able to read the actual policy from a verified source, including when it has only local read tools. Do not grant network or additional tool access merely to make an asset work.
 
