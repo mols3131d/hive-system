@@ -1,11 +1,11 @@
 # Hive System
 
-A persistent collaboration system for AI agents, built on the filesystem, Markdown and Git.
+A personal collaboration system for an individual developer managing multiple AI agent sessions across multiple projects, built on the filesystem, Markdown and Git.
 
 > [!WARNING]
 > Hive is still under active development and is not ready for real-world use. Do not use it for actual workflows. Dogfooding by Hive developers is the only exception.
 
-Hive manages directives, tasks, artifacts, Bot identities and curated memory across sessions. It is independent of agent runtimes and Git hosting providers.
+Hive manages directives, tasks, artifacts, Bot identities and curated memory across sessions. It is independent of agent runtimes and Git hosting providers, and is not a multi-user or enterprise collaboration platform.
 
 This repository owns the system and reusable assets. Actual records belong in a separate, user-controlled workspace.
 

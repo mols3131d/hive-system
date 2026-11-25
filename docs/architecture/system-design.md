@@ -4,23 +4,23 @@ description: "Read when designing or implementing the standalone Rust Hive CLI a
 
 # Hive System Design
 
-**Status: design proposal, not implemented.** Hive is an independent Rust system, separate from user-controlled data repositories. The proposed initial product is a local CLI with a Hive-owned Skill, operating on Markdown and Git workspaces. The storage access method, command contracts and deployment details remain proposals pending review.
+**Status: design proposal, not implemented.** Hive is an independent Rust system, separate from user-controlled data repositories. The proposed initial product is a local CLI with a Hive-owned Skill, operating on Markdown and Git workspaces. The foundation is the local filesystem and native Git; detailed storage semantics, command contracts and deployment details remain proposals pending review.
 
-Hive is an agent collaboration workspace, not a general project management application or an agent execution platform. Preserve the [workspace operating contracts](../policies/workspace/README.md), including project-owned specifications, human and agent authority, selective retention and non-interference with external developers. Existing records and workflows remain valid until a reviewed change explicitly replaces them.
+Hive is a personal collaboration workspace for one developer working across multiple AI agent sessions and projects, not a multi-user collaboration service, general project management application or agent execution platform. Optimize for low setup and maintenance cost, simple local operation and clear handoffs. Multiple sessions can still modify the same records, so preserve scoped write safety and conflict detection without introducing enterprise identity management or distributed orchestration. Preserve the [workspace operating contracts](../policies/workspace/README.md), including project-owned specifications, human and agent authority, selective retention and non-interference with external developers. Existing records and workflows remain valid until a reviewed change explicitly replaces them.
 
 ## Product boundary
 
 | Surface | Responsibility |
 | --- | --- |
-| Markdown and Git | Canonical workspace records, references and revision history |
+| Filesystem, Markdown and Git | Canonical workspace records, references and revision history |
 | Hive Skill | Progressive discovery of governing policy, choosing applicable actions and interpreting results |
 | Rust CLI | Deterministic discovery, parsing, validation, scoped record operations and useful diagnostics |
 | Existing Git and authentication | Repository access, credentials and revision-safe publishing |
 | Agent or human | Goal, priority, delegation, actual acceptance, permission and retention decisions |
 
-Own Hive-specific semantics directly; do not integrate Backlog.md, Beads or another task manager as a second task owner. Reuse established Rust libraries and native tools for generic parsing, serialization, Git and HTTP where they reduce maintenance and risk.
+Own Hive-specific semantics directly; do not integrate Backlog.md, Beads or another task manager as a second task owner. Reuse established Rust libraries and native tools for generic parsing, serialization and Git where they reduce maintenance and risk.
 
-CLI-first is the proposed initial interface. The Skill links to canonical policies and provides usage guidance rather than copying policies or requiring a particular runtime. Shell-capable clients can invoke the CLI; authorized clients without it can still use existing GitHub tools and Markdown. A future MCP adapter is a separate decision justified by real consumers (for example, a client without Shell access). Do not implement MCP, remote services or a general adapter framework now.
+CLI-first is the proposed initial interface. The Skill links to canonical policies and provides usage guidance rather than copying policies or requiring a particular runtime. Shell-capable clients can invoke the CLI; authorized clients without it can still use available Git and Markdown tools, including a hosting connector where appropriate. A future MCP adapter is a separate decision justified by real consumers (for example, a client without Shell access). Do not implement MCP, remote services or a general adapter framework now.
 
 No database, alternate state store, backend router, automatic synchronization, task scheduler, agent spawning, session control, distributed claims or leases, automatic memory learning, automatic artifact deletion, TUI or web application is in initial scope. The existing explicit Notion designation policy remains unchanged; this CLI operates on Hive records only and must not silently select, migrate to or write to another backend.
 
@@ -53,22 +53,17 @@ Start with one Cargo package and one executable. Separate CLI argument and outpu
 | Storage | Read the chosen repository at a known revision; apply a scoped change with a guarded write |
 | Verification | Test observable contracts with synthetic records and isolated repositories |
 
-Candidate libraries include `clap`, `serde`, `serde_json`, a maintained YAML parser, and, where required, a Markdown parser, date library and Git or HTTP client. `thiserror`, `anyhow`, `assert_cmd` and `tempfile` are candidates for errors and tests. Select and review actual dependencies when needed; no versions, licenses, compatibility or performance claims are established here. Prefer existing Git or `gh` integration over reimplementing Git, credential handling or HTTP transport when sufficient.
+Candidate libraries include `clap`, `serde`, `serde_json`, a maintained YAML parser, and, where required, a Markdown parser, date library and native Git integration. `thiserror`, `anyhow`, `assert_cmd` and `tempfile` are candidates for errors and tests. Select and review actual dependencies when needed; no versions, licenses, compatibility or performance claims are established here. Prefer existing native Git integration over reimplementing Git or credential handling. No Git hosting provider or network access is required for local operation.
 
 The existing TypeScript scripts and verification commands are not replaced by this design. Evaluate any migration of development tooling independently against existing callers, tests and maintenance cost. Development Agent Assets under `.rulesync/` remain separate from the [distributable Hive Agent Assets](../../agents-configs/README.md). Product releases must select only product sources, not the development harness; distribution mechanics remain to be designed.
 
 ## Repository access and writes
 
-Choose one initial access implementation after testing the expected deployment:
+Use the local filesystem and native Git as the initial access model. Remote repositories are optional; do not require a hosting API, hosted account or service. A single developer may have multiple concurrent agent sessions, including on different machines. Prefer explicit workspace selection, isolated working trees where needed, preservation of unrelated edits and Git-native conflict detection over distributed coordination infrastructure.
 
-| Option | Tradeoff |
-| --- | --- |
-| GitHub API | Recommended candidate for multiple sessions or machines sharing one remote repository; use explicit repository, ref and authorized account, consistent revision reads and guarded commits |
-| Local Git | Candidate for direct editing and offline inspection; avoid sharing a mutable checkout between writers, preserve dirty files and verify the remote state before publishing |
+Distinguish mutable working-tree reads from immutable Git revision reads. Define local write preconditions, safe file replacement and recovery for interrupted multi-file lifecycle changes before enabling mutations. Publishing is a separate explicit Git operation; a read must never trigger a commit, push or synchronization. Prevent stale writers from overwriting newer work, revalidate on conflict and inspect uncertain outcomes before retrying. Exact write and recovery contracts remain open.
 
-Do not implement both merely for flexibility. Decide whether a mutation prepares a local change for explicit publishing or commits an authorized remote change directly. Make the effect explicit in command help and results; a read must never trigger a commit, push or synchronization. For remote changes, require a revision precondition that prevents a stale writer from replacing another writer's work; a check followed by an unguarded ref update is insufficient. Re-resolve and revalidate on conflict, and do not blindly retry a possibly applied mutation. Apply a multi-file lifecycle change as one coherent Git change, or stop safely without leaving inconsistent records.
-
-Keep credentials with their existing owner. Require explicit workspace and account selection, reuse applicable verified context, and never switch accounts or repositories to evade a denial. No registry, automatic backend selection or fallback is proposed. Preserve [Git change paths](../policies/workspace/git-writes.md): ordinary records and approved routing metadata may use the allowed direct path; directives, identity, curated memory, governing documents and tooling require a reviewed PR. The CLI must not merge, bypass protections, publish external-project changes or grant authority merely because credentials exist.
+Keep credentials with their existing owner. Require explicit workspace selection and, for authorized remote operations, the relevant account and ref, reuse applicable verified context, and never switch accounts or repositories to evade a denial. No registry, automatic backend selection or fallback is proposed. Preserve [Git change paths](../policies/workspace/git-writes.md): ordinary records and approved routing metadata may use the allowed direct path; directives, identity, curated memory, governing documents and tooling require a reviewed PR. The CLI must not merge, bypass protections, publish external-project changes or grant authority merely because credentials exist.
 
 ## CLI surface
 
@@ -115,7 +110,7 @@ Use the existing workspace schema first. Decide how compatibility is signaled be
 ## Decisions before implementation
 
 - Define how a user explicitly selects a data workspace and compatible system revision. Preserve stable scope and work IDs except for an explicitly authorized scope split; keep a single owner for each work record across migration.
-- Choose the initial storage approach, mutation publication semantics and credential mechanism. Establish how stale reads, write conflicts and uncertain results are reported.
+- Define local filesystem and Git access semantics, mutation and explicit publication boundaries, and credential reuse for optional remote operations. Establish how stale reads, write conflicts and uncertain results are reported.
 - Define compatibility and policy reference mechanics for data workspaces, including which common documents and templates move, and how existing direct Git consumers continue to work.
 - Review the smallest initial command set, Rust dependency and distribution choices, and the relationship to current TypeScript development tooling.
 - Confirm implementation acceptance and authorization before implementation, data migration, privileged automation or release.
