@@ -4,7 +4,7 @@ description: "Hive operating contracts for agent roles, directives, project-scop
 
 # Hive Workspace
 
-These contracts describe data held in a user-controlled Hive workspace, not records stored in the public system repository. Resolve the workspace and applicable reviewed system revision before use. The system owns shared contracts and reusable templates; data workspaces own actual records and workspace-specific direction.
+These contracts describe data held in a user-controlled Hive workspace, not records stored in the public system repository. Resolve the workspace and applicable reviewed system revision before use. The system owns shared contracts, reusable templates, distributed Agent Assets and tooling. Data workspaces own actual records, private configuration and minimal record-management entrypoints and Git metadata. They do not track system development tooling, duplicate product asset definitions or generated runtime harnesses. Use authorized external tooling or direct Markdown and Git access to manage records.
 
 Before managing project or scope records, apply [collaboration backend and ownership rules](organization.md#collaboration-backend). Hive is the default; Notion is used only by explicit user designation. Hive's operating model is self-contained: external Skills and their compatibility are outside Hive's design scope. The surfaces below apply to Hive-managed work; registered Manager identity, curated memory and Hive's operating guidance retain their separate ownership. External project specifications and policies remain with their canonical owners. Personal and environment-specific private configuration is a separate durable source, held only by the authorized data workspace.
 

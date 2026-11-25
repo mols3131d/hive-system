@@ -30,13 +30,15 @@ Separate reusable software in `hive-system` from the explicitly selected, user-c
 
 | Ownership | Hive system repository | User-controlled data repository |
 | --- | --- | --- |
-| Software | Rust source, Cargo configuration, tests, synthetic fixtures, CI and release tooling | No application implementation |
-| Shared contracts | Canonical operating policies, record format, templates and Hive Skill | Minimal entrypoints referring to an applicable reviewed system revision |
+| Software | Rust source, Cargo configuration, tests, synthetic fixtures, CI and release tooling | No system implementation, build tools, tests or development CI |
+| Shared contracts | Canonical operating policies, record format, templates and native Rulesync product sources in `agents-configs/` | Minimal entrypoints referring to an applicable reviewed system revision |
 | Workspace-specific context | Generic examples without private data | Workspace directions, configuration and applicable policy references |
 | Live records | No real workspace records or credentials | Tasks, artifacts, directives, registered Bot identity and curated memory |
 | Personal configuration | No user-specific contents | Existing private configurations, with their distinct ownership |
 
 The split separates software development permissions, releases and history from day-to-day record changes. The public system must work without access to any particular private workspace. Keep private history, actual records, private identifiers, credentials and raw conversation material out of system source, fixtures, documentation, configuration and logs. Publication of software does not authorize disclosure of workspace contents.
+
+A data repository is a data-only workspace: keep actual records, private configurations and minimal documentation and Git metadata required to manage those records. Keep system development tooling, duplicate product asset definitions and generated harnesses out of its tracked tree. Optional agent runtime configuration and projection are consumer-environment concerns, not workspace data. The system owns shared validation and future CLI tooling; direct authorized Markdown and Git use remains available. Do not claim a CLI validator exists before implementation.
 
 Shared policies and record formats belong to the system. During an authorized cutover, preserve workspace-specific direction in the data repository and update references and entrypoints together. Retain the existing source until the replacement is verified and authorized. Pin or otherwise identify the reviewed compatible policy version rather than relying on an unversioned moving default. If required policy is unavailable or compatibility is uncertain, refuse affected writes. An installed binary is not proof that an agent loaded the applicable policy.
 
