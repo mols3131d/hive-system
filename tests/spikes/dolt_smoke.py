@@ -6,8 +6,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
+import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = "2.7.6"
@@ -150,4 +153,156 @@ with tempfile.TemporaryDirectory(prefix="hive-dolt-spike-") as tmp:
     assert head() == confirmed
     print(f"PASS: SQL commit publishes claim and receipt together; {base} -> {confirmed}", flush=True)
 
-print("FIRST PROBE PASSED (embedded CLI SQL only). Server/Rust/lock/crash/restore remain untested.")
+    # Phase two: actual loopback SQL Server, separate client processes.
+    # No host installation/configuration; this server belongs to the temporary fixture.
+    issue2 = "01900000-0000-7000-8000-000000000010"
+    sql(f"""INSERT INTO issues
+        (id,number,area_id,title,type,status,revision,created_at,updated_at)
+        VALUES ('{issue2}',2,'{area}','Race','task','todo','{revision}',NOW(6),NOW(6))""")
+    commit("server race fixture")
+    server_base = head()
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    client = [DOLT, "--host", "127.0.0.1", "--port", str(port),
+              "--user", "root", "--no-tls", "--use-db", "synthetic_db",
+              "sql", "-r", "csv"]
+    with (root / "server.log").open("w+", encoding="utf-8") as log:
+        server = subprocess.Popen(
+            [DOLT, "sql-server", "--host", "127.0.0.1", "--port", str(port)],
+            cwd=db, env=env, stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            def remote(query, check=True):
+                return subprocess.run(
+                    [*client, "-q", query], cwd=db, env=env,
+                    capture_output=True, text=True, timeout=10, check=check,
+                )
+
+            for _ in range(40):
+                if server.poll() is not None:
+                    raise AssertionError("Disposable server exited during startup")
+                probe = remote("SELECT DOLT_HASHOF('HEAD') AS h", check=False)
+                if probe.returncode == 0 and server_base in probe.stdout:
+                    break
+                time.sleep(0.25)
+            else:
+                raise AssertionError("Could not connect to the exact synthetic database")
+
+            remote(f"""
+                SET @@SESSION.dolt_transaction_commit=1;
+                START TRANSACTION;
+                UPDATE issues SET status='in-progress' WHERE id='{issue2}';
+                ROLLBACK;
+            """)
+            assert server_base in remote("SELECT DOLT_HASHOF('HEAD') AS h").stdout
+            assert "todo" in remote(f"SELECT status FROM issues WHERE id='{issue2}'").stdout
+            print("PASS: loopback SQL Server transaction rollback", flush=True)
+
+            # Two independent clients serialize the read/check/commit via an
+            # OS-held lock, not a Dolt merge or a read outside the lock.
+            worker = """
+import fcntl, subprocess, sys, csv, io
+lock, issue, suffix, *client = sys.argv[1:]
+def query(s):
+    return subprocess.run([*client, "-q", s], capture_output=True,
+                          text=True, timeout=15, check=True).stdout
+with open(lock, "a", encoding="utf-8") as file:
+    fcntl.flock(file, fcntl.LOCK_EX)
+    rows = list(csv.reader(io.StringIO(query(
+        f"SELECT COUNT(*) AS n FROM ready_issue_candidates WHERE id='{issue}'"))))
+    if rows != [["n"], ["1"]]:
+        if rows == [["n"], ["0"]]:
+            sys.exit(3)
+        raise AssertionError(rows)
+    base = list(csv.reader(io.StringIO(query("SELECT DOLT_HASHOF('HEAD') AS h"))))[1][0]
+    claim = "01900000-0000-7000-8000-0000000000" + suffix
+    request = "01900000-0000-7000-8000-0000000001" + suffix
+    query(f'''
+        SET @@SESSION.dolt_transaction_commit=1;
+        START TRANSACTION;
+        UPDATE issues SET status='in-progress', revision='{claim}' WHERE id='{issue}';
+        INSERT INTO issue_claims VALUES ('{issue}','{claim}','worker-{suffix}',NOW(6));
+        INSERT INTO operation_receipts
+        (request_id,kind,fingerprint,actor_ref,authorization_ref,workflow_evidence_json,
+         base_commit,result_json,created_at)
+        VALUES ('{request}','claim',REPEAT('1',64),'worker-{suffix}','synthetic',
+                '{{}}','{base}','{{}}',NOW(6));
+        COMMIT;
+    ''')
+"""
+            lock = root / "writer.lock"
+            workers = [
+                subprocess.Popen(
+                    [sys.executable, "-c", worker, str(lock), issue2, suffix, *client],
+                    cwd=db, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                for suffix in ("11", "12")
+            ]
+            statuses = []
+            try:
+                for process in workers:
+                    out, err = process.communicate(timeout=30)
+                    if process.returncode not in (0, 3):
+                        raise AssertionError(f"Worker failed: {out}\n{err}")
+                    statuses.append(process.returncode)
+            finally:
+                for process in workers:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
+            assert sorted(statuses) == [0, 3], statuses
+            confirmed_server = list(csv.reader(io.StringIO(
+                remote("SELECT DOLT_HASHOF('HEAD') AS h").stdout)))[1][0]
+            assert confirmed_server != server_base
+            rows = list(csv.reader(io.StringIO(remote(
+                f"SELECT COUNT(*) AS n FROM issue_claims AS OF '{confirmed_server}' WHERE issue_id='{issue2}'").stdout)))
+            assert rows == [["n"], ["1"]], rows
+            rows = list(csv.reader(io.StringIO(remote(
+                f"SELECT COUNT(*) AS n FROM operation_receipts AS OF '{confirmed_server}' WHERE base_commit='{server_base}'").stdout)))
+            assert rows == [["n"], ["1"]], rows
+            print("PASS: two separate SQL Server clients with one OS lock, one confirmed claim and receipt", flush=True)
+
+            # A process-held advisory lock is released by process death.
+            # This tests the primitive only, not the production recovery protocol.
+            import fcntl
+            import select
+            holder = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); time.sleep(60)",
+                 str(lock)], cwd=db, env=env, stdout=subprocess.PIPE, text=True,
+            )
+            try:
+                assert select.select([holder.stdout], [], [], 5)[0], "Lock holder did not start"
+                assert holder.stdout.readline().strip() == "locked"
+                with lock.open("a", encoding="utf-8") as file:
+                    try:
+                        fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        pass
+                    else:
+                        raise AssertionError("Lock was not exclusive")
+                    holder.kill()
+                    holder.wait(timeout=5)
+                    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                print("PASS: OS lock releases after holder process death", flush=True)
+            finally:
+                if holder.poll() is None:
+                    holder.kill()
+                    holder.wait(timeout=5)
+                holder.stdout.close()
+        except Exception:
+            log.flush()
+            log.seek(0)
+            print(log.read(), flush=True)
+            raise
+        finally:
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(timeout=5)
+
+print("PROBES PASSED: embedded CLI and loopback server; Rust driver, production recovery, restore, host remain untested.")
