@@ -31,7 +31,7 @@ Proposed relationships:
 | Relationship | Cardinality |
 | --- | --- |
 | Area to child Area | 1:N |
-| Area to owned Issue | 1:N; required vs optional ownership to decide |
+| Area to owned Issue | 1:N; required ownership recommended |
 | Project to Issue | N:M |
 | Area to Resource | N:M |
 | Issue to Resource | N:M when necessary |
@@ -43,19 +43,19 @@ Use explicit domain tables and foreign keys, not a generic entity/attribute/valu
 
 ## Work graph
 
-Proposed issue types: epic, feature, task, bug. Use labels for research, documentation and other classification. Candidate lifecycle: backlog, todo, in-progress, review, done, cancelled. Preserve acceptance, verified execution stop and safe claim recovery semantics. Keep project planning fields separate from global issue state. Decide exact lifecycle, ID allocation, priority, dependency outcome and parent completion semantics before final DDL.
+Proposed issue types: epic, feature, task, bug. Use labels for research, documentation and other classification. Candidate lifecycle: backlog, todo, in-progress, review, done, cancelled. Preserve acceptance, verified execution stop and safe claim recovery semantics. Keep project planning fields separate from global issue state. The [MVP design baseline](dolt-mvp-contract.md) proposes exact lifecycle, ID allocation, priority, dependency outcome and parent completion semantics for review.
 
 Readiness is derived: selected work, accepted prerequisites, no incompatible constraint and no active claim. Readiness is not execution authorization. A claim operation must re-evaluate authoritative state, prerequisite acceptance, assignment authority and expected revision. A stale read or duplicate request cannot establish ownership. Require evidence of former execution stop before recovery; no automatic lease reassignment in initial scope.
 
 ## Storage and runtime
 
-Dolt is the proposed canonical store for structured collaboration records, replacing native Git-tracked task bundles and frontmatter as the structured storage model. Area, Project, Issue, relationships, labels and claims are relational records. Directive and textual Artifact Markdown bodies are DB candidates; binary/large assets and Bot context remain file candidates. Decide the canonical ownership and reference integrity boundary before implementation. Never make DB and Markdown competing originals of the same record.
+Dolt is the proposed canonical store for structured collaboration records, replacing native Git-tracked task bundles and frontmatter as the structured storage model. Area, Project, Issue, relationships, labels and claims are relational records. Directive and textual Artifact Markdown bodies are recommended DB-owned; reference external binary/large assets, while Bot context remains Git-tracked Markdown. The proposed ownership boundary and cross-store recovery rules are detailed in the [MVP design baseline](dolt-mvp-contract.md). Never make DB and Markdown competing originals of the same record.
 
 Use XDG configuration and data locations; preserve explicit target resolution and no implicit initialization or migration. Keep Dolt internal files out of ordinary Git tracking. Native Git may remain for file assets and software development. Remote sync is optional and explicit; validate ordinary Git remotes for Dolt on disposable data, not an existing workspace.
 
 Prefer a shared authoritative local DB for coordination. An independent clone cannot guarantee exclusive claims across replicas. Distinguish SQL transactions, version commits and remote publishing. Test contention, constraint enforcement, graph races, version-commit failure/retry, ambiguous outcomes, merge validation and recovery. Specify what a successful mutation receipt guarantees; do not infer global ownership from local commits. No unreviewed automatic conflict resolution. DB and filesystem writes need a recoverable cross-store protocol if both are involved.
 
-Retain Rust as a candidate and compare a local Dolt SQL Server integration, CLI subprocess integration and Go embedded integration using measured synthetic probes. No language switch or daemon assumption before review. Keep DB access local by default and avoid credentials in logs or tracked configuration.
+Prefer retaining Rust with a local Dolt SQL Server; compare CLI subprocess and Go embedded alternatives if the synthetic spike finds material blockers. No language switch or new Hive daemon assumed. Keep DB access local by default and avoid credentials in logs or tracked configuration.
 
 ## Context model
 
@@ -63,7 +63,7 @@ Retain Manager, Coordinator and Executor responsibilities. Bot role is fixed; pr
 
 ## CLI direction
 
-Keep machine-readable JSON, stable errors, explicit scope selection and safe mutation receipts. Candidate domains: area, project, issue, resource, artifact, directive, bot, memory, context, validate, doctor and sync. Include filtered issue lists, ready/blocked, dependency traversal, guarded claim/release and context resolution. Prefer bounded, read-only SQL queries where useful; domain writes must enforce lifecycle and ownership invariants. Exact commands, JSON compatibility and schema versions remain to be specified.
+Keep machine-readable JSON, stable errors, explicit scope selection and safe mutation receipts. Candidate domains: area, project, issue, resource, artifact, directive, bot, memory, context, validate, doctor and sync. Include filtered issue lists, ready/blocked, dependency traversal, guarded claim/release and context resolution. Prefer bounded, read-only SQL queries where useful; domain writes must enforce lifecycle and ownership invariants. See the proposed [MVP command and compatibility contract](dolt-mvp-contract.md).
 
 ## Review and transition gates
 

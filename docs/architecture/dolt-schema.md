@@ -8,7 +8,7 @@ Status: candidate design under [#22](https://github.com/mols3131d/hive-system/is
 
 ## Relational conventions
 
-One database per workspace. Do not partition by Area, Project or repository. Use immutable application-generated UUIDs (UUIDv7 candidate; CHAR(36) initially) as PKs; paths, names and display numbers are not identities. Workspace-wide display issue numbering is optional; if added, allocate through authoritative writes, not MAX+1 or independent clones. Use UTC timestamps and explicit schema migrations. No automatic deletion cascades on business records. Prefer archive/close to delete. Stable IDs survive moves. A human or session holder reference is not a registered Bot ID or credential.
+One database per workspace. Do not partition by Area, Project or repository. Use immutable application-generated UUIDs (UUIDv7 candidate; CHAR(36) initially) as PKs; paths, names and display numbers are not identities. The recommended baseline uses immutable workspace-wide display issue numbers; allocate through a counter under the authoritative lock, not MAX+1 or independent clones. Use UTC timestamps and explicit schema migrations. No automatic deletion cascades on business records. Prefer archive/close to delete. Stable IDs survive moves. A human or session holder reference is not a registered Bot ID or credential.
 
 ## Core DDL candidate
 
@@ -37,10 +37,12 @@ CREATE TABLE projects (
 
 CREATE TABLE issues (
   id CHAR(36) PRIMARY KEY,
+  number BIGINT UNSIGNED NOT NULL UNIQUE,
   area_id CHAR(36) NOT NULL,
   parent_id CHAR(36),
   title VARCHAR(255) NOT NULL,
   body LONGTEXT,
+  acceptance_criteria TEXT,
   type VARCHAR(16) NOT NULL,
   status VARCHAR(16) NOT NULL,
   priority TINYINT,
@@ -119,14 +121,22 @@ CREATE TABLE issue_claims (
   FOREIGN KEY (issue_id) REFERENCES issues(id)
 );
 
-CREATE TABLE mutation_guard (
-  id TINYINT PRIMARY KEY,
-  token CHAR(36) NOT NULL,
-  CHECK (id = 1)
+CREATE TABLE workspace_counters (
+  name VARCHAR(32) PRIMARY KEY,
+  next_value BIGINT UNSIGNED NOT NULL
+);
+
+CREATE TABLE operation_receipts (
+  request_id CHAR(36) PRIMARY KEY,
+  kind VARCHAR(64) NOT NULL,
+  fingerprint CHAR(64) NOT NULL,
+  result_ref VARCHAR(255) NOT NULL,
+  result_revision CHAR(36),
+  created_at DATETIME(6) NOT NULL
 );
 ```
 
-Initialize exactly one mutation_guard row at explicit workspace bootstrap. This is a conservative candidate to test, not a proven Dolt lock. The MVP proposes required issue Area ownership (an explicitly chosen general Area for unclassified work, not an implicit fallback), one parent at most, optional project memberships, and a globally defined 0–3 priority (0 highest, NULL unspecified). Issue types, lifecycle and priority are reviewable decisions. Project-specific priority/order is deferred to membership fields if justified. No implicit dependency from parentage or project inclusion. Archive policy and ancestry-based eligibility must be made explicit before final readiness contract.
+Initialize the issue_number counter at explicit bootstrap. Allocate and increment it in the same guarded transaction as issue creation. The OS-held workspace write lock is the recommended MVP candidate; the prior mutation_guard is only an alternative spike. The MVP proposes required issue Area ownership (an explicitly chosen general Area for unclassified work, not an implicit fallback), one parent at most, optional project memberships, and a globally defined 0–3 priority (0 highest, NULL unspecified). Issue types, lifecycle and priority are recommended review candidates; see the [MVP design baseline](dolt-mvp-contract.md) for transition and ownership rules. Project-specific priority/order is deferred to membership fields if justified. No implicit dependency from parentage or project inclusion. Archive policy and ancestry-based eligibility must be made explicit before final readiness contract.
 
 ## Additional tables and ownership
 
@@ -144,13 +154,14 @@ Bot and asset storage, actor registry, directive scope/validity and artifact ret
 
 ## Read model
 
-Ready candidate view (execution permission and archived Area handling remain domain checks):
+Ready candidate view (not the complete readiness predicate; archived Area ancestry and execution permission remain required domain checks):
 
 ```sql
 CREATE VIEW ready_issues AS
 SELECT i.id, i.area_id, i.title, i.priority
 FROM issues i
 WHERE i.status = 'todo'
+  AND i.type <> 'epic'
   AND i.hold_reason IS NULL
   AND NOT EXISTS (
     SELECT 1 FROM issue_claims c WHERE c.issue_id = i.id
@@ -168,9 +179,9 @@ Only accepted done satisfies a prerequisite; cancelled does not. Blocked reasons
 
 Dolt supports FK, CHECK, indexes and SQL transactions, but its merge can combine independent cell updates. The transaction docs describe Read Committed while the vendor's 2026-02-17 concurrency article describes Repeatable Read and warns of lost updates. Do not assume serializable isolation or ordinary row locking. Test the installed release.
 
-Candidate MVP protocol: every authoritative domain mutation reads the singleton mutation_guard token, updates it to a distinct random token in the same transaction, then validates the complete affected graph/state and applies changes. A conflicting token must cause one concurrent transaction to fail at commit; a failure retries from a fresh snapshot only after reconciliation. Avoid identical increment values as conflict signals. The guard covers dependency changes, Area moves, readiness/claim acquisition, acceptance and release. Treat missing guard or bypassed SQL writers as invalid authority. This intentionally serializes successful writes for a personal workspace; benchmark and test the exact Dolt behavior before adoption. If not guaranteed, use a single-writer service or proven interprocess serialization; never claim safety from this sketch alone.
+Recommended MVP protocol: a verified OS-held exclusive workspace lock serializes all cooperating authoritative writers and maintenance on one local machine. Under the lock, validate affected state and graph, write one transaction and receipt, confirm version commit, then release. Direct administrative SQL is offline maintenance only; independent clones and bypassed writers are not supported. The previous singleton random mutation_guard token is a possible experimental additional check, not required schema. Test process contention, crash and ambiguous commit recovery; no safety claim until evidence. See [MVP design baseline](dolt-mvp-contract.md).
 
-Claim acquisition inserts a unique fresh claim_id into the issue-keyed claims table and changes issue status/revision in the same guarded transaction. Recheck current state, prerequisites, authority and expected revision; no upsert to replace an owner. Acceptance records outcome and clears claim in the same mutation after verified execution stop. Reopening a prerequisite with running dependents requires explicit safe reconciliation. Reject cycles in Area, issue parent and dependency graphs, including concurrent edge additions; FK and self-edge checks alone do not detect cycles.
+Claim acquisition inserts a unique fresh claim_id into the issue-keyed claims table and changes issue status/revision in the same guarded transaction. Recheck current state, prerequisites, authority and expected revision; no upsert to replace an owner. Submission records outcome/evidence, verifies execution stopped, and clears claim atomically on transition to review; separate authorized acceptance marks done. Reopening a prerequisite with running dependents requires explicit safe reconciliation. Reject cycles in Area, issue parent and dependency graphs, including concurrent edge additions; FK and self-edge checks alone do not detect cycles.
 
 Use one authoritative shared main branch. Validate the precise SQL transaction/version-commit policy and mutation receipt before announcing success. No independent-clone global claim guarantee, direct SQL writes to operational tables, force commit with constraint violations, or unreviewed remote merge. Import/merge needs full domain validation, including graphs and claims. Dolt history is evidence, not proof of runtime stop or acceptance.
 
@@ -178,4 +189,4 @@ References: [transactions](https://www.dolthub.com/docs/concepts/dolt/sql/transa
 
 ## Required spike
 
-Pin Dolt version and test DDL, root uniqueness, cyclic references, duplicate claims, claim-versus-dependency changes, same-value writes, competing guard changes, cancellation/reopen, transaction rollback, version commit failure/recovery and invalid merge. Test offline operation and restoration on synthetic data only. This design has not been executed.
+Pin Dolt version and test DDL, root uniqueness, cyclic references, duplicate claims, claim-versus-dependency changes, same-value writes, competing lock acquisition, crash and ambiguous receipt recovery, cancellation/reopen, transaction rollback, version commit failure/recovery and invalid merge. Test offline operation and restoration on synthetic data only. This design has not been executed.
