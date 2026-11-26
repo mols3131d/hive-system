@@ -40,6 +40,8 @@ The v2 validator reads a single committed snapshot of Dolt `main` through a dedi
 
 Validation checks Issue closure fields and active Claim cardinality. An active Claim is invalid when the Issue's Area or any of its ancestors is archived. In-progress, review and done Issues require done prerequisites. Done Issues and epics in review require terminal children. A cancelled child meets the terminal-state check. Verification of explicit acceptance of the changed scope requires transition evidence and belongs to lifecycle provenance validation.
 
+Validation checks canonical UUIDv7 IDs for Projects, Resources and Labels, exact Project statuses (`active`, `completed` and `archived`), and both endpoints of Project memberships, Area and Issue Resource links, and Issue Label links. Projects may span Areas, and Resources may be shared. Label-name uniqueness follows the SQL unique key and its collation. The contract calls for normalized labels and leaves the normalization rule unspecified.
+
 For an explicitly provisioned synthetic server on Dolt 2.7.6, supply the reader credentials in the process environment as `HIVE_DOLT_USER` and `HIVE_DOLT_PASSWORD`. Select the database, port and expected UUID explicitly.
 
 ```sh

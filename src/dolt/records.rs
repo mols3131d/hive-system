@@ -1,3 +1,5 @@
+mod relations;
+
 use std::collections::{BTreeSet, HashMap, VecDeque, hash_map::Entry};
 
 use crate::cli::is_slug;
@@ -183,7 +185,11 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
             prerequisite_id,
         })
         .collect();
-    Ok(validate_rows(&areas, &issues, &claims, &dependencies))
+    let mut diagnostics = validate_rows(&areas, &issues, &claims, &dependencies);
+    let area_ids = areas.iter().map(|area| area.id.as_str()).collect();
+    let issue_ids = issues.iter().map(|issue| issue.id.as_str()).collect();
+    relations::validate(snapshot, &area_ids, &issue_ids, &mut diagnostics)?;
+    Ok(diagnostics)
 }
 
 fn validate_rows(
