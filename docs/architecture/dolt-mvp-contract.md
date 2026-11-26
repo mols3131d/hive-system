@@ -94,7 +94,6 @@ Test DDL, unique IDs/numbers/root slugs, FK and graph constraints, all lifecycle
 
 References: [Dolt SQL server](https://www.dolthub.com/docs/sql-reference/server/), [configuration](https://www.dolthub.com/docs/sql-reference/server/configuration/), [access management](https://www.dolthub.com/docs/sql-reference/server/access-management/), [transactions](https://www.dolthub.com/docs/concepts/dolt/sql/transaction/), [Git remotes](https://www.dolthub.com/docs/sql-reference/version-control/remotes/), [backup](https://www.dolthub.com/docs/concepts/dolt/rdbms/backups/).
 
-
 ## Detailed MVP review contracts
 
 The following are proposals for review, not adopted policy or implementation evidence. They refine the preceding baseline without changing the existing file-memory choice. Preserve the accepted identity/context boundary in #20 and the XDG direction in #18. Numeric limits, command syntax and alternative schema below are review defaults.
@@ -234,6 +233,6 @@ End-to-end acceptance requires A01–A15 on supported runtime, plus pinned Dolt 
 
 ### Compatibility and next gates
 
-#19/#18: retain XDG precedence, absolute-path validation, explicit local default and legacy pin; Dolt-specific state/runtime directories and single local authority are proposed replacements, not reinterpretations of the old native Git coordination. #21/#20: preserve Manager-only registration, latest versus durable semantics, explicit inspection and management-context exclusion; changing memory medium or path requires review. Keep both PRs and existing branches intact. #9 configuration, #10 validation, #11 reads/context, #12 mutations, #13 coordination and #14 Skill can reuse unaffected code/tests; storage-specific implementation must be reconciled after #22 adoption. #15 acceptance moves to the new matrix only after approved contract transition. No closing issues, cancelling existing work or activating new policies from this draft.
+PR #19 / Issue #18: retain XDG precedence, absolute-path validation, explicit local default and legacy pin; Dolt-specific state/runtime directories and single local authority are proposed replacements, not reinterpretations of the old native Git coordination. #21/#20: preserve Manager-only registration, latest versus durable semantics, explicit inspection and management-context exclusion; changing memory medium or path requires review. Keep both PRs and existing branches intact. #9 configuration, #10 validation, #11 reads/context, #12 mutations, #13 coordination and #14 Skill can reuse unaffected code/tests; storage-specific implementation must be reconciled after #22 adoption. #15 acceptance moves to the new matrix only after approved contract transition. No closing issues, cancelling existing work or activating new policies from this draft.
 
 Open decisions: Memory medium and exact asset path; supported Dolt release/OS and SQL/version-commit protocol; authority/review evidence representation, receipt schema and revision granularity; final command names and bounds. Verify these in review and synthetic spike before implementation/adoption. Do not treat this section as proof of runtime safety.
