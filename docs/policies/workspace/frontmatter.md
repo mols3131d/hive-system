@@ -31,7 +31,7 @@ Common fields apply in every row. A dash means no additional metadata is require
 | `directives/<project-id>/<slug>.md` or `<slug>/README.md` | `status` | — |
 | Supporting Markdown within a directive bundle | — | — |
 | Standalone or work-scoped artifact file or bundle README | — | `kind`, `status` |
-| Bot README, SOUL.md, memory navigation, scoped MEMORY.md and topic notes | — | — |
+| Optional Bot README/AGENTS.md, SOUL.md, latest MEMORY.md, scoped MEMORY.md and topic notes | — | — |
 
 A directory README's description identifies the purpose and scope of its directory, not its README file. A scope README identifies its verified project or non-project purpose in the body. Directory navigation is not a task, directive or artifact record; omit status, priority and kind there. Identity, routing, provenance, evidence and source references belong in the appropriate body sections. Do not introduce unowned metadata fields without updating this contract.
 
@@ -99,7 +99,7 @@ Optional `status` describes temporary artifact usefulness: `active`, `parked`, `
 
 ### Bots and memory
 
-Use common fields only. The path determines the bot and memory scope; identity and purpose live in SOUL.md, verified routing in the bot README, and scoped learning and per-entry source/review dates in memory. Do not add task or artifact status, priority or kind. See [bot rules](bots.md).
+Use common fields only. The path determines the bot and memory scope; identity and purpose live in `SOUL.md`, latest curated memory in root `MEMORY.md`, and durable scoped learning and per-entry source/review dates under `memory/`. Optional `README.md` is human navigation (and may describe verified routing); optional `AGENTS.md` guides directory management. Neither is Bot runtime context. Do not add task or artifact status, priority or kind. See [bot rules](bots.md).
 
 ## Templates and verification
 
