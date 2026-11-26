@@ -55,3 +55,5 @@ jobs:
         run: python3 tests/spikes/dolt_restore.py
       - name: Verify graph contention with the shared Rust writer
         run: python3 tests/spikes/dolt_graph_rust.py
+      - name: Verify pending request and receipt recovery
+        run: python3 tests/spikes/dolt_recovery.py
