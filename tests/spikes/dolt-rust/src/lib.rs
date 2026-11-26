@@ -1,5 +1,7 @@
 //! MySQL sessions for the synthetic Dolt spikes.
 
+pub mod guard;
+
 use mysql::prelude::Queryable;
 use mysql::{Conn, DriverError, OptsBuilder, Transaction, TxOpts};
 use std::fmt;
