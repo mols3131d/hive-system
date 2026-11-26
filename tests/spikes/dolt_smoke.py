@@ -165,7 +165,7 @@ with tempfile.TemporaryDirectory(prefix="hive-dolt-spike-") as tmp:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     client = [DOLT, "--host", "127.0.0.1", "--port", str(port),
-              "--user", "root", "--no-tls", "--use-db", "synthetic_db",
+              "--user", "root", "--password", "", "--no-tls", "--use-db", "synthetic_db",
               "sql", "-r", "csv"]
     with (root / "server.log").open("w+", encoding="utf-8") as log:
         server = subprocess.Popen(
@@ -175,7 +175,7 @@ with tempfile.TemporaryDirectory(prefix="hive-dolt-spike-") as tmp:
         try:
             def remote(query, check=True):
                 return subprocess.run(
-                    [*client, "-q", query], cwd=db, env=env,
+                    [*client, "-q", query], cwd=home, env=env,
                     capture_output=True, text=True, timeout=10, check=check,
                 )
 
@@ -187,7 +187,9 @@ with tempfile.TemporaryDirectory(prefix="hive-dolt-spike-") as tmp:
                     break
                 time.sleep(0.25)
             else:
-                raise AssertionError("Could not connect to the exact synthetic database")
+                raise AssertionError(f"Could not connect to the exact synthetic database: "
+                                     f"exit={probe.returncode}, expected={server_base}, "
+                                     f"stdout={probe.stdout!r}, stderr={probe.stderr!r}")
 
             remote(f"""
                 SET @@SESSION.dolt_transaction_commit=1;
@@ -235,7 +237,7 @@ with open(lock, "a", encoding="utf-8") as file:
             workers = [
                 subprocess.Popen(
                     [sys.executable, "-c", worker, str(lock), issue2, suffix, *client],
-                    cwd=db, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    cwd=home, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
                 for suffix in ("11", "12")
             ]
