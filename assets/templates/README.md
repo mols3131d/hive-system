@@ -12,7 +12,7 @@ Copy only applicable templates into the explicitly selected data workspace; neve
 | [task.md](task.md) | Work bundle README: goal, acceptance and references |
 | [directive.md](directive.md) | Project or scope direction, applicability and provenance |
 | [bot.md](bot.md) | Canonical bot identity and purpose in `SOUL.md` |
-| [memory.md](memory.md) | Scoped bot memory entrypoint or topic note |
+| [memory.md](memory.md) | Latest Bot memory (`MEMORY.md`), durable scoped memory or topic note |
 | [artifact-manifest.md](artifact-manifest.md) | Group related outputs and provenance |
 | [message.md](message.md) | Optional retained directed message when needed |
 | [session-context.md](session-context.md) | Optional selected resumption checkpoint |
