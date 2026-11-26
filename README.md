@@ -1,6 +1,6 @@
 # Hive System
 
-A personal collaboration system for an individual developer managing multiple AI agent sessions across multiple projects, built on the filesystem, Markdown and Git.
+A personal collaboration system for an individual developer managing multiple AI agent sessions across multiple projects. Dolt v2 is the adopted MVP development baseline. Existing Markdown/Git workspaces follow their pinned v1 contracts.
 
 > [!WARNING]
 > Hive is still under active development and is not ready for real-world use. Do not use it for actual workflows. Dogfooding by Hive developers is the only exception.
@@ -20,7 +20,7 @@ Use an authorized workspace and a reviewed system policy revision. Follow the [w
 ## Documentation
 
 - [Goals and scope](docs/goal/README.md)
-- [System design](docs/architecture/system-design.md)
+- [Architecture](docs/architecture/README.md)
 - [Record templates](assets/templates/README.md)
 - [Agent assets](agents-configs/README.md)
 - [Development](docs/development/README.md)
