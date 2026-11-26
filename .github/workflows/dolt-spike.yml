@@ -6,6 +6,7 @@ on:
       - docs/dolt-domain-redesign
     paths:
       - tests/spikes/dolt_smoke.py
+      - tests/spikes/dolt_migration.py
       - .github/workflows/dolt-spike.yml
 
 permissions:
@@ -39,3 +40,5 @@ jobs:
           printf '%s\n' "$work/bin" >> "$GITHUB_PATH"
       - name: Execute first isolated probe
         run: python3 tests/spikes/dolt_smoke.py
+      - name: Rehearse legacy mapping and rollback
+        run: python3 tests/spikes/dolt_migration.py
