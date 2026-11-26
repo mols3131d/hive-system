@@ -77,6 +77,8 @@ def run_rehearsal(root, dolt, git):
         "PATH": os.environ["PATH"],
         "HOME": str(home),
         "DOLT_ROOT_PATH": str(home),
+        "DOLT_DISABLE_VERSION_CHECKS": "true",
+        "DOLT_DISABLE_EVENT_FLUSH": "1",
         "XDG_CONFIG_HOME": str(home / "config"),
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",

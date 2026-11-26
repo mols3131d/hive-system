@@ -36,6 +36,8 @@ with tempfile.TemporaryDirectory(prefix="hive-dolt-spike-") as tmp:
         "XDG_DATA_HOME": str(home / "data"),
         "XDG_STATE_HOME": str(home / "state"),
         "DOLT_ROOT_PATH": str(home),
+        "DOLT_DISABLE_VERSION_CHECKS": "true",
+        "DOLT_DISABLE_EVENT_FLUSH": "1",
         "LANG": "C.UTF-8",
     }
 
