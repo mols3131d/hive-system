@@ -1,6 +1,7 @@
 mod graph;
 mod records;
 
+use std::num::NonZeroU16;
 use std::time::Duration;
 
 use mysql::prelude::{FromRow, Queryable};
@@ -50,12 +51,22 @@ pub(crate) struct ValidationReport {
 pub(crate) fn validate(args: &ValidateArgs) -> Result<ValidationReport, HiveError> {
     let (Some(database), Some(port), Some(workspace_id)) = (
         args.database.as_deref(),
-        args.port,
+        args.port.as_deref(),
         args.workspace_id.as_deref(),
     ) else {
         return Err(HiveError::new(
             ErrorCode::InvalidArgument,
             "Supply the database, port, and expected workspace ID.",
+        ));
+    };
+    // Parse the value after clap has recognized the contract and output options.
+    let Some(port) = port
+        .to_str()
+        .and_then(|value| value.parse::<NonZeroU16>().ok())
+    else {
+        return Err(HiveError::new(
+            ErrorCode::InvalidArgument,
+            "Supply a Dolt port between 1 and 65535.",
         ));
     };
 

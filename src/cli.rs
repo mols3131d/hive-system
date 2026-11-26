@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -632,7 +631,7 @@ pub(crate) struct ValidateArgs {
     pub(crate) database: Option<String>,
     /// Explicit local Dolt SQL Server port.
     #[arg(long, value_name = "PORT")]
-    pub(crate) port: Option<NonZeroU16>,
+    pub(crate) port: Option<OsString>,
 }
 
 pub(crate) fn parse() -> Result<Invocation, ParseFailure> {

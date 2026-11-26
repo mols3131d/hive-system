@@ -183,6 +183,57 @@ fn explicit_dolt_validation_refuses_ambiguous_selection_without_touching_config(
 }
 
 #[test]
+fn malformed_dolt_port_preserves_the_explicit_contract_and_format() {
+    let sandbox = Sandbox::new();
+    let target = [
+        "validate",
+        "--all",
+        "--database",
+        "fixture_db",
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+    ];
+    for (before_port, after_port) in [
+        (&["--contract", "2"][..], &[][..]),
+        (&[][..], &["--contract", "2"][..]),
+    ] {
+        let args = [
+            &["--json"][..],
+            &target,
+            before_port,
+            &["--port", "0"],
+            after_port,
+        ]
+        .concat();
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?} {report}");
+        assert_eq!(report["schema_version"], 2, "{args:?} {report}");
+        assert_eq!(report["command"], "validate", "{args:?} {report}");
+        assert_eq!(
+            report["error"]["code"], "INVALID_ARGUMENT",
+            "{args:?} {report}"
+        );
+        assert!(output.stderr.is_empty(), "{args:?}");
+    }
+
+    let args = [&target[..], &["--port", "0", "--json", "--contract", "2"]].concat();
+    let output = sandbox.run(&args);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    assert!(output.stderr.is_empty());
+
+    let args = [&target[..], &["--port=--json", "--contract", "2"]].concat();
+    let output = sandbox.run(&args);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
 fn recognized_commands_accept_matching_globals_and_report_unavailable_operations() {
     let sandbox = Sandbox::new();
     let commands: &[(&str, &[&str])] = &[
