@@ -52,14 +52,3 @@ No actionable findings in the reviewed scope.
 {% endif %}
 
 (*Review decision (comment/approve/request changes) belongs to GitHub. Include only evidence-backed claims.*)
-(*Required when an agent substantially authored or rewrote the review.*)
-{% if author %}
-
-```yaml
-author:
-{% for identity in author %}
-  - {{ identity }}
-{% endfor %}
-```
-
-{% endif %}

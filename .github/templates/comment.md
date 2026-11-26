@@ -21,15 +21,3 @@
 - {{ item }}
 {% endfor %}
 {% endif %}
-
-(*Required when an agent substantially authored or rewrote the comment.*)
-{% if author %}
-
-```yaml
-author:
-{% for identity in author %}
-  - {{ identity }}
-{% endfor %}
-```
-
-{% endif %}

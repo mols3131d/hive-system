@@ -37,12 +37,3 @@ body:
     attributes:
       label: Starting points and references
       description: Known files, API contracts, related issues or Change records. Leave unknown paths for investigation.
-  - type: textarea
-    id: agent_author
-    attributes:
-      label: Agent author (if agent-written)
-      description: "Only for agent-authored issues. Follow .github/templates/README.md; use unknown for unverified identity components."
-      placeholder: |
-        author:
-          - <user>:<provider>:<product>:<model>
-      render: yaml
