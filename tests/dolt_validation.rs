@@ -313,6 +313,214 @@ fn diagnostic_codes(report: &Value) -> Vec<&str> {
         .collect()
 }
 
+fn assert_only_diagnostic(report: &Value, code: &str, table: &str, ids: &[&str]) {
+    assert_eq!(diagnostic_codes(report), [code]);
+    let diagnostic = &report["error"]["details"]["diagnostics"][0];
+    assert_eq!(diagnostic["table"], table);
+    assert_eq!(diagnostic["record_ids"], serde_json::json!(ids));
+}
+
+fn set_issue_status(connection: &mut Conn, issue: &str, status: &str) {
+    let terminal = matches!(status, "done" | "cancelled");
+    connection
+        .exec_drop(
+            "UPDATE issues SET status=?, closed_at=IF(?, UTC_TIMESTAMP(6), NULL),
+             closed_by_ref=?, resolution_note=? WHERE id=?",
+            (
+                status,
+                terminal,
+                terminal.then_some("fixture-reviewer"),
+                terminal.then_some("Fixture outcome"),
+                issue,
+            ),
+        )
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
+fn rejects_active_claims_in_archived_area_ancestry() {
+    let fixture = Fixture::start();
+    let mut admin = fixture.connect(ADMIN);
+    let owner = id(5);
+    let root = id(2);
+    let issue = id(11);
+    admin
+        .exec_drop(
+            "INSERT INTO areas (id, parent_id, slug, name, revision, archived_at) VALUES
+             (?, ?, 'owner', 'Owner', ?, NULL),
+             (?, ?, 'sibling', 'Archived sibling', ?, UTC_TIMESTAMP(6))",
+            (&owner, id(3), id(4), id(6), id(3), id(4)),
+        )
+        .unwrap();
+    admin
+        .exec_drop("UPDATE issues SET area_id=? WHERE id=?", (&owner, &issue))
+        .unwrap();
+    commit(&mut admin);
+    let mut previous = fixture.check(0, &mut admin);
+
+    for (archived, previous_exit) in [(&owner, 0), (&root, 4)] {
+        admin
+            .exec_drop(
+                "UPDATE areas SET archived_at=IF(id=?, UTC_TIMESTAMP(6), NULL) WHERE id IN (?, ?)",
+                (archived, &owner, &root),
+            )
+            .unwrap();
+        admin.query_drop("CALL DOLT_ADD('areas')").unwrap();
+        assert_eq!(fixture.check(previous_exit, &mut admin), previous);
+        commit(&mut admin);
+        previous = fixture.check(4, &mut admin);
+        assert_only_diagnostic(
+            &previous,
+            "ARCHIVED_AREA_CLAIM",
+            "issue_claims",
+            &[&issue, &id(14), archived],
+        );
+    }
+
+    admin
+        .exec_drop("DELETE FROM issue_claims WHERE issue_id=?", (&issue,))
+        .unwrap();
+    set_issue_status(&mut admin, &issue, "todo");
+    commit(&mut admin);
+    fixture.check(0, &mut admin);
+}
+
+#[test]
+#[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
+fn requires_done_prerequisites_during_execution_review_and_completion() {
+    let fixture = Fixture::start();
+    let mut admin = fixture.connect(ADMIN);
+    let issue = id(11);
+    let prerequisite = id(12);
+    fixture.check(0, &mut admin);
+
+    for prerequisite_status in ["todo", "cancelled"] {
+        set_issue_status(&mut admin, &prerequisite, prerequisite_status);
+        commit(&mut admin);
+        assert_only_diagnostic(
+            &fixture.check(4, &mut admin),
+            "UNMET_PREREQUISITE",
+            "issue_dependencies",
+            &[&issue, &prerequisite],
+        );
+    }
+
+    admin
+        .exec_drop("DELETE FROM issue_claims WHERE issue_id=?", (&issue,))
+        .unwrap();
+    set_issue_status(&mut admin, &issue, "todo");
+    admin
+        .exec_drop("UPDATE issues SET type='epic' WHERE id=?", (&issue,))
+        .unwrap();
+    for status in ["review", "done"] {
+        set_issue_status(&mut admin, &issue, status);
+        commit(&mut admin);
+        assert_only_diagnostic(
+            &fixture.check(4, &mut admin),
+            "UNMET_PREREQUISITE",
+            "issue_dependencies",
+            &[&issue, &prerequisite],
+        );
+    }
+    set_issue_status(&mut admin, &issue, "cancelled");
+    commit(&mut admin);
+    fixture.check(0, &mut admin);
+
+    set_issue_status(&mut admin, &prerequisite, "done");
+    for status in ["review", "done"] {
+        set_issue_status(&mut admin, &issue, status);
+        commit(&mut admin);
+        fixture.check(0, &mut admin);
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
+fn requires_terminal_children_of_done_issues_and_epics_in_review() {
+    let fixture = Fixture::start();
+    let mut admin = fixture.connect(ADMIN);
+    let parent = id(10);
+    let child = id(11);
+    fixture.check(0, &mut admin);
+
+    set_issue_status(&mut admin, &parent, "review");
+    commit(&mut admin);
+    assert_only_diagnostic(
+        &fixture.check(4, &mut admin),
+        "UNRESOLVED_CHILD",
+        "issues",
+        &[&parent, &child],
+    );
+
+    admin
+        .exec_drop("UPDATE issues SET type='task' WHERE id=?", (&parent,))
+        .unwrap();
+    commit(&mut admin);
+    fixture.check(0, &mut admin);
+
+    set_issue_status(&mut admin, &parent, "done");
+    commit(&mut admin);
+    assert_only_diagnostic(
+        &fixture.check(4, &mut admin),
+        "UNRESOLVED_CHILD",
+        "issues",
+        &[&parent, &child],
+    );
+
+    admin
+        .exec_drop("DELETE FROM issue_claims WHERE issue_id=?", (&child,))
+        .unwrap();
+    for status in ["cancelled", "done"] {
+        set_issue_status(&mut admin, &child, status);
+        commit(&mut admin);
+        fixture.check(0, &mut admin);
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
+fn requires_issue_closure_fields_to_match_status() {
+    let fixture = Fixture::start();
+    let mut admin = fixture.connect(ADMIN);
+    fixture.check(0, &mut admin);
+
+    // Dolt 2.7.6 generates this name for the initial schema's closure check.
+    admin
+        .query_drop("ALTER TABLE issues DROP CHECK issues_chk_klp6nseh")
+        .unwrap();
+    let done = id(12);
+    admin
+        .exec_drop(
+            "UPDATE issues SET resolution_note=NULL WHERE id=?",
+            (&done,),
+        )
+        .unwrap();
+    commit(&mut admin);
+    assert_only_diagnostic(
+        &fixture.check(4, &mut admin),
+        "INVALID_ISSUE_CLOSURE",
+        "issues",
+        &[&done],
+    );
+
+    set_issue_status(&mut admin, &done, "done");
+    let todo = id(13);
+    admin
+        .exec_drop(
+            "UPDATE issues SET closed_at=UTC_TIMESTAMP(6) WHERE id=?",
+            (&todo,),
+        )
+        .unwrap();
+    commit(&mut admin);
+    assert_only_diagnostic(
+        &fixture.check(4, &mut admin),
+        "INVALID_ISSUE_CLOSURE",
+        "issues",
+        &[&todo],
+    );
+}
+
 #[test]
 #[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
 fn rejects_noncanonical_issue_values_with_case_insensitive_collation() {
@@ -411,11 +619,13 @@ fn validates_committed_dolt_records_without_writes() {
     assert_eq!(storage_state(&mut admin), baseline);
 
     admin
-        .query_drop(format!(
-            "INSERT INTO issue_dependencies VALUES ('{}','{}')",
-            id(11),
-            id(10)
-        ))
+        .exec_drop("UPDATE issues SET parent_id=? WHERE id=?", (id(10), id(13)))
+        .unwrap();
+    admin
+        .exec_drop(
+            "INSERT INTO issue_dependencies VALUES (?, ?)",
+            (id(13), id(10)),
+        )
         .unwrap();
     // The mixed cycle first exists only in the working set.
     assert_eq!(
@@ -427,7 +637,7 @@ fn validates_committed_dolt_records_without_writes() {
     assert_eq!(diagnostic_codes(&report), ["COMPLETION_CYCLE"]);
     assert_eq!(
         report["error"]["details"]["diagnostics"][0]["record_ids"],
-        serde_json::json!([id(10), id(11)])
+        serde_json::json!([id(10), id(13)])
     );
     assert_eq!(fixture.check(4, &mut admin), report);
 
@@ -444,8 +654,8 @@ fn validates_committed_dolt_records_without_writes() {
         ),
         format!(
             "INSERT INTO issue_dependencies VALUES ('{}','{}')",
-            id(12),
-            id(11)
+            id(10),
+            id(13)
         ),
         format!("DELETE FROM issue_claims WHERE issue_id='{}'", id(11)),
         format!(
