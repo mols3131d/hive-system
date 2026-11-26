@@ -254,7 +254,8 @@ fn seed_sql() -> String {
     let claim = id(14);
     let bot = id(15);
     format!(
-        "{SCHEMA}
+        "ALTER DATABASE {DATABASE} COLLATE utf8mb4_0900_ai_ci;
+         {SCHEMA}
          INSERT INTO workspace_meta VALUES (1, '{workspace}');
          INSERT INTO schema_migrations VALUES (1, '{schema_digest}', UTC_TIMESTAMP(6));
          INSERT INTO workspace_counters VALUES ('issue_number', 5);
@@ -310,6 +311,45 @@ fn diagnostic_codes(report: &Value) -> Vec<&str> {
         .iter()
         .map(|diagnostic| diagnostic["code"].as_str().unwrap())
         .collect()
+}
+
+#[test]
+#[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
+fn rejects_noncanonical_issue_values_with_case_insensitive_collation() {
+    let fixture = Fixture::start();
+    let mut admin = fixture.connect(ADMIN);
+    let collation: (String, String) = admin
+        .query_first("SELECT COLLATION(status), COLLATION(type) FROM issues LIMIT 1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(collation.0, "utf8mb4_0900_ai_ci");
+    assert_eq!(collation.1, "utf8mb4_0900_ai_ci");
+    let issue = id(13);
+
+    for (status, kind, diagnostic) in [
+        ("in-progress", "task", "INVALID_CLAIM_STATE"),
+        ("todo", "TASK", "INVALID_ISSUE_TYPE"),
+        ("IN-PROGRESS", "task", "INVALID_ISSUE_STATUS"),
+    ] {
+        admin
+            .exec_drop(
+                "UPDATE issues SET status=?, type=? WHERE id=?",
+                (status, kind, &issue),
+            )
+            .unwrap();
+        commit(&mut admin);
+        let saved: (String, String) = admin
+            .exec_first("SELECT status, type FROM issues WHERE id=?", (&issue,))
+            .unwrap()
+            .unwrap();
+        assert_eq!((saved.0.as_str(), saved.1.as_str()), (status, kind));
+        let report = fixture.check(4, &mut admin);
+        assert_eq!(diagnostic_codes(&report), [diagnostic]);
+        assert_eq!(
+            report["error"]["details"]["diagnostics"][0]["record_ids"],
+            serde_json::json!([&issue])
+        );
+    }
 }
 
 #[test]

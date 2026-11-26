@@ -161,8 +161,30 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
                 );
             }
         }
+        // SQL CHECK comparisons can accept other spellings under a case-insensitive collation.
+        if !matches!(kind.as_str(), "epic" | "feature" | "task" | "bug") {
+            diagnostics.add(
+                "INVALID_ISSUE_TYPE",
+                "issues",
+                &[id],
+                "Use a canonical lowercase Issue type.",
+            );
+        }
+        let in_progress = match status.as_str() {
+            "in-progress" => true,
+            "backlog" | "todo" | "review" | "done" | "cancelled" => false,
+            _ => {
+                diagnostics.add(
+                    "INVALID_ISSUE_STATUS",
+                    "issues",
+                    &[id],
+                    "Use a canonical lowercase Issue status.",
+                );
+                continue;
+            }
+        };
         let claimed = claimed_issues.contains(id.as_str());
-        if claimed != (status == "in-progress") || (kind == "epic" && status == "in-progress") {
+        if claimed != in_progress || (kind == "epic" && in_progress) {
             diagnostics.add(
                 "INVALID_CLAIM_STATE",
                 "issues",
