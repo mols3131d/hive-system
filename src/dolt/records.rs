@@ -183,7 +183,24 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
             prerequisite_id,
         })
         .collect();
-    Ok(validate_rows(&areas, &issues, &claims, &dependencies))
+    let counters: Vec<(String, u64)> = snapshot.rows(
+        "workspace_counters",
+        "name, next_value",
+        "WHERE name = 'issue_number' LIMIT 2",
+    )?;
+    let highest_number = issues.iter().map(|issue| issue.number).max().unwrap_or(0);
+    let mut diagnostics = validate_rows(&areas, &issues, &claims, &dependencies);
+    // Compare the spelling explicitly because the counter table may use a case-insensitive collation.
+    if !matches!(counters.as_slice(), [(name, next_value)] if name == "issue_number" && *next_value > highest_number)
+    {
+        diagnostics.add(
+            "INVALID_ISSUE_COUNTER",
+            "workspace_counters",
+            &[],
+            "The issue_number counter must exist and be greater than zero and every stored Issue number.",
+        );
+    }
+    Ok(diagnostics)
 }
 
 fn validate_rows(
@@ -460,4 +477,53 @@ fn archived_ancestry(areas: &[AreaRow]) -> HashMap<&str, &str> {
         }
     }
     archived_by
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requires_issue_closure_fields_to_match_status() {
+        let area = AreaRow {
+            id: "01900000-0000-7000-8000-000000000001".to_owned(),
+            parent_id: None,
+            slug: "fixture-area".to_owned(),
+            archived: false,
+        };
+        let mut issue = IssueRow {
+            id: "01900000-0000-7000-8000-000000000002".to_owned(),
+            area_id: area.id.clone(),
+            parent_id: None,
+            number: 1,
+            kind: "task".to_owned(),
+            status: None,
+            closure_fields_present: [false; 3],
+        };
+        for (status, fields, expected) in [
+            (IssueStatus::Done, [true; 3], None),
+            (
+                IssueStatus::Done,
+                [true, true, false],
+                Some("INVALID_ISSUE_CLOSURE"),
+            ),
+            (IssueStatus::Todo, [false; 3], None),
+            (
+                IssueStatus::Todo,
+                [true, false, false],
+                Some("INVALID_ISSUE_CLOSURE"),
+            ),
+        ] {
+            issue.status = Some(status);
+            issue.closure_fields_present = fields;
+            let diagnostics = validate_rows(
+                std::slice::from_ref(&area),
+                std::slice::from_ref(&issue),
+                &[],
+                &[],
+            );
+            let codes: Vec<_> = diagnostics.items.iter().map(|item| item.code).collect();
+            assert_eq!(codes, expected.as_slice());
+        }
+    }
 }
