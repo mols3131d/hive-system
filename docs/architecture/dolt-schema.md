@@ -199,6 +199,36 @@ CREATE TABLE bots (
   CHECK (role = 'manager')
 );
 
+CREATE TABLE bot_memories (
+  id CHAR(36) PRIMARY KEY,
+  bot_id CHAR(36) NOT NULL,
+  area_id CHAR(36),
+  kind VARCHAR(16) NOT NULL,
+  topic_key VARCHAR(100) NOT NULL,
+  title VARCHAR(255) NOT NULL,
+  body LONGTEXT NOT NULL,
+  source_ref TEXT NOT NULL,
+  author_ref VARCHAR(255) NOT NULL,
+  reviewed_by_ref VARCHAR(255) NOT NULL,
+  approval_ref TEXT NOT NULL,
+  observed_at DATETIME(6),
+  reviewed_at DATETIME(6) NOT NULL,
+  revision CHAR(36) NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  retired_at DATETIME(6),
+  retirement_reason TEXT,
+  FOREIGN KEY (bot_id) REFERENCES bots(id),
+  FOREIGN KEY (area_id) REFERENCES areas(id),
+  CHECK (kind IN ('latest','durable')),
+  CHECK (
+    (retired_at IS NULL AND retirement_reason IS NULL)
+    OR (retired_at IS NOT NULL AND retirement_reason IS NOT NULL)
+  ),
+  INDEX bot_memories_recall (bot_id, area_id, retired_at, kind, id),
+  INDEX bot_memories_topic (bot_id, area_id, topic_key)
+);
+
 CREATE TABLE directives (
   id CHAR(36) PRIMARY KEY,
   scope_kind VARCHAR(16) NOT NULL,
@@ -287,7 +317,7 @@ CREATE TABLE artifact_resources (
 );
 ```
 
-Normalize identifiers and label names using one tested rule before writes; validate collation and root slug uniqueness. Bot role and slug are immutable in normal operations; the path is derived, not a second stored locator. Retired Bots cannot be selected. Directive status or approval_ref alone is not permission; verify provenance and applicability. Supersession is a guarded domain transition, reject cycles and invalid scope changes. Artifact kind vocabulary is bounded by the domain (research, design, decision, report, review, handoff, evidence, work-note and retained legacy mappings). Artifacts can have no joins; any linked open Issue protects retention. For linked work use the latest applicable substantive/closure event; never infer cleanup eligibility from timestamps alone. Issue updates are append-only in normal use; corrections are new notes. Do not record raw logs. Do not use polymorphic pseudo-FKs. The [MVP baseline](dolt-mvp-contract.md) owns remaining semantic constraints.
+Normalize identifiers and label names using one tested rule before writes; validate collation and root slug uniqueness. Bot role and slug are immutable in normal operations; the path is derived, not a second stored locator. Retired Bots cannot be selected. The selected Memory boundary adds one candidate table (24 total). The guarded domain operation validates live topic-key uniqueness per Bot and exact Area (including NULL global scope), verified approval/source, allowed scope and current revision. Test NULL-aware uniqueness and concurrent changes in the spike. A latest/durable transition edits one record rather than duplicating it. Exclude retired records, retired Bots and archived Area ancestry from operational recall; historical inspection is separate. Directive status or approval_ref alone is not permission; verify provenance and applicability. Supersession is a guarded domain transition, reject cycles and invalid scope changes. Artifact kind vocabulary is bounded by the domain (research, design, decision, report, review, handoff, evidence, work-note and retained legacy mappings). Artifacts can have no joins; any linked open Issue protects retention. For linked work use the latest applicable substantive/closure event; never infer cleanup eligibility from timestamps alone. Issue updates are append-only in normal use; corrections are new notes. Do not record raw logs. Do not use polymorphic pseudo-FKs. The [MVP baseline](dolt-mvp-contract.md) owns remaining semantic constraints.
 
 A mutation may change several rows. Update the affected aggregate's revision on relationship changes as well as field edits; enforce request ID idempotency and expected revision in the domain layer. Record closure, claim, graph, archive and retention invariants across tables with guarded domain validation. The schema migration ledger is authoritative; test DDL transaction semantics instead of assuming transactional DDL. Keep failed migration state isolated and require explicit recovery.
 
