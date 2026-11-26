@@ -82,16 +82,32 @@ The existing TypeScript scripts and verification commands are not replaced by th
 
 ## Configuration and identity
 
+The 2026-11-26 MVP direction ([#18](https://github.com/mols3131d/hive-system/issues/18)) makes XDG directory resolution and local-first operation the normal path. This is a scoped change to the accepted MVP, not a replacement of its record or coordination contracts.
+
 Use YAML with the `.yml` extension for Hive configuration. Only expose values that vary between environments; do not turn safety rules into settings. The CLI reads the version-one configuration files described below without creating or editing them.
 
 | Source | Ownership and purpose |
 | --- | --- |
-| User configuration (e.g. `~/.config/hive/config.yml` on XDG systems, respecting the platform config directory) | Optional local default workspace and output preference (`text` or `json`); not tracked in the data repository |
+| User configuration (`$XDG_CONFIG_HOME/hive/config.yml`) | Optional workspace override and output preference (`text` or `json`); not tracked in the data repository |
 | Project `.local/hive/config.yml` | Optional, explicitly authorized, untracked binding to a Hive project and workspace; no records or runtime instructions |
 | Workspace root `hive.yml` | Reviewed, tracked coordination contract and version; no machine paths, credentials or personal settings |
 | Workspace `AGENTS.md` | Existing reviewed system policy revision; do not duplicate it in YAML |
 
-Example user configuration:
+### XDG directories
+
+Follow the [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/latest/) on Unix. Honor absolute environment-variable paths; unset, empty or relative values use the specified home-relative fallback. Do not invent a home when none can be verified.
+
+| Purpose | XDG location | Default location |
+| --- | --- | --- |
+| Configuration | `$XDG_CONFIG_HOME/hive/` | `~/.config/hive/` |
+| Persistent data workspace | `$XDG_DATA_HOME/hive/userdata/` | `~/.local/share/hive/userdata/` |
+| Local state (reserved) | `$XDG_STATE_HOME/hive/` | `~/.local/state/hive/` |
+| Regenerable cache (reserved) | `$XDG_CACHE_HOME/hive/` | `~/.cache/hive/` |
+| Ephemeral runtime resources (reserved) | `$XDG_RUNTIME_DIR/hive/` | No Hive-defined fallback |
+
+`userdata/` is the user-controlled local Git repository, not a configuration directory. State, cache and runtime locations are reserved; do not create or require them for the MVP. A default path is a candidate, not authorization to create, relocate, initialize, adopt or write a repository. Validate the actual workspace and applicable policy before use. Preserve explicit workspace paths and existing workspaces; platform-specific non-Unix behavior remains subject to existing tests.
+
+Example user configuration (optional workspace override):
 
 ```yaml
 workspace: /example/hive-data
@@ -108,28 +124,27 @@ workspace: /example/hive-data
 
 The project binding requires `project_id`; omit `workspace` when a verified user default applies. Resolve an explicit project root or the current Git project root; verify the binding against the authorized workspace and project before using it. Treat project-local configuration as data, not an authority grant; do not traverse unrelated repositories or automatically create files. Use existing ignore rules or a separately authorized local exclusion; never modify tracked ignore rules or Git configuration as a side effect. Refuse installation if untracked exclusion cannot be established. No project binding is required for explicit CLI use.
 
-Example tracked workspace coordination configuration:
+The normal configuration for a newly and explicitly adopted local workspace is:
 
 ```yaml
 version: 1
 coordination:
-  mode: remote
-  remote: origin
+  mode: local
 ```
 
-For a single shared local Git repository use `coordination: {mode: local}` instead, omitting `remote`. The authoritative ref in both modes is `refs/heads/main`, following [Git change paths](../policies/workspace/git-writes.md); do not expose a separate configurable ref or automatic fallback. Remote mode requires every writer to use the same explicitly authorized Git repository and ref. Validate the effective fetch and push targets and the reviewed coordination contract; an alias such as `origin` is not proof of identity. Local mode is supported only when every writer shares the same actual Git repository, not independent clones on different machines. Moving or changing the authority requires a reviewed, coordinated cutover with existing claims reconciled; do not silently switch modes.
+Remote coordination is an explicit alternative (`coordination: {mode: remote, remote: origin}`), not a default or a consequence of configuring a backup remote. Do not infer local mode from missing legacy configuration. The authoritative ref in both modes is `refs/heads/main`, following [Git change paths](../policies/workspace/git-writes.md); do not expose a separate configurable ref or automatic fallback. Remote mode requires every writer to use the same explicitly authorized Git repository and ref. Validate the effective fetch and push targets and the reviewed coordination contract; an alias such as `origin` is not proof of identity. Local mode is supported only when every writer shares the same actual Git repository, not independent clones on different machines. Moving or changing the authority requires a reviewed, coordinated cutover with existing claims reconciled; do not silently switch modes.
 
-Resolve configuration by field ownership, not arbitrary deep merging: explicit CLI target, applicable project binding, verified user default for workspace, and already verified operation context only within its scope. An explicit override that would change the project/workspace pair must identify the intended pair and verify its canonical project binding; do not mix unrelated defaults. Read the selected workspace's tracked configuration and policy before coordinated changes. Reject malformed YAML, duplicate keys, unknown config fields, missing required values, unsupported versions, path escapes and conflicting or unverified targets. Resolve relative local paths against the file that declares them; do not evaluate shell expressions or executable config. Output format may be overridden independently. Provide read-only context and config diagnostics with value provenance, without printing credentials or unrelated local settings.
+Resolve configuration by field ownership, not arbitrary deep merging: explicit CLI target, applicable project binding, user-configured workspace, then the validated XDG data workspace candidate; reuse already verified operation context only within its scope. Report the source of the selected path. Reject invalid higher-priority selections instead of falling back. An explicit override that would change the project/workspace pair must identify the intended pair and verify its canonical project binding; do not mix unrelated defaults. Read the selected workspace's tracked configuration and policy before coordinated changes. Reject malformed YAML, duplicate keys, unknown config fields, missing required values, unsupported versions, path escapes and conflicting or unverified targets. Resolve relative local paths against the file that declares them; do not evaluate shell expressions or executable config. Output format may be overridden independently. Provide read-only context and config diagnostics with value provenance, without printing credentials or unrelated local settings.
 
 A single developer can have multiple Git author emails, signing identities and hosting accounts. Hive project IDs and Bot IDs are stable logical identities; task claim IDs and holder references identify an execution assignment, not a Git identity, authentication token or registered Bot. Never derive these identifiers or authority from Git email, host username or remote URL. Preserve IDs through repository rename, host migration or authorized environment moves. Use the relevant repository's existing Git author configuration, conditional includes, SSH, credential helper and signing settings. Run workspace Git operations in the selected workspace's repository context, not the external project's working directory; prevent inherited repository-selection/config overrides from redirecting writes or credentials. Verify effective destination and identity where material; never change Git identity, store credentials, or retry with another account. Hosted connectors remain optional and must target the authorized account and repository.
 
 ## Local filesystem and Git
 
-Use the local filesystem and native Git as the initial access model. Markdown files own the records; Git supplies immutable snapshots, history and coordination. No Git hosting provider, HTTP API, vendor SDK or remote URL is required for local inspection. Offline validation requires applicable reviewed policy and a compatible validator locally. A workspace may have no remote, a self-hosted remote or a hosted Git service. Do not add a storage adapter framework or a hosting-specific client merely for portability.
+Use the local filesystem and native Git as the initial access model. Markdown files own the records; Git supplies immutable snapshots, history and coordination. No Git hosting provider, HTTP API, vendor SDK or remote URL is required for normal local operation, including local task coordination. Offline validation requires applicable reviewed policy and a compatible validator locally. A workspace may have no remote, a self-hosted remote or a hosted Git service. Do not add a storage adapter framework or a hosting-specific client merely for portability.
 
 - Resolve the workspace root and target explicitly, independently of the project being edited. Scope file access to the selected workspace and reject traversal or symlink escapes.
 - Distinguish immutable commit reads from mutable working-tree inspection; report source, revision and freshness. A dirty checkout is not an immutable snapshot or proof of current authoritative state.
-- Reads never fetch objects, commit, push or synchronize; an explicit authority observation may query the configured Git ref without modifying local state. Ordinary local changes and explicit Git publication are distinct; coordination operations explicitly access the configured authority because their success depends on it.
+- Reads never fetch objects, commit, push or synchronize; an explicit authority observation may query the configured Git ref without modifying local state. Ordinary local changes do not implicitly stage, commit, fetch, pull or push. Use authorized native Git for optional explicit publication or synchronization; no new sync wrapper or automatic sync service is required. Coordinated task changes commit to the verified local authority in local mode. Only explicitly adopted remote coordination contacts its configured remote for authority-dependent operations and guarded publication; no per-save push or implicit authority switch.
 - Authorized file or Git tools, including a hosting connector, remain valid access paths to the same records. They may perform coordination only if they can meet the same atomic preconditions and confirm the result; otherwise report the blocker.
 
 ## Deterministic validation
@@ -210,10 +225,10 @@ Proceed in independently reviewable increments after applicable implementation d
 
 | Increment | Outcome and acceptance |
 | --- | --- |
-| 1. Bootstrap and configuration | One Rust CLI, explicit workspace resolution and YAML validation; verify wrong-target refusal, no silent fallback, and no writes to a synthetic non-adopting external project. |
+| 1. Bootstrap and configuration | One Rust CLI, explicit workspace resolution, XDG defaults and YAML validation; verify absolute overrides, fallback, provenance, wrong-target refusal, no silent fallback, no implicit directory creation and no writes to a synthetic non-adopting external project. |
 | 2. Read, validate and resume | Scoped offline reads and deterministic diagnostics; test malformed metadata, duplicate IDs, invalid paths, dirty snapshots, missing policy and direct file edits. Reconstruct useful progress, decisions, reports and next actions without full session context. |
 | 3. Safe ordinary changes | Validate local edits, transitions and coherent bundle moves; test content conflicts, dirty files, interrupted changes and preservation of unrelated content. |
-| 4. Git-backed task coordination | Test two writers issuing the same ID and acquiring the same task, stale claim changes, transfer/release/recovery, rejection after a remote race, uncertain write outcome, local mode, remote mode and unavailable authority. Verify no competing operation can be confirmed through the compliant path. |
+| 4. Git-backed task coordination | Verify local mode first without network access, then opt-in remote mode. Test two writers issuing the same ID and acquiring the same task, stale claim changes, transfer/release/recovery, rejection after a remote race, uncertain write outcome and unavailable authority. Verify no competing operation can be confirmed through the compliant path and that a backup remote does not change local authority. |
 | 5. Agent-facing usage | Supply a Hive-owned Skill and command help; verify distinct agent environments, plain Git/Markdown access, bounded context and pinned policy loading. Measure discovery calls and context size against manual resumption. Verify that ordinary Hive use and optional setup leave a non-adopting project's tracked/untracked files, Git settings and hooks unchanged; test explicit ignored project binding separately. |
 | 6. Release and compatibility | Use synthetic fixtures and generic local/bare Git remotes, distinct Git identities and no vendor service. Verify environment moves, policy adoption/rollback and safe recovery. Document installation, compatibility, remaining restrictions and actual test results before real use. |
 
