@@ -22,7 +22,7 @@ Hive is a local-first collaboration and context system for one developer and mul
 | Claim | Current exclusive execution assignment, not a permission grant |
 | Directive | Applicable direction and provenance |
 | Artifact | Intentional deliverable, evidence, decision or handoff |
-| Bot | Persistent identity with fixed role and selectively recalled memory |
+| Bot | Registered persistent Manager agent identity with Soul and selectively recalled memory |
 
 Area and Sub-area are the same entity. A nullable parent reference forms a hierarchy; a stable ID survives renaming and moving. No required Area type, repository association or project lifecycle. A Project is not an Area, repository or parent Issue. It may contain issues from multiple Areas; membership does not duplicate the issue or its execution state. Closing or removing a Project must not close or delete its issues.
 
@@ -59,7 +59,7 @@ Prefer retaining Rust with a local Dolt SQL Server; compare CLI subprocess and G
 
 ## Context model
 
-Retain Manager, Coordinator and Executor responsibilities. Bot role is fixed; SOUL.md remains a file asset (exact path pending review); memory lives in scoped Dolt records. Inject identity, latest curated memory and explicitly selected durable context only. No canonical MEMORY.md or per-Area memory files in the proposed model. Optional management README/AGENTS must not enter runtime Bot context; test host auto-loading. Existing Manager-only registration remains until explicitly changed. Scope selection does not confer access or instruction authority. No raw session logs or private user data in public source or test fixtures.
+Retain Manager, Coordinator and Executor responsibilities. Bot is a persistent Manager agent by definition, not a configurable role. Coordinator and Executor are task-scoped responsibilities without independent Bot identities, Soul or memory. A Manager may coordinate or execute directly without changing Bot identity. The Soul asset is `assets/bots/<slug>/SOUL.md`; the globally unique immutable Bot slug is a locator and the DB UUID is identity. Memory lives in scoped Dolt records. Inject identity, latest curated memory and explicitly selected durable context only. No canonical MEMORY.md or per-Area memory files in the proposed model. Optional management README/AGENTS must not enter runtime Bot context; test host auto-loading. Registration never selects a role; a role describes execution responsibility, not permission. Sessions remain host-owned. Scope selection does not confer access or instruction authority. No raw session logs or private user data in public source or test fixtures.
 
 ## CLI direction
 
