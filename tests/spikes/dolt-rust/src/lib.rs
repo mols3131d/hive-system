@@ -91,9 +91,12 @@ impl Target {
                 .user(Some(&self.user))
                 .pass(Some(&self.password)),
         )?;
-        let identity: Option<(Option<String>, Option<String>, String)> = connection.query_first(
-            "SELECT DATABASE(), ACTIVE_BRANCH(), workspace_id FROM workspace_meta WHERE singleton_id = 1",
-        )?;
+        let identity: Option<(Option<String>, Option<String>, String)> = connection
+            .query_first_opt(
+                "SELECT DATABASE(), ACTIVE_BRANCH(), workspace_id FROM workspace_meta WHERE singleton_id = 1",
+            )?
+            .transpose()
+            .map_err(|_| ConnectError::IdentityMismatch)?;
         match identity {
             Some((database, branch, workspace_id))
                 if database.as_deref() == Some(self.database.as_str())

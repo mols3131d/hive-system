@@ -221,3 +221,39 @@ fn authenticated_loopback_and_versioned_claim() -> Result<(), Box<dyn Error>> {
     );
     Ok(())
 }
+
+#[test]
+fn malformed_identity_is_refused() -> Result<(), Box<dyn Error>> {
+    let target = Target::from_fixture_env()?;
+    assert_eq!(target.connect().err(), Some(ConnectError::IdentityMismatch));
+    println!("PASS malformed workspace identity returns a bounded typed refusal");
+    Ok(())
+}
+
+#[test]
+fn non_main_is_refused() -> Result<(), Box<dyn Error>> {
+    let target = Target::from_fixture_env()?;
+    let mut connection = mysql::Conn::new(
+        mysql::OptsBuilder::new()
+            .ip_or_hostname(Some("127.0.0.1"))
+            .tcp_port(target.port)
+            .prefer_socket(false)
+            .db_name(Some(&target.database))
+            .user(Some(&target.user))
+            .pass(Some(&target.password)),
+    )?;
+    let identity: Option<(String, String, String)> = connection.query_first(
+        "SELECT DATABASE(), ACTIVE_BRANCH(), workspace_id FROM workspace_meta WHERE singleton_id = 1",
+    )?;
+    assert_eq!(
+        identity,
+        Some((
+            target.database.clone(),
+            "fixture-other".to_owned(),
+            target.workspace_id.clone(),
+        ))
+    );
+    assert_eq!(target.connect().err(), Some(ConnectError::IdentityMismatch));
+    println!("PASS authenticated non-main rejected for the expected database and workspace");
+    Ok(())
+}

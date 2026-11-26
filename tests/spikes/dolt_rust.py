@@ -56,12 +56,19 @@ def wait_for_listener(server, port):
 
 
 @contextmanager
-def fixture():
+def fixture(case="main"):
     dolt = Path(os.environ["HIVE_DOLT_BIN"]).resolve() / "dolt"
     schema = (ROOT / "docs/architecture/dolt-schema.md").read_text(encoding="utf-8")
     ddl = "\n".join(re.findall(r"(?ms)^```sql\n(.*?)^```$", schema))
     if len(re.findall(r"\bCREATE TABLE\b", ddl)) != 24:
         raise RuntimeError("Unexpected candidate DDL table count")
+
+    workspace = f"'{WORKSPACE}'"
+    if case == "malformed-identity":
+        required = "workspace_id CHAR(36) NOT NULL UNIQUE"
+        assert ddl.count(required) == 1
+        ddl = ddl.replace(required, "workspace_id CHAR(36) UNIQUE")
+        workspace = "NULL"
 
     with tempfile.TemporaryDirectory(prefix="hive-dolt-rust-") as temp:
         root = Path(temp)
@@ -92,9 +99,11 @@ def fixture():
         run("config", "--global", "--add", "metrics.disabled", "true",
             "user.name", "Hive Rust Spike", "user.email", "spike@example.invalid")
         run("init", "--initial-branch", "main")
-        run("sql", sql=f"{ddl}\nINSERT INTO workspace_meta VALUES (1, '{WORKSPACE}');\n")
+        run("sql", sql=f"{ddl}\nINSERT INTO workspace_meta VALUES (1, {workspace});\n")
         run("add", ".")
         run("commit", "-m", "Candidate schema and synthetic workspace")
+        if case == "non-main":
+            run("branch", "fixture-other")
         run("sql", sql=f"""
             CREATE USER '{USER}'@'{HOST}' IDENTIFIED BY '{password}';
             GRANT SELECT, INSERT, UPDATE ON {DATABASE}.* TO '{USER}'@'{HOST}';
@@ -108,9 +117,13 @@ def fixture():
                 available.bind((HOST, 0))
                 port = available.getsockname()[1]
             config = root / "server.yml"
+            variables = (
+                f"system_variables:\n  {DATABASE}_default_branch: fixture-other\n"
+                if case == "non-main" else ""
+            )
             config.write_text(
                 "log_level: warning\nmax_logged_query_len: -1\n"
-                f"listener:\n  host: {HOST}\n  port: {port}\n",
+                f"listener:\n  host: {HOST}\n  port: {port}\n" + variables,
                 encoding="utf-8",
             )
             server = subprocess.Popen(
@@ -160,11 +173,16 @@ def main():
             [*command, "--no-run"], cwd=root, env=isolated_env(root) | cargo_env,
             check=True, timeout=300,
         )
-        with fixture() as (directory, env):
-            subprocess.run(
-                [*command, "--offline", "--", "--nocapture"],
-                cwd=directory, env=env | cargo_env, check=True, timeout=60,
-            )
+        for case, test in (
+            ("main", "authenticated_loopback_and_versioned_claim"),
+            ("malformed-identity", "malformed_identity_is_refused"),
+            ("non-main", "non_main_is_refused"),
+        ):
+            with fixture(case) as (directory, env):
+                subprocess.run(
+                    [*command, "--offline", "--", "--nocapture", "--exact", test],
+                    cwd=directory, env=env | cargo_env, check=True, timeout=60,
+                )
 
 
 if __name__ == "__main__":
