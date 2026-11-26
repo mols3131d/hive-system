@@ -1,10 +1,10 @@
 ---
-description: "Review the proposed relational tables, constraints, readiness queries and concurrent mutation design for the Dolt migration."
+description: "Use when implementing Dolt v2 tables, constraints, readiness queries and guarded mutations."
 ---
 
-# Proposed Dolt Relational Schema
+# Dolt v2 Relational Schema
 
-Status: candidate design under [#22](https://github.com/mols3131d/hive-system/issues/22) and [architecture redesign](dolt-redesign.md). This is not a migration, adopted schema, or tested implementation.
+This relational design supports the [adopted Dolt v2 development baseline](dolt-redesign.md). Use the [MVP contract](dolt-mvp-contract.md) for domain invariants and the illustrative DDL below to implement and verify the versioned schema. Any live schema activation during migration or authority switch requires separate explicit operator approval.
 
 ## Relational conventions
 
@@ -12,7 +12,7 @@ One database per workspace. Do not partition by Area, Project or repository. Use
 
 ## Core DDL candidate
 
-Illustrative MySQL-compatible SQL; verify against a pinned Dolt release. Root sibling slug uniqueness needs additional domain validation because nullable parent IDs do not enforce it through a composite unique key. All mutations affecting those invariants use the same guarded authority.
+Verify the illustrative MySQL-compatible SQL against a pinned Dolt release. Root sibling slug uniqueness needs additional domain validation because nullable parent IDs do not enforce it through a composite unique key. All mutations affecting those invariants use the same guarded authority.
 
 ```sql
 CREATE TABLE areas (
@@ -376,6 +376,6 @@ Use one authoritative shared main branch. Validate the precise SQL transaction/v
 
 References: [transactions](https://www.dolthub.com/docs/concepts/dolt/sql/transaction/), [concurrency](https://www.dolthub.com/blog/2026-02-17-dolt-concurrency/), [constraints](https://www.dolthub.com/docs/concepts/dolt/sql/constraints/), [Dolt procedures](https://www.dolthub.com/docs/sql-reference/version-control/dolt-sql-procedures/).
 
-## Required spike
+## Schema verification
 
-Pin Dolt version and test DDL, root uniqueness, cyclic references, duplicate claims, claim-versus-dependency changes, same-value writes, competing lock acquisition, crash and ambiguous receipt recovery, cancellation/reopen, transaction rollback, version commit failure/recovery and invalid merge. Test offline operation and restoration on synthetic data only. This design has not been executed.
+Use the [synthetic spike evidence (#24)](https://github.com/mols3131d/hive-system/pull/24) when verifying the implementation. Pin Dolt version and test DDL, root uniqueness, cyclic references, duplicate claims, claim-versus-dependency changes, same-value writes, competing lock acquisition, crash and ambiguous receipt recovery, cancellation/reopen, transaction rollback, version commit failure/recovery and invalid merge. Test offline operation and restoration on synthetic data only.
