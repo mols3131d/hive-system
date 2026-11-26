@@ -207,10 +207,11 @@ CREATE TABLE bot_memories (
   body LONGTEXT NOT NULL,
   source_ref TEXT NOT NULL,
   author_ref VARCHAR(255) NOT NULL,
-  reviewed_by_ref VARCHAR(255) NOT NULL,
-  approval_ref TEXT NOT NULL,
+  authorization_mode VARCHAR(16) NOT NULL,
+  authorization_ref TEXT NOT NULL,
+  reviewed_by_ref VARCHAR(255),
   observed_at DATETIME(6),
-  reviewed_at DATETIME(6) NOT NULL,
+  reviewed_at DATETIME(6),
   revision CHAR(36) NOT NULL,
   created_at DATETIME(6) NOT NULL,
   updated_at DATETIME(6) NOT NULL,
@@ -225,6 +226,12 @@ CREATE TABLE bot_memories (
       AND recall_tier IS NOT NULL
       AND recall_tier IN ('core','reference')
     )
+  ),
+  CHECK (
+    (authorization_mode = 'reviewed'
+      AND reviewed_by_ref IS NOT NULL AND reviewed_at IS NOT NULL)
+    OR (authorization_mode = 'delegated'
+      AND reviewed_by_ref IS NULL AND reviewed_at IS NULL)
   ),
   CHECK (
     (retired_at IS NULL AND retirement_reason IS NULL)
@@ -322,7 +329,7 @@ CREATE TABLE artifact_resources (
 );
 ```
 
-Normalize identifiers and label names using one tested rule before writes; validate collation and root slug uniqueness. Bot means a registered Manager agent; no role column, role table or role selector is needed for Bot identity. The workspace-wide unique Bot slug is immutable in normal operations, including after retirement; the path `assets/bots/<slug>/SOUL.md` is derived, not a second stored locator. UUID remains the stable relational identity. Coordinator and Executor have no separate Bot records. Retired Bots cannot be selected. The selected Memory boundary adds one candidate table (24 total). The guarded domain operation validates live topic-key uniqueness per Bot and exact Area (including NULL global scope), verified approval/source, allowed scope and current revision. Test NULL-aware uniqueness and concurrent changes in the spike. Latest has NULL recall_tier; durable requires core or reference. The logical views are `memories/LATEST.md`, `memories/core/`, and `memories/references/`, scoped to the selected Bot and authorized Area. Transitions between these categories edit one record rather than duplicating it. Test all valid and invalid kind/tier combinations (including SQL NULL behavior) on the pinned release. Exclude retired records, retired Bots and archived Area ancestry from operational recall; historical inspection is separate. Directive status or approval_ref alone is not permission; verify provenance and applicability. Supersession is a guarded domain transition, reject cycles and invalid scope changes. Artifact kind vocabulary is bounded by the domain (research, design, decision, report, review, handoff, evidence, work-note and retained legacy mappings). Artifacts can have no joins; any linked open Issue protects retention. For linked work use the latest applicable substantive/closure event; never infer cleanup eligibility from timestamps alone. Issue updates are append-only in normal use; corrections are new notes. Do not record raw logs. Do not use polymorphic pseudo-FKs. The [MVP baseline](dolt-mvp-contract.md) owns remaining semantic constraints.
+Normalize identifiers and label names using one tested rule before writes; validate collation and root slug uniqueness. Bot means a registered Manager agent; no role column, role table or role selector is needed for Bot identity. The workspace-wide unique Bot slug is immutable in normal operations, including after retirement; the path `assets/bots/<slug>/SOUL.md` is derived, not a second stored locator. UUID remains the stable relational identity. Coordinator and Executor have no separate Bot records. Retired Bots cannot be selected. The selected Memory boundary adds one candidate table (24 total). The guarded domain operation validates live topic-key uniqueness per Bot and exact Area (including NULL global scope), verified approval or delegation and source, allowed scope, byte limits and current revision. Authorization fields describe the last mutation, not a persistent permission; verify the actual current grant under the lock. Never fabricate a reviewer for delegated writes. The grant storage and actor binding remain review gates. Test NULL-aware uniqueness and concurrent changes in the spike. Latest has NULL recall_tier; durable requires core or reference. The logical views are `memories/LATEST.md`, `memories/core/`, and `memories/references/`, scoped to the selected Bot and authorized Area. Transitions between these categories edit one record rather than duplicating it. Check final aggregate byte totals and unique live topic keys for all touched scopes inside the guarded transaction; an explicitly requested multi-record curation batch may edit, classify and retire atomically, but never auto-evict. Read-only candidate reports and views cannot mutate records. Test all valid and invalid kind/tier combinations (including SQL NULL behavior) on the pinned release. Exclude retired records, retired Bots and archived Area ancestry from operational recall; historical inspection is separate. Directive status or approval_ref alone is not permission; verify provenance and applicability. Supersession is a guarded domain transition, reject cycles and invalid scope changes. Artifact kind vocabulary is bounded by the domain (research, design, decision, report, review, handoff, evidence, work-note and retained legacy mappings). Artifacts can have no joins; any linked open Issue protects retention. For linked work use the latest applicable substantive/closure event; never infer cleanup eligibility from timestamps alone. Issue updates are append-only in normal use; corrections are new notes. Do not record raw logs. Do not use polymorphic pseudo-FKs. The [MVP baseline](dolt-mvp-contract.md) owns remaining semantic constraints.
 
 A mutation may change several rows. Update the affected aggregate's revision on relationship changes as well as field edits; enforce request ID idempotency and expected revision in the domain layer. Record closure, claim, graph, archive and retention invariants across tables with guarded domain validation. The schema migration ledger is authoritative; test DDL transaction semantics instead of assuming transactional DDL. Keep failed migration state isolated and require explicit recovery.
 
