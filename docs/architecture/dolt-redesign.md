@@ -49,7 +49,7 @@ Readiness is derived: selected work, accepted prerequisites, no incompatible con
 
 ## Storage and runtime
 
-Dolt is the proposed canonical store for structured collaboration records, replacing native Git-tracked task bundles and frontmatter as the structured storage model. Area, Project, Issue, relationships, labels and claims are relational records. Directive and textual Artifact Markdown bodies are recommended DB-owned; reference external binary/large assets, while Bot context remains Git-tracked Markdown. The proposed ownership boundary and cross-store recovery rules are detailed in the [MVP design baseline](dolt-mvp-contract.md). Never make DB and Markdown competing originals of the same record.
+Dolt is the proposed canonical store for structured collaboration records, replacing native Git-tracked task bundles and frontmatter as the structured storage model. Area, Project, Issue, relationships, labels and claims are relational records. Directive and textual Artifact Markdown bodies are recommended DB-owned; reference external binary/large assets, while user-owned SOUL.md remains Git-tracked Markdown. Curated Bot memory is canonical in Dolt; the storage boundary is selected, while schema and runtime remain proposals. The proposed ownership boundary and cross-store recovery rules are detailed in the [MVP design baseline](dolt-mvp-contract.md). Never make DB and Markdown competing originals of the same record.
 
 Use XDG configuration and data locations; preserve explicit target resolution and no implicit initialization or migration. Keep Dolt internal files out of ordinary Git tracking. Native Git may remain for file assets and software development. Remote sync is optional and explicit; validate ordinary Git remotes for Dolt on disposable data, not an existing workspace.
 
@@ -59,7 +59,7 @@ Prefer retaining Rust with a local Dolt SQL Server; compare CLI subprocess and G
 
 ## Context model
 
-Retain Manager, Coordinator and Executor responsibilities. Bot role is fixed; proposed paths are `bots/<role>/<bot-id>/SOUL.md`, `MEMORY.md`, and `memory/<area-id>/`. Inject identity, latest curated memory and explicitly selected long-term context only. Optional management README/AGENTS must not enter runtime Bot context; test host auto-loading. Existing Manager-only registration remains until explicitly changed. Scope selection does not confer access or instruction authority. No raw session logs or private user data in public source or test fixtures.
+Retain Manager, Coordinator and Executor responsibilities. Bot role is fixed; SOUL.md remains a file asset (exact path pending review); memory lives in scoped Dolt records. Inject identity, latest curated memory and explicitly selected durable context only. No canonical MEMORY.md or per-Area memory files in the proposed model. Optional management README/AGENTS must not enter runtime Bot context; test host auto-loading. Existing Manager-only registration remains until explicitly changed. Scope selection does not confer access or instruction authority. No raw session logs or private user data in public source or test fixtures.
 
 ## CLI direction
 
