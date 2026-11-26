@@ -22,6 +22,7 @@ CREATE TABLE areas (
   name VARCHAR(255) NOT NULL,
   description TEXT,
   archived_at DATETIME(6),
+  revision CHAR(36) NOT NULL,
   UNIQUE (parent_id, slug),
   FOREIGN KEY (parent_id) REFERENCES areas(id),
   CHECK (parent_id IS NULL OR parent_id <> id)
@@ -32,6 +33,7 @@ CREATE TABLE projects (
   name VARCHAR(255) NOT NULL,
   description TEXT,
   status VARCHAR(16) NOT NULL,
+  revision CHAR(36) NOT NULL,
   CHECK (status IN ('active', 'completed', 'archived'))
 );
 
@@ -56,7 +58,9 @@ CREATE TABLE issues (
   FOREIGN KEY (area_id) REFERENCES areas(id),
   FOREIGN KEY (parent_id) REFERENCES issues(id),
   CHECK (parent_id IS NULL OR parent_id <> id),
+  CHECK (number > 0),
   CHECK (type IN ('epic','feature','task','bug')),
+  CHECK (type <> 'epic' OR status <> 'in-progress'),
   CHECK (status IN ('backlog','todo','in-progress','review','done','cancelled')),
   CHECK (priority IS NULL OR priority BETWEEN 0 AND 3),
   CHECK (
@@ -92,7 +96,8 @@ CREATE TABLE resources (
   id CHAR(36) PRIMARY KEY,
   kind VARCHAR(32) NOT NULL,
   name VARCHAR(255) NOT NULL,
-  uri TEXT
+  uri TEXT,
+  revision CHAR(36) NOT NULL
 );
 
 CREATE TABLE area_resources (
@@ -138,26 +143,160 @@ CREATE TABLE operation_receipts (
 
 Initialize the issue_number counter at explicit bootstrap. Allocate and increment it in the same guarded transaction as issue creation. The OS-held workspace write lock is the recommended MVP candidate; the prior mutation_guard is only an alternative spike. The MVP proposes required issue Area ownership (an explicitly chosen general Area for unclassified work, not an implicit fallback), one parent at most, optional project memberships, and a globally defined 0–3 priority (0 highest, NULL unspecified). Issue types, lifecycle and priority are recommended review candidates; see the [MVP design baseline](dolt-mvp-contract.md) for transition and ownership rules. Project-specific priority/order is deferred to membership fields if justified. No implicit dependency from parentage or project inclusion. Archive policy and ancestry-based eligibility must be made explicit before final readiness contract.
 
-## Additional tables and ownership
+## Additional DDL candidate
 
-| Table | Key and semantics |
-| --- | --- |
-| labels | id PK; unique normalized name within workspace |
-| issue_labels | composite PK (issue_id, label_id), two FKs |
-| bots | id PK, unique stable role-qualified locator; role immutable under normal operations; no duplicate Soul/Memory content |
-| directives | id PK, explicit applicable scope relation, Markdown body, provenance and validity |
-| artifacts | id PK, kind, title, provenance, body or file locator with content digest; choose canonical ownership before DDL |
-| artifact_issues / artifact_projects / artifact_areas | explicit FK join tables only when needed; no generic polymorphic foreign key |
-| schema_migrations | applied version and migration identity; compatibility check before writes |
+The following tables complete the first-pass relational layout. Metadata is relational; Markdown remains opaque text. Validate all SQL and migration ordering against the selected Dolt release. The system is the canonical schema owner; the workspace descriptor must match the database identity, not override it.
 
-Bot and asset storage, actor registry, directive scope/validity and artifact retention still require separate decisions. Do not use a generic entity-reference table to evade FK constraints. Do not store raw sessions, credentials or private paths in shared records. Environment-specific resource path bindings stay outside shared data.
+```sql
+CREATE TABLE workspace_meta (
+  singleton_id TINYINT PRIMARY KEY,
+  workspace_id CHAR(36) NOT NULL UNIQUE,
+  CHECK (singleton_id = 1)
+);
+
+CREATE TABLE schema_migrations (
+  version INT UNSIGNED PRIMARY KEY,
+  migration_digest CHAR(64) NOT NULL,
+  applied_at DATETIME(6) NOT NULL
+);
+
+CREATE TABLE labels (
+  id CHAR(36) PRIMARY KEY,
+  name VARCHAR(100) NOT NULL UNIQUE,
+  description TEXT,
+  revision CHAR(36) NOT NULL
+);
+
+CREATE TABLE issue_labels (
+  issue_id CHAR(36) NOT NULL,
+  label_id CHAR(36) NOT NULL,
+  PRIMARY KEY (issue_id, label_id),
+  FOREIGN KEY (issue_id) REFERENCES issues(id),
+  FOREIGN KEY (label_id) REFERENCES labels(id),
+  INDEX issue_labels_reverse (label_id, issue_id)
+);
+
+CREATE TABLE issue_updates (
+  id CHAR(36) PRIMARY KEY,
+  issue_id CHAR(36) NOT NULL,
+  kind VARCHAR(16) NOT NULL,
+  body LONGTEXT NOT NULL,
+  author_ref VARCHAR(255) NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  FOREIGN KEY (issue_id) REFERENCES issues(id),
+  CHECK (kind IN ('progress','review','handoff','evidence','comment')),
+  INDEX issue_updates_order (issue_id, created_at, id)
+);
+
+CREATE TABLE bots (
+  id CHAR(36) PRIMARY KEY,
+  role VARCHAR(16) NOT NULL,
+  slug VARCHAR(100) NOT NULL,
+  display_name VARCHAR(255) NOT NULL,
+  revision CHAR(36) NOT NULL,
+  retired_at DATETIME(6),
+  UNIQUE (role, slug),
+  CHECK (role = 'manager')
+);
+
+CREATE TABLE directives (
+  id CHAR(36) PRIMARY KEY,
+  scope_kind VARCHAR(16) NOT NULL,
+  area_id CHAR(36),
+  project_id CHAR(36),
+  include_descendants BOOLEAN NOT NULL DEFAULT FALSE,
+  title VARCHAR(255) NOT NULL,
+  body LONGTEXT NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  issuer_ref VARCHAR(255) NOT NULL,
+  source_ref TEXT NOT NULL,
+  approval_ref TEXT,
+  valid_from DATETIME(6),
+  expires_at DATETIME(6),
+  supersedes_id CHAR(36),
+  revision CHAR(36) NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  FOREIGN KEY (area_id) REFERENCES areas(id),
+  FOREIGN KEY (project_id) REFERENCES projects(id),
+  FOREIGN KEY (supersedes_id) REFERENCES directives(id),
+  CHECK (
+    (scope_kind = 'workspace' AND area_id IS NULL AND project_id IS NULL)
+    OR (scope_kind = 'area' AND area_id IS NOT NULL AND project_id IS NULL)
+    OR (scope_kind = 'project' AND area_id IS NULL AND project_id IS NOT NULL)
+  ),
+  CHECK (scope_kind = 'area' OR include_descendants = FALSE),
+  CHECK (status IN ('proposed','active','superseded','withdrawn')),
+  CHECK (status <> 'active' OR approval_ref IS NOT NULL),
+  CHECK (valid_from IS NULL OR expires_at IS NULL OR expires_at > valid_from),
+  CHECK (supersedes_id IS NULL OR supersedes_id <> id)
+);
+
+CREATE TABLE artifacts (
+  id CHAR(36) PRIMARY KEY,
+  kind VARCHAR(32) NOT NULL,
+  title VARCHAR(255) NOT NULL,
+  body LONGTEXT NOT NULL,
+  author_ref VARCHAR(255) NOT NULL,
+  source_ref TEXT,
+  revision CHAR(36) NOT NULL,
+  created_at DATETIME(6) NOT NULL,
+  substantive_updated_at DATETIME(6) NOT NULL,
+  archived_at DATETIME(6),
+  archive_reason TEXT,
+  CHECK (
+    (archived_at IS NULL AND archive_reason IS NULL)
+    OR (archived_at IS NOT NULL AND archive_reason IS NOT NULL)
+  )
+);
+
+CREATE TABLE artifact_areas (
+  artifact_id CHAR(36) NOT NULL,
+  area_id CHAR(36) NOT NULL,
+  PRIMARY KEY (artifact_id, area_id),
+  FOREIGN KEY (artifact_id) REFERENCES artifacts(id),
+  FOREIGN KEY (area_id) REFERENCES areas(id),
+  INDEX artifact_areas_reverse (area_id, artifact_id)
+);
+
+CREATE TABLE artifact_projects (
+  artifact_id CHAR(36) NOT NULL,
+  project_id CHAR(36) NOT NULL,
+  PRIMARY KEY (artifact_id, project_id),
+  FOREIGN KEY (artifact_id) REFERENCES artifacts(id),
+  FOREIGN KEY (project_id) REFERENCES projects(id),
+  INDEX artifact_projects_reverse (project_id, artifact_id)
+);
+
+CREATE TABLE artifact_issues (
+  artifact_id CHAR(36) NOT NULL,
+  issue_id CHAR(36) NOT NULL,
+  PRIMARY KEY (artifact_id, issue_id),
+  FOREIGN KEY (artifact_id) REFERENCES artifacts(id),
+  FOREIGN KEY (issue_id) REFERENCES issues(id),
+  INDEX artifact_issues_reverse (issue_id, artifact_id)
+);
+
+CREATE TABLE artifact_resources (
+  artifact_id CHAR(36) NOT NULL,
+  resource_id CHAR(36) NOT NULL,
+  PRIMARY KEY (artifact_id, resource_id),
+  FOREIGN KEY (artifact_id) REFERENCES artifacts(id),
+  FOREIGN KEY (resource_id) REFERENCES resources(id),
+  INDEX artifact_resources_reverse (resource_id, artifact_id)
+);
+```
+
+Normalize identifiers and label names using one tested rule before writes; validate collation and root slug uniqueness. Bot role and slug are immutable in normal operations; the path is derived, not a second stored locator. Retired Bots cannot be selected. Directive status or approval_ref alone is not permission; verify provenance and applicability. Supersession is a guarded domain transition, reject cycles and invalid scope changes. Artifact kind vocabulary is bounded by the domain (research, design, decision, report, review, handoff, evidence, work-note and retained legacy mappings). Artifacts can have no joins; any linked open Issue protects retention. For linked work use the latest applicable substantive/closure event; never infer cleanup eligibility from timestamps alone. Issue updates are append-only in normal use; corrections are new notes. Do not record raw logs. Do not use polymorphic pseudo-FKs. The [MVP baseline](dolt-mvp-contract.md) owns remaining semantic constraints.
+
+A mutation may change several rows. Update the affected aggregate's revision on relationship changes as well as field edits; enforce request ID idempotency and expected revision in the domain layer. Record closure, claim, graph, archive and retention invariants across tables with guarded domain validation. The schema migration ledger is authoritative; test DDL transaction semantics instead of assuming transactional DDL. Keep failed migration state isolated and require explicit recovery.
 
 ## Read model
 
 Ready candidate view (not the complete readiness predicate; archived Area ancestry and execution permission remain required domain checks):
 
 ```sql
-CREATE VIEW ready_issues AS
+CREATE VIEW ready_issue_candidates AS
 SELECT i.id, i.area_id, i.title, i.priority
 FROM issues i
 WHERE i.status = 'todo'
@@ -173,7 +312,7 @@ WHERE i.status = 'todo'
   );
 ```
 
-Only accepted done satisfies a prerequisite; cancelled does not. Blocked reasons, children, dependents, project progress and recursive Area paths are derived. Query membership with joins, not copied arrays. Recursive traversal and its limits must be tested. Ready is not a claim or authority.
+Only accepted done satisfies a prerequisite; cancelled does not. The public ready operation filters candidate rows against archived Area ancestry and the remaining domain rules before returning them. Blocked reasons, children, dependents, project progress and recursive Area paths are derived. Query membership with joins, not copied arrays. Recursive traversal and its limits must be tested. Ready is not a claim or authority.
 
 ## Transaction and merge safety
 
