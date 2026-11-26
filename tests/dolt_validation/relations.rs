@@ -1,8 +1,7 @@
 use mysql::Conn;
 use mysql::prelude::Queryable;
-use serde_json::{Value, json};
 
-use super::{ADMIN, Fixture, commit, id, storage_state};
+use super::{ADMIN, Fixture, assert_diagnostics, commit, id, storage_state};
 
 const PROJECT: u32 = 0x3a;
 const RESOURCE: u32 = 0x3b;
@@ -36,23 +35,6 @@ fn assert_sql_error(admin: &mut Conn, sql: &str, code: u16) {
         panic!("Expected SQL error {code} for {sql}");
     };
     assert_eq!(error.code, code, "{sql}: {error}");
-}
-
-fn assert_diagnostics(report: &Value, expected: &[(&str, &str, &[&str])]) {
-    assert_eq!(report["error"]["code"], "CONSTRAINT_VIOLATION");
-    let diagnostics = report["error"]["details"]["diagnostics"]
-        .as_array()
-        .unwrap();
-    assert_eq!(diagnostics.len(), expected.len(), "{report}");
-    for (diagnostic, (code, table, ids)) in diagnostics.iter().zip(expected) {
-        assert_eq!(diagnostic["code"], *code, "{diagnostic}");
-        assert_eq!(diagnostic["table"], *table, "{diagnostic}");
-        if ids.is_empty() {
-            assert!(diagnostic.get("record_ids").is_none(), "{diagnostic}");
-        } else {
-            assert_eq!(diagnostic["record_ids"], json!(ids), "{diagnostic}");
-        }
-    }
 }
 
 #[test]

@@ -42,6 +42,8 @@ Validation checks Issue closure fields and active Claim cardinality. An active C
 
 Validation checks canonical UUIDv7 IDs for Projects, Resources and Labels, exact Project statuses (`active`, `completed` and `archived`), and both endpoints of Project memberships, Area and Issue Resource links, and Issue Label links. Projects may span Areas, and Resources may be shared. Label-name uniqueness follows the SQL unique key and its collation. The contract calls for normalized labels and leaves the normalization rule unspecified.
 
+Validation checks canonical UUIDv7 IDs for Artifacts and Directives. It checks Artifact kinds, including legacy `message`, `checkpoint`, and `manifest`, paired archive fields, and both endpoints of Area, Project, Issue, and Resource links. Artifacts may be standalone or link to multiple scopes. For Directives, it checks the exact status and scope fields, scope and supersession references, supersession cycles, approval reference presence for active records, and ordering of stored validity bounds. Applicability at a given time belongs to context resolution. Authorization and provenance belong to guarded operations and historical validation.
+
 The validator compares each required table's `SHOW CREATE TABLE ... AS OF` output with the migration's Dolt 2.7.6 schema shape. Dirty and staged definitions are outside the inspected commit. The exact `issue_number` counter key must have a positive next value greater than every Issue number at that commit. Historical issuance and reuse require separate history evidence.
 
 For an explicitly provisioned synthetic server on Dolt 2.7.6, supply the reader credentials in the process environment as `HIVE_DOLT_USER` and `HIVE_DOLT_PASSWORD`. Select the database, port and expected UUID explicitly.

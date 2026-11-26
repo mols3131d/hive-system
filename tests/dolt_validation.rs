@@ -1,3 +1,7 @@
+#[path = "dolt_validation/artifacts.rs"]
+mod artifacts;
+#[path = "dolt_validation/directives.rs"]
+mod directives;
 #[path = "dolt_validation/relations.rs"]
 mod relations;
 
@@ -323,11 +327,25 @@ fn diagnostic_codes(report: &Value) -> Vec<&str> {
 }
 
 fn assert_only_diagnostic(report: &Value, code: &str, table: &str, ids: &[&str]) {
-    assert_eq!(diagnostic_codes(report), [code]);
-    let diagnostic = &report["error"]["details"]["diagnostics"][0];
-    assert_eq!(diagnostic["table"], table);
-    let expected_ids = (!ids.is_empty()).then(|| serde_json::json!(ids));
-    assert_eq!(diagnostic.get("record_ids"), expected_ids.as_ref());
+    assert_diagnostics(report, &[(code, table, ids)]);
+}
+
+fn assert_diagnostics(report: &Value, expected: &[(&str, &str, &[&str])]) {
+    assert_eq!(report["error"]["code"], "CONSTRAINT_VIOLATION");
+    let diagnostics = report["error"]["details"]["diagnostics"]
+        .as_array()
+        .unwrap();
+    assert_eq!(diagnostics.len(), expected.len(), "{report}");
+    for (diagnostic, (code, table, ids)) in diagnostics.iter().zip(expected) {
+        assert_eq!(diagnostic["code"], *code, "{diagnostic}");
+        assert_eq!(diagnostic["table"], *table, "{diagnostic}");
+        let expected_ids = (!ids.is_empty()).then(|| serde_json::json!(ids));
+        assert_eq!(
+            diagnostic.get("record_ids"),
+            expected_ids.as_ref(),
+            "{diagnostic}"
+        );
+    }
 }
 
 fn set_issue_status(connection: &mut Conn, issue: &str, status: &str) {

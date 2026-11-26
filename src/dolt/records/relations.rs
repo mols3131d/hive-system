@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::dolt::{Snapshot, is_uuid_v7};
 use crate::error::HiveError;
 
-use super::Diagnostics;
+use super::{Diagnostics, artifacts, directives};
 
 pub(super) fn validate(
     snapshot: &mut Snapshot,
@@ -33,6 +33,8 @@ pub(super) fn validate(
         }
     }
 
+    let artifacts = artifacts::validate(snapshot, diagnostics)?;
+    let artifact_ids = artifacts.iter().map(String::as_str).collect();
     let project_ids = projects.iter().map(|(id, _)| id.as_str()).collect();
     let resource_ids = resources.iter().map(String::as_str).collect();
     let label_ids = labels.iter().map(String::as_str).collect();
@@ -56,6 +58,30 @@ pub(super) fn validate(
             &resource_ids,
         ),
         ("issue_labels", "issue_id, label_id", issue_ids, &label_ids),
+        (
+            "artifact_areas",
+            "artifact_id, area_id",
+            &artifact_ids,
+            area_ids,
+        ),
+        (
+            "artifact_projects",
+            "artifact_id, project_id",
+            &artifact_ids,
+            &project_ids,
+        ),
+        (
+            "artifact_issues",
+            "artifact_id, issue_id",
+            &artifact_ids,
+            issue_ids,
+        ),
+        (
+            "artifact_resources",
+            "artifact_id, resource_id",
+            &artifact_ids,
+            &resource_ids,
+        ),
     ] {
         for (left, right) in snapshot.records::<(String, String)>(table, columns, columns)? {
             let ids = [left.as_str(), right.as_str()];
@@ -81,5 +107,5 @@ pub(super) fn validate(
             }
         }
     }
-    Ok(())
+    directives::validate(snapshot, area_ids, &project_ids, diagnostics)
 }
