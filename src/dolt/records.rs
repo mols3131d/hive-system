@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, VecDeque, hash_map::Entry};
 
 use crate::cli::is_slug;
 use crate::error::{HiveError, RecordDiagnostic};
@@ -6,6 +6,73 @@ use crate::error::{HiveError, RecordDiagnostic};
 use super::{Snapshot, graph::Graph, is_uuid_v7};
 
 const MAX_DIAGNOSTICS: usize = 100;
+
+struct AreaRow {
+    id: String,
+    parent_id: Option<String>,
+    slug: String,
+    archived: bool,
+}
+
+struct IssueRow {
+    id: String,
+    area_id: String,
+    parent_id: Option<String>,
+    number: u64,
+    kind: String,
+    status: Option<IssueStatus>,
+    closure_fields_present: [bool; 3],
+}
+
+impl IssueRow {
+    fn requires_terminal_children(&self) -> bool {
+        self.status == Some(IssueStatus::Done)
+            || (self.kind == "epic" && self.status == Some(IssueStatus::Review))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IssueStatus {
+    Backlog,
+    Todo,
+    InProgress,
+    Review,
+    Done,
+    Cancelled,
+}
+
+impl IssueStatus {
+    fn parse(value: &str) -> Option<Self> {
+        // SQL CHECK comparisons can accept other spellings under a case-insensitive collation.
+        match value {
+            "backlog" => Some(Self::Backlog),
+            "todo" => Some(Self::Todo),
+            "in-progress" => Some(Self::InProgress),
+            "review" => Some(Self::Review),
+            "done" => Some(Self::Done),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Cancelled)
+    }
+
+    fn requires_done_prerequisites(self) -> bool {
+        matches!(self, Self::InProgress | Self::Review | Self::Done)
+    }
+}
+
+struct ClaimRow {
+    issue_id: String,
+    claim_id: String,
+}
+
+struct DependencyRow {
+    issue_id: String,
+    prerequisite_id: String,
+}
 
 #[derive(Default)]
 pub(crate) struct Diagnostics {
@@ -53,13 +120,89 @@ impl Diagnostics {
 }
 
 pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError> {
+    let areas: Vec<_> = snapshot
+        .records::<(String, Option<String>, String, bool)>(
+            "areas",
+            "id, parent_id, slug, archived_at IS NOT NULL",
+            "id",
+        )?
+        .into_iter()
+        .map(|(id, parent_id, slug, archived)| AreaRow {
+            id,
+            parent_id,
+            slug,
+            archived,
+        })
+        .collect();
+    let issues: Vec<_> = snapshot
+        .records::<(
+            String,
+            String,
+            Option<String>,
+            u64,
+            String,
+            String,
+            bool,
+            bool,
+            bool,
+        )>(
+            "issues",
+            "id, area_id, parent_id, number, type, status, closed_at IS NOT NULL,
+             closed_by_ref IS NOT NULL, resolution_note IS NOT NULL",
+            "id",
+        )?
+        .into_iter()
+        .map(
+            |(id, area_id, parent_id, number, kind, status, closed_at, closed_by, resolution)| {
+                IssueRow {
+                    id,
+                    area_id,
+                    parent_id,
+                    number,
+                    kind,
+                    status: IssueStatus::parse(&status),
+                    closure_fields_present: [closed_at, closed_by, resolution],
+                }
+            },
+        )
+        .collect();
+    let claims: Vec<_> = snapshot
+        .records("issue_claims", "issue_id, claim_id", "issue_id, claim_id")?
+        .into_iter()
+        .map(|(issue_id, claim_id)| ClaimRow { issue_id, claim_id })
+        .collect();
+    let dependencies: Vec<_> = snapshot
+        .records(
+            "issue_dependencies",
+            "issue_id, prerequisite_id",
+            "issue_id, prerequisite_id",
+        )?
+        .into_iter()
+        .map(|(issue_id, prerequisite_id)| DependencyRow {
+            issue_id,
+            prerequisite_id,
+        })
+        .collect();
+    Ok(validate_rows(&areas, &issues, &claims, &dependencies))
+}
+
+fn validate_rows(
+    areas: &[AreaRow],
+    issues: &[IssueRow],
+    claims: &[ClaimRow],
+    dependencies: &[DependencyRow],
+) -> Diagnostics {
     let mut diagnostics = Diagnostics::default();
-    let areas: Vec<(String, Option<String>, String)> =
-        snapshot.records("areas", "id, parent_id, slug", "id")?;
-    let area_ids: BTreeSet<_> = areas.iter().map(|(id, ..)| id.as_str()).collect();
+    let area_ids: BTreeSet<_> = areas.iter().map(|area| area.id.as_str()).collect();
     let mut siblings = BTreeSet::new();
     let mut area_graph = Graph::default();
-    for (id, parent, slug) in &areas {
+    for AreaRow {
+        id,
+        parent_id,
+        slug,
+        ..
+    } in areas
+    {
         diagnostics.check_id("areas", id, &[]);
         if !is_slug(slug) {
             diagnostics.add(
@@ -69,7 +212,7 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
                 "Use a lowercase kebab-case Area slug.",
             );
         }
-        if !siblings.insert((parent.as_deref(), slug.as_str())) {
+        if !siblings.insert((parent_id.as_deref(), slug.as_str())) {
             diagnostics.add(
                 "DUPLICATE_AREA_SLUG",
                 "areas",
@@ -77,7 +220,7 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
                 "Sibling Areas must have unique slugs, including at the root.",
             );
         }
-        if let Some(parent) = parent {
+        if let Some(parent) = parent_id {
             if area_ids.contains(parent.as_str()) {
                 area_graph.add(id, parent);
             } else {
@@ -99,18 +242,24 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
         );
     }
 
-    let issues: Vec<(String, String, Option<String>, u64, String, String)> = snapshot.records(
-        "issues",
-        "id, area_id, parent_id, number, type, status",
-        "id",
-    )?;
-    let issue_ids: BTreeSet<_> = issues.iter().map(|(id, ..)| id.as_str()).collect();
-    let claims: Vec<(String, String)> =
-        snapshot.records("issue_claims", "issue_id, claim_id", "issue_id")?;
+    let archived_by = archived_ancestry(areas);
+    let issues_by_id: HashMap<_, _> = issues
+        .iter()
+        .map(|issue| (issue.id.as_str(), issue))
+        .collect();
     let mut claimed_issues = BTreeSet::new();
-    for (issue_id, claim_id) in &claims {
+    for ClaimRow { issue_id, claim_id } in claims {
         diagnostics.check_id("issue_claims", claim_id, &[issue_id]);
-        if !issue_ids.contains(issue_id.as_str()) {
+        if let Some(issue) = issues_by_id.get(issue_id.as_str()) {
+            if let Some(archived_area) = archived_by.get(issue.area_id.as_str()) {
+                diagnostics.add(
+                    "ARCHIVED_AREA_CLAIM",
+                    "issue_claims",
+                    &[issue_id, claim_id, archived_area],
+                    "An active Claim cannot be in an archived Area or its descendants.",
+                );
+            }
+        } else {
             diagnostics.add(
                 "MISSING_REFERENCE",
                 "issue_claims",
@@ -130,7 +279,16 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
 
     let mut numbers = BTreeSet::new();
     let mut parent_graph = Graph::default();
-    for (id, area_id, parent, number, kind, status) in &issues {
+    for issue in issues {
+        let IssueRow {
+            id,
+            area_id,
+            parent_id,
+            number,
+            kind,
+            status,
+            closure_fields_present,
+        } = issue;
         diagnostics.check_id("issues", id, &[]);
         if *number == 0 || !numbers.insert(*number) {
             diagnostics.add(
@@ -148,15 +306,26 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
                 "The owning Area is missing.",
             );
         }
-        if let Some(parent) = parent {
-            if issue_ids.contains(parent.as_str()) {
-                // A parent must wait for each child to finish.
-                parent_graph.add(parent, id);
+        if let Some(parent_id) = parent_id {
+            if let Some(parent) = issues_by_id.get(parent_id.as_str()) {
+                // Parent completion depends on each child reaching a terminal state.
+                parent_graph.add(parent_id, id);
+                // Acceptance of a cancelled child's scope change requires transition evidence.
+                if parent.requires_terminal_children()
+                    && status.is_some_and(|status| !status.is_terminal())
+                {
+                    diagnostics.add(
+                        "UNRESOLVED_CHILD",
+                        "issues",
+                        &[parent_id, id],
+                        "A done Issue or an epic in review requires terminal children.",
+                    );
+                }
             } else {
                 diagnostics.add(
                     "MISSING_REFERENCE",
                     "issues",
-                    &[id, parent],
+                    &[id, parent_id],
                     "The parent Issue is missing.",
                 );
             }
@@ -170,19 +339,24 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
                 "Use a canonical lowercase Issue type.",
             );
         }
-        let in_progress = match status.as_str() {
-            "in-progress" => true,
-            "backlog" | "todo" | "review" | "done" | "cancelled" => false,
-            _ => {
-                diagnostics.add(
-                    "INVALID_ISSUE_STATUS",
-                    "issues",
-                    &[id],
-                    "Use a canonical lowercase Issue status.",
-                );
-                continue;
-            }
+        let Some(status) = status else {
+            diagnostics.add(
+                "INVALID_ISSUE_STATUS",
+                "issues",
+                &[id],
+                "Use a canonical lowercase Issue status.",
+            );
+            continue;
         };
+        if *closure_fields_present != [status.is_terminal(); 3] {
+            diagnostics.add(
+                "INVALID_ISSUE_CLOSURE",
+                "issues",
+                &[id],
+                "Done and cancelled Issues require all closure fields. Other statuses require them to be unset.",
+            );
+        }
+        let in_progress = *status == IssueStatus::InProgress;
         let claimed = claimed_issues.contains(id.as_str());
         if claimed != in_progress || (kind == "epic" && in_progress) {
             diagnostics.add(
@@ -194,20 +368,36 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
         }
     }
 
-    let dependencies: Vec<(String, String)> = snapshot.records(
-        "issue_dependencies",
-        "issue_id, prerequisite_id",
-        "issue_id, prerequisite_id",
-    )?;
     let mut prerequisites = Graph::default();
-    for (issue, prerequisite) in &dependencies {
-        if issue_ids.contains(issue.as_str()) && issue_ids.contains(prerequisite.as_str()) {
-            prerequisites.add(issue, prerequisite);
+    for DependencyRow {
+        issue_id,
+        prerequisite_id,
+    } in dependencies
+    {
+        if let (Some(issue), Some(prerequisite)) = (
+            issues_by_id.get(issue_id.as_str()),
+            issues_by_id.get(prerequisite_id.as_str()),
+        ) {
+            prerequisites.add(issue_id, prerequisite_id);
+            if issue
+                .status
+                .is_some_and(IssueStatus::requires_done_prerequisites)
+                && prerequisite
+                    .status
+                    .is_some_and(|status| status != IssueStatus::Done)
+            {
+                diagnostics.add(
+                    "UNMET_PREREQUISITE",
+                    "issue_dependencies",
+                    &[issue_id, prerequisite_id],
+                    "An Issue in progress, in review, or done requires done prerequisites.",
+                );
+            }
         } else {
             diagnostics.add(
                 "MISSING_REFERENCE",
                 "issue_dependencies",
-                &[issue, prerequisite],
+                &[issue_id, prerequisite_id],
                 "A dependency endpoint is missing.",
             );
         }
@@ -242,5 +432,32 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
             );
         }
     }
-    Ok(diagnostics)
+    diagnostics
+}
+
+fn archived_ancestry(areas: &[AreaRow]) -> HashMap<&str, &str> {
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut archived_by = HashMap::new();
+    let mut pending = VecDeque::new();
+    for area in areas {
+        let id = area.id.as_str();
+        if let Some(parent) = area.parent_id.as_deref() {
+            children.entry(parent).or_default().push(id);
+        }
+        if area.archived {
+            archived_by.insert(id, id);
+            pending.push_back((id, id));
+        }
+    }
+    // Start at every archived Area so each descendant is assigned its nearest archived ancestor.
+    // Visiting an Area once also bounds traversal when the snapshot contains a cycle.
+    while let Some((id, ancestor)) = pending.pop_front() {
+        for &child in children.get(id).into_iter().flatten() {
+            if let Entry::Vacant(entry) = archived_by.entry(child) {
+                entry.insert(ancestor);
+                pending.push_back((child, ancestor));
+            }
+        }
+    }
+    archived_by
 }
