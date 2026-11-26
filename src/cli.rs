@@ -630,7 +630,7 @@ pub(crate) struct ValidateArgs {
     #[arg(long, value_name = "NAME")]
     pub(crate) database: Option<String>,
     /// Explicit local Dolt SQL Server port.
-    #[arg(long, value_name = "PORT")]
+    #[arg(long, value_name = "PORT", allow_negative_numbers = true)]
     pub(crate) port: Option<OsString>,
 }
 
