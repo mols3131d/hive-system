@@ -16,7 +16,7 @@ if not DOLT:
     raise SystemExit("Dolt is not installed; this probe has not run.")
 
 schema = (ROOT / "docs/architecture/dolt-schema.md").read_text(encoding="utf-8")
-ddl = "\n".join(re.findall(r"(?ms)^``sql\n(.*?)^```$", schema))
+ddl = "\n".join(re.findall(r"(?ms)^```sql\n(.*?)^```$", schema))
 assert len(re.findall(r"\bCREATE TABLE\b", ddl)) == 24, "Unexpected DDL table count"
 assert "CREATE VIEW ready_issue_candidates" in ddl, "Missing readiness view"
 
