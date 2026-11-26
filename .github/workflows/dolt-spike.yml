@@ -53,5 +53,5 @@ jobs:
         run: python3 tests/spikes/dolt_rust.py
       - name: Verify pinned backup and restore primitives
         run: python3 tests/spikes/dolt_restore.py
-      - name: Verify the graph contention control
-        run: python3 tests/spikes/dolt_graph.py
+      - name: Verify graph contention with the shared Rust writer
+        run: python3 tests/spikes/dolt_graph_rust.py
