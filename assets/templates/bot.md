@@ -2,7 +2,7 @@
 description: "[When to read this bot's identity]"
 ---
 
-<!-- Save as bots/<bot-id>/SOUL.md. Define only durable identity and purpose. Keep routing/runtime references in README.md and learned knowledge in memory/<project-id>/MEMORY.md, with root MEMORY.md as navigation. Use common frontmatter fields only. Remove placeholders/comments. -->
+<!-- Save as bots/<bot-id>/SOUL.md. Define only durable identity and purpose. Keep optional human routing/navigation references in README.md, optional record-management instructions in AGENTS.md, latest curated memory in root MEMORY.md, and durable scoped knowledge in memory/<project-id>/MEMORY.md. Never inject the management entrypoints into Bot context. Use common frontmatter fields only. Remove placeholders/comments. -->
 
 # [Bot name]
 
