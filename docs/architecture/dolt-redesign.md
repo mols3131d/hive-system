@@ -75,3 +75,5 @@ Keep machine-readable JSON, stable errors, explicit scope selection and safe mut
 6. Implement and verify the reviewed baseline. Confirm old execution has stopped or been safely handed off before switching authority.
 
 No runtime, concurrency, migration or remote verification is claimed by this document.
+
+See the [proposed relational schema](dolt-schema.md) for candidate DDL, ready queries and concurrency invariants.
