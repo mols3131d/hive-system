@@ -72,6 +72,8 @@ with tempfile.TemporaryDirectory(prefix="hive-dolt-spike-") as tmp:
     assert re.search(r"\b" + re.escape(VERSION) + r"\b", version), version
     run("init", "--initial-branch", "main", "--name", "Hive Spike",
         "--email", "spike@example.invalid")
+    run("config", "--local", "--add", "user.name", "Hive Spike")
+    run("config", "--local", "--add", "user.email", "spike@example.invalid")
     run("sql", stdin=ddl)
     commit("synthetic schema")
     print("PASS: candidate DDL and readiness view created", flush=True)
