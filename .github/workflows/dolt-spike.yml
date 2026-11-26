@@ -5,8 +5,7 @@ on:
     branches:
       - docs/dolt-domain-redesign
     paths:
-      - tests/spikes/dolt_smoke.py
-      - tests/spikes/dolt_migration.py
+      - "tests/spikes/**"
       - .github/workflows/dolt-spike.yml
 
 permissions:
@@ -15,11 +14,16 @@ permissions:
 jobs:
   synthetic:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+      - name: Verify checked-out revision
+        env:
+          SPIKE_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$SPIKE_HEAD"
       - name: Download and verify pinned upstream release
         shell: bash
         run: |
@@ -38,7 +42,16 @@ jobs:
           tar -xzf "$work/$asset" -C "$work/bin" --strip-components=2 dolt-linux-amd64/bin/dolt
           test -x "$work/bin/dolt"
           printf '%s\n' "$work/bin" >> "$GITHUB_PATH"
+          printf 'HIVE_DOLT_BIN=%s\n' "$work/bin" >> "$GITHUB_ENV"
       - name: Execute first isolated probe
         run: python3 tests/spikes/dolt_smoke.py
       - name: Rehearse legacy mapping and rollback
         run: python3 tests/spikes/dolt_migration.py
+      - name: Set up the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+      - name: Verify Rust client against Dolt
+        run: python3 tests/spikes/dolt_rust.py
+      - name: Verify pinned backup and restore primitives
+        run: python3 tests/spikes/dolt_restore.py
+      - name: Verify the graph contention control
+        run: python3 tests/spikes/dolt_graph.py

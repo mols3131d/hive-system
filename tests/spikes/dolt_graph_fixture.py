@@ -27,6 +27,8 @@ def fixture_env(root):
     return {
         "HOME": str(home),
         "DOLT_ROOT_PATH": str(home),
+        "DOLT_DISABLE_VERSION_CHECKS": "true",
+        "DOLT_DISABLE_EVENT_FLUSH": "1",
         "XDG_CONFIG_HOME": str(home / "config"),
         "XDG_DATA_HOME": str(home / "data"),
         "XDG_STATE_HOME": str(home / "state"),
