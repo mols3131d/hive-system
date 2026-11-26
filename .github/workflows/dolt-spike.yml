@@ -1,0 +1,41 @@
+name: Dolt synthetic first probe
+
+on:
+  pull_request:
+    branches:
+      - docs/dolt-domain-redesign
+    paths:
+      - tests/spikes/dolt_smoke.py
+      - .github/workflows/dolt-spike.yml
+
+permissions:
+  contents: read
+
+jobs:
+  synthetic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download and verify pinned upstream release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=v2.7.6
+          asset=dolt-linux-amd64.tar.gz
+          work="$(mktemp -d "$RUNNER_TEMP/hive-dolt-release.XXXXXX")"
+          curl --fail --silent --show-error --location --retry 2 \
+            "https://api.github.com/repos/dolthub/dolt/releases/tags/$version" -o "$work/release.json"
+          digest="$(python3 -c 'import json,sys; a=next(x for x in json.load(open(sys.argv[1]))["assets"] if x["name"]==sys.argv[2]); print(a["digest"])' "$work/release.json" "$asset")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          curl --fail --silent --show-error --location --retry 2 \
+            "https://github.com/dolthub/dolt/releases/download/$version/$asset" -o "$work/$asset"
+          printf '%s  %s\n' "${digest#sha256:}" "$work/$asset" | sha256sum -c -
+          mkdir "$work/bin"
+          tar -xzf "$work/$asset" -C "$work/bin" --strip-components=2 dolt-linux-amd64/bin/dolt
+          test -x "$work/bin/dolt"
+          printf '%s\n' "$work/bin" >> "$GITHUB_PATH"
+      - name: Execute first isolated probe
+        run: python3 tests/spikes/dolt_smoke.py
