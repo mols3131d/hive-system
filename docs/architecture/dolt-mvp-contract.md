@@ -93,3 +93,147 @@ Migration: inventory legacy files read-only, stop/handoff affected agents, prese
 Test DDL, unique IDs/numbers/root slugs, FK and graph constraints, all lifecycle transitions, claim races, lock crash/recovery, commit ambiguity/retry, forbidden mutations, backup/restore, safe paths and host context exclusion on synthetic fixtures. Compare Rust SQL connectivity and operational cost before selecting production dependencies. No live data migration, production schema activation, automatic server launch or remote push implied. Later: multi-host authority, background leases/scheduling, generalized SQL query UI, binary store, custom Project fields, broader persistent Bot roles. Canonical legacy policies continue until reviewed replacement.
 
 References: [Dolt SQL server](https://www.dolthub.com/docs/sql-reference/server/), [configuration](https://www.dolthub.com/docs/sql-reference/server/configuration/), [access management](https://www.dolthub.com/docs/sql-reference/server/access-management/), [transactions](https://www.dolthub.com/docs/concepts/dolt/sql/transaction/), [Git remotes](https://www.dolthub.com/docs/sql-reference/version-control/remotes/), [backup](https://www.dolthub.com/docs/concepts/dolt/rdbms/backups/).
+
+
+## Detailed MVP review contracts
+
+The following are proposals for review, not adopted policy or implementation evidence. They refine the preceding baseline without changing the existing file-memory choice. Preserve the accepted identity/context boundary in #20 and the XDG direction in #18. Numeric limits, command syntax and alternative schema below are review defaults.
+
+### Bot and curated memory
+
+Keep system-owned Role policy, user-owned Soul, curated memory, work records and harness-owned sessions distinct. A Bot is a persistent Manager identity; Coordinator and Executor are runtime roles, not registered identities. A runtime session reference is optional, opaque and descriptive; it is neither an authenticated actor nor a Claim. No session table, transcript capture, runtime registry or native memory synchronization.
+
+Resolve the proposed path inconsistency before adoption: recommend `assets/bots/manager/<bot-uuid>/SOUL.md`, derived only from the immutable DB Bot ID and role, not from display name or slug. Existing slug paths remain unchanged until an explicit migration. System Role policy is versioned with the installed system; Soul contains the Bot identity and purpose, not a competing Role policy or authority grant. Registry and Soul identity fields must match. Optional README/AGENTS remain management-only. Reject traversal, symlinks/reparse points escaping the asset root, and invalid UTF-8. Never use a Bot asset directory as a host working directory for activation.
+
+Compare storage options:
+
+| Criterion | Git Markdown (current candidate) | Dolt memory records (recommended alternative) |
+| --- | --- | --- |
+| Canonical body | Scoped files, editable with review | One Markdown body per record, edited through reviewed domain operation |
+| Selection | File manifest and scoped paths | Bot/scope/key index and explicit queries |
+| Provenance/revisions | Frontmatter and Git object | Typed metadata and Dolt revision |
+| Coordination | Separate Git review and asset snapshot | Common guarded transaction and receipt |
+| Restore | DB + Git asset pair | Memory restored with DB; Soul still needs asset pair |
+
+Recommend the Dolt alternative for predictable selection and consistency, subject to user approval and spike. Do not alter the 23-table schema or required MEMORY.md files before that decision. Preserve #20's semantic distinction: a compact, required latest-memory entrypoint (empty is valid) and optional long-term scoped knowledge. In the alternative, latest becomes a derived view over explicitly curated latest records (empty list is valid), not a duplicated summary file or generated canonical text. A single record belongs to exactly one Bot and either global or exact Area scope; Project and Issue are not memory namespaces. Task-specific continuity belongs in Issue handoff/evidence, not memory. Authoritative policy, source facts and reusable procedures remain at their source.
+
+Conditional schema (not active DDL): add one `bot_memories` table with id UUID, bot_id FK, nullable area_id FK, kind latest|durable, stable topic_key, title, body, source_ref, author_ref, reviewed_by_ref, approval_ref, observed_at, reviewed_at, revision, created_at, updated_at, retired_at and retirement_reason. A latest entry has global scope; durable entries may be global or Area-specific. Enforce uniqueness of live (bot_id, scope, topic_key) under the common lock including NULL scope, same key retained on update; no duplicate copy between kinds. Promotion changes the same record's kind/scope, requires review and removes it from latest recall. Require nonempty source/evidence and approval references verified through the existing authorization contract, not merely self-asserted text. Retire rather than purge, exclude retired from recall; history/backups may retain content. No secrets or information requiring guaranteed erasure. An empty memory namespace is normal. Initial migration maps legacy general to global, other scopes to explicit Areas; distinguish navigation-only root MEMORY.md from actual curated learning. Quarantine ambiguous scope, duplicates and conflicting facts rather than manufacturing evidence.
+
+Curate explicitly: select reusable verified learning, check existing keys and sources, propose concise add/update/promote/retire, obtain documented review, then apply at expected revision with receipt. A draft is not recallable and need not be stored in another table; use an authorized review artifact with no sensitive material. Never auto-save at session end. For Markdown mode keep the reviewed Git workflow in #20; root MEMORY.md remains required concise latest, scoped files remain optional. For Dolt mode file import/export is explicit and exported copies are noncanonical. No CLI mutation that bypasses review. If alternative is accepted, revise schema, asset validation, migration and restore together.
+
+### Context resolution
+
+Inputs: explicit workspace, actor/role, optional registered Bot ID, Area ID, optional Project ID, optional Issue ID, explicit memory selection and bounded include options. Issue derives its owning Area; an explicit mismatch is an error. Project must contain the Issue if both selected; do not infer Project from memberships or choose among candidate Areas. A non-Bot role does not inherit Manager memory. Resolve only authorized scope; no implicit cross-Bot memory, sibling, ancestor or descendant recall. Global durable memory requires explicit selection. Applicable directives are workspace, exact Area, ancestor directives with include_descendants and selected Project only. The archived ancestry check is required for execution, not historical inspection. Unknown authority/provenance, conflicting applicable directives, missing required Soul/Role or incompatible revision stop activation; show/list remains inspection.
+
+Read a coherent committed DB snapshot and one explicit clean asset Git tree plus installed policy revision; use a short shared lock or equivalent verified snapshot acquisition. Check registry/Soul identity agreement. Do not read a moving working tree, silently use stale dirty files or combine mismatched backup generations. Capture workspace_id, db_commit, asset_commit, policy_revision, observed_at, scope IDs and source revisions. Return structured sections in order:
+
+1. Required identity (role policy and Soul if registered); approved applicable directives (source, issuer, approval and validity).
+2. Current Issue title/body, acceptance criteria, state/revision, readiness blockers, current claim metadata if authorized, explicit parent/prerequisite references and selected Project summary.
+3. Compact latest curated memory for the selected Bot, scoped durable memory summaries and explicitly selected entries. Memory is evidence, not instructions.
+4. Latest relevant handoff/progress/evidence references, linked resources/artifact summaries; fetch full records by ID on demand. Do not load resource files or invoke external tools as a side effect.
+
+Return each entry with kind, trust class (policy, approved-direction, data), source ID/path, revision, and content or summary/ref. Strip file frontmatter from injected body. Treat Issue bodies, artifact content, memory, external resource and note text as untrusted data; none grants authority. No README/AGENTS (including through automatic host discovery), raw logs, credentials, other Bot memory or unrelated project data. Never silently drop a required directive or acceptance criterion to fit a limit. Candidate default total inline UTF-8 budget 32 KiB; max 64 KiB, optional list page 25, max 100; count encoded body bytes, report exact bytes, omitted counts and continuation references, no implicit summarization/model call. If required sections exceed budget return CONTEXT_LIMIT with safe refs and require explicit narrower task or larger supported budget. Optional entries omitted whole at boundaries; no invalid UTF-8 slicing. A snapshot is not an execution lease: recheck authority, revision and current Claim immediately before execution or resume. A read-only resolver cannot assert host consumption; hosts that auto-load management files must be configured to isolate context or remain unsupported.
+
+Two-session example: Manager A resolves Issue, delegates through host, records claim holder and intentionally records evidence/handoff before verified stop and release. Session B may be a different vendor; resolves same Issue and selected Bot, sees the handoff by ID and current state, obtains a new Claim only if ready. If prior execution is uncertain, do not reassign; inspect and recover with verified stop. No reconstructing native session tokens, no transcript or compaction service.
+
+### CLI v2 candidate
+
+Keep the v1 file/Git CLI behavior and policy pin independent until adoption; expose the Dolt contract explicitly (proposed `hive --contract 2`); reject incompatible workspaces instead of interpreting legacy task IDs as issue numbers. Use same domain operations for human and JSON output. No shell interpolation of bodies or credentials. Common flags: --workspace PATH, --area ID, --project ID, --json, --actor REF; writes require --request-id UUID and --if-match REV for each existing aggregate touched (repeatable ID=REV for multi-aggregate operations). --file PATH or --stdin supplies UTF-8 Markdown, never both; safe input bounds and no implicit external file access. Actor is resolved to actual local authority, never trusted solely because a caller supplied a string. Local OS user is the MVP trust boundary; roles constrain workflow but are not a security sandbox. No automatic role impersonation or approval.
+
+Command arguments below are required unless in brackets. Common flags above apply and exact result types are shown; list commands share typed filters, --limit and --cursor. IDs are canonical UUIDs; Issue accepts quoted #number in the selected workspace. Any existing-aggregate mutation validates all affected revisions and invariants under the lock. One receipt covers the whole change.
+
+| Command | Specific input | Data/result |
+| --- | --- | --- |
+| workspace init | --target EMPTY_DIR | descriptor, schema, initial DB/asset revisions |
+| workspace status / doctor | workspace | observed identity, versions, state, diagnostics; no repairs |
+| workspace start / stop | workspace | verified process and endpoint state; no claim changes |
+| area create | --slug SLUG --name NAME [--parent ID] | Area ID/revision |
+| area list / tree / show | [--parent ID] / [--root ID] / ID | scoped summaries/tree/detail, bounded traversal |
+| area move / archive / restore | ID [--parent ID or --root for move] | Area receipt; reject cycles/active subtree claims |
+| project create / list / show | --name NAME / [--status STATE] / ID | Project ID or page/detail |
+| project add-issue / remove-issue | PROJECT ISSUE | membership receipt; no Issue lifecycle change |
+| project complete / archive | PROJECT --reason TEXT | Project receipt |
+| issue create | --area ID --type TYPE --title TITLE [--file PATH] | ID, immutable number, backlog revision |
+| issue list / ready / blocked | explicit scope or --all; [--status, --type, --priority, --label] | page of summaries; readiness reasons |
+| issue show | ISSUE | detail and relation refs |
+| issue update | ISSUE [--title, --file, --acceptance-file, --priority, --hold, --clear-hold] | revision; reject no-op or invalidation of running/accepted work |
+| issue select | ISSUE | todo receipt; acceptance criteria required |
+| issue claim | ISSUE --holder REF | confirmed Claim ID and issue revision |
+| issue release / recover | ISSUE --claim ID --stop-evidence REF --reason TEXT | todo; recovery requires authorized reviewer/owner |
+| issue submit | ISSUE --claim ID --stop-evidence REF --evidence REF --file PATH | review; append result note, clear claim |
+| issue submit-epic | ISSUE --evidence REF --file PATH | review; children resolved, no claim |
+| issue request-changes / accept | ISSUE --file PATH --approval REF | todo/done with review or outcome |
+| issue cancel / reopen | ISSUE --reason TEXT --approval REF | terminal/todo; cancel running only after explicit release, reopen checks dependents |
+| issue note | ISSUE --kind KIND --file PATH [--claim ID] | note ID; claim required for holder-sensitive updates |
+| issue set-parent | ISSUE --parent ID or --clear | relation receipt |
+| issue add-dependency / remove-dependency | ISSUE PREREQUISITE | relation receipt, DAG validation |
+| label create / list | --name NAME / scope | label ID or page |
+| issue label / unlabel | ISSUE LABEL | relation receipt |
+| resource register / list / show | --kind KIND --name NAME [--uri URI] / scope / ID | Resource ID or page/detail |
+| resource link-area / link-issue | RESOURCE AREA_OR_ISSUE | relation receipt |
+| directive create / list / show | one scope + --title + --file + --source / scope / ID | proposed record or page/detail |
+| directive activate / withdraw / supersede | ID --approval REF [--replacement ID for supersede] | verified applicability/review receipt |
+| artifact create / list / show / update | --kind --title --file [scope refs] / scope / ID / ID --file PATH | Artifact ID or page/detail/revision |
+| artifact link / unlink | ID --kind area|project|issue|resource --target ID | relation receipt |
+| artifact archive | ID --reason TEXT --approval REF | receipt, retention guard |
+| bot list / show | list / ID | metadata and explicit Soul inspection; no activation |
+| bot register / retire | --slug --asset-revision --approval / ID --approval | registry receipt; prepare reviewed Soul first; retire only after related execution reconciled |
+| memory list / show | BOT [--latest or --area ID or --global] / BOT MEMORY_REF | page/detail of authorized curated records |
+| memory apply | BOT --proposal REF --approval REF | conditional Dolt-mode curated mutation; Markdown mode uses reviewed Git edits instead |
+| context resolve | scope flags [--bot ID --issue ID --include-memory REF --budget BYTES] | bounded context snapshot |
+| validate | --all or explicit scope | structural/domain diagnostics and source revisions |
+| operation show | REQUEST_ID | confirmed historical receipt or explicit absent/uncertain state, current claim separately |
+| backup create / restore | --destination NEW_DIR / --source SNAPSHOT --target EMPTY_DIR | verified manifest or inactive restored copy |
+
+Commands that edit identities, directives, memories or terminal decisions require verified review as appropriate; approval refs are not proof by themselves. For registration in Markdown mode verify required latest MEMORY.md too. No public generic SQL write, raw transition setter or automatic deletion. Unlisted administrative operations remain offline and explicit, not hidden CLI behavior.
+
+JSON v2 uses one object on stdout, diagnostics on stderr. Envelope: schema_version:2, ok, command, context:{workspace_id,db_commit,asset_commit,policy_revision,scope,observed_at}, data or error:{code,message,details}, warnings. Omit unavailable fields; no invented revision. All lists return items, next_cursor|null, truncated, observed revision. Stable sort with ID tie-breaker, NULL priority last; cursor binds query, scope, sort and snapshot; reject changed query/revision as STALE_CURSOR, never skip/repeat silently. Ready/blocked distinguish empty from unavailable, and readiness does not convey permission. Mutation receipt: request_id, kind, result IDs/revisions, base commit, confirmed commit, outcome confirmed|replayed. Persist enough result metadata to reproduce original receipt (extend operation_receipts if required by spike); historical receipt does not prove current Claim. Same request/fingerprint returns original result; changed payload conflicts. Never report confirmed on lost acknowledgement or pending version publication.
+
+Retain v1 exit categories where possible: 0 success; 1 INTERNAL_ERROR; 2 INVALID_ARGUMENT/AMBIGUOUS_SCOPE/CONTEXT_LIMIT; 3 NOT_FOUND; 4 INVALID_TRANSITION/SCHEMA_INCOMPATIBLE/CONSTRAINT_VIOLATION/NOT_READY; 5 CLAIM_CONFLICT/STALE_REVISION/STALE_CURSOR/LOCK_BUSY/REQUEST_CONFLICT; 6 UNAUTHORIZED; 7 AUTHORITY_UNVERIFIED/IO_ERROR/NOT_IMPLEMENTED/RUNTIME_UNAVAILABLE; 8 COMMIT_UNCERTAIN. Errors specify safe observed revision or blocker, not secret payload; unknown write requires operation show and authoritative reconciliation before retry. Before activation all v2 operations return NOT_IMPLEMENTED or incompatible contract without opening real data.
+
+### Shared Skill procedure
+
+Use distributable Rulesync source, not generated vendor assets. Skill is instructions for the host, not an executor or approval service. Establish exact workspace/role and applicable user authority; doctor/status then context resolve. Inspect only selected scope; list ready or inspect specific Issue; blocked work remains blocked. Manager plans/delegates, Coordinator coordinates, Executor performs approved task; no automatic runtime invocation assumed. Before execution acquire/verify exact Claim, check fresh authority and required context. Use host-native execution only within authorized scope. Record concise progress, evidence and handoff as Issue notes/artifacts; do not log all conversation. Confirm stop from actual host or authorized external evidence, then release or submit with exact Claim. Reviewer independently accepts or requests changes; no automatic self-accept. Uncertain stop or commit means halt and reconcile; never recover automatically. Resume in another session by fresh resolution and current claim check, not previous conversation. Memory curation is separate reviewed action. Skill consumes v2 JSON and handles errors without assuming command success, and must not install/configure hosts or modify external repositories without explicit authorization.
+
+### Installation, lifecycle and recovery
+
+Candidate first target: Unix local filesystem with reliable process-held locks. Pin tested Dolt release, Rust dependencies and supported platform in release manifest; no version claim before spike. Installation copies verified binary and distributable Skill to explicit user destinations; no auto-start/service/host integration. Doctor checks binary version, XDG absolute paths and owner/mode, supported filesystem/lock, free space, endpoint, schema, matching workspace descriptor/DB identity and clean authority; read-only, never prints credentials. Unsupported platform or path refuses operation rather than falling back silently.
+
+Init only on explicit empty target (no symlink escape), initialize DB main/schema/ledger/counter, Git asset tree and descriptor in isolated staging; verify consistency before publication. Failed init preserves clearly marked partial staging and does not select it. Recommend local restrictive directories/files (0700/0600 where supported). Keep endpoint, PID/process-start identity, runtime nonce, local credentials and recovery markers outside tracked data. Use a private runtime socket if supported by pinned Dolt; else authenticated loopback, no external listener. No ambient root/no-password access; separate constrained reader/writer identities, tested procedure privileges. Resolve lock by canonical root plus verified workspace identity; reject aliases/duplicate active authority. Keep lock file inode stable; never unlink to steal.
+
+Start under lock, verify no competing process/endpoint, launch explicit Dolt process, verify identity/database and connection using bounded timeout before reporting running; failure reports stopped or unknown, not success. Stop under lock only verified owned process; drain Hive writes, request graceful stop, check actual exit; never kill arbitrary PID or clear a claim. PID reuse, stale marker and unexpected external server require inspection and safe refusal. Status distinguishes uninitialized, stopped, running, incompatible, recovery-required, unknown. No automatic repair or restart. Crash releases OS lock; next writer checks dirty DB working set, unresolved receipts and authority before any mutation. If SQL commit/version commit split, require explicit recovery protocol and block new writes until identified commit or rollback proven; never delete state to resolve ambiguity. Execution may continue outside Hive after DB stop; never infer worker stop from server shutdown.
+
+Backup: take exclusive workspace lock and require quiesced asset editors; require committed DB and clean asset Git tree; refuse pending writes or unknown claims/execution state for promotable backup. Export Dolt-native recoverable snapshot with history and Git asset snapshot with history into new staging destination, not a copy of live database files. Manifest includes format version, workspace ID, schema, Dolt version/commit, asset Git commit, policy revision, relative file paths, SHA-256 digests, creation time, and consistency state; no credentials, local bindings, host paths or logs. Verify actual revisions and digests before final atomic publication within same filesystem; incomplete snapshot never usable as completed backup. Explicit destination only, no network or remote push. A known active claim may be preserved in an inactive forensic snapshot only if explicitly classified non-promotable; never clear it during export.
+
+Restore checks manifest/version, safe relative paths, digest and exact revisions before importing to separate empty target. Use isolated restore staging, validate schema, graph, IDs, receipt history, assets and claims; compare logical row counts and content hashes. Keep workspace identity, regenerate only machine-local bindings/credentials after verification. Restore returns inactive copy; explicit authority promotion requires old writers and external executions stopped, review of all claims and separate authorization. Two writable copies with same identity unsupported. No automatic authority switch, overwrite, merge, rollback of live state or deletion of original. Malformed/incomplete snapshot remains isolated, no writes to original. Remote backup/merge remains a synthetic spike and future review item.
+
+### Acceptance matrix and evidence
+
+All tests use isolated synthetic workspaces, two independent CLI processes where needed, no real data or remote credentials. Commands are proposed v2 names; executable tests must use actual implemented syntax and record exact version, OS/filesystem, revision, command/fixture, exit/JSON, observed commits and invariants. A missing/unrun test is not a pass.
+
+| Case | Procedure | Required result |
+| --- | --- | --- |
+| A01 bootstrap | doctor, init empty target, start, status; repeat init | verified identity, no network; second init refuses, original unchanged |
+| A02 domain | create Area/sub-area, cross-Area Project, two Issues, membership and dependency; select | stable IDs/numbers, blocked until prerequisite done; Project has no independent execution state |
+| A03 lifecycle | claim prerequisite, note, submit with stop/evidence, accept; ready dependent | transitions exact, only in-progress has one claim, accepted done unlocks readiness |
+| A04 contention | two processes claim same Issue from same revision; also competing dependency changes | exactly one verified claim; no cycle or invalid prerequisite; loser conflict |
+| A05 continuity | save authorized curated memory and handoff; release verified stopped; new session context and claim | bounded correct scope, stable refs, fresh Claim, no old session requirement |
+| A06 scope and trust | two Bots/Areas and multi-Project membership; conflicting directives and management files | no unrelated memory/README/AGENTS; mismatch/conflict fails closed; representative host isolation separately observed |
+| A07 lifecycle negatives | try epic claim, blocked claim, invalid closure, cancelled prerequisite, reopen with running dependent | reject; no state or Claim side effects |
+| A08 graph/identity | duplicate ID/root slug/number; Area, parent and dependency cycles; archived ancestry | reject duplicate/cycle and executing archived scope; no partial write |
+| A09 revisions/receipt | same request twice; modified payload same ID; stale revision and cursor; simulate lost ack | replay original, conflict/uncertain as appropriate; reconcile current authority separately |
+| A10 crash/lock | crash writer before transaction commit and after commit before response; contend lock and restart | rollback or exactly one committed receipt; no lock theft; uncertain state blocks writes |
+| A11 inputs | malformed UUID/UTF-8, oversize required context, symlink/path traversal, spoofed actor/approval | typed errors, no unintended I/O or disclosure |
+| A12 review | request changes then re-claim and submit; parent with cancelled child | new Claim required, recorded scope acceptance, reviewer evidence |
+| A13 backup/restore | stop execution, consistent backup, restore separate target; corrupt digest/manifest and reuse nonempty target | logical contents/history match; inactive copy; corrupted/nonempty targets refused |
+| A14 lifecycle failure | stale PID, occupied endpoint, wrong identity/version, pending DB state | no arbitrary stop/start or authority fallback; safe diagnostics |
+| A15 compatibility | legacy workspace pinned policy, explicit v2 command, existing v1 read | no reinterpretation/migration; preserve prior state and v1 contract |
+| A16 remote spike | local synthetic remote backup/restore and divergent graph/claim updates | no automatic merge or independent-clone ownership; domain revalidation catches conflicts |
+
+End-to-end acceptance requires A01–A15 on supported runtime, plus pinned Dolt spike evidence covering DDL including FK/CHECK, root uniqueness, transaction isolation and SQL/version commit behavior, OS lock contention, rollback, restore and merge constraints (A16). Test actual Rust SQL connection, no credentials in diagnostics, and at least two representative host/session flows or explicitly restrict supported host integration. Documentation checks alone are insufficient. Migration requires separately reviewed mapping and disposable-copy rollback validation; not part of live MVP test.
+
+### Compatibility and next gates
+
+#19/#18: retain XDG precedence, absolute-path validation, explicit local default and legacy pin; Dolt-specific state/runtime directories and single local authority are proposed replacements, not reinterpretations of the old native Git coordination. #21/#20: preserve Manager-only registration, latest versus durable semantics, explicit inspection and management-context exclusion; changing memory medium or path requires review. Keep both PRs and existing branches intact. #9 configuration, #10 validation, #11 reads/context, #12 mutations, #13 coordination and #14 Skill can reuse unaffected code/tests; storage-specific implementation must be reconciled after #22 adoption. #15 acceptance moves to the new matrix only after approved contract transition. No closing issues, cancelling existing work or activating new policies from this draft.
+
+Open decisions: Memory medium and exact asset path; supported Dolt release/OS and SQL/version-commit protocol; authority/review evidence representation, receipt schema and revision granularity; final command names and bounds. Verify these in review and synthetic spike before implementation/adoption. Do not treat this section as proof of runtime safety.
