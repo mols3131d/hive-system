@@ -8,6 +8,8 @@ This relational design supports the adopted Dolt v2 development baseline. The MV
 
 The system-owned initial migration implements the 24 reviewed tables on Dolt 2.7.6. Storage schema version 1 records the lowercase SHA-256 of that SQL file in `schema_migrations`. Keep the migration bytes fixed once applied. An explicit bootstrap supplies the singleton workspace identity, ledger row and initial Issue counter. The illustrative SQL below retains the reviewed design and its spike inputs. [Initial migration](../../assets/schema/dolt/0001_initial.sql), [read-only validation and verification](../development/README.md#dolt-record-validation).
 
+The validator checks the committed column, key, foreign key and CHECK definitions against SHA-256 fingerprints generated from the migration with the Dolt 2.7.6 renderer. It omits the trailing table-default `utf8mb4` collation token since the migration inherits that setting. The charset, column-level collation overrides and constraint names and definitions are part of the fingerprint. [Schema shape manifest](../../assets/schema/dolt/0001_schema.sha256).
+
 ## Relational conventions
 
 One database per workspace. Do not partition by Area, Project or repository. Use immutable application-generated UUIDs (UUIDv7 candidate; CHAR(36) initially) as PKs; paths, names and display numbers are not identities. The recommended baseline uses immutable workspace-wide display issue numbers; allocate through a counter under the authoritative lock, not MAX+1 or independent clones. Use UTC timestamps and explicit schema migrations. No automatic deletion cascades on business records. Prefer archive/close to delete. Stable IDs survive moves. A human or session holder reference is not a registered Bot ID or credential.

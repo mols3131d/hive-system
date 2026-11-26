@@ -42,6 +42,8 @@ Validation checks Issue closure fields and active Claim cardinality. An active C
 
 Validation checks canonical UUIDv7 IDs for Projects, Resources and Labels, exact Project statuses (`active`, `completed` and `archived`), and both endpoints of Project memberships, Area and Issue Resource links, and Issue Label links. Projects may span Areas, and Resources may be shared. Label-name uniqueness follows the SQL unique key and its collation. The contract calls for normalized labels and leaves the normalization rule unspecified.
 
+The validator compares each required table's `SHOW CREATE TABLE ... AS OF` output with the migration's Dolt 2.7.6 schema shape. Dirty and staged definitions are outside the inspected commit. The exact `issue_number` counter key must have a positive next value greater than every Issue number at that commit. Historical issuance and reuse require separate history evidence.
+
 For an explicitly provisioned synthetic server on Dolt 2.7.6, supply the reader credentials in the process environment as `HIVE_DOLT_USER` and `HIVE_DOLT_PASSWORD`. Select the database, port and expected UUID explicitly.
 
 ```sh
@@ -56,6 +58,13 @@ Run the integration tests with the pinned Dolt executable. The fixtures provisio
 
 ```sh
 HIVE_DOLT_BIN=/absolute/path/to/dolt cargo test --locked --test dolt_validation -- --ignored
+```
+
+To reproduce the schema shape manifest, run its fixture with output enabled. It applies the canonical migration in fresh databases with inherited `utf8mb4_0900_bin` and `utf8mb4_0900_ai_ci` collations. For each database it prints the SHA-256 of the returned table definition after omitting the trailing table-default collation token, with one digest and table name per line in table name order. Both sets must match the checked-in manifest. [Schema shape manifest](../../assets/schema/dolt/0001_schema.sha256).
+
+```sh
+HIVE_DOLT_BIN=/absolute/path/to/dolt cargo test --locked --test dolt_validation \
+  reproduces_initial_schema_manifest_across_inherited_collations -- --exact --ignored --nocapture
 ```
 
 ## Agent-assisted development

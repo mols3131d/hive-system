@@ -14,32 +14,7 @@ use crate::error::{ErrorCode, HiveError};
 const DOLT_VERSION: &str = "2.7.6";
 pub(crate) const STORAGE_SCHEMA_VERSION: u32 = 1;
 const INITIAL_SCHEMA: &[u8] = include_bytes!("../assets/schema/dolt/0001_initial.sql");
-const REQUIRED_TABLES: &[&str] = &[
-    "area_resources",
-    "areas",
-    "artifact_areas",
-    "artifact_issues",
-    "artifact_projects",
-    "artifact_resources",
-    "artifacts",
-    "bot_memories",
-    "bots",
-    "directives",
-    "issue_claims",
-    "issue_dependencies",
-    "issue_labels",
-    "issue_resources",
-    "issue_updates",
-    "issues",
-    "labels",
-    "operation_receipts",
-    "project_issues",
-    "projects",
-    "resources",
-    "schema_migrations",
-    "workspace_counters",
-    "workspace_meta",
-];
+const INITIAL_SCHEMA_MANIFEST: &str = include_str!("../assets/schema/dolt/0001_schema.sha256");
 const MAX_ROWS_PER_TABLE: usize = 100_000;
 
 pub(crate) struct ValidationReport {
@@ -150,6 +125,7 @@ pub(crate) fn validate(args: &ValidateArgs) -> Result<ValidationReport, HiveErro
         ));
     }
 
+    snapshot.verify_table_definitions()?;
     let diagnostics = records::validate(&mut snapshot)?;
     Ok(ValidationReport {
         workspace_id: workspace_id.to_owned(),
@@ -181,7 +157,7 @@ impl Snapshot {
             &mut self.connection,
             format!("SHOW FULL TABLES AS OF '{}'", self.commit),
         )?;
-        for required in REQUIRED_TABLES {
+        for (required, _) in initial_schema_tables() {
             if !tables
                 .iter()
                 .any(|(name, kind)| name == required && kind == "BASE TABLE")
@@ -202,6 +178,23 @@ impl Snapshot {
             return Err(incompatible_schema(
                 "The committed migration ledger must contain exactly the supported schema version and digest.",
             ));
+        }
+        Ok(())
+    }
+
+    fn verify_table_definitions(&mut self) -> Result<(), HiveError> {
+        for (table, expected_digest) in initial_schema_tables() {
+            let definitions: Vec<(String, String)> = query_rows(
+                &mut self.connection,
+                format!("SHOW CREATE TABLE {table} AS OF '{}'", self.commit),
+            )?;
+            if !matches!(definitions.as_slice(), [(name, sql)]
+                if name == table && format!("{:x}", Sha256::digest(table_shape(sql))) == expected_digest)
+            {
+                return Err(incompatible_schema(format!(
+                    "The committed definition of {table} differs from storage schema version {STORAGE_SCHEMA_VERSION}."
+                )));
+            }
         }
         Ok(())
     }
@@ -241,6 +234,32 @@ impl Snapshot {
             ));
         }
         Ok(rows)
+    }
+}
+
+fn initial_schema_tables() -> impl Iterator<Item = (&'static str, &'static str)> {
+    INITIAL_SCHEMA_MANIFEST.lines().map(|entry| {
+        let (digest, table) = entry
+            .split_once("  ")
+            .expect("schema manifest digest and table");
+        (table, digest)
+    })
+}
+
+fn table_shape(definition: &str) -> &str {
+    // The migration inherits the table-default collation. Preserve the charset and all column clauses.
+    if let Some((shape, collation)) = definition.rsplit_once(" COLLATE=")
+        && shape.ends_with(" DEFAULT CHARSET=utf8mb4")
+        && collation.strip_prefix("utf8mb4_").is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+    {
+        shape
+    } else {
+        definition
     }
 }
 
