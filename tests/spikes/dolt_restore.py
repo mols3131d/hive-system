@@ -447,6 +447,48 @@ def probe_restore(tools, root):
     return native, db_commit
 
 
+def probe_stale_promotion(tools, root, native, base):
+    # Both copies retain the workspace ID. Only the former authority receives
+    # a new issued number and receipt, after the snapshot was taken.
+    root.mkdir()
+    for name in ("recovered", "former-authority"):
+        tools.dolt(root, "backup", "restore", native.as_uri(), name)
+    recovered, former = root / "recovered", root / "former-authority"
+    issue, request, revision = map(fixture_id, (80, 81, 82))
+    tools.dolt(
+        former,
+        "sql",
+        stdin=f"""
+        SET @@SESSION.dolt_transaction_commit=1;
+        START TRANSACTION;
+        INSERT INTO issues (id,number,area_id,title,type,status,revision,created_at,updated_at)
+        VALUES ('{issue}',5,'{AREA}','Issued after backup','task','backlog','{revision}',
+                '{TIMESTAMP}','{TIMESTAMP}');
+        UPDATE workspace_counters SET next_value=6 WHERE name='issue_number';
+        INSERT INTO operation_receipts
+        (request_id,kind,fingerprint,actor_ref,authorization_ref,workflow_evidence_json,
+         base_commit,result_json,created_at)
+        VALUES ('{request}','issue.create',REPEAT('b',64),'fixture-actor','fixture-review',
+                '{{}}','{base}','{{"issue_id":"{issue}","number":5}}','{TIMESTAMP}');
+        COMMIT;
+        """,
+    )
+    verified_final = tools.head(former)
+    assert verified_final != base
+    assert tools.workspace_id(recovered) == tools.workspace_id(former) == WORKSPACE
+    assert tools.head(recovered) == base
+    counter = "SELECT next_value FROM workspace_counters WHERE name='issue_number'"
+    assert tools.scalar(recovered, counter) == "5"
+    assert tools.scalar(former, counter) == "6"
+    receipt = f"SELECT COUNT(*) FROM operation_receipts WHERE request_id='{request}'"
+    assert tools.scalar(recovered, receipt) == "0"
+    assert tools.scalar(former, receipt) == "1"
+    with rejects("incomplete final authority history"):
+        if tools.head(recovered) != verified_final:
+            raise Rejected("incomplete final authority history")
+    print("PASS: stale same-identity restore would reuse issue #5 and omit its receipt")
+
+
 def probe_git_transport(tools, root, native, base):
     root.mkdir()
     tools.dolt(root, "backup", "restore", native.as_uri(), "transport-db")
@@ -575,6 +617,7 @@ def main():
         print(version, flush=True)
         print(tools.git(root, "--version").strip(), flush=True)
         native, base = probe_restore(tools, root)
+        probe_stale_promotion(tools, root / "stale-promotion", native, base)
         probe_git_transport(tools, root / "transport", native, base)
     print("PROBES PASSED: isolated backup, inactive restore and local Git divergence")
 
