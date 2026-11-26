@@ -39,7 +39,7 @@ Proposed relationships:
 | Issue to prerequisite Issue | N:M |
 | Issue to active Claim | 0:1 |
 
-Use explicit domain tables and foreign keys, not a generic entity/attribute/value store. Resolve stable IDs separately from names, paths and external addresses. Define uniqueness, root sibling slug collisions, deletion restrictions, cross-area references and cycle rejection. Area ancestry and issue parentage do not imply execution dependencies or automatic context/authority inheritance.
+Use explicit domain tables and foreign keys, not a generic entity/attribute/value store. Resolve stable IDs separately from names, paths and external addresses. Define uniqueness, root sibling slug collisions, deletion restrictions, cross-area references and cycle rejection. Area ancestry and issue parentage do not imply execution dependencies or automatic context/authority inheritance. Validate the combined completion graph (prerequisite and parent-completion obligations) to prevent otherwise acyclic graphs from deadlocking acceptance.
 
 ## Work graph
 
@@ -63,7 +63,7 @@ Retain Manager, Coordinator and Executor responsibilities. Bot is a persistent M
 
 ## CLI direction
 
-Keep machine-readable JSON, stable errors, explicit scope selection and safe mutation receipts. Candidate domains: area, project, issue, resource, artifact, directive, bot, memory, context, validate, doctor and sync. Include filtered issue lists, ready/blocked, dependency traversal, guarded claim/release and context resolution. Prefer bounded, read-only SQL queries where useful; domain writes must enforce lifecycle and ownership invariants. See the proposed [MVP command and compatibility contract](dolt-mvp-contract.md).
+Keep machine-readable JSON, stable errors, explicit scope selection and safe mutation receipts. Candidate domains: area, project, issue, resource, artifact, directive, bot, memory, context, validate, doctor and backup. Remote sync is deferred beyond the local MVP. Include filtered issue lists, ready/blocked, dependency traversal, guarded claim/release and context resolution. Prefer bounded, read-only SQL queries where useful; domain writes must enforce lifecycle and ownership invariants. See the proposed [MVP command and compatibility contract](dolt-mvp-contract.md).
 
 ## Review and transition gates
 
