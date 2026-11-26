@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -20,10 +21,29 @@ pub(crate) struct Invocation {
 pub(crate) enum ParseFailure {
     Display(clap::Error),
     Invalid {
+        contract: Contract,
         format: Format,
         command: Option<String>,
         message: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub(crate) enum Contract {
+    #[default]
+    #[value(name = "1")]
+    V1,
+    #[value(name = "2")]
+    V2,
+}
+
+impl Contract {
+    pub(crate) const fn schema_version(self) -> u8 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -51,6 +71,9 @@ impl Format {
 
 #[derive(Args)]
 struct CommonArgs {
+    /// Select the CLI contract version.
+    #[arg(long, value_enum, value_name = "VERSION")]
+    contract: Vec<Contract>,
     /// Select the Hive workspace.
     #[arg(long, value_name = "PATH")]
     workspace: Vec<PathBuf>,
@@ -75,6 +98,7 @@ struct CommonArgs {
 }
 
 pub(crate) struct CommonOptions {
+    pub(crate) contract: Contract,
     pub(crate) workspace: Option<PathBuf>,
     pub(crate) project: Option<ProjectId>,
     pub(crate) project_root: Option<PathBuf>,
@@ -140,16 +164,20 @@ impl FromStr for TaskId {
 }
 
 fn parse_slug(value: &str) -> Result<String, &'static str> {
-    if value.split('-').all(|part| {
-        !part.is_empty()
-            && part
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-    }) {
+    if is_slug(value) {
         Ok(value.to_owned())
     } else {
         Err("expected a lowercase kebab-case identifier")
     }
+}
+
+pub(crate) fn is_slug(value: &str) -> bool {
+    value.split('-').all(|part| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -586,7 +614,6 @@ pub(crate) enum MemoryCommand {
 }
 
 #[derive(Args)]
-#[allow(dead_code, reason = "Workspace validation follows the CLI bootstrap")]
 pub(crate) struct ValidateArgs {
     #[arg(long, value_name = "TASK", conflicts_with = "all_projects")]
     pub(crate) task: Option<TaskId>,
@@ -594,6 +621,18 @@ pub(crate) struct ValidateArgs {
     pub(crate) all_projects: bool,
     #[arg(long, value_name = "BASE-OID")]
     pub(crate) against: Option<CommitOid>,
+    /// Validate the whole workspace with contract 2.
+    #[arg(long)]
+    pub(crate) all: bool,
+    /// Expected identity of the local Dolt workspace.
+    #[arg(long, value_name = "UUID")]
+    pub(crate) workspace_id: Option<String>,
+    /// Explicit local Dolt database name.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) database: Option<String>,
+    /// Explicit local Dolt SQL Server port.
+    #[arg(long, value_name = "PORT")]
+    pub(crate) port: Option<NonZeroU16>,
 }
 
 pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
@@ -624,6 +663,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             let matched = root.and_then(|args| matched_leaf(&cli, args));
             let leaf = matched.as_ref().map(|(_, args)| *args);
             let format = requested_format(root, leaf);
+            let contract = requested_contract(root, leaf);
             let message = safe_parse_message(error.kind());
             let message = if format == Format::Text {
                 cli.build();
@@ -632,6 +672,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 message.to_owned()
             };
             return Err(ParseFailure::Invalid {
+                contract,
                 format,
                 command: matched.map(|(name, _)| name),
                 message,
@@ -640,8 +681,11 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     };
 
     let matched = matched_leaf(&cli, &matches);
-    let format = requested_format(Some(&matches), matched.as_ref().map(|(_, args)| *args));
+    let leaf = matched.as_ref().map(|(_, args)| *args);
+    let format = requested_format(Some(&matches), leaf);
+    let contract = requested_contract(Some(&matches), leaf);
     let (command_name, leaf) = matched.ok_or_else(|| ParseFailure::Invalid {
+        contract,
         format,
         command: None,
         message: "A command is required.".to_owned(),
@@ -664,6 +708,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             command_name,
         }),
         Err(message) => Err(ParseFailure::Invalid {
+            contract,
             format,
             command: Some(command_name),
             message: message.to_owned(),
@@ -723,6 +768,16 @@ fn requested_format(root: Option<&ArgMatches>, leaf: Option<&ArgMatches>) -> For
     }
 }
 
+fn requested_contract(root: Option<&ArgMatches>, leaf: Option<&ArgMatches>) -> Contract {
+    root.into_iter()
+        .chain(leaf)
+        .filter_map(|args| args.try_get_many::<Contract>("contract").ok().flatten())
+        .flatten()
+        .copied()
+        .next()
+        .unwrap_or_default()
+}
+
 fn safe_parse_message(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand => {
@@ -741,6 +796,7 @@ fn safe_parse_message(kind: ErrorKind) -> &'static str {
 impl CommonArgs {
     fn resolve(self, leaf: Self) -> Result<CommonOptions, &'static str> {
         let CommonArgs {
+            contract,
             workspace,
             project,
             project_root,
@@ -763,6 +819,8 @@ impl CommonArgs {
             (false, None) => View::WorkingTree,
         };
         Ok(CommonOptions {
+            contract: one_value(contract, leaf.contract, "Conflicting --contract values.")?
+                .unwrap_or_default(),
             workspace: one_path(workspace, leaf.workspace, "Conflicting --workspace values.")?,
             project: one_value(project, leaf.project, "Conflicting --project values.")?,
             project_root: one_path(
@@ -831,6 +889,12 @@ impl CommonOptions {
 
 impl Command {
     fn validate(&self, common: &CommonOptions) -> Result<(), &'static str> {
+        if common.contract == Contract::V2 {
+            if let Self::Validate(args) = self {
+                return args.validate_dolt_selection(common);
+            }
+            return Ok(());
+        }
         match self {
             Self::Config(ConfigCommand::Bind) => {
                 common.require_working_tree()?;
@@ -846,6 +910,13 @@ impl Command {
                 common.check_project(project_id.as_ref())
             }
             Self::Validate(args) => {
+                if args.all
+                    || args.workspace_id.is_some()
+                    || args.database.is_some()
+                    || args.port.is_some()
+                {
+                    return Err("Dolt validation requires --contract 2.");
+                }
                 if args.against.is_some() && matches!(common.view, View::Authority) {
                     return Err("validate --against does not accept --authority.");
                 }
@@ -855,6 +926,31 @@ impl Command {
             Self::Artifact(command) => command.validate(common),
             _ => Ok(()),
         }
+    }
+}
+
+impl ValidateArgs {
+    fn validate_dolt_selection(&self, common: &CommonOptions) -> Result<(), &'static str> {
+        if self.task.is_some()
+            || self.all_projects
+            || self.against.is_some()
+            || common.workspace.is_some()
+            || common.project.is_some()
+            || common.project_root.is_some()
+            || !matches!(common.view, View::WorkingTree)
+        {
+            return Err(
+                "Dolt validation accepts only an explicit local database and whole-workspace scope.",
+            );
+        }
+        if !self.all
+            || self.workspace_id.is_none()
+            || self.database.is_none()
+            || self.port.is_none()
+        {
+            return Err("Dolt validation requires --all, --workspace-id, --database, and --port.");
+        }
+        Ok(())
     }
 }
 

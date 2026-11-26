@@ -4,10 +4,8 @@ use std::process::ExitCode;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::cli::Format;
+use crate::cli::{Contract, Format};
 use crate::error::HiveError;
-
-const SCHEMA_VERSION: u8 = 1;
 
 #[derive(Serialize)]
 struct Envelope<'a> {
@@ -30,6 +28,7 @@ enum Outcome<'a> {
 }
 
 pub(crate) fn success(
+    contract: Contract,
     format: Format,
     command: &str,
     context: Option<&Value>,
@@ -51,7 +50,7 @@ pub(crate) fn success(
         Format::Json => write_json(
             &mut stdout,
             &Envelope {
-                schema_version: SCHEMA_VERSION,
+                schema_version: contract.schema_version(),
                 ok: true,
                 command: Some(command),
                 context,
@@ -71,15 +70,21 @@ fn write_json(output: &mut impl Write, envelope: &Envelope<'_>) -> bool {
     serde_json::to_writer(&mut *output, envelope).is_ok() && writeln!(output).is_ok()
 }
 
-pub(crate) fn failure(format: Format, command: Option<&str>, error: HiveError) -> ExitCode {
+pub(crate) fn failure(
+    contract: Contract,
+    format: Format,
+    command: Option<&str>,
+    context: Option<&Value>,
+    error: HiveError,
+) -> ExitCode {
     let written = match format {
-        Format::Text => writeln!(io::stderr().lock(), "error: {error}").is_ok(),
+        Format::Text => write_failure(io::stderr().lock(), &error).is_ok(),
         Format::Json => {
             let envelope = Envelope {
-                schema_version: SCHEMA_VERSION,
+                schema_version: contract.schema_version(),
                 ok: false,
                 command,
-                context: None,
+                context,
                 outcome: Outcome::Failure { error: &error },
                 warnings: &[],
             };
@@ -94,18 +99,36 @@ pub(crate) fn failure(format: Format, command: Option<&str>, error: HiveError) -
     }
 }
 
+fn write_failure(mut output: impl Write, error: &HiveError) -> io::Result<()> {
+    writeln!(output, "error: {error}")?;
+    let Some((diagnostics, truncated)) = error.record_diagnostics() else {
+        return Ok(());
+    };
+    for diagnostic in diagnostics {
+        write!(output, "{} ({})", diagnostic.code, diagnostic.table)?;
+        for id in &diagnostic.record_ids {
+            write!(output, " {id}")?;
+        }
+        writeln!(output, " — {}", diagnostic.message)?;
+    }
+    if truncated {
+        writeln!(output, "More record violations were found.")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{Envelope, Outcome, SCHEMA_VERSION};
+    use super::{Contract, Envelope, Outcome};
 
     #[test]
     fn v1_success_preserves_the_scope_data_and_warning_fields() {
         let context = json!({"project_id": "example-project", "view": "working-tree"});
         let data = json!({"items": [], "truncated": false});
         let envelope = Envelope {
-            schema_version: SCHEMA_VERSION,
+            schema_version: Contract::V1.schema_version(),
             ok: true,
             command: Some("task list"),
             context: Some(&context),

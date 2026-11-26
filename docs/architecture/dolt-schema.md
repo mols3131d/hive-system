@@ -4,7 +4,7 @@ description: "Review the proposed relational tables, constraints, readiness quer
 
 # Proposed Dolt Relational Schema
 
-Status: candidate design under [#22](https://github.com/mols3131d/hive-system/issues/22) and [architecture redesign](dolt-redesign.md). This is not a migration, adopted schema, or tested implementation.
+The Dolt v2 development baseline was adopted in #22. The system-owned initial schema implements the 24 reviewed tables on Dolt 2.7.6. Storage schema version 1 records the lowercase SHA-256 of that SQL file in `schema_migrations`. Keep the migration bytes fixed once applied. An explicit bootstrap supplies the singleton workspace identity, ledger row and initial Issue counter. The SQL below retains the reviewed design and its spike inputs. [Adoption](https://github.com/mols3131d/hive-system/issues/22#issuecomment-7198810176), [initial schema](../../assets/schema/dolt/0001_initial.sql), [development verification](../development/README.md#dolt-record-validation).
 
 ## Relational conventions
 
@@ -378,4 +378,4 @@ References: [transactions](https://www.dolthub.com/docs/concepts/dolt/sql/transa
 
 ## Required spike
 
-Pin Dolt version and test DDL, root uniqueness, cyclic references, duplicate claims, claim-versus-dependency changes, same-value writes, competing lock acquisition, crash and ambiguous receipt recovery, cancellation/reopen, transaction rollback, version commit failure/recovery and invalid merge. Test offline operation and restoration on synthetic data only. This design has not been executed.
+Pin Dolt version and test DDL, root uniqueness, cyclic references, duplicate claims, claim-versus-dependency changes, same-value writes, competing lock acquisition, crash and ambiguous receipt recovery, cancellation/reopen, transaction rollback, version commit failure/recovery and invalid merge. Test offline operation and restoration on synthetic data only. The design evidence is tracked in [#24](https://github.com/mols3131d/hive-system/pull/24).

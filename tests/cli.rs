@@ -117,6 +117,72 @@ fn top_level_help_and_version_run_without_a_workspace() {
 }
 
 #[test]
+fn explicit_dolt_validation_refuses_ambiguous_selection_without_touching_config() {
+    let sandbox = Sandbox::new();
+    assert_json_failure(
+        &sandbox.run(&["--json", "--contract", "1", "validate"]),
+        &["--json", "--contract", "1", "validate"],
+        "validate",
+        "NOT_IMPLEMENTED",
+        7,
+    );
+    assert_json_failure(
+        &sandbox.run(&["--json", "validate", "--all"]),
+        &["--json", "validate", "--all"],
+        "validate",
+        "INVALID_ARGUMENT",
+        2,
+    );
+    for args in [
+        &["--json", "--contract", "2", "validate"][..],
+        &[
+            "--json",
+            "validate",
+            "--contract",
+            "2",
+            "--all",
+            "--workspace",
+            WORKSPACE,
+        ],
+        &[
+            "--json",
+            "--contract",
+            "2",
+            "validate",
+            "--all",
+            "--database",
+            "fixture_db",
+            "--workspace-id",
+            "01900000-0000-7000-8000-000000000001",
+            "--port",
+            "0",
+        ],
+    ] {
+        let output = sandbox.run(args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?} {report}");
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT", "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+    }
+
+    let output = sandbox.run(&[
+        "--json",
+        "--contract",
+        "2",
+        "config",
+        "show",
+        "--scope",
+        "user",
+    ]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(7), "{report}");
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["error"]["code"], "NOT_IMPLEMENTED");
+    sandbox.assert_empty();
+}
+
+#[test]
 fn recognized_commands_accept_matching_globals_and_report_unavailable_operations() {
     let sandbox = Sandbox::new();
     let commands: &[(&str, &[&str])] = &[
