@@ -4,7 +4,9 @@ description: "Use when implementing Dolt v2 tables, constraints, readiness queri
 
 # Dolt v2 Relational Schema
 
-This relational design supports the [adopted Dolt v2 development baseline](dolt-redesign.md). Use the [MVP contract](dolt-mvp-contract.md) for domain invariants and the illustrative DDL below to implement and verify the versioned schema. Any live schema activation during migration or authority switch requires separate explicit operator approval.
+This relational design supports the adopted Dolt v2 development baseline. The MVP contract governs domain invariants. Existing Markdown/Git workspaces operate under their reviewed v1 pins. Live schema activation during migration or an authority switch requires separate explicit operator approval. [Dolt v2 architecture](dolt-redesign.md), [MVP contract](dolt-mvp-contract.md), [v1 compatibility](README.md#v1-compatibility).
+
+The system-owned initial migration implements the 24 reviewed tables on Dolt 2.7.6. Storage schema version 1 records the lowercase SHA-256 of that SQL file in `schema_migrations`. Keep the migration bytes fixed once applied. An explicit bootstrap supplies the singleton workspace identity, ledger row and initial Issue counter. The illustrative SQL below retains the reviewed design and its spike inputs. [Initial migration](../../assets/schema/dolt/0001_initial.sql), [read-only validation and verification](../development/README.md#dolt-record-validation).
 
 ## Relational conventions
 

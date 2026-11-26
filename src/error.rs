@@ -17,6 +17,8 @@ pub(crate) enum ErrorCode {
     InvalidRecord,
     InvalidTransition,
     IncompatiblePolicy,
+    SchemaIncompatible,
+    ConstraintViolation,
     AlreadyExists,
     AlreadyClaimed,
     ClaimMismatch,
@@ -25,6 +27,8 @@ pub(crate) enum ErrorCode {
     DirtyConflict,
     Unauthorized,
     AuthorityUnavailable,
+    AuthorityUnverified,
+    RuntimeUnavailable,
     ObjectUnavailable,
     PolicyUnavailable,
     IoError,
@@ -41,7 +45,11 @@ impl ErrorCode {
             | Self::AmbiguousScope
             | Self::ContextLimit => 2,
             Self::NotFound => 3,
-            Self::InvalidRecord | Self::InvalidTransition | Self::IncompatiblePolicy => 4,
+            Self::InvalidRecord
+            | Self::InvalidTransition
+            | Self::IncompatiblePolicy
+            | Self::SchemaIncompatible
+            | Self::ConstraintViolation => 4,
             Self::AlreadyExists
             | Self::AlreadyClaimed
             | Self::ClaimMismatch
@@ -50,6 +58,8 @@ impl ErrorCode {
             | Self::DirtyConflict => 5,
             Self::Unauthorized => 6,
             Self::AuthorityUnavailable
+            | Self::AuthorityUnverified
+            | Self::RuntimeUnavailable
             | Self::ObjectUnavailable
             | Self::PolicyUnavailable
             | Self::IoError
@@ -69,8 +79,15 @@ pub(crate) struct HiveError {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct ErrorDetails {
-    diagnostics: [Diagnostic; 1],
+#[serde(untagged)]
+enum ErrorDetails {
+    Legacy {
+        diagnostics: [Diagnostic; 1],
+    },
+    Records {
+        diagnostics: Vec<RecordDiagnostic>,
+        truncated: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -80,6 +97,16 @@ struct Diagnostic {
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct RecordDiagnostic {
+    pub(crate) code: &'static str,
+    pub(crate) severity: &'static str,
+    pub(crate) table: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) record_ids: Vec<String>,
+    pub(crate) message: &'static str,
 }
 
 impl HiveError {
@@ -93,7 +120,7 @@ impl HiveError {
 
     pub(crate) fn diagnostic(mut self, path: Option<&str>) -> Self {
         if self.details.is_none() {
-            self.details = Some(ErrorDetails {
+            self.details = Some(ErrorDetails::Legacy {
                 diagnostics: [Diagnostic {
                     code: self.code,
                     severity: "error",
@@ -103,6 +130,27 @@ impl HiveError {
             });
         }
         self
+    }
+
+    pub(crate) fn record_violations(diagnostics: Vec<RecordDiagnostic>, truncated: bool) -> Self {
+        Self {
+            code: ErrorCode::ConstraintViolation,
+            message: "Record validation failed at the selected Dolt commit.".to_owned(),
+            details: Some(ErrorDetails::Records {
+                diagnostics,
+                truncated,
+            }),
+        }
+    }
+
+    pub(crate) fn record_diagnostics(&self) -> Option<(&[RecordDiagnostic], bool)> {
+        match &self.details {
+            Some(ErrorDetails::Records {
+                diagnostics,
+                truncated,
+            }) => Some((diagnostics, *truncated)),
+            _ => None,
+        }
     }
 }
 
