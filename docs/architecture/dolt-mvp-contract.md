@@ -1,10 +1,10 @@
 ---
-description: "Review the recommended MVP lifecycle, storage ownership, context selection, local runtime, CLI and migration contracts for the Dolt redesign."
+description: "Use when implementing or verifying Dolt v2 lifecycle, storage, context, CLI and migration contracts."
 ---
 
-# Proposed MVP Design Baseline
+# Dolt v2 MVP Contract
 
-Status: recommended decisions for review under [#22](https://github.com/mols3131d/hive-system/issues/22). Read with the [redesign](dolt-redesign.md) and [schema](dolt-schema.md). These are proposed replacements, not active workspace policy. User direction establishes Dolt, generic Area/Sub-area, purpose-based Projects, Bot as an inherently Manager identity, role-free slug-based Soul paths, file-based SOUL.md, Dolt-owned curated Memory and the logical latest/core/reference namespace and delegated autonomous Memory curation, with mechanical operations designed for optional lifecycle hooks and security enforcement owned by the provider/harness; other decisions below need review and technical evidence.
+This contract defines the Dolt v2 MVP development baseline adopted in [#22](https://github.com/mols3131d/hive-system/issues/22#issuecomment-7198810176). Read it with the [architecture overview](dolt-redesign.md) and [relational schema](dolt-schema.md). The command syntax, limits and DDL guide implementation and require verification through the [acceptance matrix](#acceptance-matrix-and-evidence). Existing workspaces follow their reviewed v1 policy pins. Live migration and an authority switch require separate explicit operator approval.
 
 ## Domain and identity
 
@@ -53,7 +53,7 @@ Bot is a registered persistent Manager agent by definition. Registration stores 
 
 ## Local runtime and authority
 
-Recommended Rust CLI + local Dolt SQL Server (MySQL protocol) first. Preserve reusable CLI/config/JSON code. Go embedded is a fallback only if measured setup, latency or reliability warrants a rewrite; CLI subprocess access is a bootstrap/diagnostic candidate, not the normal per-query data path. Pin Dolt and Rust dependency versions after a synthetic spike; verify supported versions at doctor/start. One local server per authorized workspace, explicit start/stop; no auto-install, background scheduler, service registration, external bind or remote exposure. Prefer a private Unix socket and restrictive permissions where supported; otherwise authenticated loopback with unique endpoint. Disable or secure default root access, use limited writer/read-only credentials, redact diagnostics. No credential in Git, DB records, command argv or logs. No Hive HTTP daemon required.
+Use the Rust CLI and local Dolt SQL Server (MySQL protocol). Preserve reusable CLI/config/JSON code. Go embedded is a fallback only if measured setup, latency or reliability warrants a rewrite; CLI subprocess access is a bootstrap/diagnostic candidate, not the normal per-query data path. Pin Dolt and Rust dependency versions and verify supported versions at doctor/start. One local server per authorized workspace, explicit start/stop; no auto-install, background scheduler, service registration, external bind or remote exposure. Prefer a private Unix socket and restrictive permissions where supported; otherwise authenticated loopback with unique endpoint. Disable or secure default root access, use limited writer/read-only credentials, redact diagnostics. No credential in Git, DB records, command argv or logs. No Hive HTTP daemon required.
 
 Use an OS-held exclusive advisory lock per canonical workspace for all Hive mutations, maintenance, backup/restore and sync; process death releases it. Local filesystem only, no independent clone or multi-host writers. Use a stable workspace-ID-keyed lock and active-root registration in the single configured local Hive state directory; verify canonical root and DB identity against that registration. A restored copy at another root stays inactive; never create a second active lock just by changing its path. Different state-directory configurations or machines cannot guarantee mutual exclusion; independent writable copies are unsupported. No deleting lock files or stealing based on age. All participating writers must use the lock; direct Dolt administrative writes are explicit offline maintenance with full validation, not normal operation. Raw DB access is not a security boundary against the same OS user. Use read-only access for UI and analysis; do not expose arbitrary mutation SQL. If lock tests or process ownership fail, refuse writes; prefer a verified single writer rather than assuming Dolt merge semantics provide serializable graph invariants. The previous mutation_guard token remains an alternative experimental conflict check, not an MVP dependency.
 
@@ -97,7 +97,7 @@ References: [Dolt SQL server](https://www.dolthub.com/docs/sql-reference/server/
 
 ## Detailed MVP review contracts
 
-The following are proposals for review, not adopted policy or implementation evidence. They refine the preceding baseline with the selected Soul-file/Memory-Dolt storage boundary. Preserve the accepted identity/context boundary in #20 and the XDG direction in #18. Numeric limits, command syntax and candidate schema below are review defaults.
+The detailed contracts apply the selected Soul and Memory storage boundary to Bot context, CLI, runtime and recovery. Verify the initial numeric limits, command syntax and candidate schema during implementation.
 
 ### Bot and curated memory
 
@@ -115,7 +115,7 @@ Storage decision comparison (Dolt memory selected):
 | Coordination | Separate Git review and asset snapshot | Common guarded transaction and receipt |
 | Restore | DB + Git asset pair | Memory restored with DB; Soul still needs asset pair |
 
-The selected MVP design retains SOUL.md as a file and stores Memory in Dolt. The 24-table DDL remains a candidate pending review and spike. Existing live MEMORY.md files remain unchanged until an approved migration. Preserve #20's semantic distinction: a compact, required latest-memory entrypoint (empty is valid) and optional long-term scoped knowledge. The selected logical namespace is:
+Preserve #20's distinction between a compact latest-memory view, which may be empty, and optional durable scoped knowledge. The [candidate DDL](dolt-schema.md) defines the underlying `bot_memories` table.
 
 ```text
 memories/
@@ -136,7 +136,7 @@ Mechanical operations: list exact scoped keys and deterministic candidate report
 
 Initial size contract for testing: latest aggregate 2 KiB and durable core aggregate 4 KiB per Bot and exact scope (including NULL global); each latest/core body at most 1 KiB; each reference body at most 16 KiB. Global plus one Area defaults to at most 12 KiB of memory bodies. Count UTF-8 body bytes, separately track metadata and serialization. Check final aggregate totals under the common lock, reject limit violations without side effects. Permit explicit atomic curation batches of typed edits with expected revisions for all touched records and one request ID/receipt; verify all authorization, scope, live-key uniqueness and size invariants for the final state. A read-only plan/preview is advisory; revalidate against fresh state before apply. No silent truncation, overwrite, eviction or implicit mutation.
 
-File import/export is explicit and exported copies are noncanonical. Existing Git review workflow in #20 remains active until reviewed adoption. Dolt writes require verified authorization, revision and receipt; no bypass. Registration validates Soul only; empty memory is valid. Restore verifies memory ownership, scope, content and provenance with the DB and Soul against the paired Git snapshot. Physical deletion/history erasure is outside normal MVP operations.
+File import/export is explicit and exported copies are noncanonical. Follow the applicable pinned v1 policy for Git-backed Bot records. Dolt writes require verified authorization, revision and receipt; no bypass. Registration validates Soul only; empty memory is valid. Restore verifies memory ownership, scope, content and provenance with the DB and Soul against the paired Git snapshot. Physical deletion/history erasure is outside normal MVP operations.
 
 ### Context resolution
 
@@ -155,7 +155,7 @@ Two-session example: Manager A resolves Issue, delegates through host, records c
 
 ### CLI v2 candidate
 
-Keep the v1 file/Git CLI behavior and policy pin independent until adoption; expose the Dolt contract explicitly (proposed `hive --contract 2`); reject incompatible workspaces instead of interpreting legacy task IDs as issue numbers. Use same domain operations for human and JSON output. No shell interpolation of bodies or credentials. Common flags: --workspace PATH, --area ID, --project ID, --json, --actor REF; writes require --request-id UUID and --if-match REV for each existing aggregate touched (repeatable ID=REV for multi-aggregate operations). --file PATH or --stdin supplies UTF-8 Markdown, never both; safe input bounds and no implicit external file access. Actor references identify collaboration participants supplied by the operator or host. A caller-supplied string alone is not approval or workflow delegation. Roles constrain workflow, not security permissions. No automatic role impersonation or approval. Use the workflow evidence contract below; --actor is descriptive and cannot establish authenticated identity.
+Retain the v1 file/Git CLI behavior and policy pins for compatibility. Use explicit contract selection (initial CLI syntax `hive --contract 2`). Reject incompatible workspaces and preserve the distinction between v1 task IDs and v2 Issue numbers. Use the same domain operations for human and JSON output. No shell interpolation of bodies or credentials. Common flags: --workspace PATH, --area ID, --project ID, --json, --actor REF; writes require --request-id UUID and --if-match REV for each existing aggregate touched (repeatable ID=REV for multi-aggregate operations). --file PATH or --stdin supplies UTF-8 Markdown, never both; safe input bounds and no implicit external file access. Actor references identify collaboration participants supplied by the operator or host. A caller-supplied string alone is not approval or workflow delegation. Roles constrain workflow, not security permissions. No automatic role impersonation or approval. Use the workflow evidence contract below; --actor is descriptive and cannot establish authenticated identity.
 
 Command arguments below are required unless in brackets. Common flags above apply and exact result types are shown; list commands share typed filters, --limit and --cursor. IDs are canonical UUIDs; Issue accepts quoted #number in the selected workspace. Any existing-aggregate mutation validates all affected revisions and invariants under the lock. One receipt covers the whole change.
 
@@ -277,7 +277,7 @@ End-to-end acceptance requires A01–A15 and A17–A21 on supported runtime, plu
 
 ### Execution defaults and decision gates
 
-The following implementation defaults are selected as a delegated design recommendation, not an adopted security policy or authorization to write real data. Preserve the current v1 implementation, policy pins, independent branches and live records. No new service, agent runtime, event bus, RBAC subsystem or external project modifications.
+Apply these v2 implementation defaults alongside pinned v1 compatibility. No new service, agent runtime, event bus, RBAC subsystem or external project modifications.
 
 #### 1. Context and authorization
 
@@ -315,16 +315,15 @@ Use explicit verified binary/Skill installation and existing XDG precedence. Ini
 
 #### 5. Implementation order and acceptance
 
-Implementation order: (1) isolated Dolt spike and pinned release evidence before contract adoption; after review of that evidence and adoption, (2) schema, domain validation and transaction/receipt core; (3) workflow evidence, scoped reads and context; (4) typed mutations, claims, memory and recovery; (5) CLI/Skill/hook and installation/backup/restore; (6) synthetic end-to-end acceptance and migration dry-run. Keep existing v1 compatible and preserve independent work. The first gate must verify the actual SQL constraints including NULL behavior, two-process lock/claim/graph races, version commit/rollback/crash reconciliation, Rust connectivity and native backup/restore; no fake pass based on documentation CI. If a gate fails, isolate the failure and revise only that design or stop the affected work.
+Implement in the delivery order in [#15](https://github.com/mols3131d/hive-system/issues/15), beginning with read-only schema and domain validation in #10. Use the [synthetic evidence (#24)](https://github.com/mols3131d/hive-system/pull/24) for the selected Rust/Dolt integration. Verify the implemented SQL constraints including NULL behavior, two-process lock/claim/graph races, version commit/rollback/crash reconciliation, Rust connectivity and native backup/restore. If a gate fails, isolate the failure and revise only that design or stop the affected work.
 
 Additional cases A19–A21 extend the acceptance matrix above. Run these in addition to A01–A18. Same-UID hostile agent resistance is explicitly not an acceptance claim.
 
-The adoption decision requires the independent contract review and the pinned Dolt, lock, graph, receipt/recovery, restore and disposable mapping evidence in #22. Verify the implemented workflow evidence, memory bounds, supported agent hosts and end-to-end compatibility under #14/#15. Live migration, authority promotion and remote publication require separate explicit operator approval. Provider/harness authentication stays outside Hive.
+Verify the implemented workflow evidence, memory bounds, supported agent hosts, end-to-end compatibility and disposable migration rehearsal under #14/#15. Live migration, authority promotion and remote publication require separate explicit operator approval. Provider/harness authentication stays outside Hive.
 
 ### Compatibility and next gates
 
-PR #19 / Issue #18: retain XDG precedence, absolute-path validation, explicit local default and legacy pin; Dolt-specific state/runtime directories and single local authority are proposed replacements, not reinterpretations of the old native Git coordination. #21/#20: preserve the Manager-only Bot model, latest versus durable semantics refined with durable core/reference, logical `memories/LATEST.md` and durable collections, explicit inspection and management-context exclusion; Bot as Manager by definition, role-free slug-based Soul paths and Dolt memory are selected. Legacy identity/path mapping and migration still require review. Keep both PRs and existing branches intact. #9 configuration, #10 validation, #11 reads/context, #12 mutations, #13 coordination and #14 Skill can reuse unaffected code/tests; storage-specific implementation must be reconciled after #22 adoption. #15 acceptance moves to the new matrix only after approved contract transition. No closing issues, cancelling existing work or activating new policies from this draft.
+- Carry forward XDG precedence, absolute-path validation, local-first operation and legacy policy pins from #19/#18. Implement the versioned v2 config, data and state roots, runtime endpoint and single local Dolt authority under #18. Native Git-ref coordination belongs to v1 compatibility.
+- Carry forward registered Manager identity, explicit inspection, latest and durable recall and management-context exclusion from #21/#20. Use the role-free Soul asset path and Dolt-backed latest/core/reference Memory for v2. Review legacy identity and file-memory mapping under #20 and rehearse it on disposable copies.
 
-Reconciliation plan after adoption: #9 is closed; retain reusable configuration validation and v1 compatibility, schedule only a v2 delta under #18. #10 replace file-model implementation scope with Dolt schema/domain validation; #11 replace Git views with committed SQL snapshots and scoped Context Resolver; #12 replace content-token writes with typed guarded transactions and receipts; #13 replace Git authority operations with local lock/Claim and commit reconciliation; #14 retain Rulesync Skill, add optional hook-callable contracts and installation tests; #15 replace completion criteria with A01–A21 only after adoption. #19/#18 XDG decisions are retained except for explicit Dolt state/runtime needs; #21/#20 management separation and Soul purpose remain, file-memory templates and path rules require a coordinated v2 replacement. Preserve both open PRs for review; do not merge incompatible old storage wording into v2 or reopen closed work automatically. Canonical Goals, Architecture, workspace policy, templates, distributable assets and docs must be reconciled together when #22 is adopted; this proposal intentionally leaves their active v1 text intact.
-
-Record outstanding adoption checks in #22 and delivery acceptance in #15. The default implementation choices remain subject to evidence.
+Reuse applicable v1 configuration validation and tests from #9. Coordinate v2 workspace contracts, templates and distributable Rulesync sources with their implementation in #10–#14. Use the reviewed v2 acceptance matrix and record exact-head delivery evidence in #15.

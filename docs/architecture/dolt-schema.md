@@ -1,10 +1,12 @@
 ---
-description: "Review the proposed relational tables, constraints, readiness queries and concurrent mutation design for the Dolt migration."
+description: "Use when implementing Dolt v2 tables, constraints, readiness queries and guarded mutations."
 ---
 
-# Proposed Dolt Relational Schema
+# Dolt v2 Relational Schema
 
-The Dolt v2 development baseline was adopted in #22. The system-owned initial schema implements the 24 reviewed tables on Dolt 2.7.6. Storage schema version 1 records the lowercase SHA-256 of that SQL file in `schema_migrations`. Keep the migration bytes fixed once applied. An explicit bootstrap supplies the singleton workspace identity, ledger row and initial Issue counter. The SQL below retains the reviewed design and its spike inputs. [Adoption](https://github.com/mols3131d/hive-system/issues/22#issuecomment-7198810176), [initial schema](../../assets/schema/dolt/0001_initial.sql), [development verification](../development/README.md#dolt-record-validation).
+This relational design supports the adopted Dolt v2 development baseline. The MVP contract governs domain invariants. Existing Markdown/Git workspaces operate under their reviewed v1 pins. Live schema activation during migration or an authority switch requires separate explicit operator approval. [Dolt v2 architecture](dolt-redesign.md), [MVP contract](dolt-mvp-contract.md), [v1 compatibility](README.md#v1-compatibility).
+
+The system-owned initial migration implements the 24 reviewed tables on Dolt 2.7.6. Storage schema version 1 records the lowercase SHA-256 of that SQL file in `schema_migrations`. Keep the migration bytes fixed once applied. An explicit bootstrap supplies the singleton workspace identity, ledger row and initial Issue counter. The illustrative SQL below retains the reviewed design and its spike inputs. [Initial migration](../../assets/schema/dolt/0001_initial.sql), [read-only validation and verification](../development/README.md#dolt-record-validation).
 
 ## Relational conventions
 
@@ -12,7 +14,7 @@ One database per workspace. Do not partition by Area, Project or repository. Use
 
 ## Core DDL candidate
 
-Illustrative MySQL-compatible SQL; verify against a pinned Dolt release. Root sibling slug uniqueness needs additional domain validation because nullable parent IDs do not enforce it through a composite unique key. All mutations affecting those invariants use the same guarded authority.
+Verify the illustrative MySQL-compatible SQL against a pinned Dolt release. Root sibling slug uniqueness needs additional domain validation because nullable parent IDs do not enforce it through a composite unique key. All mutations affecting those invariants use the same guarded authority.
 
 ```sql
 CREATE TABLE areas (
@@ -376,6 +378,6 @@ Use one authoritative shared main branch. Validate the precise SQL transaction/v
 
 References: [transactions](https://www.dolthub.com/docs/concepts/dolt/sql/transaction/), [concurrency](https://www.dolthub.com/blog/2026-02-17-dolt-concurrency/), [constraints](https://www.dolthub.com/docs/concepts/dolt/sql/constraints/), [Dolt procedures](https://www.dolthub.com/docs/sql-reference/version-control/dolt-sql-procedures/).
 
-## Required spike
+## Schema verification
 
-Pin Dolt version and test DDL, root uniqueness, cyclic references, duplicate claims, claim-versus-dependency changes, same-value writes, competing lock acquisition, crash and ambiguous receipt recovery, cancellation/reopen, transaction rollback, version commit failure/recovery and invalid merge. Test offline operation and restoration on synthetic data only. The design evidence is tracked in [#24](https://github.com/mols3131d/hive-system/pull/24).
+Use the [synthetic spike evidence (#24)](https://github.com/mols3131d/hive-system/pull/24) when verifying the implementation. Pin Dolt version and test DDL, root uniqueness, cyclic references, duplicate claims, claim-versus-dependency changes, same-value writes, competing lock acquisition, crash and ambiguous receipt recovery, cancellation/reopen, transaction rollback, version commit failure/recovery and invalid merge. Test offline operation and restoration on synthetic data only.

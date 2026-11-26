@@ -1,10 +1,10 @@
 ---
-description: "Review the proposed Dolt-backed architecture, Area hierarchy, purpose-based Projects and issue work graph before extending the MVP."
+description: "Use when implementing the Dolt v2 Area hierarchy, purpose-based Projects, Issue work graph and workspace storage."
 ---
 
-# Proposed MVP Architecture Redesign
+# Dolt v2 MVP Architecture
 
-Status: proposed, tracked in [#22](https://github.com/mols3131d/hive-system/issues/22). This is a design baseline for review and a technical spike, not an adopted workspace policy, implementation contract, or migration authorization. The existing [system design](system-design.md), [CLI contract](cli-contract.md), and [workspace policies](../policies/workspace/README.md) remain authoritative for existing workspaces until reviewed replacement and explicit adoption.
+Dolt v2 is the adopted MVP development baseline in the [#22 decision](https://github.com/mols3131d/hive-system/issues/22#issuecomment-7198810176). Implement against the [MVP contract](dolt-mvp-contract.md) and [relational schema](dolt-schema.md). Existing workspaces continue under their [pinned v1 contracts](README.md#v1-compatibility). Live migration and an authority switch require separate explicit operator approval.
 
 ## Product boundary
 
@@ -26,12 +26,10 @@ Hive is a local-first collaboration and context system for one developer and mul
 
 Area and Sub-area are the same entity. A nullable parent reference forms a hierarchy; a stable ID survives renaming and moving. No required Area type, repository association or project lifecycle. A Project is not an Area, repository or parent Issue. It may contain issues from multiple Areas; membership does not duplicate the issue or its execution state. Closing or removing a Project must not close or delete its issues.
 
-Proposed relationships:
-
 | Relationship | Cardinality |
 | --- | --- |
 | Area to child Area | 1:N |
-| Area to owned Issue | 1:N; required ownership recommended |
+| Area to owned Issue | 1:N (one owning Area per Issue) |
 | Project to Issue | N:M |
 | Area to Resource | N:M |
 | Issue to Resource | N:M when necessary |
@@ -43,19 +41,19 @@ Use explicit domain tables and foreign keys, not a generic entity/attribute/valu
 
 ## Work graph
 
-Proposed issue types: epic, feature, task, bug. Use labels for research, documentation and other classification. Candidate lifecycle: backlog, todo, in-progress, review, done, cancelled. Preserve acceptance, verified execution stop and safe claim recovery semantics. Keep project planning fields separate from global issue state. The [MVP design baseline](dolt-mvp-contract.md) proposes exact lifecycle, ID allocation, priority, dependency outcome and parent completion semantics for review.
+The Issue types are epic, feature, task and bug. Use labels for research, documentation and other classification. The lifecycle uses backlog, todo, in-progress, review, done and cancelled. Preserve acceptance, verified execution stop and safe claim recovery semantics. Keep project planning fields separate from global Issue state. The [MVP contract](dolt-mvp-contract.md) defines lifecycle, ID allocation, priority, dependency outcome and parent completion semantics.
 
 Readiness is derived: selected work, accepted prerequisites, no incompatible constraint and no active claim. Readiness is not execution authorization. A claim operation must re-evaluate authoritative state, prerequisite acceptance, assignment authority and expected revision. A stale read or duplicate request cannot establish ownership. Require evidence of former execution stop before recovery; no automatic lease reassignment in initial scope.
 
 ## Storage and runtime
 
-Dolt is the proposed canonical store for structured collaboration records, replacing native Git-tracked task bundles and frontmatter as the structured storage model. Area, Project, Issue, relationships, labels and claims are relational records. Directive and textual Artifact Markdown bodies are recommended DB-owned; reference external binary/large assets, while user-owned SOUL.md remains Git-tracked Markdown. Curated Bot memory is canonical in Dolt; the storage boundary is selected, while schema and runtime remain proposals. The proposed ownership boundary and cross-store recovery rules are detailed in the [MVP design baseline](dolt-mvp-contract.md). Never make DB and Markdown competing originals of the same record.
+In v2, Dolt owns structured collaboration records, including Area, Project, Issue, relationships, labels, Claims and curated Bot Memory. Dolt also owns Directive and textual Artifact Markdown bodies. Reference large or binary assets at their existing owners and keep user-owned `SOUL.md` in Git-tracked Markdown. Follow the ownership and cross-store recovery rules in the [MVP contract](dolt-mvp-contract.md). Never make DB and Markdown competing originals of the same record.
 
 Use versioned v2 XDG configuration and data locations alongside the current v1 paths. Select the contract before workspace resolution and require explicit initialization or migration. Keep Dolt internal files out of ordinary Git tracking. Native Git may remain for file assets and software development. Remote sync is optional and explicit; validate ordinary Git remotes for Dolt on disposable data, not an existing workspace.
 
-Prefer a shared authoritative local DB for coordination. An independent clone cannot guarantee exclusive claims across replicas. Distinguish SQL transactions, version commits and remote publishing. Test contention, constraint enforcement, graph races, version-commit failure/retry, ambiguous outcomes, merge validation and recovery. Specify what a successful mutation receipt guarantees; do not infer global ownership from local commits. No unreviewed automatic conflict resolution. DB and filesystem writes need a recoverable cross-store protocol if both are involved.
+Use one shared authoritative local DB per workspace for coordination. An independent clone cannot guarantee exclusive claims across replicas. Distinguish SQL transactions, version commits and remote publishing. Test contention, constraint enforcement, graph races, version-commit failure/retry, ambiguous outcomes, merge validation and recovery. Specify what a successful mutation receipt guarantees; do not infer global ownership from local commits. No unreviewed automatic conflict resolution. DB and filesystem writes need a recoverable cross-store protocol if both are involved.
 
-Prefer retaining Rust with a local Dolt SQL Server; compare CLI subprocess and Go embedded alternatives if the synthetic spike finds material blockers. No language switch or new Hive daemon assumed. Keep DB access local by default and avoid credentials in logs or tracked configuration.
+Use the Rust CLI with a local Dolt SQL Server. The [MVP contract](dolt-mvp-contract.md#local-runtime-and-authority) describes the runtime boundary and conditions for revisiting alternatives. Keep DB access local by default and avoid credentials in logs or tracked configuration.
 
 ## Context model
 
@@ -63,17 +61,14 @@ Retain Manager, Coordinator and Executor responsibilities. Bot is a persistent M
 
 ## CLI direction
 
-Keep machine-readable JSON, stable errors, explicit scope selection and safe mutation receipts. Candidate domains: area, project, issue, resource, artifact, directive, bot, memory, context, validate, doctor and backup. Remote sync is deferred beyond the local MVP. Include filtered issue lists, ready/blocked, dependency traversal, guarded claim/release and context resolution. Prefer bounded, read-only SQL queries where useful; domain writes must enforce lifecycle and ownership invariants. See the proposed [MVP command and compatibility contract](dolt-mvp-contract.md).
+Keep machine-readable JSON, stable errors, explicit scope selection and safe mutation receipts. Candidate domains: area, project, issue, resource, artifact, directive, bot, memory, context, validate, doctor and backup. Remote sync is deferred beyond the local MVP. Include filtered issue lists, ready/blocked, dependency traversal, guarded claim/release and context resolution. Prefer bounded, read-only SQL queries where useful; domain writes must enforce lifecycle and ownership invariants. See the [v2 command and compatibility contract](dolt-mvp-contract.md).
 
 ## Review and transition gates
 
-1. Confirm domain semantics and cardinalities, lifecycle, stable IDs and schema ownership.
-2. Run a synthetic Dolt spike: installation/offline, SQL connectivity, FK/CHECK, concurrent claims and graph writes, rollback, version history and failure recovery, remote backup/restore and conflicting changes. Record versions and actual results.
-3. Decide language/runtime, canonical DB/file boundary, synchronization and migration protocol.
-4. Revise product acceptance, architecture, workspace semantics, schema, CLI, templates, tests and distributable assets together. Reconcile #9–#15, #18, #20 and PRs #19/#21; preserve independent work. Do not treat existing file-based implementation as the new contract.
-5. Inventory legacy records read-only. Map old project/reserved-scope IDs to explicit Areas and Projects without assuming one repository equals one Area. Preserve work IDs or explicit mappings, relationships, lifecycle, claims, memory, references and evidence. Validate disposable copies and rollback; do not migrate live data or change policy pins until authorized.
-6. Implement and verify the reviewed baseline. Confirm old execution has stopped or been safely handed off before switching authority.
+The adoption decision follows independent design review and pinned Dolt/Rust experiments on Linux. The recovery fixture covers writer death before commit and after Dolt acknowledges SQL COMMIT, before the caller receives the outcome. Implemented recovery, supported hosts, compatibility and migration rehearsal remain acceptance work. [Design review (#23)](https://github.com/mols3131d/hive-system/pull/23#issuecomment-7198009441) · [Synthetic evidence (#24)](https://github.com/mols3131d/hive-system/pull/24)
 
-No runtime, concurrency, migration or remote verification is claimed by this document.
+1. Implement and verify the reviewed baseline in the delivery order in [#15](https://github.com/mols3131d/hive-system/issues/15). Coordinate the v2 workspace semantics, schema, CLI, templates, tests and distributable assets with their implementation. Preserve reusable work and pinned v1 compatibility.
+2. Inventory legacy records read-only. Map old project/reserved-scope IDs to explicit Areas and Projects without assuming one repository equals one Area. Preserve work IDs or explicit mappings, relationships, lifecycle, claims, memory, references and evidence. Validate disposable copies and rollback before seeking live cutover approval.
+3. Obtain separate explicit approval for live migration, policy-pin changes and an authority switch. Confirm old execution has stopped or been safely handed off before switching authority.
 
-See the [proposed relational schema](dolt-schema.md) for candidate DDL, ready queries and concurrency invariants.
+See the [relational schema](dolt-schema.md) for candidate DDL, ready queries and concurrency invariants.
