@@ -154,13 +154,14 @@ These are read-focused domains in MVP. The existing policies own reviewed creati
 | `directive list` | Resolved project, `--status <proposed\|active\|superseded\|withdrawn\|all>` (active default), list options | Scoped directive metadata/references; active does not prove applicability |
 | `directive show` | `<id>`, resolved project | Directive entrypoint and source references |
 | `bot list` | List options | Registered Manager identity summaries/routing references only |
-| `bot show` | `<bot-id>` | SOUL and routing/navigation metadata; no automatic memory load or activation |
+| `bot show` | `<bot-id>` | SOUL and optional descriptive routing/navigation metadata for inspection; no automatic memory load or activation |
 | `memory list` | `<bot-id>`, resolved project, list options | Authorized scoped memory entrypoint/topic references |
 | `memory show` | `<bot-id>`, optional `<topic>`, resolved project | Scoped MEMORY.md when topic omitted; otherwise one selected topic |
+| `memory show` | `<bot-id> --latest` | Root MEMORY.md only; conflicts with a topic argument and does not load scoped memory |
 
-No cross-Bot memory aggregation, implicit `_general` recall or session context persistence. General memory/directives require explicit applicable scope. Bot lists do not prove runtime availability. Directives require verified issuer and applicability, not a status alone. See [directives](../policies/workspace/directives.md) and [Bot/memory](../policies/workspace/bots.md).
+For the revised [Bot record contract](../policies/workspace/bots.md), registration discovery and validation require `SOUL.md` and root `MEMORY.md`, not optional `README.md` or `AGENTS.md`. Management inspection is separate from Bot context assembly: a client explicitly resuming a Bot reads its SOUL, latest memory and only applicable scoped memory, excluding both management entrypoints and indirect inclusion of their contents. `--latest` is an explicit read mode, independent of project scope; the existing scoped lookup remains unchanged. Preserve legacy navigation-only memory interpretation under the pinned older policy. No cross-Bot memory aggregation, implicit `_general` recall or session context persistence. General memory/directives require explicit applicable scope. Bot lists do not prove runtime availability. Directives require verified issuer and applicability, not a status alone. See [directives](../policies/workspace/directives.md) and [Bot/memory](../policies/workspace/bots.md).
 
-Internal operations: `directive::list/show` with validated project and directive query/key; `bot::list/show` with Bot query/key; `memory::list/show` with verified Bot and project/topic key. Return typed pages/details with observations and reference metadata. No provider adapters or public write endpoints. Reviewed changes remain possible through the authorized direct document/Git workflow.
+Internal operations: `directive::list/show` with validated project and directive query/key; `bot::list/show` with Bot query/key; `memory::list/show` with verified Bot and project/topic key or explicit latest-memory view for show. Return typed pages/details with observations and reference metadata. No provider adapters or public write endpoints. Reviewed changes remain possible through the authorized direct document/Git workflow.
 
 ## Validation and Git coordination
 
