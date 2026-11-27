@@ -15,11 +15,11 @@ const SORT: &str = "CAST(id AS BINARY) ASC";
 type BotRow = (String, String, String, String, Option<String>);
 
 #[derive(Serialize)]
-struct BotMetadata {
-    id: String,
-    slug: String,
+pub(super) struct BotMetadata {
+    pub(super) id: String,
+    pub(super) slug: String,
     display_name: String,
-    revision: String,
+    pub(super) revision: String,
     role: &'static str,
     status: &'static str,
     retired_at: Option<String>,
@@ -168,6 +168,37 @@ fn select_bot(snapshot: &mut Snapshot, id: &str) -> Result<BotMetadata, HiveErro
 }
 
 #[cfg(target_os = "linux")]
+pub(super) struct SoulRead {
+    pub(super) bot: BotMetadata,
+    pub(super) path: String,
+    pub(super) body: String,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn read_soul(
+    snapshot: &mut Snapshot,
+    root: &crate::config_file::ScopedDirectory,
+    id: &str,
+    commit: &str,
+) -> Result<SoulRead, HiveError> {
+    let bot = select_bot(snapshot, id)?;
+    let relative = format!("bots/{}/SOUL.md", bot.slug);
+    let bytes = crate::config_git::read_asset_blob(root, commit, Path::new(&relative))?
+        .ok_or_else(|| {
+            HiveError::new(
+                ErrorCode::NotFound,
+                "The selected Queen's Soul is missing from the asset commit.",
+            )
+        })?;
+    let body = soul_body(&bytes, &snapshot.workspace_id, &bot)?.to_owned();
+    Ok(SoulRead {
+        bot,
+        path: format!("assets/{relative}"),
+        body,
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn show_soul(
     target: &DoltTargetArgs,
     id: &str,
@@ -193,21 +224,11 @@ fn show_soul(
         )));
     }
 
-    let mut result = read(target, |snapshot, workspace_id| {
-        let bot = select_bot(snapshot, id)?;
-        let relative = format!("bots/{}/SOUL.md", bot.slug);
-        let bytes = config_git::read_asset_blob(&candidate.root, commit, Path::new(&relative))?
-            .ok_or_else(|| {
-                HiveError::new(
-                    ErrorCode::NotFound,
-                    "The selected Queen's Soul is missing from the asset commit.",
-                )
-            })?;
-        let body = soul_body(&bytes, workspace_id, &bot)?;
+    let mut result = read(target, |snapshot, _| {
+        let soul = read_soul(snapshot, &candidate.root, id, commit)?;
         Ok(json!({
-            "bot": bot,
-            "observed_revision": snapshot.commit,
-            "soul": { "path": format!("assets/{relative}"), "body": body },
+            "bot": soul.bot, "observed_revision": snapshot.commit,
+            "soul": { "path": soul.path, "body": soul.body },
         }))
     })?;
     result.context["asset_commit"] = json!(commit.to_ascii_lowercase());

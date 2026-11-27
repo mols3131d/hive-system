@@ -184,6 +184,201 @@ fn explicit_dolt_validation_refuses_ambiguous_selection_without_touching_config(
 }
 
 #[test]
+fn context_resolve_rejects_parent_options_with_the_requested_v2_envelope() {
+    let sandbox = Sandbox::new();
+    for args in [
+        &["context", "--contract", "2", "resolve", "--json"][..],
+        &["--contract", "2", "context", "--json", "resolve"],
+        &["context", "--contract=2", "--format=json", "resolve"],
+        &[
+            "--json",
+            "context",
+            "--workspace=fixture",
+            "resolve",
+            "--contract=2",
+        ],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            serde_json::json!({
+                "schema_version": 2,
+                "ok": false,
+                "command": "context resolve",
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "Supply common options before context or after resolve.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+
+    for args in [
+        &["--contract=2", "context", "--workspace=--json", "resolve"][..],
+        &["--contract=2", "context", "resolve", "--", "--json"],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+
+    for args in [
+        &["--json", "context", "--workspace=--contract=2", "resolve"][..],
+        &["--json", "context", "resolve", "--", "--contract=2"],
+        &["--json", "context", "--contract=1", "resolve"],
+    ] {
+        assert_json_failure(&sandbox.run(args), args, "context", "INVALID_ARGUMENT", 2);
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn unknown_context_resolve_option_preserves_v2_errors_and_literal_boundaries() {
+    let sandbox = Sandbox::new();
+    let command = ["context", "resolve"];
+    for (prefix, options) in [
+        (&["--contract", "2"][..], &["--unknown", "--json"][..]),
+        (&[], &["--unknown", "--contract", "2", "--json"]),
+        (&[], &["--unknown=--contract=1", "--contract=2", "--json"]),
+        (&[], &["--unknown=--", "--contract=2", "--format=json"]),
+        (&[], &["--unknown", "--typo", "--contract=2", "--json"]),
+        (&["--contract=2"], &["-x", "--json"]),
+        (&[], &["-xyz", "--unknown", "--contract=2", "--format=json"]),
+        (
+            &[],
+            &[
+                "-xy=--contract=1",
+                "-x",
+                "--typo",
+                "--typo=--json",
+                "--contract=2",
+                "--json",
+                "--",
+            ],
+        ),
+    ] {
+        let args = [prefix, &command, options].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            serde_json::json!({
+                "schema_version": 2,
+                "ok": false,
+                "command": "context resolve",
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "An argument or command is not recognized.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+
+    for options in [
+        &["--unknown=--json", "--contract=2"][..],
+        &["--unknown", "--contract=2", "--", "--json"],
+        &["--", "--unknown", "--contract=2", "--json"],
+        &["--unknown", "detached", "--contract=2", "--json"],
+        &["-x", "detached", "--contract=2", "--json"],
+        &["-xy=--json", "--contract=2"],
+        &["-x--json", "--contract=2"],
+        &["-xy", "--workspace=--json", "--contract=2"],
+        &["-x", "--workspace", "--json", "--contract=2"],
+        &["-xy", "--typo", "--contract=2", "--", "--json"],
+    ] {
+        let args = [&command[..], options].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+
+    let args = ["--json", "context", "resolve", "--unknown=--contract=2"];
+    assert_json_failure(&sandbox.run(&args), &args, "context", "INVALID_ARGUMENT", 2);
+    for args in [
+        &["--json", "context", "resolve", "-xy=--contract=2"][..],
+        &[
+            "--json",
+            "context",
+            "resolve",
+            "-xy",
+            "--workspace=--contract=2",
+        ],
+        &["--json", "context", "resolve", "-xy", "--", "--contract=2"],
+        &[
+            "--contract=1",
+            "--json",
+            "context",
+            "resolve",
+            "-xyz",
+            "--unknown",
+        ],
+    ] {
+        let output = sandbox.run(args);
+        assert_json_failure(&output, args, "context", "INVALID_ARGUMENT", 2);
+        assert_eq!(
+            output.stdout,
+            b"{\"schema_version\":1,\"ok\":false,\"command\":\"context\",\"error\":{\"code\":\"INVALID_ARGUMENT\",\"message\":\"An argument or command is not recognized.\"},\"warnings\":[]}\n",
+            "{args:?}",
+        );
+    }
+    let args = [
+        "--contract=1",
+        "context",
+        "resolve",
+        "-xyz",
+        "--unknown",
+        "--json",
+    ];
+    let output = sandbox.run(&args);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"error: An argument or command is not recognized.\n\nUsage: hive context [OPTIONS]\n",
+    );
+    let help = sandbox.run(&["context", "--help"]);
+    assert!(help.status.success());
+    assert!(help.stderr.is_empty());
+    assert!(!String::from_utf8(help.stdout).unwrap().contains("resolve"));
+    sandbox.assert_empty();
+}
+
+#[test]
+fn context_resolve_unknown_option_recovery_has_a_retry_limit() {
+    let sandbox = Sandbox::new();
+    let unknown: Vec<_> = (0..33).map(|i| format!("--unknown-{i}")).collect();
+    for count in [32, 33] {
+        let args: Vec<_> = ["context", "resolve"]
+            .into_iter()
+            .chain(unknown[..count].iter().map(String::as_str))
+            .chain(["--contract=2", "--json"])
+            .collect();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{count} unknown options");
+        if count == 32 {
+            assert!(output.stderr.is_empty());
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], "context resolve");
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(!output.stderr.is_empty());
+        }
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn malformed_dolt_port_preserves_the_explicit_contract_and_format() {
     let sandbox = Sandbox::new();
     let target = [

@@ -577,6 +577,11 @@ mod filesystem {
                 .map(|file| read_file(file, limit))
                 .transpose()
         }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(crate) fn open_regular(&self, name: &OsStr) -> Result<Option<File>, HiveError> {
+            open_regular_child(&self.file, name)
+        }
     }
 
     pub(crate) fn has_nonempty_regular(

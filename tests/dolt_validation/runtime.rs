@@ -446,3 +446,339 @@ fn workspace_runtime_cli_starts_and_stops_registered_workspace() {
     assert!(!state.join("server.json").exists());
     assert!(state.join("lock").exists());
 }
+
+#[test]
+#[ignore = "requires pinned Dolt at HIVE_DOLT_BIN, local TCP, Linux pidfds and native Git"]
+fn context_resolves_owned_snapshot_and_clean_asset_commit() {
+    let workspace = id(1);
+    let area = id(3);
+    let issue = id(11);
+    let handoff = id(40);
+    let artifact = id(41);
+    let project = id(42);
+    let directive = id(43);
+    let activation = id(44);
+    let invocation = id(45);
+    let bot = id(15);
+    let activated = serde_json::json!({
+        "id": directive, "revision": "directive-r1", "scope": {"kind": "project", "id": project}
+    });
+    let fingerprint = "a".repeat(64);
+    let approval = serde_json::json!({
+        "version": 1, "workspace_id": workspace, "request_id": activation, "fingerprint": fingerprint,
+        "actor_ref": "fixture-actor", "reviewer_ref": "fixture-reviewer",
+        "approval_ref": "fixture-approval", "decision": "approved", "directive": activated
+    });
+    let activation_result = serde_json::json!({"version": 1, "directive": activated});
+    let fixture = Fixture::initialize(&format!(
+        "{}
+
+         INSERT INTO issue_updates VALUES
+             ('{handoff}', '{issue}', 'handoff', 'Synthetic handoff', 'fixture-author', '2026-01-01', NULL);
+         INSERT INTO artifacts (id, kind, title, body, author_ref, revision, created_at, substantive_updated_at)
+             VALUES ('{artifact}', 'report', 'Fixture report', 'Synthetic artifact', 'fixture-author', 'artifact-r1', '2026-01-01', '2026-01-01');
+         INSERT INTO artifact_issues VALUES ('{artifact}', '{issue}');
+         INSERT INTO projects (id, name, status, revision) VALUES ('{project}', 'Fixture project', 'active', 'project-r1');
+         INSERT INTO project_issues VALUES ('{project}', '{issue}');
+         INSERT INTO directives (id, scope_kind, project_id, title, body, status, issuer_ref, source_ref, approval_ref, revision, created_at, updated_at)
+             VALUES ('{directive}', 'project', '{project}', 'Fixture directive', 'Synthetic direction', 'proposed',
+                     'fixture-issuer', 'fixture-source', NULL, 'draft-r1', '2026-01-01', '2026-01-01');
+",
+        seed_sql(CASE_INSENSITIVE),
+    ));
+    let base = fixture.local(
+        &[
+            "sql",
+            "-r",
+            "csv",
+            "-q",
+            "SELECT DOLT_HASHOF('HEAD') AS head",
+        ],
+        None,
+    );
+    let base = base.lines().last().unwrap();
+    fixture.local(&["sql"], Some(&format!(
+        "UPDATE directives SET status = 'active', approval_ref = 'fixture-approval', revision = 'directive-r1'
+         WHERE id = '{directive}';
+         INSERT INTO operation_receipts
+             (request_id, kind, fingerprint, actor_ref, authorization_ref, workflow_evidence_json, base_commit, result_json, created_at)
+             VALUES ('{activation}', 'directive.activate', '{fingerprint}', 'fixture-actor', 'fixture-approval',
+                     '{approval}', '{base}', '{activation_result}', '2026-01-01');"
+    )));
+    fixture.local(&["add", "."], None);
+    fixture.local(&["commit", "-m", "Synthetic atomic activation"], None);
+    let root = fixture.root.join("workspace");
+    fs::create_dir(&root).unwrap();
+    fs::rename(fixture.root.join(DATABASE), root.join("db")).unwrap();
+    let policy = fixture.root.join("policy");
+    let assets = root.join("assets");
+    fs::create_dir_all(policy.join("docs/architecture")).unwrap();
+    fs::create_dir_all(assets.join("bots/fixture")).unwrap();
+    fs::write(
+        policy.join("docs/architecture/dolt-mvp-contract.md"),
+        "# Fixture\n\n### Bot and curated memory\n\n| Queen | Synthetic policy |\n\n#### Continuity boundaries and proposed MVP scope\n",
+    ).unwrap();
+    let soul = assets.join("bots/fixture/SOUL.md");
+    fs::write(&soul, "---\nrole: queen\n---\nSynthetic Soul\n").unwrap();
+    fs::write(
+        assets.join("bots/fixture/AGENTS.md"),
+        "excluded fixture management",
+    )
+    .unwrap();
+    let git = |root: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", fixture.root.join("home"))
+            .current_dir(root)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let commit = |root| {
+        git(root, &["init", "--quiet"]);
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "Synthetic inspection fixture"]);
+        git(root, &["rev-parse", "HEAD"])
+    };
+    let policy_pin = commit(&policy);
+    let asset_pin = commit(&assets);
+    fs::write(root.join("hive-workspace.yml"), format!(
+        "version: 2\nworkspace_id: {workspace}\nschema_version: 1\npolicy_revision: {policy_pin}\n"
+    )).unwrap();
+    let local_state = fixture.root.join("state");
+    let state = local_state.join("hive/v2/workspaces").join(&workspace);
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+    fs::write(
+        state.join("active-root.json"),
+        serde_json::json!({
+            "version": 2, "workspace_id": workspace, "workspace_root": root
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind((HOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+    let fixture_root = fixture.root.clone();
+    let dolt = fixture.dolt.clone();
+    let invoke = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_hive"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", fixture_root.join("home"))
+            .env("XDG_STATE_HOME", &local_state)
+            .current_dir(&fixture_root)
+            .args([
+                "--contract",
+                "2",
+                "--json",
+                "--workspace",
+                root.to_str().unwrap(),
+            ])
+            .args(args)
+            .output()
+    };
+    let run = |args: &[&str], exit| {
+        let output = invoke(args).unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{report}");
+        report
+    };
+
+    struct StopOnDrop<F: Fn() -> bool> {
+        fixture: Option<Fixture>,
+        stop: F,
+    }
+    impl<F: Fn() -> bool> StopOnDrop<F> {
+        fn finish(&mut self) -> bool {
+            let fixture = self.fixture.take().expect("armed runtime fixture");
+            if (self.stop)() {
+                drop(fixture);
+                true
+            } else {
+                eprintln!(
+                    "Verified stop failed. Preserving disposable runtime store at {}",
+                    fixture.root.display()
+                );
+                // Fixture::drop would remove the store even though the server may be live.
+                std::mem::forget(fixture);
+                false
+            }
+        }
+    }
+    impl<F: Fn() -> bool> Drop for StopOnDrop<F> {
+        fn drop(&mut self) {
+            if self.fixture.is_some() {
+                self.finish();
+            }
+        }
+    }
+    let mut cleanup = StopOnDrop {
+        fixture: Some(fixture),
+        stop: || {
+            invoke(&["workspace", "stop"]).ok().is_some_and(|output| {
+                output.status.success()
+                    && serde_json::from_slice::<Value>(&output.stdout).is_ok_and(|report| {
+                        report["ok"] == true && report["data"]["process_exit"] == "pidfd_verified"
+                    })
+            })
+        },
+    };
+    let started = run(
+        &[
+            "workspace",
+            "start",
+            "--dolt-bin",
+            dolt.to_str().unwrap(),
+            "--port",
+            &port,
+        ],
+        0,
+    );
+    let inspect = [
+        "context",
+        "resolve",
+        "--database",
+        "db",
+        "--port",
+        &port,
+        "--workspace-id",
+        &workspace,
+        "--policy-root",
+        policy.to_str().unwrap(),
+        "--asset-commit",
+        &asset_pin,
+        "--actor",
+        "fixture-actor",
+        "--bot",
+        &bot,
+        "--issue",
+        "#4",
+    ];
+    let before = run(&inspect, 0);
+    assert_eq!(before["context"]["asset_commit"], asset_pin);
+    assert_eq!(
+        before["context"]["db_commit"],
+        started["data"]["committed_identity"]["dolt_commit"]
+    );
+    assert_eq!(before["context"]["policy_revision"], policy_pin);
+    assert_eq!(
+        before["data"]["sections"][0]["content"]["soul"]["body"],
+        "Synthetic Soul\n"
+    );
+    assert!(!before.to_string().contains("excluded fixture management"));
+    assert!(!before.to_string().contains("reader-password"));
+    assert!(!before.to_string().contains("Synthetic handoff"));
+    assert!(!before.to_string().contains("Synthetic artifact"));
+    assert!(!before.to_string().contains("Synthetic direction"));
+
+    let commit = before["context"]["db_commit"].as_str().unwrap();
+    let mut work = inspect;
+    *work.last_mut().unwrap() = "#2";
+    let evidence_path = fixture_root.join("context-evidence.json");
+    let rich = [
+        work.as_slice(),
+        &[
+            "--project",
+            &project,
+            "--evidence-file",
+            evidence_path.to_str().unwrap(),
+            "--invocation-id",
+            &invocation,
+        ],
+    ]
+    .concat();
+    let mut evidence = serde_json::json!({
+        "version": 1,
+        "directive_receipts": [{"directive_id": directive, "request_id": activation}],
+    });
+    fs::write(&evidence_path, evidence.to_string()).unwrap();
+    let proof_missing = run(&rich, 7);
+    assert_eq!(proof_missing["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert!(proof_missing.get("data").is_none());
+
+    let declaration = |kind, operation, record, revision| {
+        serde_json::json!({
+            "version": 1, "evidence_id": "fixture-current-secret-marker", "revision": "grant-r1",
+            "source_ref": "fixture-current-source", "issuer_ref": "fixture-current-issuer",
+            "workspace_id": workspace, "actor_ref": "fixture-actor", "bot_id": bot, "area_id": area,
+            "issue_id": issue, "operations": [operation], "record": {"kind": kind, "id": record, "revision": revision},
+            "invocation_id": invocation, "db_commit": commit, "valid_from": "2000-01-01T00:00:00Z",
+            "expires_at": "2099-01-01T00:00:00Z", "withdrawn": false,
+        })
+    };
+    evidence["handoff"] = declaration(
+        "issue_update",
+        "read_handoff_body",
+        handoff.as_str(),
+        commit,
+    );
+    evidence["artifacts"] = serde_json::json!([declaration(
+        "artifact",
+        "disclose_artifact_body",
+        artifact.as_str(),
+        "artifact-r1"
+    )]);
+    fs::write(&evidence_path, evidence.to_string()).unwrap();
+    let unauthorized = run(&rich, 6);
+    assert_eq!(unauthorized["error"]["code"], "UNAUTHORIZED");
+    let selected = [rich.as_slice(), &["--include-artifact", artifact.as_str()]].concat();
+    let resolved = run(&selected, 0);
+    assert_eq!(resolved["context"]["db_commit"], commit);
+    assert!(
+        resolved["context"]["observed_at"]
+            .as_str()
+            .unwrap()
+            .ends_with('Z')
+    );
+    let sections = resolved["data"]["sections"].as_array().unwrap();
+    assert_eq!(sections[1]["content"][0]["body"], "Synthetic direction");
+    assert_eq!(sections[4]["content"]["body"], "Synthetic handoff");
+    assert_eq!(sections[5]["content"][0]["body"], "Synthetic artifact");
+    for private in [
+        "fixture-current-secret-marker",
+        "fixture-current-source",
+        "fixture-current-issuer",
+        "withdrawn",
+        "invocation_id",
+        "reader-password",
+        "pid_start_verified",
+    ] {
+        assert!(!resolved.to_string().contains(private), "{private}");
+    }
+    evidence["handoff"]["db_commit"] = "v".repeat(32).into();
+    fs::write(&evidence_path, evidence.to_string()).unwrap();
+    let stale = run(&selected, 6);
+    assert_eq!(stale["error"]["code"], "UNAUTHORIZED");
+    assert!(stale.get("data").is_none());
+
+    let lock = fs::File::open(state.join("lock")).unwrap();
+    // SAFETY: the open descriptor identifies the existing workspace lock.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let busy = run(&inspect, 5);
+    assert_eq!(busy["error"]["code"], "LOCK_BUSY");
+    drop(lock);
+
+    fs::write(soul, "dirty asset").unwrap();
+    let dirty = run(&inspect, 5);
+    assert_eq!(dirty["error"]["code"], "DIRTY_CONFLICT");
+    assert!(dirty.get("data").is_none());
+    assert!(cleanup.finish(), "Verified runtime fixture stop failed");
+}

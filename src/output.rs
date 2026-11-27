@@ -70,6 +70,26 @@ fn write_json(output: &mut impl Write, envelope: &Envelope<'_>) -> bool {
     serde_json::to_writer(&mut *output, envelope).is_ok() && writeln!(output).is_ok()
 }
 
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn context_json_bytes(context: &Value, data: &Value) -> Result<usize, HiveError> {
+    let envelope = Envelope {
+        schema_version: Contract::V2.schema_version(),
+        ok: true,
+        command: Some("context resolve"),
+        context: Some(context),
+        outcome: Outcome::Success { data },
+        warnings: &[],
+    };
+    serde_json::to_vec(&envelope)
+        .map(|bytes| bytes.len() + 1)
+        .map_err(|_| {
+            HiveError::new(
+                crate::error::ErrorCode::InternalError,
+                "Could not encode the context envelope.",
+            )
+        })
+}
+
 pub(crate) fn failure(
     contract: Contract,
     format: Format,

@@ -16,6 +16,9 @@ pub(crate) struct Registration {
 #[path = "workspace_runtime.rs"]
 mod runtime;
 
+#[cfg(target_os = "linux")]
+pub(crate) use runtime::with_owned_snapshot;
+
 pub(crate) fn run(
     options: &CommonOptions,
     command: &WorkspaceCommand,

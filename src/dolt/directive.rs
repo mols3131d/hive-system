@@ -6,13 +6,14 @@ use crate::error::{ErrorCode, HiveError};
 
 use super::{DoltFailure, DoltSuccess, Snapshot, encode_id_cursor, id_cursor_key, is_uuid_v7};
 
-const METADATA: &str = "id, scope_kind, area_id, project_id, include_descendants, title, status,
+pub(super) const METADATA: &str =
+    "id, scope_kind, area_id, project_id, include_descendants, title, status,
     revision, DATE_FORMAT(valid_from, '%Y-%m-%dT%H:%i:%s.%fZ'),
     DATE_FORMAT(expires_at, '%Y-%m-%dT%H:%i:%s.%fZ'), approval_ref IS NOT NULL";
 const SORT: &str = "CAST(id AS BINARY) ASC";
 const MAX_INLINE_BYTES: u32 = 64 * 1024;
 
-type MetadataRow = (
+pub(super) type MetadataRow = (
     String,
     String,
     Option<String>,
@@ -29,7 +30,7 @@ type DetailRow = (String, String, String, Option<String>);
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
-enum Scope<'a> {
+pub(super) enum Scope<'a> {
     Workspace,
     Area(&'a str),
     Project(&'a str),
@@ -91,7 +92,7 @@ impl<'a> Scope<'a> {
         }
     }
 
-    fn metadata(self, row: MetadataRow) -> Result<Metadata, HiveError> {
+    pub(super) fn metadata(self, row: MetadataRow) -> Result<Metadata, HiveError> {
         let (
             id,
             kind,
@@ -141,14 +142,14 @@ impl<'a> Scope<'a> {
 }
 
 #[derive(Serialize)]
-struct Metadata {
-    id: String,
+pub(super) struct Metadata {
+    pub(super) id: String,
     title: String,
     status: String,
-    revision: String,
-    valid_from: Option<String>,
-    expires_at: Option<String>,
-    include_descendants: bool,
+    pub(super) revision: String,
+    pub(super) valid_from: Option<String>,
+    pub(super) expires_at: Option<String>,
+    pub(super) include_descendants: bool,
 }
 
 pub(crate) fn list(

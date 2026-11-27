@@ -172,7 +172,7 @@ fn show(snapshot: &mut Snapshot, id: &str) -> Result<Value, HiveError> {
     }))
 }
 
-fn is_project_status(status: &str) -> bool {
+pub(super) fn is_project_status(status: &str) -> bool {
     matches!(status, "active" | "completed" | "archived")
 }
 
