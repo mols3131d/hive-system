@@ -15,6 +15,8 @@ mod directive_receipt;
 mod graph;
 mod issue;
 mod issue_list;
+#[cfg(any(test, target_os = "linux"))]
+mod issue_note_fingerprint;
 #[cfg(target_os = "linux")]
 mod issue_note_receipt;
 mod issue_readiness;
