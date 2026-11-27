@@ -3255,6 +3255,39 @@ fn operation_show_requires_v2_and_exact_current_selection() {
 }
 
 #[test]
+fn conversation_import_help_and_invocation_require_explicit_v2() {
+    let sandbox = Sandbox::new();
+    for options in [&[][..], &["--contract", "1"][..]] {
+        for leaf in ["--help", "--stdin"] {
+            for (prefix, suffix) in [(options, &[][..]), (&[][..], options)] {
+                let actual =
+                    sandbox.run(&[prefix, &["conversation", "import", leaf], suffix].concat());
+                let unknown =
+                    sandbox.run(&[prefix, &["conversation", "unknown", leaf], suffix].concat());
+                assert_eq!(actual.status.code(), Some(2));
+                assert_eq!(actual.status, unknown.status);
+                assert_eq!(actual.stdout, unknown.stdout);
+                assert_eq!(actual.stderr, unknown.stderr);
+            }
+        }
+    }
+    for args in [
+        ["--contract", "2", "conversation", "import", "--help"],
+        ["conversation", "import", "--help", "--contract", "2"],
+    ] {
+        let help = sandbox.run(&args);
+        assert!(help.status.success());
+        let help = String::from_utf8(help.stdout).unwrap();
+        assert!(help.contains("Usage: hive conversation import"));
+        assert!(help.contains("--stdin"));
+    }
+    let help = sandbox.run(&["conversation", "--help"]);
+    assert!(help.status.success());
+    assert!(!String::from_utf8(help.stdout).unwrap().contains("import"));
+    sandbox.assert_empty();
+}
+
+#[test]
 fn operation_is_registered_for_v2_help_and_preserves_v1_unknown_command_bytes() {
     let sandbox = Sandbox::new();
     for selection in [&[][..], &["--contract", "1"][..]] {
