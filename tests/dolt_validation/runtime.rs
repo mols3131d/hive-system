@@ -1060,6 +1060,7 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
         &restart,
         &dolt,
     );
+    issue_create_writer_fixture(&state, &fixture_root, &port, &run, &restart);
     assert!(cleanup.finish(), "Verified runtime fixture stop failed");
 }
 
@@ -1093,22 +1094,7 @@ fn issue_note_writer_fixture(
             "progress",
             digest(body.as_bytes()),
         ]);
-        let now = time::OffsetDateTime::from_unix_timestamp(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64,
-        )
-        .unwrap();
-        let stamp = |at: time::OffsetDateTime| {
-            format!(
-                "{}T{:02}:{:02}:{:02}Z",
-                at.date(),
-                at.hour(),
-                at.minute(),
-                at.second()
-            )
-        };
+        let now = fixture_now();
         let evidence = serde_json::json!({
             "decision": "allow",
             "evidence": {
@@ -1119,8 +1105,8 @@ fn issue_note_writer_fixture(
                 "authorization_ref": "fixture-write-authorization",
                 "evidence_id": "fixture-write-evidence", "revision": "r1",
                 "source_ref": "fixture-write-source", "issuer_ref": "fixture-write-issuer",
-                "valid_from": stamp(now - time::Duration::seconds(10)),
-                "expires_at": stamp(now + time::Duration::hours(1)), "withdrawn": false,
+                "valid_from": fixture_timestamp(now - time::Duration::seconds(10)),
+                "expires_at": fixture_timestamp(now + time::Duration::hours(1)), "withdrawn": false,
             }
         });
         fs::write(&body_path, body).unwrap();
@@ -1200,28 +1186,8 @@ fn issue_note_writer_fixture(
     let stale = note(&id(62), "fixture-holder", revision, body, 5);
     assert_eq!(stale["error"]["code"], "STALE_REVISION");
 
-    let launch_nonce = || {
-        let server: Value =
-            serde_json::from_slice(&fs::read(state.join("server.json")).unwrap()).unwrap();
-        server["nonce"].as_str().unwrap().to_owned()
-    };
-    let nonce = launch_nonce();
-    let connect = |role: &str| {
-        let nonce = launch_nonce();
-        let password =
-            fs::read_to_string(state.join(format!("run-{nonce}/{role}-password"))).unwrap();
-        let user = format!("{role}_{}", &nonce.replace('-', "")[..24]);
-        Conn::new(
-            OptsBuilder::new()
-                .ip_or_hostname(Some(HOST))
-                .tcp_port(port.parse().unwrap())
-                .prefer_socket(false)
-                .user(Some(user))
-                .pass(Some(password))
-                .db_name(Some("db")),
-        )
-        .unwrap_or_else(|_| panic!("Could not connect the synthetic independent client."))
-    };
+    let nonce = launch_nonce(state);
+    let connect = |role| connect_owned(state, port, role);
     let mut reader = connect("reader");
     let head: String = reader
         .query_first("SELECT DOLT_HASHOF('HEAD')")
@@ -1364,7 +1330,7 @@ fn issue_note_writer_fixture(
         let message = legacy["error"]["message"].as_str().unwrap();
         assert!(message.contains("lacks the required Issue note writer grants"));
         assert!(message.contains("workspace stop") && message.contains("workspace start"));
-        assert!(!message.contains("writer_") && !message.contains(&launch_nonce()));
+        assert!(!message.contains("writer_") && !message.contains(&launch_nonce(state)));
         assert!(!marker.exists());
 
         let old_pending = b"synthetic unresolved pending request";
@@ -1396,5 +1362,389 @@ fn issue_note_writer_fixture(
         // Only the fixture removes its deliberately fabricated marker.
         fs::remove_file(&marker).unwrap();
         run(&start, 0);
+    }
+}
+
+fn fixture_now() -> time::OffsetDateTime {
+    time::OffsetDateTime::from_unix_timestamp(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
+    )
+    .unwrap()
+}
+
+fn fixture_timestamp(at: time::OffsetDateTime) -> String {
+    format!(
+        "{}T{:02}:{:02}:{:02}Z",
+        at.date(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+    )
+}
+
+fn launch_nonce(state: &Path) -> String {
+    let server: Value =
+        serde_json::from_slice(&fs::read(state.join("server.json")).unwrap()).unwrap();
+    server["nonce"].as_str().unwrap().to_owned()
+}
+
+fn connect_owned(state: &Path, port: &str, role: &str) -> Conn {
+    let nonce = launch_nonce(state);
+    let password = fs::read_to_string(state.join(format!("run-{nonce}/{role}-password"))).unwrap();
+    let user = format!("{role}_{}", &nonce.replace('-', "")[..24]);
+    Conn::new(
+        OptsBuilder::new()
+            .ip_or_hostname(Some(HOST))
+            .tcp_port(port.parse().unwrap())
+            .prefer_socket(false)
+            .user(Some(user))
+            .pass(Some(password))
+            .db_name(Some("db")),
+    )
+    .unwrap_or_else(|_| panic!("Could not connect the synthetic independent client."))
+}
+
+fn issue_create_writer_fixture(
+    state: &Path,
+    root: &Path,
+    port: &str,
+    run: &impl Fn(&[&str], i32) -> Value,
+    restart: &impl Fn(Option<&str>, Option<&std::ffi::OsStr>),
+) {
+    let workspace = id(1);
+    let area = id(3);
+    let actor = "fixture-planner";
+    let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    let decision_path = root.join("create-decision.json");
+    let body_path = root.join("issue-body.md");
+    let marker = state.join("pending-request.json");
+    let create =
+        |request: &str, area: &str, title: &str, body: Option<&str>, expiry_hours: i64, exit| {
+            let payload = serde_json::json!([
+                1,
+                "issue.create",
+                workspace,
+                area,
+                actor,
+                "task",
+                title,
+                body.map(|value| digest(value.as_bytes())),
+            ]);
+            let now = fixture_now();
+            let evidence = serde_json::json!({
+                "decision": "allow",
+                "evidence": {
+                    "version": 1, "operation": "issue.create", "workspace_id": workspace,
+                    "request_id": request, "fingerprint": digest(payload.to_string().as_bytes()),
+                    "actor_ref": actor, "area_id": area,
+                    "authorization_ref": "fixture-create-authorization",
+                    "evidence_id": "fixture-create-evidence", "revision": "r1",
+                    "source_ref": "fixture-create-source", "issuer_ref": "fixture-create-issuer",
+                    "valid_from": fixture_timestamp(now - time::Duration::hours(2)),
+                    "expires_at": fixture_timestamp(now + time::Duration::hours(expiry_hours)),
+                    "withdrawn": false,
+                }
+            });
+            fs::write(&decision_path, evidence.to_string()).unwrap();
+            let mut args = vec![
+                "issue",
+                "create",
+                "--workspace-id",
+                &workspace,
+                "--database",
+                "db",
+                "--port",
+                port,
+                "--area",
+                area,
+                "--type",
+                "task",
+                "--title",
+                title,
+                "--actor",
+                actor,
+                "--request-id",
+                request,
+                "--evidence-file",
+                decision_path.to_str().unwrap(),
+            ];
+            if let Some(body) = body {
+                fs::write(&body_path, body).unwrap();
+                args.extend(["--file", body_path.to_str().unwrap()]);
+            }
+            let report = run(&args, exit);
+            assert_eq!(report["command"], "issue create");
+            assert!(!report.to_string().contains("fixture-create-authorization"));
+            report
+        };
+
+    let title = "Fixture café";
+    let body = "Synthetic Issue body\r\nλ\n";
+    let request = id(80);
+    let connect = |role| connect_owned(state, port, role);
+    if let Some(baseline) = std::env::var_os("HIVE_ISSUE_CREATE_BASELINE_BIN") {
+        restart(None, Some(&baseline));
+        let mut reader = connect("reader");
+        let before = storage_state(&mut reader);
+        let legacy = create(&request, &area, title, Some(body), 1, 7);
+        assert_eq!(legacy["error"]["code"], "RUNTIME_UNAVAILABLE");
+        assert!(
+            legacy["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("workspace stop")
+        );
+        assert_eq!(storage_state(&mut reader), before);
+        assert!(!marker.exists());
+        drop(reader);
+        restart(None, None);
+    }
+
+    let mut reader = connect("reader");
+    let before = storage_state(&mut reader);
+    let expired = create(&request, &area, title, Some(body), -1, 7);
+    assert_eq!(expired["error"]["code"], "AUTHORITY_UNVERIFIED");
+    let missing = create(&request, &id(85), title, Some(body), 1, 7);
+    assert_eq!(missing["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert_eq!(storage_state(&mut reader), before);
+    assert!(!marker.exists());
+
+    let created = create(&request, &area, title, Some(body), 1, 0);
+    let result = &created["data"]["result"];
+    assert_eq!(created["data"]["outcome"], "confirmed");
+    assert_eq!(created["data"]["base_commit"], before.0);
+    assert_eq!(result["area_id"], area);
+    assert_eq!(result["number"], 5);
+    let issue = result["issue_id"].as_str().unwrap();
+    assert_eq!(&issue[14..15], "7");
+    assert_eq!(&result["issue_revision"].as_str().unwrap()[14..15], "7");
+    assert!(!created.to_string().contains("Synthetic Issue body"));
+    assert!(!marker.exists());
+
+    let after = storage_state(&mut reader);
+    assert_eq!(created["data"]["confirmed_commit"], after.0);
+    assert!(after.3.is_empty());
+    let stored: (String, u64, String, String, String, Vec<u8>, u64) = reader
+        .exec_first(
+            "SELECT area_id, number, revision, status, title, CAST(body AS BINARY),
+                (SELECT next_value FROM workspace_counters WHERE name = 'issue_number')
+         FROM issues WHERE id = ?",
+            (issue,),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored,
+        (
+            area.clone(),
+            5,
+            result["issue_revision"].as_str().unwrap().to_owned(),
+            "backlog".to_owned(),
+            title.to_owned(),
+            body.as_bytes().to_owned(),
+            6
+        )
+    );
+    let replayed = create(&request, &area, title, Some(body), 1, 0);
+    assert_eq!(replayed["data"]["outcome"], "replayed");
+    assert_eq!(replayed["data"]["result"], *result);
+    assert_eq!(replayed["data"]["confirmed_commit"], after.0);
+    let expired = create(&request, &area, title, Some(body), -1, 7);
+    assert_eq!(expired["error"]["code"], "AUTHORITY_UNVERIFIED");
+    let conflict = create(&request, &area, title, None, 1, 5);
+    assert_eq!(conflict["error"]["code"], "REQUEST_CONFLICT");
+    let conflict = create(&id(46), &area, title, None, 1, 5);
+    assert_eq!(conflict["error"]["code"], "REQUEST_CONFLICT");
+    assert_eq!(storage_state(&mut reader), after);
+
+    let missing_ack: (String, String, String, String, String, String, String, String) = reader.exec_first(
+        "SELECT kind, actor_ref, fingerprint, authorization_ref, base_commit,
+                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'), workflow_evidence_json, result_json
+           FROM operation_receipts WHERE request_id = ?", (&request,),
+    ).unwrap().unwrap();
+    let mut current = connect("writer");
+    let insert_tables: Vec<String> = current
+        .query(
+            "SELECT TABLE_NAME FROM information_schema.TABLE_PRIVILEGES
+         WHERE TABLE_SCHEMA = 'db' AND PRIVILEGE_TYPE = 'INSERT' ORDER BY TABLE_NAME",
+        )
+        .unwrap();
+    assert_eq!(
+        insert_tables,
+        ["issue_updates", "issues", "operation_receipts"]
+    );
+    let mut prior = connect("writer");
+    prior.query_drop("START TRANSACTION").unwrap();
+    let session: u64 = prior
+        .query_first("SELECT CONNECTION_ID()")
+        .unwrap()
+        .unwrap();
+    let intent = serde_json::json!({
+        "version": 2, "kind": "issue.create", "workspace_id": workspace,
+        "launch_nonce": launch_nonce(state), "session_id": session, "request_id": request,
+        "base_commit": before.0, "fingerprint": missing_ack.2, "area_id": area,
+        "issue_id": issue, "receipt_digest": digest(serde_json::json!(missing_ack).to_string().as_bytes()),
+    }).to_string();
+    fs::write(&marker, &intent).unwrap();
+    fs::set_permissions(&marker, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let blocked = create(&id(81), &area, title, None, 1, 8);
+    assert_eq!(blocked["error"]["code"], "COMMIT_UNCERTAIN");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), intent);
+    prior.query_drop("ROLLBACK").unwrap();
+    drop(prior);
+    // The observer polls for positive fixture teardown evidence before invoking Hive.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while current
+        .exec_first::<u64, _, _>(
+            "SELECT ID FROM information_schema.PROCESSLIST WHERE ID = ?",
+            (session,),
+        )
+        .unwrap()
+        .is_some()
+    {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        create(&request, &area, title, Some(body), 1, 0)["data"],
+        replayed["data"]
+    );
+    assert!(!marker.exists());
+
+    current
+        .query_drop("UPDATE workspace_counters SET next_value = 7 WHERE name = 'issue_number'")
+        .unwrap();
+    let dirty = storage_state(&mut reader);
+    assert!(!dirty.3.is_empty());
+    let rejected = create(&id(81), &area, title, None, 1, 5);
+    assert_eq!(rejected["error"]["code"], "DIRTY_CONFLICT");
+    assert_eq!(storage_state(&mut reader), dirty);
+    current
+        .query_drop("UPDATE workspace_counters SET next_value = 6 WHERE name = 'issue_number'")
+        .unwrap();
+    assert_eq!(storage_state(&mut reader), after);
+    let second = create(&id(81), &area, title, None, 1, 0);
+    assert_eq!(second["data"]["result"]["number"], 6);
+    let second_id = second["data"]["result"]["issue_id"].as_str().unwrap();
+    let no_body: bool = reader
+        .exec_first("SELECT body IS NULL FROM issues WHERE id = ?", (second_id,))
+        .unwrap()
+        .unwrap();
+    assert!(no_body);
+    let observed_commit = storage_state(&mut reader).0;
+    let invocation = id(86);
+    let now = fixture_now();
+    let inspection = serde_json::json!({
+        "version": 1, "evidence_id": "fixture-inspection", "revision": "r1",
+        "source_ref": "fixture-source", "issuer_ref": "fixture-issuer",
+        "workspace_id": workspace, "actor_ref": actor, "bot_id": null,
+        "area_id": area, "issue_id": issue, "operations": ["inspect_operation_receipt"],
+        "record": {"kind": "operation_receipt", "id": request, "revision": observed_commit},
+        "invocation_id": invocation, "db_commit": observed_commit,
+        "valid_from": fixture_timestamp(now - time::Duration::seconds(10)),
+        "expires_at": fixture_timestamp(now + time::Duration::hours(1)),
+        "withdrawn": false,
+    });
+    fs::write(&decision_path, inspection.to_string()).unwrap();
+    let inspected = run(
+        &[
+            "operation",
+            "show",
+            &request,
+            "--database",
+            "db",
+            "--port",
+            port,
+            "--workspace-id",
+            &workspace,
+            "--area",
+            &area,
+            "--issue",
+            issue,
+            "--actor",
+            actor,
+            "--invocation-id",
+            &invocation,
+            "--evidence-file",
+            decision_path.to_str().unwrap(),
+        ],
+        0,
+    );
+    assert_eq!(inspected["data"]["result"], *result);
+    assert_eq!(inspected["data"]["confirmed_commit"], after.0);
+    assert_eq!(inspected["context"]["db_commit"], observed_commit);
+    assert!(inspected["data"]["current_claim"].is_null());
+
+    drop(current);
+    drop(reader);
+
+    for (sql, request, error) in [
+        (
+            format!(
+                "UPDATE areas SET archived_at = UTC_TIMESTAMP(6) WHERE id = '{}'",
+                id(2)
+            ),
+            id(82),
+            "INVALID_TRANSITION",
+        ),
+        (
+            format!(
+                "UPDATE areas SET archived_at = NULL WHERE id = '{}';
+                  UPDATE workspace_counters SET next_value = 6 WHERE name = 'issue_number'",
+                id(2)
+            ),
+            id(82),
+            "INVALID_RECORD",
+        ),
+        (
+            format!("DELETE FROM issues WHERE id = '{second_id}'"),
+            id(82),
+            "INVALID_RECORD",
+        ),
+        (
+            "UPDATE workspace_counters SET next_value = 0 WHERE name = 'issue_number'".to_owned(),
+            id(82),
+            "INVALID_RECORD",
+        ),
+        (
+            "DELETE FROM workspace_counters WHERE name = 'issue_number'".to_owned(),
+            id(82),
+            "INVALID_RECORD",
+        ),
+        (
+            "INSERT INTO workspace_counters VALUES ('ISSUE_NUMBER', 7)".to_owned(),
+            id(82),
+            "INVALID_RECORD",
+        ),
+        (
+            "DELETE FROM workspace_counters;
+          INSERT INTO workspace_counters VALUES ('issue_number', 18446744073709551615)"
+                .to_owned(),
+            id(82),
+            "INVALID_RECORD",
+        ),
+        (
+            format!(
+                "UPDATE workspace_counters SET next_value = 7 WHERE name = 'issue_number';
+                  DELETE FROM operation_receipts WHERE request_id = '{}'",
+                id(81)
+            ),
+            id(81),
+            "COMMIT_UNCERTAIN",
+        ),
+    ] {
+        restart(Some(&sql), None);
+        let mut reader = connect("reader");
+        let unchanged = storage_state(&mut reader);
+        let exit = if error == "COMMIT_UNCERTAIN" { 8 } else { 4 };
+        assert_eq!(
+            create(&request, &area, title, None, 1, exit)["error"]["code"],
+            error
+        );
+        assert_eq!(storage_state(&mut reader), unchanged);
+        assert!(!marker.exists());
     }
 }

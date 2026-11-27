@@ -25,11 +25,3 @@ pub(crate) fn write(
 
 #[cfg(target_os = "linux")]
 mod linux;
-
-#[cfg(target_os = "linux")]
-fn uncertain() -> HiveError {
-    HiveError::new(
-        ErrorCode::CommitUncertain,
-        "The pending Issue note outcome could not be established.",
-    )
-}

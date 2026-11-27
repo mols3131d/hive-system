@@ -161,18 +161,37 @@ fn inspect(
             )
         });
     };
-    let result = super::issue_note_receipt::check_scope(
-        snapshot,
-        selected.request,
-        selected.area,
-        selected.issue,
-        selected.actor,
-        &receipt,
-    )?;
-    let introduced = receipt_history::receipt_introduction(snapshot, selected.request, &receipt)
-        .map_err(|_| uncertain())?;
-    super::issue_note_receipt::verify_effect(snapshot, &introduced, &receipt, &result, None)
-        .map_err(|_| uncertain())?;
+    let (introduced, result) = if receipt.kind == super::issue_create::KIND {
+        let result = super::issue_create::check_scope(
+            snapshot,
+            selected.request,
+            selected.area,
+            Some(selected.issue),
+            selected.actor,
+            &receipt,
+        )?;
+        let introduced =
+            receipt_history::receipt_introduction(snapshot, selected.request, &receipt)
+                .map_err(|_| uncertain())?;
+        super::issue_create::verify_effect(snapshot, &introduced, &receipt, &result)
+            .map_err(|_| uncertain())?;
+        (introduced, json!(result))
+    } else {
+        let result = super::issue_note_receipt::check_scope(
+            snapshot,
+            selected.request,
+            selected.area,
+            selected.issue,
+            selected.actor,
+            &receipt,
+        )?;
+        let introduced =
+            receipt_history::receipt_introduction(snapshot, selected.request, &receipt)
+                .map_err(|_| uncertain())?;
+        super::issue_note_receipt::verify_effect(snapshot, &introduced, &receipt, &result, None)
+            .map_err(|_| uncertain())?;
+        (introduced, json!(result.result))
+    };
     let claim = current_claim(snapshot, selected.issue, status)?;
     let observed_at = workflow::format_observed_at(observed);
     Ok(DoltSuccess {
@@ -184,7 +203,7 @@ fn inspect(
         data: json!({
             "request_id": selected.request, "kind": receipt.kind, "outcome": "confirmed",
             "base_commit": receipt.base_commit, "confirmed_commit": introduced,
-            "result": result.result, "current_claim": claim,
+            "result": result, "current_claim": claim,
         }),
     })
 }
