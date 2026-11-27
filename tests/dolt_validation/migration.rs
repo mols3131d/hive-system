@@ -681,14 +681,14 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
     assert_eq!(counter_rollback, 1);
 
     // Commit Git-tracked Soul bytes BEFORE committing Dolt bots row; exclude README & Memory.
-    let target_assets = fixture.root.join("target-assets-git");
+    let target_assets = fixture.root.join("target-workspace").join("assets");
     init_git(
         &target_assets,
         &home,
         "Synthetic Target",
         "target@example.invalid",
     );
-    let soul_path = target_assets.join("assets/bots/queen-synth/SOUL.md");
+    let soul_path = target_assets.join("bots/queen-synth/SOUL.md");
     fs::create_dir_all(soul_path.parent().unwrap()).unwrap();
     fs::write(&soul_path, &projection.soul_bytes).unwrap();
     git(&target_assets, &home, &["add", "."]);
@@ -704,15 +704,12 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
             &home,
             &["ls-tree", "--name-only", "-r", &asset_commit]
         ),
-        "assets/bots/queen-synth/SOUL.md"
+        "bots/queen-synth/SOUL.md"
     );
     let committed_soul = git(
         &target_assets,
         &home,
-        &[
-            "show",
-            &format!("{asset_commit}:assets/bots/queen-synth/SOUL.md"),
-        ],
+        &["show", &format!("{asset_commit}:bots/queen-synth/SOUL.md")],
     );
     assert_eq!(
         sha256_hex(&committed_soul),
@@ -739,8 +736,45 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
         .unwrap()
         .unwrap();
     assert_eq!(counter_committed, 3);
-    assert_eq!(row_count(&mut admin, "issue_claims"), 0);
-    assert_eq!(row_count(&mut admin, "bot_memories"), 0);
+    for (table, expected) in [
+        ("areas", 3),
+        ("projects", 1),
+        ("resources", 1),
+        ("area_resources", 1),
+        ("issues", 2),
+        ("project_issues", 1),
+        ("issue_resources", 1),
+        ("issue_claims", 0),
+        ("directives", 2),
+        ("artifacts", 1),
+        ("artifact_issues", 1),
+        ("artifact_areas", 1),
+        ("bots", 1),
+        ("bot_memories", 0),
+    ] {
+        assert_eq!(
+            row_count(&mut admin, table),
+            expected,
+            "committed rows in {table}"
+        );
+    }
+
+    let membership: (u64, String, String, String) = admin
+        .exec_first(
+            "SELECT i.number, i.area_id, pi.project_id, ir.resource_id
+             FROM issues i
+             JOIN project_issues pi ON pi.issue_id = i.id
+             JOIN issue_resources ir ON ir.issue_id = i.id
+             JOIN area_resources ar ON ar.area_id = i.area_id AND ar.resource_id = ir.resource_id
+             WHERE i.id = ?",
+            (id(0x112),),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        membership,
+        (2, id(AREA_APP), id(PROJECT_RELEASE), id(RESOURCE_REPO))
+    );
 
     let supersession: (String, Option<String>) = admin
         .exec_first(
@@ -759,9 +793,9 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
         .unwrap();
     assert_eq!(replaced_supersedes, None);
 
-    let artifact_link: (String, String, String) = admin
+    let artifact_link: (String, String, String, String) = admin
         .exec_first(
-            "SELECT a.kind, DATE_FORMAT(a.substantive_updated_at, '%Y-%m-%d %H:%i:%s'), ai.issue_id
+            "SELECT a.kind, DATE_FORMAT(a.substantive_updated_at, '%Y-%m-%d %H:%i:%s'), ai.issue_id, a.author_ref
              FROM artifacts a JOIN artifact_issues ai ON ai.artifact_id = a.id WHERE a.id = ?",
             (id(ARTIFACT_REPORT),),
         )
@@ -772,7 +806,8 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
         (
             "report".to_owned(),
             "2026-01-02 01:00:00".to_owned(),
-            id(0x112)
+            id(0x112),
+            "synthetic-author".to_owned(),
         )
     );
 
