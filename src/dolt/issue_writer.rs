@@ -202,6 +202,13 @@ pub(super) trait Mutation {
     fn verify_decision(&self, now: OffsetDateTime) -> Result<(), HiveError>;
     fn evidence(&self) -> Result<String, HiveError>;
     fn check_scope(&self, snapshot: &mut Snapshot) -> Result<(), HiveError>;
+    fn verify_replay_decision(
+        &self,
+        _snapshot: &mut Snapshot,
+        _base: &str,
+    ) -> Result<(), HiveError> {
+        Ok(())
+    }
     fn guard(
         &self,
         db: &mut Transaction<'_>,
@@ -492,6 +499,7 @@ pub(super) fn execute(
             let result = scoped
                 .verify(snapshot, &introduced, &receipt)
                 .map_err(|_| uncertain())?;
+            mutation.verify_replay_decision(snapshot, &receipt.base_commit)?;
             require_clean(&mut snapshot.connection, &commit)?;
             runtime.check()?;
             mutation.verify_decision(observe_time()?)?;

@@ -808,6 +808,19 @@ fn execute(
     issue_writer::execute(&workspace, target, &transition)
 }
 
+impl Transition<'_> {
+    fn verify_submission_review(
+        &self,
+        snapshot: &mut Snapshot,
+        base: &str,
+    ) -> Result<(), HiveError> {
+        if let Some(review) = &self.decision.evidence.review {
+            submission_history::verify(snapshot, base, &self.request, review)?;
+        }
+        Ok(())
+    }
+}
+
 impl Mutation for Transition<'_> {
     type Guard = (Issue, Option<Claim>);
 
@@ -853,6 +866,10 @@ impl Mutation for Transition<'_> {
         }
     }
 
+    fn verify_replay_decision(&self, snapshot: &mut Snapshot, base: &str) -> Result<(), HiveError> {
+        self.verify_submission_review(snapshot, base)
+    }
+
     fn guard(
         &self,
         db: &mut Transaction<'_>,
@@ -867,10 +884,8 @@ impl Mutation for Transition<'_> {
             None
         };
         request.check_readiness(db, &issue, None)?;
-        if let Some(review) = &self.decision.evidence.review {
-            let base = snapshot.commit.clone();
-            submission_history::verify(snapshot, &base, request, review)?;
-        }
+        let base = snapshot.commit.clone();
+        self.verify_submission_review(snapshot, &base)?;
         if request.operation.is_reconciliation() {
             reconcile::check_closure(db, request, None)?;
             reconcile::check_graph(

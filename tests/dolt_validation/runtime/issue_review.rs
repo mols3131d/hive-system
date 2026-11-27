@@ -262,6 +262,13 @@ pub(super) fn exercise_epic(
     );
     assert_eq!(storage_state(&mut reader), before);
 
+    let mut predating = accept(REVIEWER, 253, std::slice::from_ref(&child));
+    predating.evidence["evidence"]["review"]["reviewed_at"] = json!("2000-01-01T00:00:00Z");
+    assert_eq!(
+        predating.run(run, 7)["error"]["code"],
+        "AUTHORITY_UNVERIFIED"
+    );
+    assert_eq!(storage_state(&mut reader), before);
     let accept = accept(REVIEWER, 253, std::slice::from_ref(&child));
     let mut writer = connect_owned(state, port, "writer");
     let session: u64 = writer
@@ -328,6 +335,13 @@ pub(super) fn exercise_epic(
             ("operation_receipts".to_owned(), 1, 0, 0),
         ]
     );
+    let settled = storage_state(&mut reader);
+    assert_eq!(
+        predating.run(run, 7)["error"]["code"],
+        "AUTHORITY_UNVERIFIED"
+    );
+    assert_eq!(storage_state(&mut reader), settled);
+    assert!(!state.join("pending-request.json").exists());
     assert_eq!(accept.run(run, 0)["data"]["outcome"], "replayed");
     assert_eq!(submit.run(run, 0)["data"]["result"], *result);
 
