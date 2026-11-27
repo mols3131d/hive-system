@@ -4,7 +4,9 @@ use std::str::FromStr;
 
 use clap::{
     ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
-    builder::NonEmptyStringValueParser, error::ErrorKind, value_parser,
+    builder::{NonEmptyStringValueParser, StringValueParser, TypedValueParser},
+    error::ErrorKind,
+    value_parser,
 };
 
 pub(crate) struct Invocation {
@@ -696,7 +698,13 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     // Global clap arguments propagate values across levels. Separate declarations
     // retain every occurrence at the root and at the selected leaf.
     let mut cli = CommonArgs::augment_args(cli.mut_subcommands(add_leaf_options));
-    let matches = match cli.clone().try_get_matches_from(&args) {
+    let matches = match cli.clone().try_get_matches_from(&args).or_else(|error| {
+        if error.kind() == ErrorKind::ValueValidation {
+            retry_issue_list(&cli, &args).ok_or(error)
+        } else {
+            Err(error)
+        }
+    }) {
         Ok(matches) => matches,
         Err(error)
             if matches!(
@@ -769,6 +777,23 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             message: message.to_owned(),
         }),
     }
+}
+
+fn retry_issue_list(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {
+    // A malformed Project must reach the v2 UUID check after Clap has read
+    // the contract and format. Keep the original parser for all other commands.
+    let defer_project_check = |command: clap::Command| {
+        command.mut_arg("project", |arg| {
+            arg.value_parser(StringValueParser::new().map(ProjectId::Ordinary))
+        })
+    };
+    let retry = defer_project_check(cli.clone().mut_subcommand("issue", |issue| {
+        issue.mut_subcommand("list", defer_project_check)
+    }));
+    let matches = retry.try_get_matches_from(args).ok()?;
+    let (command, leaf) = matched_leaf(cli, &matches)?;
+    (command == "issue list" && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+        .then_some(matches)
 }
 
 fn add_leaf_options(command: clap::Command) -> clap::Command {

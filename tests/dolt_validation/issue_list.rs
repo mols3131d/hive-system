@@ -61,8 +61,8 @@ fn lists_exact_committed_issue_scopes_with_stable_pages() {
         format!("INSERT INTO labels (id, name, revision) VALUES ('{label}', 'Résumé', '{revision}')"),
         format!("INSERT INTO issue_labels VALUES ('{child}', '{label}'), ('{dependent}', '{label}')"),
         "UPDATE issues SET created_at = '2025-01-01 00:00:00.000002', body = 'private body', acceptance_criteria = 'private criteria'".to_owned(),
-        format!("UPDATE issues SET priority = 0 WHERE id IN ('{parent}', '{child}', '{dependent}')"),
-        format!("UPDATE issues SET created_at = '2025-01-01 00:00:00.000001' WHERE id = '{dependent}'"),
+        format!("UPDATE issues SET priority = 0 WHERE id IN ('{parent}', '{child}')"),
+        format!("UPDATE issues SET priority = 2, created_at = '2025-01-01 00:00:00.000001' WHERE id = '{dependent}'"),
     ] {
         writer.query_drop(sql).unwrap();
     }
@@ -82,7 +82,7 @@ fn lists_exact_committed_issue_scopes_with_stable_pages() {
     };
 
     let first = run(&["--all", "--limit", "2"], 0);
-    assert_eq!(numbers(&first), [4, 1]);
+    assert_eq!(numbers(&first), [1, 2]);
     assert_eq!(first["data"]["truncated"], true);
     let cursor = first["data"]["next_cursor"].as_str().unwrap();
     assert_eq!(run(&["--all", "--limit", "2"], 0), first);
@@ -90,13 +90,13 @@ fn lists_exact_committed_issue_scopes_with_stable_pages() {
     // Changes in the staged and working roots must neither leak nor stale the cursor.
     writer
         .query_drop(format!(
-            "UPDATE issues SET title = 'staged title' WHERE id = '{child}'"
+            "UPDATE issues SET title = 'staged title' WHERE id = '{dependent}'"
         ))
         .unwrap();
     writer.query_drop("CALL DOLT_ADD('issues')").unwrap();
     writer
         .query_drop(format!(
-            "UPDATE issues SET title = 'working title' WHERE id = '{child}'"
+            "UPDATE issues SET title = 'working title' WHERE id = '{dependent}'"
         ))
         .unwrap();
     writer
@@ -105,8 +105,9 @@ fn lists_exact_committed_issue_scopes_with_stable_pages() {
         ))
         .unwrap();
     let second = run(&["--all", "--limit", "2", "--cursor", cursor], 0);
-    assert_eq!(numbers(&second), [2, 3]);
-    assert_eq!(second["data"]["items"][0]["title"], "Child");
+    assert_eq!(numbers(&second), [4, 3]);
+    assert_eq!(second["data"]["items"][0]["title"], "Dependent");
+    assert_eq!(second["data"]["items"][0]["priority"], 2);
     assert_eq!(second["data"]["items"][1]["priority"], Value::Null);
     assert_eq!(second["data"]["truncated"], false);
     assert_eq!(second["data"]["next_cursor"], Value::Null);
@@ -115,6 +116,16 @@ fn lists_exact_committed_issue_scopes_with_stable_pages() {
     assert_eq!(numbers(&run(&["--project", &project], 0)), [2, 3]);
     let unknown = run(&["--project", &case_mismatched_project], 3);
     assert_eq!(unknown["error"]["code"], "NOT_FOUND");
+
+    for (flag, value, expected) in [
+        ("--status", "in-progress", [2].as_slice()),
+        ("--type", "epic", &[1]),
+        ("--priority", "0", &[1, 2]),
+        ("--priority", "2", &[4]),
+        ("--label", "Résumé", &[2, 4]),
+    ] {
+        assert_eq!(numbers(&run(&["--all", flag, value], 0)), expected);
+    }
 
     let filters = [
         "--project",
@@ -146,10 +157,16 @@ fn lists_exact_committed_issue_scopes_with_stable_pages() {
         assert_eq!(run(options, 5)["error"]["code"], "STALE_CURSOR");
     }
 
+    writer
+        .exec_drop("UPDATE issues SET priority = 0 WHERE id = ?", (&dependent,))
+        .unwrap();
     commit(&mut writer);
     let stale = run(&["--all", "--limit", "2", "--cursor", cursor], 5);
     assert_eq!(stale["error"]["code"], "STALE_CURSOR");
     assert_ne!(stale["context"]["db_commit"], first["context"]["db_commit"]);
+
+    // With equal priorities, the oldest Issue comes first despite its larger ID.
+    assert_eq!(numbers(&run(&["--all"], 0)), [4, 1, 2, 3]);
 
     // The second sorted row is the lookahead on a one-item page.
     let malformed = id(14);

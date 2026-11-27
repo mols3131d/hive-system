@@ -875,3 +875,45 @@ fn dolt_issue_list_requires_one_explicit_scope_and_preserves_v1_help() {
         assert!(output.stderr.is_empty(), "{args:?}");
     }
 }
+
+#[test]
+fn malformed_dolt_list_project_preserves_late_v2_and_json_options() {
+    let sandbox = Sandbox::new();
+    let target = [
+        "issue",
+        "list",
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+    ];
+    let malformed = "01900000-0000-7000-8000-00000000000A";
+    let selection = ["--project", malformed, "--contract", "2", "--json"];
+    for args in [
+        [target.as_slice(), &selection].concat(),
+        [selection.as_slice(), &target].concat(),
+    ] {
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?} {report}");
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], "issue list", "{args:?}");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT", "{args:?}");
+        assert!(
+            report["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("UUIDv7")
+        );
+        assert!(!report.to_string().contains(malformed));
+        assert!(output.stderr.is_empty(), "{args:?}");
+    }
+
+    let args = [target.as_slice(), &["--project=--json", "--contract", "2"]].concat();
+    let output = sandbox.run(&args);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr).unwrap().contains("UUIDv7"));
+}
