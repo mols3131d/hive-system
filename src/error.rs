@@ -20,6 +20,7 @@ pub(crate) enum ErrorCode {
     SchemaIncompatible,
     ConstraintViolation,
     AlreadyExists,
+    RequestConflict,
     AlreadyClaimed,
     ClaimMismatch,
     StaleRevision,
@@ -54,6 +55,7 @@ impl ErrorCode {
             | Self::SchemaIncompatible
             | Self::ConstraintViolation => 4,
             Self::AlreadyExists
+            | Self::RequestConflict
             | Self::AlreadyClaimed
             | Self::ClaimMismatch
             | Self::StaleRevision
