@@ -7,6 +7,7 @@ mod dolt;
 mod error;
 mod output;
 
+use std::io::Write;
 use std::process::ExitCode;
 
 use cli::{
@@ -168,13 +169,22 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         ))),
     };
     match result {
-        Ok(report) => output::success(
-            Contract::V2,
-            format,
-            name,
-            Some(&report.context),
-            &report.data,
-        ),
+        Ok(report) => {
+            let status = output::success(
+                Contract::V2,
+                format,
+                name,
+                Some(&report.context),
+                &report.data,
+            );
+            if status != ExitCode::SUCCESS && name == "conversation export" {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "error: The conversation export was published, but its success response could not be written."
+                );
+            }
+            status
+        }
         Err(failure) => output::failure(
             Contract::V2,
             format,

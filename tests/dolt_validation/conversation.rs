@@ -50,36 +50,41 @@ fn conversation_reads_only_the_explicit_verified_copy() {
     let marker = copy.join("hive-workspace.yml");
     fs::write(&marker, descriptor(&workspace_id)).unwrap();
     let port = fixture.port.to_string();
-    let run = |bot: &str, expected_workspace: &str, password: &str, destination: Option<&str>| {
-        let mut args = vec![
-            "conversation",
-            if destination.is_some() {
-                "export"
-            } else {
-                "show"
-            },
-            "--workspace",
-            "copy",
-            "--workspace-id",
-            expected_workspace,
-            "--database",
-            DATABASE,
-            "--port",
-            &port,
-            "--bot",
-            bot,
-            "--id",
-            &conversation,
-            "--contract",
-            "2",
-            "--json",
-        ];
-        if let Some(destination) = destination {
-            args.extend(["--destination", destination]);
-        }
-        fixture.run_hive(&args, password)
+    let command =
+        |bot: &str, expected_workspace: &str, password: &str, destination: Option<&str>| {
+            let mut args = vec![
+                "conversation",
+                if destination.is_some() {
+                    "export"
+                } else {
+                    "show"
+                },
+                "--workspace",
+                "copy",
+                "--workspace-id",
+                expected_workspace,
+                "--database",
+                DATABASE,
+                "--port",
+                &port,
+                "--bot",
+                bot,
+                "--id",
+                &conversation,
+                "--contract",
+                "2",
+                "--json",
+            ];
+            if let Some(destination) = destination {
+                args.extend(["--destination", destination]);
+            }
+            fixture.hive_command(&args, password)
+        };
+    let show = |bot, expected_workspace, password| {
+        command(bot, expected_workspace, password, None)
+            .output()
+            .unwrap()
     };
-    let show = |bot, expected_workspace, password| run(bot, expected_workspace, password, None);
     let report = |output: Output, status: i32| {
         let json: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(output.status.code(), Some(status), "{json}");
@@ -104,7 +109,9 @@ fn conversation_reads_only_the_explicit_verified_copy() {
     #[cfg(target_os = "linux")]
     let export =
         |bot: &str, expected_workspace: &str, password: &str, destination: &str, status| {
-            let output = run(bot, expected_workspace, password, Some(destination));
+            let output = command(bot, expected_workspace, password, Some(destination))
+                .output()
+                .unwrap();
             let json: Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(output.status.code(), Some(status), "{json}");
             assert!(output.stderr.is_empty());
@@ -160,6 +167,73 @@ fn conversation_reads_only_the_explicit_verified_copy() {
     let content = fs::read_to_string(&path).unwrap();
     let other_workspace = id(98);
     let different_id = id(99);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let blocked = [
+            folder.join("copy.md").to_str().unwrap().to_owned(),
+            format!("copy/conversations/./bots/{retired}/../{active}/{different_id}.md"),
+        ];
+        for destination in blocked {
+            let json = export(&active, &workspace_id, &fixture.password, &destination, 2);
+            assert_eq!(json["error"]["code"], "INVALID_ARGUMENT");
+            assert!(!fixture.root.join(&destination).exists());
+        }
+
+        let list = fixture.run_hive(
+            &[
+                "conversation",
+                "list",
+                "--workspace",
+                "copy",
+                "--workspace-id",
+                &workspace_id,
+                "--database",
+                DATABASE,
+                "--port",
+                &port,
+                "--bot",
+                &active,
+                "--contract",
+                "2",
+                "--json",
+            ],
+            &fixture.password,
+        );
+        assert!(
+            list.status.success(),
+            "{}",
+            String::from_utf8_lossy(&list.stdout)
+        );
+        assert!(list.stderr.is_empty());
+        let json: Value = serde_json::from_slice(&list.stdout).unwrap();
+        let items = json["data"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["conversation_id"], conversation);
+
+        let destination = "synthetic-stdout-failure.md";
+        let full = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let output = command(&active, &workspace_id, &fixture.password, Some(destination))
+            .stdout(Stdio::from(full))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "error: The conversation export was published, but its success response could not be written.\n"
+        );
+        let saved = fixture.root.join(destination);
+        assert_eq!(fs::read(&saved).unwrap(), BODY.as_bytes());
+        assert_eq!(
+            fs::metadata(&saved).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
     let bad_headers = [
         content.replace("Last line", "Changed line"),
         content.replace(&workspace_id, &other_workspace),

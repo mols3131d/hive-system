@@ -169,7 +169,7 @@ pub(super) fn read(
         })?;
     let (metadata, body) = validate_file(&bytes, workspace_id, bot_id, bot_slug, conversation_id)?;
     let data = if let Some(destination) = destination {
-        publish_export(destination, body.as_bytes())?;
+        publish_export(&candidate.root.path, destination, body.as_bytes())?;
         json!({ "bot_id": bot_id, "conversation_id": conversation_id })
     } else {
         json!({ "metadata": metadata, "body": body })
@@ -181,7 +181,7 @@ pub(super) fn read(
 }
 
 #[cfg(target_os = "linux")]
-fn publish_export(destination: &Path, body: &[u8]) -> Result<(), HiveError> {
+fn publish_export(workspace: &Path, destination: &Path, body: &[u8]) -> Result<(), HiveError> {
     use std::ffi::CString;
     use std::fs::File;
     use std::io::{Error, ErrorKind, Write};
@@ -218,6 +218,13 @@ fn publish_export(destination: &Path, body: &[u8]) -> Result<(), HiveError> {
             "Could not open the export directory without following symlinks.",
         )
     })?;
+    // Compare the component paths resolved by the no-follow directory walk.
+    if directory.path.starts_with(workspace.join("conversations")) {
+        return Err(HiveError::new(
+            ErrorCode::InvalidArgument,
+            "The export destination must be outside the selected conversation storage.",
+        ));
+    }
     let parent = directory.handle();
     let parent_fd = parent.as_raw_fd();
 
@@ -288,7 +295,7 @@ fn publish_export(destination: &Path, body: &[u8]) -> Result<(), HiveError> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn publish_export(_destination: &Path, _body: &[u8]) -> Result<(), HiveError> {
+fn publish_export(_workspace: &Path, _destination: &Path, _body: &[u8]) -> Result<(), HiveError> {
     Err(HiveError::new(
         ErrorCode::NotImplemented,
         "Conversation export is unavailable on this platform.",
@@ -460,15 +467,15 @@ mod tests {
         let body = "\r\n# 합성\r\n---\nno final newline".as_bytes();
 
         let results = std::thread::scope(|scope| {
-            let first = scope.spawn(|| publish_export(&destination, body));
-            let second = scope.spawn(|| publish_export(&destination, body));
+            let first = scope.spawn(|| publish_export(root, &destination, body));
+            let second = scope.spawn(|| publish_export(root, &destination, body));
             [first.join().unwrap(), second.join().unwrap()]
         });
         let ([Ok(()), Err(error)] | [Err(error), Ok(())]) = results else {
             panic!("Expected exactly one publisher to succeed");
         };
         assert!(matches!(error.code, ErrorCode::AlreadyExists));
-        let error = publish_export(&destination, b"replacement").unwrap_err();
+        let error = publish_export(root, &destination, b"replacement").unwrap_err();
         assert!(matches!(error.code, ErrorCode::AlreadyExists));
         assert_eq!(fs::read(&destination).unwrap(), body);
         assert_eq!(
@@ -479,7 +486,7 @@ mod tests {
 
         let dangling = root.join("dangling.md");
         symlink("missing.md", &dangling).unwrap();
-        let error = publish_export(&dangling, body).unwrap_err();
+        let error = publish_export(root, &dangling, body).unwrap_err();
         assert!(matches!(error.code, ErrorCode::AlreadyExists));
         assert_eq!(fs::read_link(&dangling).unwrap(), Path::new("missing.md"));
         assert!(!root.join("missing.md").exists());
@@ -489,20 +496,27 @@ mod tests {
         let redirect = root.join("redirect");
         symlink(&real, &redirect).unwrap();
         for path in [redirect.join("escaped.md"), redirect.join("../escaped.md")] {
-            let error = publish_export(&path, body).unwrap_err();
+            let error = publish_export(root, &path, body).unwrap_err();
             assert!(matches!(error.code, ErrorCode::InvalidConfig));
         }
         assert_eq!(fs::read_dir(&real).unwrap().count(), 0);
         assert!(!root.join("escaped.md").exists());
 
         for path in [root.join("missing/"), root.join("."), root.join("..")] {
-            let error = publish_export(&path, body).unwrap_err();
+            let error = publish_export(root, &path, body).unwrap_err();
             assert!(matches!(error.code, ErrorCode::InvalidArgument));
         }
         let empty = root.join("empty.md");
-        publish_export(&empty, b"").unwrap();
+        publish_export(root, &empty, b"").unwrap();
         assert!(fs::read(&empty).unwrap().is_empty());
         assert_eq!(fs::read_dir(root).unwrap().count(), 5);
+
+        let storage = root.join("conversations");
+        fs::create_dir(&storage).unwrap();
+        let blocked = root.join("real/../conversations/copy.md");
+        let error = publish_export(root, &blocked, body).unwrap_err();
+        assert!(matches!(error.code, ErrorCode::InvalidArgument));
+        assert_eq!(fs::read_dir(&storage).unwrap().count(), 0);
     }
 
     #[test]
