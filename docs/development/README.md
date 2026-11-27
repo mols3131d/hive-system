@@ -97,7 +97,9 @@ The optional filters are `--status`, `--type`, `--priority` (0–3), and `--labe
 
 A selected Issue with malformed summary fields returns `INVALID_RECORD` at the verified commit.
 
-Recursive Area listing, global discovery, readiness and blocker queries, and context resolution are follow-up work.
+`issue ready` and `issue blocked` accept the same target, scopes, filters, and pagination options. Both select executable todo Issues. Ready Issues have no hold, current Claim, unmet prerequisite, or archived Area in their ancestry. Missing prerequisites, invalid readiness metadata, and uncertain Area chains also block readiness. Blocked summaries include a `reasons` array of stable codes. The query reports prerequisite and Area blockers without exposing related records. Each cursor is specific to its view. Readiness describes the observed commit and grants no execution permission.
+
+Recursive Area listing, global discovery, and context resolution are follow-up work.
 
 ## Agent-assisted development
 
