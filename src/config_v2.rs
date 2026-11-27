@@ -476,7 +476,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub(crate) use unix::{read_explicit, select_workspace, xdg_root};
+pub(crate) use unix::{Candidate, read_explicit, select_workspace, xdg_root};
 
 use crate::cli::{CommonOptions, ConfigShowArgs, Format};
 use crate::error::HiveError;

@@ -2594,3 +2594,69 @@ fn conversation_show_recovers_output_for_target_and_scope_errors() {
     assert_eq!(implicit.stdout, explicit.stdout);
     assert_eq!(implicit.stderr, explicit.stderr);
 }
+
+#[test]
+fn conversation_list_recovers_scoped_v2_output_without_consuming_values_as_flags() {
+    let sandbox = Sandbox::new();
+    let uuid = "01900000-0000-7000-8000-000000000001";
+    let command = [
+        "conversation",
+        "list",
+        "--workspace",
+        ".",
+        "--workspace-id",
+        uuid,
+        "--database",
+        "fixture",
+        "--port",
+        "3306",
+    ];
+    for malformed in [
+        vec!["--bot", uuid, "--limit", "0"],
+        vec!["--bot", uuid, "--limit", "101"],
+        vec!["--bot", uuid, "--limit", "-private-value"],
+        vec!["--bot", uuid, "--limit", "2", "--limit", "2"],
+        vec!["--bot", uuid, "--cursor"],
+        vec!["--bot", "-private-value"],
+        vec!["--bot", uuid, "--project", "INVALID"],
+        vec!["--bot", uuid, "--private-value"],
+    ] {
+        let args = [&command[..], &malformed[..], &["--contract", "2", "--json"]].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "conversation list");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(report.get("data").is_none());
+        assert!(
+            !String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("private-value")
+        );
+    }
+    for tail in [
+        &["--bot=--json", "--contract", "2"][..],
+        &[
+            "--bot",
+            uuid,
+            "--limit",
+            "0",
+            "--",
+            "--contract",
+            "2",
+            "--json",
+        ],
+    ] {
+        let output = sandbox.run(&[&command[..], tail].concat());
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    let output = sandbox.run(&["--json", "conversation", "list", "--bot", uuid]);
+    let legacy: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(legacy["schema_version"], 1);
+    assert_ne!(legacy["command"], "conversation list");
+    sandbox.assert_empty();
+}
