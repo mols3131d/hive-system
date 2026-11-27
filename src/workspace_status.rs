@@ -1,12 +1,34 @@
 use serde_json::Value;
 
-use crate::cli::{CommonOptions, DoltTargetArgs, Format};
+use crate::cli::{CommonOptions, DoltTargetArgs, Format, WorkspaceCommand};
 use crate::error::HiveError;
 
-pub(crate) fn observe(
+#[cfg(target_os = "linux")]
+#[path = "workspace_runtime.rs"]
+mod runtime;
+
+#[cfg(target_os = "linux")]
+pub(crate) use runtime::with_owned_snapshot;
+
+pub(crate) fn run(
     options: &CommonOptions,
-    target: &DoltTargetArgs,
+    command: &WorkspaceCommand,
 ) -> (Format, Result<Value, HiveError>) {
+    if let WorkspaceCommand::Status(target) = command {
+        return observe(options, target);
+    }
+    let mut format = options.format.unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    let result = runtime::run(options, command, &mut format);
+    #[cfg(not(target_os = "linux"))]
+    let result = Err(HiveError::new(
+        crate::error::ErrorCode::NotImplemented,
+        "Workspace lifecycle is available only on Linux.",
+    ));
+    (format, result)
+}
+
+fn observe(options: &CommonOptions, target: &DoltTargetArgs) -> (Format, Result<Value, HiveError>) {
     #[cfg(unix)]
     {
         let mut format = options.format.unwrap_or_default();
@@ -31,7 +53,7 @@ mod unix {
     use std::ffi::OsStr;
     use std::num::NonZeroU16;
 
-    use serde::{Deserialize, de::DeserializeOwned};
+    use serde::{Deserialize, Serialize, de::DeserializeOwned};
     use serde_json::{Value, json};
 
     use crate::cli::{CommonOptions, DoltTargetArgs, Format};
@@ -45,30 +67,30 @@ mod unix {
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct Registration {
-        version: u32,
-        workspace_id: String,
-        workspace_root: String,
+    pub(super) struct Registration {
+        pub(super) version: u32,
+        pub(super) workspace_id: String,
+        pub(super) workspace_root: String,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
-    struct Server {
-        version: u32,
-        workspace_id: String,
-        workspace_root: String,
-        pid: i32,
-        boot_id: String,
-        start_ticks: u64,
-        nonce: String,
-        endpoint: Loopback,
+    pub(super) struct Server {
+        pub(super) version: u32,
+        pub(super) workspace_id: String,
+        pub(super) workspace_root: String,
+        pub(super) pid: i32,
+        pub(super) boot_id: String,
+        pub(super) start_ticks: u64,
+        pub(super) nonce: String,
+        pub(super) endpoint: Loopback,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
-    struct Loopback {
-        port: NonZeroU16,
-        database: String,
+    pub(super) struct Loopback {
+        pub(super) port: NonZeroU16,
+        pub(super) database: String,
     }
 
     pub(super) fn observe(
@@ -86,31 +108,7 @@ mod unix {
         // An absent DB is valid for descriptor-only inspection. An existing
         // DB entry must be a directory reached through the open workspace.
         workspace.root.open_child_directory(OsStr::new("db"))?;
-        let state_path = xdg_root(
-            "XDG_STATE_HOME",
-            absolute_env("HOME").as_deref(),
-            ".local/state",
-        )?;
-        let state = match ScopedDirectory::open_absolute(&state_path) {
-            Ok(directory) => Some(directory),
-            Err(error) if matches!(error.code, ErrorCode::NotFound) => None,
-            Err(error) => return Err(error),
-        };
-        if state
-            .as_ref()
-            .is_some_and(|state| state.path.starts_with(&workspace.root.path))
-        {
-            return Err(invalid(
-                "The v2 state directory must be outside the selected workspace.",
-            ));
-        }
-        let state = match state {
-            Some(state) => match state.open_child_directory(OsStr::new("workspaces"))? {
-                Some(workspaces) => workspaces.open_child_directory(OsStr::new(workspace_id))?,
-                None => None,
-            },
-            None => None,
-        };
+        let state = find_state(workspace_id, &workspace.root.path)?;
         let state = state.as_ref();
         let registration: Option<Registration> = read_json(state, "active-root.json")?;
         if let Some(registration) = &registration {
@@ -125,26 +123,10 @@ mod unix {
 
         let server: Option<Server> = read_json(state, "server.json")?;
         let process = if let Some(server) = &server {
-            check_identity(
-                server.version,
-                &server.workspace_id,
-                &server.workspace_root,
-                workspace_id,
-                root,
-            )?;
+            check_server(server, workspace_id, root)?;
             if registration.is_none() {
                 return Err(unverified(
                     "The recorded server requires an active-root registration.",
-                ));
-            }
-            if server.pid <= 0
-                || server.start_ticks == 0
-                || !is_uuid(&server.boot_id)
-                || !is_uuid(&server.nonce)
-                || !is_database_name(&server.endpoint.database)
-            {
-                return Err(invalid(
-                    "The server record has invalid process or endpoint fields.",
                 ));
             }
             process_evidence(server)?
@@ -202,6 +184,59 @@ mod unix {
         }))
     }
 
+    pub(super) fn find_state(
+        workspace_id: &str,
+        root: &std::path::Path,
+    ) -> Result<Option<ScopedDirectory>, HiveError> {
+        let state_path = xdg_root(
+            "XDG_STATE_HOME",
+            absolute_env("HOME").as_deref(),
+            ".local/state",
+        )?;
+        let state = match ScopedDirectory::open_absolute(&state_path) {
+            Ok(directory) => directory,
+            Err(error) if matches!(error.code, ErrorCode::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        // The XDG base can be an ancestor of the selected workspace while
+        // the directory that holds this UUID's lock is inside the workspace.
+        if state
+            .path
+            .join("workspaces")
+            .join(workspace_id)
+            .starts_with(root)
+        {
+            return Err(invalid(
+                "The v2 state directory must be outside the selected workspace.",
+            ));
+        }
+        match state.open_child_directory(OsStr::new("workspaces"))? {
+            Some(workspaces) => workspaces.open_child_directory(OsStr::new(workspace_id)),
+            None => Ok(None),
+        }
+    }
+
+    pub(super) fn check_server(server: &Server, id: &str, root: &str) -> Result<(), HiveError> {
+        check_identity(
+            server.version,
+            &server.workspace_id,
+            &server.workspace_root,
+            id,
+            root,
+        )?;
+        if server.pid <= 0
+            || server.start_ticks == 0
+            || !is_uuid(&server.boot_id)
+            || !is_uuid(&server.nonce)
+            || !is_database_name(&server.endpoint.database)
+        {
+            return Err(invalid(
+                "The server record has invalid process or endpoint fields.",
+            ));
+        }
+        Ok(())
+    }
+
     fn read_state(
         state: Option<&ScopedDirectory>,
         name: &str,
@@ -212,7 +247,7 @@ mod unix {
         })
     }
 
-    fn read_json<T: DeserializeOwned>(
+    pub(super) fn read_json<T: DeserializeOwned>(
         state: Option<&ScopedDirectory>,
         name: &str,
     ) -> Result<Option<T>, HiveError> {
@@ -223,7 +258,7 @@ mod unix {
             .transpose()
     }
 
-    fn check_identity(
+    pub(super) fn check_identity(
         version: u32,
         recorded_id: &str,
         recorded_root: &str,
@@ -250,7 +285,7 @@ mod unix {
     }
 
     #[cfg(target_os = "linux")]
-    fn process_evidence(server: &Server) -> Result<&'static str, HiveError> {
+    pub(super) fn process_evidence(server: &Server) -> Result<&'static str, HiveError> {
         use std::{fs, io::ErrorKind};
 
         let Ok(boot_id) = fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
@@ -270,21 +305,21 @@ mod unix {
             }
             Err(_) => return Ok("recorded"),
         };
-        // comm is parenthesized and may contain spaces and parentheses.
-        let Some((_, fields)) = stat.rsplit_once(") ") else {
-            return Ok("recorded");
-        };
-        let mut fields = fields.split_ascii_whitespace();
-        let Some(state) = fields.next() else {
-            return Ok("recorded");
-        };
-        let Some(ticks) = fields.nth(18).and_then(|value| value.parse::<u64>().ok()) else {
+        let Some((state, ticks)) = process_start(&stat) else {
             return Ok("recorded");
         };
         if matches!(state, "Z" | "X" | "x") || ticks != server.start_ticks {
             return Err(unverified("The recorded server process identity is stale."));
         }
         Ok("pid_start_verified")
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn process_start(stat: &str) -> Option<(&str, u64)> {
+        // comm is parenthesized and may contain spaces and parentheses.
+        let (_, fields) = stat.rsplit_once(") ")?;
+        let mut fields = fields.split_ascii_whitespace();
+        Some((fields.next()?, fields.nth(18)?.parse().ok()?))
     }
 
     #[cfg(not(target_os = "linux"))]

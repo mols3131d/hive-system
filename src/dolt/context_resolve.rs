@@ -161,13 +161,22 @@ fn preflight(
             ),
         ));
     }
-    if let Some(path) = args.evidence_file.as_deref() {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            use super::context_evidence::{EvidenceFile, Selection};
-            EvidenceFile::read(path)
-                .and_then(|file| {
-                    file.validate(&Selection {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use super::context_evidence::{CheckedEvidence, EvidenceFile, Selection};
+
+        let observed_at =
+            observe_time().map_err(|error| DoltFailure::with_context(context.clone(), error))?;
+        let evidence = args
+            .evidence_file
+            .as_deref()
+            .map(EvidenceFile::read)
+            .transpose()
+            .map_err(|error| DoltFailure::with_context(context.clone(), error))?;
+        let checked = match evidence.as_ref() {
+            Some(file) => file
+                .validate(
+                    &Selection {
                         workspace_id: workspace.workspace_id(),
                         actor_ref: args.actor.as_deref().expect("validated actor"),
                         bot_id: args.bot.as_deref(),
@@ -175,21 +184,44 @@ fn preflight(
                         issue: args.issue.as_deref(),
                         area: args.area.as_deref(),
                         artifacts: &args.include_artifact,
-                    })
-                })
-                .map_err(|error| DoltFailure::with_context(context.clone(), error))?;
+                    },
+                    observed_at,
+                )
+                .map_err(|error| DoltFailure::with_context(context.clone(), error))?,
+            None => CheckedEvidence::default(),
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(asset_commit) = args.asset_commit.as_deref() {
+            return crate::workspace_status::with_owned_snapshot(&workspace, target, |snapshot| {
+                super::issue::context::resolve_snapshot(
+                    snapshot,
+                    &workspace,
+                    common,
+                    args,
+                    asset_commit,
+                    &VerifiedInputs {
+                        role,
+                        body: &policy,
+                        budget,
+                        observed_at,
+                        evidence: checked,
+                    },
+                )
+            })
+            .map_err(|error| DoltFailure::with_context(context, error));
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let _ = path;
-            return Err(DoltFailure::with_context(
-                context,
-                HiveError::new(
-                    ErrorCode::NotImplemented,
-                    "Safe context evidence files require Linux or macOS.",
-                ),
-            ));
-        }
+        #[cfg(target_os = "macos")]
+        let _ = checked;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    if args.evidence_file.is_some() {
+        return Err(DoltFailure::with_context(
+            context,
+            HiveError::new(
+                ErrorCode::NotImplemented,
+                "Safe context evidence files require Linux or macOS.",
+            ),
+        ));
     }
     Err(DoltFailure::with_context(
         context,
@@ -198,6 +230,31 @@ fn preflight(
             "Current context requires verified pairing of the workspace DB endpoint and asset commit.",
         ),
     ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn observe_time() -> Result<time::OffsetDateTime, HiveError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| {
+            time::OffsetDateTime::from_unix_timestamp_nanos(duration.as_nanos() as i128).ok()
+        })
+        .ok_or_else(|| {
+            HiveError::new(
+                ErrorCode::RuntimeUnavailable,
+                "The context observation time is unavailable.",
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
+pub(super) struct VerifiedInputs<'a> {
+    pub(super) role: ContextRole,
+    pub(super) body: &'a str,
+    pub(super) budget: usize,
+    pub(super) observed_at: time::OffsetDateTime,
+    pub(super) evidence: super::context_evidence::CheckedEvidence<'a>,
 }
 
 #[cfg(not(unix))]

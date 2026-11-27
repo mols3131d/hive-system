@@ -321,15 +321,14 @@ pub(crate) fn read_asset_blob(
 }
 
 /// Bind current context to the explicitly selected clean asset HEAD.
-// Compile through the existing asset fixture until runtime pairing can use it.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub(crate) struct PinnedAssets<'a> {
     root: &'a crate::config_file::ScopedDirectory,
     repository: AssetRepository,
     revision: &'a str,
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 impl<'a> PinnedAssets<'a> {
     pub(crate) fn open(
         root: &'a crate::config_file::ScopedDirectory,
@@ -448,7 +447,6 @@ impl AssetRepository {
         })
     }
 
-    #[cfg(test)]
     fn status_command(&self) -> Result<Command, HiveError> {
         use std::os::unix::ffi::OsStringExt;
 

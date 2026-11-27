@@ -1,7 +1,7 @@
 //! Explicit v2 context evidence. A receipt locator only selects a historical
 //! record. Current declarations carry their own operation and invocation binding.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Component, Path};
 
@@ -47,6 +47,17 @@ pub(super) struct Selection<'a> {
     pub(super) artifacts: &'a [String],
 }
 
+#[derive(Default)]
+#[cfg_attr(
+    target_os = "macos",
+    allow(dead_code, reason = "Runtime pairing is Linux-only")
+)]
+pub(super) struct CheckedEvidence<'a> {
+    pub(super) activation_receipts: BTreeMap<&'a str, &'a str>,
+    pub(super) handoff: Option<&'a [u8]>,
+    pub(super) artifacts: BTreeMap<String, &'a [u8]>,
+}
+
 impl EvidenceFile {
     pub(super) fn read(path: &Path) -> Result<Self, HiveError> {
         let path = resolve_path(path, &current_dir()?, absolute_env("HOME").as_deref())?;
@@ -90,7 +101,11 @@ impl EvidenceFile {
             .map_err(|_| invalid("The context evidence file is not a valid versioned JSON object."))
     }
 
-    pub(super) fn validate(&self, selection: &Selection<'_>) -> Result<(), HiveError> {
+    pub(super) fn validate(
+        &self,
+        selection: &Selection<'_>,
+        observed_at: time::OffsetDateTime,
+    ) -> Result<CheckedEvidence<'_>, HiveError> {
         if self.version != 1 {
             return Err(invalid("The context evidence file version must be 1."));
         }
@@ -102,12 +117,15 @@ impl EvidenceFile {
             ));
         }
 
-        let mut directives = BTreeSet::new();
+        let mut checked = CheckedEvidence::default();
         let mut requests = BTreeSet::new();
         for receipt in &self.directive_receipts {
             if !is_uuid_v7(&receipt.directive_id)
                 || !is_uuid(&receipt.request_id)
-                || !directives.insert(&receipt.directive_id)
+                || checked
+                    .activation_receipts
+                    .insert(receipt.directive_id.as_str(), receipt.request_id.as_str())
+                    .is_some()
                 || !requests.insert(&receipt.request_id)
             {
                 return Err(invalid(
@@ -118,33 +136,20 @@ impl EvidenceFile {
 
         let selected: BTreeSet<_> = selection.artifacts.iter().map(String::as_str).collect();
         if self.handoff.is_none() && self.artifacts.is_empty() && selected.is_empty() {
-            return Ok(());
+            return Ok(checked);
         }
         let issue = selection.issue.ok_or_else(|| {
             unauthorized("Current body declarations require an explicitly selected Issue.")
         })?;
         let invocation_id = selection.invocation_id.ok_or_else(workflow::unverified)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|duration| {
-                time::OffsetDateTime::from_unix_timestamp_nanos(duration.as_nanos() as i128).ok()
-            })
-            .ok_or_else(|| {
-                HiveError::new(
-                    ErrorCode::RuntimeUnavailable,
-                    "The context observation time is unavailable.",
-                )
-            })?;
         let binding = CurrentBinding {
             workspace_id: selection.workspace_id,
             actor_ref: selection.actor_ref,
             bot_id: selection.bot_id,
             invocation_id,
-            observed_at: now,
+            observed_at,
         };
         let mut exact_scope = None;
-        let mut declared = BTreeSet::new();
         for (body, handoff) in self
             .handoff
             .iter()
@@ -180,23 +185,28 @@ impl EvidenceFile {
                         "The handoff declaration must authorize the exact handoff body.",
                     ));
                 }
+                checked.handoff = Some(body.get().as_bytes());
             } else {
                 if !artifact || !selected.contains(declaration.record.id.as_str()) {
                     return Err(unauthorized(
                         "Artifact evidence must match an explicitly selected Artifact body.",
                     ));
                 }
-                if !declared.insert(declaration.record.id) {
+                if checked
+                    .artifacts
+                    .insert(declaration.record.id, body.get().as_bytes())
+                    .is_some()
+                {
                     return Err(invalid(
                         "Supply one current declaration per selected Artifact.",
                     ));
                 }
             }
         }
-        if declared.len() != selected.len() {
+        if checked.artifacts.len() != selected.len() {
             return Err(workflow::unverified());
         }
-        Ok(())
+        Ok(checked)
     }
 }
 

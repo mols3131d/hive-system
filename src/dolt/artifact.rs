@@ -252,7 +252,7 @@ fn verify_links(snapshot: &mut Snapshot, id: &str, scopes: &[Scope<'_>]) -> Resu
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 pub(super) fn verify_context_artifact_links(
     snapshot: &mut Snapshot,
     artifact: &str,

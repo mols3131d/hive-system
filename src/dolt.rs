@@ -10,7 +10,7 @@ mod context_workflow;
 #[cfg(unix)]
 mod conversation;
 pub(crate) mod directive;
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 mod directive_receipt;
 mod graph;
 mod issue;
@@ -198,7 +198,7 @@ fn reader_credential(name: &'static str) -> Result<String, HiveError> {
         })
 }
 
-struct Snapshot {
+pub(crate) struct Snapshot {
     connection: Conn,
     commit: String,
     #[cfg(any(test, target_os = "linux"))]
@@ -232,15 +232,7 @@ impl<'a> DoltTarget<'a> {
             ));
         };
         // Parse the value after clap has recognized the contract and output options.
-        let port = port
-            .to_str()
-            .and_then(|value| value.parse().ok())
-            .ok_or_else(|| {
-                HiveError::new(
-                    ErrorCode::InvalidArgument,
-                    "Supply a Dolt port between 1 and 65535.",
-                )
-            })?;
+        let port = parse_port(port)?;
         if !is_uuid(workspace_id) {
             return Err(HiveError::new(
                 ErrorCode::InvalidArgument,
@@ -261,15 +253,31 @@ impl<'a> DoltTarget<'a> {
     }
 }
 
+pub(crate) fn parse_port(port: &OsStr) -> Result<NonZeroU16, HiveError> {
+    port.to_str()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| {
+            HiveError::new(
+                ErrorCode::InvalidArgument,
+                "Supply a Dolt port between 1 and 65535.",
+            )
+        })
+}
+
 #[cfg(unix)]
 pub(crate) fn committed_identity(target: DoltTarget<'_>) -> Result<Value, HiveError> {
     let (snapshot, workspace_id) = Snapshot::open_target(target)?;
-    Ok(json!({
+    Ok(identity_report(&snapshot, workspace_id))
+}
+
+#[cfg(unix)]
+fn identity_report(snapshot: &Snapshot, workspace_id: String) -> Value {
+    json!({
         "workspace_id": workspace_id,
         "dolt_commit": snapshot.commit,
         "dolt_version": DOLT_VERSION,
         "storage_schema_version": STORAGE_SCHEMA_VERSION,
-    }))
+    })
 }
 
 impl Snapshot {
@@ -278,13 +286,35 @@ impl Snapshot {
     }
 
     fn open_target(target: DoltTarget<'_>) -> Result<(Self, String), HiveError> {
+        let user = reader_credential("HIVE_DOLT_USER")?;
+        let password = reader_credential("HIVE_DOLT_PASSWORD")?;
+        Self::open_with_reader(target, &user, &password)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_runtime(
+        target: DoltTarget<'_>,
+        user: &str,
+        password: &str,
+    ) -> Result<Self, HiveError> {
+        Self::open_with_reader(target, user, password).map(|(snapshot, _)| snapshot)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn runtime_identity(&self) -> Value {
+        identity_report(self, self.workspace_id.clone())
+    }
+
+    fn open_with_reader(
+        target: DoltTarget<'_>,
+        user: &str,
+        password: &str,
+    ) -> Result<(Self, String), HiveError> {
         let DoltTarget {
             database,
             port,
             workspace_id,
         } = target;
-        let user = reader_credential("HIVE_DOLT_USER")?;
-        let password = reader_credential("HIVE_DOLT_PASSWORD")?;
         if user.eq_ignore_ascii_case("root") {
             return Err(HiveError::new(
                 ErrorCode::InvalidArgument,

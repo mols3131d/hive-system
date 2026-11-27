@@ -1,7 +1,6 @@
-// Compile the draft resolver with tests until the authority path is integrated.
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 #[path = "context.rs"]
-mod context;
+pub(super) mod context;
 
 use serde::Serialize;
 use serde_json::{Value, json};

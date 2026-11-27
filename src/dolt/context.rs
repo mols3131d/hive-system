@@ -421,5 +421,79 @@ fn limit(message: &str) -> HiveError {
     HiveError::new(ErrorCode::ContextLimit, message)
 }
 
+#[cfg(target_os = "linux")]
+pub(in crate::dolt) fn resolve_snapshot(
+    snapshot: &mut Snapshot,
+    workspace: &crate::config_v2::Candidate,
+    common: &crate::cli::CommonOptions,
+    args: &crate::cli::ContextResolveArgs,
+    asset_commit: &str,
+    verified: &crate::dolt::context_resolve::VerifiedInputs<'_>,
+) -> Result<crate::dolt::DoltSuccess, HiveError> {
+    use crate::config_git::PinnedAssets;
+    use workflow::CurrentInput::OperatorRequest;
+
+    let assets = PinnedAssets::open(&workspace.root, asset_commit)?;
+    let scope = resolve_scope(
+        snapshot,
+        args.area.as_deref(),
+        common.project.as_ref().map(|project| project.as_str()),
+        args.issue.as_deref(),
+    )?;
+    let soul = args
+        .bot
+        .as_deref()
+        .map(|id| crate::dolt::bot::read_soul(snapshot, &workspace.root, id, asset_commit))
+        .transpose()?;
+    let commit = snapshot.commit.clone();
+    let workspace_id = snapshot.workspace_id.clone();
+    let policy_revision = workspace.policy_revision();
+    let artifacts: Vec<_> = verified
+        .evidence
+        .artifacts
+        .iter()
+        .map(|(id, bytes)| assembly::SelectedArtifact {
+            id,
+            evidence: OperatorRequest(bytes),
+        })
+        .collect();
+    let result = assembly::assemble(
+        snapshot,
+        &scope,
+        &assembly::Inputs {
+            role: verified.role,
+            policy_revision,
+            asset_commit,
+            role_body: assembly::RoleBody {
+                role: verified.role,
+                policy_revision,
+                body: verified.body,
+            },
+            soul: soul.as_ref().map(|soul| assembly::SoulBody {
+                workspace_id: &workspace_id,
+                db_commit: &commit,
+                asset_commit,
+                bot_id: &soul.bot.id,
+                bot_slug: &soul.bot.slug,
+                registry_revision: &soul.bot.revision,
+                body: &soul.body,
+            }),
+            request: workflow::Request {
+                actor_ref: args.actor.as_deref().expect("validated actor"),
+                bot_id: args.bot.as_deref(),
+                invocation_id: args.invocation_id.as_deref().unwrap_or_default(),
+                observed_at: verified.observed_at,
+                input: verified.evidence.handoff.map(OperatorRequest),
+            },
+            activation_receipts: &verified.evidence.activation_receipts,
+            artifacts: &artifacts,
+            budget: Some(verified.budget),
+        },
+    )?;
+    assets.recheck()?;
+    Ok(result)
+}
+
+#[cfg(test)]
 #[path = "context/tests.rs"]
 mod tests;

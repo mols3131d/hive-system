@@ -44,7 +44,13 @@ pub(super) fn read_required(
 
     let artifacts = artifact_candidates(snapshot, &work.issue.id)?;
     let candidate = match (work.handoff.as_ref(), artifacts.as_slice()) {
-        (None, []) => return Ok(None),
+        (None, []) if request.input.is_none() => return Ok(None),
+        (None, []) => {
+            return Err(HiveError::new(
+                ErrorCode::Unauthorized,
+                "No current handoff matches the supplied declaration.",
+            ));
+        }
         (Some(note), []) => (
             RecordKind::IssueUpdate,
             Operation::ReadHandoffBody,

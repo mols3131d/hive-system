@@ -65,19 +65,20 @@ pub(super) struct Locator<'a> {
     pub(super) issuer_ref: &'a str,
 }
 
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 #[derive(Clone, Copy)]
 pub(super) enum CurrentInput<'a> {
     /// A one-invocation declaration supplied through the explicit operator path.
     OperatorRequest(&'a [u8]),
     /// Bytes returned by the current state of the explicitly selected source.
+    #[cfg(test)]
     ResolvedSource {
         selected: Locator<'a>,
         bytes: &'a [u8],
     },
 }
 
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 #[derive(Clone, Copy)]
 pub(super) struct Request<'a> {
     pub(super) actor_ref: &'a str,
@@ -87,7 +88,7 @@ pub(super) struct Request<'a> {
     pub(super) input: Option<CurrentInput<'a>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 pub(super) struct Expected<'a> {
     pub(super) workspace_id: &'a str,
     pub(super) db_commit: &'a str,
@@ -99,12 +100,13 @@ pub(super) struct Expected<'a> {
     pub(super) record_revision: &'a str,
 }
 
-#[cfg(test)]
+#[cfg(any(test, target_os = "linux"))]
 pub(super) fn verify(request: &Request<'_>, expected: &Expected<'_>) -> Result<(), HiveError> {
-    let (selected, bytes) = match request.input.as_ref() {
-        Some(CurrentInput::OperatorRequest(bytes)) => (None, *bytes),
-        Some(CurrentInput::ResolvedSource { selected, bytes }) => (Some(selected), *bytes),
-        None => return Err(unverified()),
+    let input = request.input.as_ref().ok_or_else(unverified)?;
+    let bytes = match input {
+        CurrentInput::OperatorRequest(bytes) => *bytes,
+        #[cfg(test)]
+        CurrentInput::ResolvedSource { bytes, .. } => *bytes,
     };
     let evidence = Declaration::parse(bytes)?;
     evidence.check_current(&CurrentBinding {
@@ -114,12 +116,15 @@ pub(super) fn verify(request: &Request<'_>, expected: &Expected<'_>) -> Result<(
         invocation_id: request.invocation_id,
         observed_at: request.observed_at,
     })?;
-    if selected.is_some_and(|locator| {
-        evidence.evidence_id != locator.evidence_id
+    #[cfg(test)]
+    if let CurrentInput::ResolvedSource {
+        selected: locator, ..
+    } = input
+        && (evidence.evidence_id != locator.evidence_id
             || evidence.revision != locator.revision
             || evidence.source_ref != locator.source_ref
-            || evidence.issuer_ref != locator.issuer_ref
-    }) {
+            || evidence.issuer_ref != locator.issuer_ref)
+    {
         return Err(unverified());
     }
     if evidence.area_id != expected.area_id

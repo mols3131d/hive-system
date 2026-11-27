@@ -25,6 +25,7 @@ pub(crate) enum ErrorCode {
     StaleRevision,
     StaleCursor,
     ConcurrentChange,
+    LockBusy,
     DirtyConflict,
     Unauthorized,
     AuthorityUnavailable,
@@ -57,6 +58,7 @@ impl ErrorCode {
             | Self::StaleRevision
             | Self::StaleCursor
             | Self::ConcurrentChange
+            | Self::LockBusy
             | Self::DirtyConflict => 5,
             Self::Unauthorized => 6,
             Self::AuthorityUnavailable
@@ -83,7 +85,7 @@ pub(crate) struct HiveError {
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 enum ErrorDetails {
-    #[cfg(test)]
+    #[cfg(any(test, target_os = "linux"))]
     ContextReference {
         kind: &'static str,
         id: String,
@@ -125,7 +127,7 @@ impl HiveError {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn context_limit_ref(mut self, kind: &'static str, id: &str) -> Self {
         if matches!(self.code, ErrorCode::ContextLimit) && self.details.is_none() {
             self.details = Some(ErrorDetails::ContextReference {

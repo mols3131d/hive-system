@@ -367,6 +367,11 @@ mod filesystem {
     }
 
     impl ScopedDirectory {
+        #[cfg(target_os = "linux")]
+        pub(crate) fn directory_file(&self) -> &File {
+            &self.file
+        }
+
         pub(crate) fn open_absolute(path: &Path) -> Result<Self, HiveError> {
             let mut components = path.components();
             if components.next() != Some(Component::RootDir) {
