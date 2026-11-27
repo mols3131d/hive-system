@@ -1,16 +1,18 @@
 #[cfg(unix)]
 mod unix {
     use std::ffi::OsStr;
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
 
     use serde::Deserialize;
     use serde_json::{Value, json};
 
-    use crate::cli::{CommonOptions, Format, View};
+    use crate::cli::{CommonOptions, ConfigScope, ConfigShowArgs, Format, View};
     use crate::config::{absolute_env, current_dir, json_path, resolve_path};
     use crate::config_file::{self, OutputFields, ScopedDirectory, parse_v2, present, untagged};
-    use crate::dolt::{STORAGE_SCHEMA_VERSION, is_uuid};
+    use crate::dolt::{STORAGE_SCHEMA_VERSION, is_uuid, is_uuid_v7};
     use crate::error::{ErrorCode, HiveError};
+
+    mod bindings;
 
     const MARKER: &str = "hive-workspace.yml";
 
@@ -52,23 +54,43 @@ mod unix {
         descriptor: Descriptor,
     }
 
-    pub(super) fn show(options: &CommonOptions) -> (Format, Result<Value, HiveError>) {
+    pub(super) fn show(
+        options: &CommonOptions,
+        args: &ConfigShowArgs,
+    ) -> (Format, Result<Value, HiveError>) {
         let mut format = options.format.unwrap_or_default();
-        let result = inspect(options, &mut format);
+        let result = inspect(options, args, &mut format);
         (format, result)
     }
 
-    fn inspect(options: &CommonOptions, format: &mut Format) -> Result<Value, HiveError> {
-        if options.project.is_some()
-            || options.project_root.is_some()
+    fn inspect(
+        options: &CommonOptions,
+        args: &ConfigShowArgs,
+        format: &mut Format,
+    ) -> Result<Value, HiveError> {
+        let resolved = matches!(args.target.scope, ConfigScope::Resolved);
+        if options.project_root.is_some()
             || !matches!(options.view, View::WorkingTree)
+            || (!resolved
+                && (options.project.is_some() || args.area.is_some() || args.resource.is_some()))
         {
             return Err(HiveError::new(
                 ErrorCode::InvalidArgument,
-                "Workspace descriptor inspection accepts only workspace and output selection.",
+                if resolved {
+                    "Unsupported scope or view option for this configuration report."
+                } else {
+                    "Workspace descriptor inspection accepts only workspace and output selection."
+                },
             ));
         }
 
+        let workspace_error = |source, error| {
+            if resolved {
+                source_error(source, error)
+            } else {
+                error
+            }
+        };
         let home = absolute_env("HOME");
         let home = home.as_deref();
         let explicit = options
@@ -79,43 +101,108 @@ mod unix {
                 let target = resolve_path(path, &current_dir()?, home)?;
                 read_candidate(&target)
             })
-            .transpose()?;
+            .transpose()
+            .map_err(|error| workspace_error("CLI workspace", error))?;
 
-        // With both inputs explicit, there is no user-level setting to resolve.
-        let user = if explicit.is_some() && options.format.is_some() {
-            None
-        } else {
-            read_user(home)?
-        };
-        let output = user.as_ref().and_then(|source| source.format);
-        let output_source = match (options.format, output) {
-            (Some(_), _) => "cli",
-            (None, Some(user_format)) => {
-                *format = user_format;
-                "user"
+        let area = args.area.as_deref();
+        let project = options.project.as_ref().map(|id| id.as_str());
+        for (flag, id) in [("--area", area), ("--project", project)] {
+            if id.is_some_and(|id| !is_uuid_v7(id)) {
+                return Err(HiveError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("CLI {flag} must be a canonical lowercase UUIDv7."),
+                ));
             }
-            (None, None) => "default",
+        }
+        let resource_root = args
+            .resource
+            .as_deref()
+            .map(|path| bindings::explicit_root(path, home))
+            .transpose()?;
+        let mut binding = if let Some(root) = &resource_root {
+            bindings::select(Some(root), home)?
+        } else {
+            None
         };
 
-        let (candidate, workspace_source) = if let Some(candidate) = explicit {
+        let mut read_user_for_report = || -> Result<_, HiveError> {
+            let user = read_user(home)?;
+            if options.format.is_none()
+                && let Some(user_format) = user.as_ref().and_then(|source| source.format)
+            {
+                *format = user_format;
+            }
+            Ok(user)
+        };
+        // Implicit lookup errors use the configured format. Exact Resource
+        // lookup only reads user config early when it supplies the workspace.
+        let format_from_user_early = options.format.is_none() && resource_root.is_none();
+        let mut user = if format_from_user_early {
+            read_user_for_report()?
+        } else {
+            None
+        };
+
+        if resolved && resource_root.is_none() {
+            binding = bindings::select(None, home)?;
+        }
+        let needs_user_workspace = binding.as_ref().map_or(explicit.is_none(), |selected| {
+            selected.binding.workspace.is_none()
+        });
+        if needs_user_workspace && !format_from_user_early {
+            user = read_user_for_report()?;
+        }
+        let user_workspace = user.as_ref().and_then(|source| {
+            source
+                .workspace
+                .as_deref()
+                .map(|path| (path, source.path.as_path()))
+        });
+
+        let mut binding = binding.as_ref();
+        let (candidate, workspace_source) = if let Some(selected) = binding {
+            let source = if explicit.is_some() { "cli" } else { "binding" };
+            let (candidate, applies) =
+                resolve_bound_workspace(selected, explicit, user_workspace, home)
+                    .map_err(|error| source_error("Selected binding", error))?;
+            if !applies {
+                if resource_root.is_some() {
+                    return Err(HiveError::new(
+                        ErrorCode::NotFound,
+                        "The CLI Resource binding belongs to a different workspace.",
+                    ));
+                }
+                binding = None;
+            }
+            (candidate, source)
+        } else if let Some(candidate) = explicit {
             (candidate, "cli")
-        } else if let Some(UserSource {
-            path,
-            workspace: Some(workspace),
-            ..
-        }) = &user
-        {
-            let base = path.parent().expect("versioned user config has a parent");
-            let target = resolve_path(workspace, base, home)?;
-            (read_candidate(&target)?, "user")
+        } else if let Some((path, source)) = user_workspace {
+            let target = resolve_path(path, config_parent(source), home)?;
+            let candidate = read_candidate(&target)
+                .map_err(|error| workspace_error("User workspace", error))?;
+            (candidate, "user")
         } else {
             let path = xdg_root("XDG_DATA_HOME", home, ".local/share")?.join("userdata");
-            (read_candidate(&path)?, "xdg-default")
+            let candidate = read_candidate(&path)
+                .map_err(|error| workspace_error("XDG default workspace", error))?;
+            (candidate, "xdg-default")
         };
 
+        if options.format.is_none() && resource_root.is_some() && !needs_user_workspace {
+            user = read_user_for_report()?;
+        }
+        let output_source = match (
+            options.format,
+            user.as_ref().and_then(|source| source.format),
+        ) {
+            (Some(_), _) => "cli",
+            (None, Some(_)) => "user",
+            (None, None) => "default",
+        };
         let descriptor = candidate.descriptor;
         let mut report = json!({
-            "scope": "workspace",
+            "scope": if resolved { "resolved" } else { "workspace" },
             "workspace_root": json_path(&candidate.root)?,
             "workspace_id": descriptor.workspace_id,
             "policy_revision": descriptor.policy_revision,
@@ -130,11 +217,98 @@ mod unix {
             }
         });
         if let Some(source) = user
-            && (workspace_source == "user" || output_source == "user")
+            && (workspace_source == "user"
+                || output_source == "user"
+                || binding.is_some_and(|selected| selected.binding.workspace.is_none()))
         {
             report["user_config"] = json!(json_path(&source.path)?);
         }
+        if resolved {
+            report["verification"]["scope_membership"] = json!("unverified");
+            let mut bound_area = None;
+            let mut bound_project = None;
+            if let Some(selected) = binding {
+                report["binding"] = json!(json_path(&selected.file)?);
+                report["resource_root"] = json!(json_path(&selected.root)?);
+                report["resource_id"] = json!(selected.binding.resource_id);
+                report["sources"]["resource"] = json!("binding");
+                bound_area = selected.binding.area_id.as_deref();
+                bound_project = selected.binding.project_id.as_deref();
+            }
+            for (scope, field, cli, bound) in [
+                ("area", "area_id", area, bound_area),
+                ("project", "project_id", project, bound_project),
+            ] {
+                if let Some(id) = cli.or(bound) {
+                    report[field] = json!(id);
+                    report["sources"][scope] = json!(if cli.is_some() { "cli" } else { "binding" });
+                }
+            }
+        }
         Ok(report)
+    }
+
+    fn resolve_bound_workspace(
+        selected: &bindings::Selected,
+        explicit: Option<Candidate>,
+        user_workspace: Option<(&Path, &Path)>,
+        home: Option<&Path>,
+    ) -> Result<(Candidate, bool), HiveError> {
+        let (path, source) = match selected.binding.workspace.as_deref() {
+            Some(path) => (path, selected.file.as_path()),
+            None => user_workspace.ok_or_else(|| {
+                invalid("A binding without a workspace requires a workspace in user configuration.")
+            })?,
+        };
+        validate_path(path)?;
+        let target = resolve_path(path, config_parent(source), home)?;
+        let candidate = if let Some(candidate) = explicit {
+            if normalized_root(&target) != candidate.root {
+                return Ok((candidate, false));
+            }
+            // Verify the matching spelling still traverses only real directories.
+            ScopedDirectory::open_absolute(&target)?;
+            candidate
+        } else {
+            read_candidate(&target)?
+        };
+        selected.binding.validate_scope()?;
+        if selected
+            .binding
+            .workspace_id
+            .as_ref()
+            .is_some_and(|id| *id != candidate.descriptor.workspace_id)
+        {
+            return Err(HiveError::new(
+                ErrorCode::AuthorityUnverified,
+                "The binding workspace ID does not match the selected descriptor.",
+            ));
+        }
+        Ok((candidate, true))
+    }
+
+    fn source_error(source: &str, error: HiveError) -> HiveError {
+        HiveError::new(error.code, format!("{source}: {error}"))
+    }
+
+    fn config_parent(path: &Path) -> &Path {
+        path.parent().expect("versioned config file has a parent")
+    }
+
+    // Compare an untrusted target to the explicit root without inspecting a
+    // different workspace. An equal spelling still needs a no-follow traversal.
+    fn normalized_root(path: &Path) -> PathBuf {
+        let mut root = PathBuf::from("/");
+        for component in path.components() {
+            match component {
+                Component::Normal(name) => root.push(name),
+                Component::ParentDir => {
+                    root.pop();
+                }
+                _ => {}
+            }
+        }
+        root
     }
 
     fn xdg_root(variable: &str, home: Option<&Path>, fallback: &str) -> Result<PathBuf, HiveError> {
@@ -244,17 +418,21 @@ mod unix {
     }
 }
 
-use crate::cli::{CommonOptions, Format};
+use crate::cli::{CommonOptions, ConfigShowArgs, Format};
 use crate::error::HiveError;
 use serde_json::Value;
 
-pub(crate) fn show(options: &CommonOptions) -> (Format, Result<Value, HiveError>) {
+pub(crate) fn show(
+    options: &CommonOptions,
+    args: &ConfigShowArgs,
+) -> (Format, Result<Value, HiveError>) {
     #[cfg(unix)]
     {
-        unix::show(options)
+        unix::show(options, args)
     }
     #[cfg(not(unix))]
     {
+        let _ = args;
         (
             options.format.unwrap_or_default(),
             Err(HiveError::new(

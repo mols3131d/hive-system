@@ -392,6 +392,6 @@ pub(crate) fn is_uuid(value: &str) -> bool {
         })
 }
 
-fn is_uuid_v7(value: &str) -> bool {
+pub(crate) fn is_uuid_v7(value: &str) -> bool {
     is_uuid(value) && value.as_bytes()[14] == b'7'
 }

@@ -922,6 +922,60 @@ fn malformed_dolt_list_project_preserves_late_v2_and_json_options() {
 }
 
 #[test]
+fn malformed_dolt_config_scope_preserves_late_v2_and_json_options() {
+    let sandbox = Sandbox::new();
+    let command = ["config", "show"];
+    let assert_scope_error = |args: &[&str], flag: &str| {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["ok"], false, "{args:?}");
+        assert_eq!(report["command"], "config show", "{args:?}");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT", "{args:?}");
+        let message = report["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(flag) && message.contains("UUIDv7"),
+            "{args:?}"
+        );
+    };
+    for (flag, value) in [
+        ("--area", "-1"),
+        ("--area", "123"),
+        ("--project", "-1"),
+        ("--project", "01900000-0000-7000-8000-00000000000A"),
+    ] {
+        let args = [
+            command.as_slice(),
+            &[flag, value, "--contract", "2", "--json"],
+        ]
+        .concat();
+        assert_scope_error(&args, flag);
+    }
+
+    for (flag, json_literal, contract_literal) in [
+        ("--area", "--area=--json", "--area=--contract"),
+        ("--project", "--project=--json", "--project=--contract"),
+    ] {
+        let args = [command.as_slice(), &[json_literal, "--contract", "2"]].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("UUIDv7"), "{args:?}");
+        assert!(!stderr.contains("--json"), "{args:?}");
+
+        let args = [
+            command.as_slice(),
+            &[contract_literal, "--contract", "2", "--json"],
+        ]
+        .concat();
+        assert_scope_error(&args, flag);
+    }
+}
+
+#[test]
 fn bot_metadata_has_explicit_v2_selection_and_preserves_v1_parsing() {
     let sandbox = Sandbox::new();
     for (command, args) in [
@@ -1436,4 +1490,57 @@ fn dolt_area_option_recovery_preserves_literals_and_v1_errors() {
         assert_eq!(explicit.stderr, output.stderr, "{v1:?}");
     }
     sandbox.assert_empty();
+}
+
+#[test]
+fn duplicate_and_missing_config_scope_options_preserve_v2_parse_errors() {
+    let sandbox = Sandbox::new();
+    let command = ["config", "show"];
+    let selectors = ["--contract", "2", "--json"];
+    let area = "01900000-0000-7000-8000-000000000001";
+    for (invalid, message) in [
+        (&["--area", area, "--area", area][..], "Arguments conflict."),
+        (
+            &["--resource", ".", "--resource", "."],
+            "Arguments conflict.",
+        ),
+        (&["--area"], "An argument has a missing or invalid value."),
+        (
+            &["--resource"],
+            "An argument has a missing or invalid value.",
+        ),
+        (
+            &["--resource="],
+            "An argument has a missing or invalid value.",
+        ),
+        (
+            &["--area="],
+            "CLI --area must be a canonical lowercase UUIDv7.",
+        ),
+    ] {
+        let early = sandbox.run(&[&selectors[..], &command, invalid].concat());
+        let late = sandbox.run(&[&command[..], invalid, &selectors].concat());
+        for output in [&early, &late] {
+            assert_eq!(output.status.code(), Some(2), "{invalid:?}");
+            assert!(output.stderr.is_empty(), "{invalid:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2, "{invalid:?}");
+            assert_eq!(report["command"], "config show", "{invalid:?}");
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT", "{invalid:?}");
+            assert_eq!(report["error"]["message"], message, "{invalid:?}");
+        }
+        assert_eq!(early.stdout, late.stdout, "{invalid:?}");
+    }
+
+    for args in [
+        &["--area=--json", "--area"][..],
+        &["--resource=--json", "--resource"],
+        &["--resource=", "--area=--json"],
+        &["--resource=", "--area=--contract"],
+    ] {
+        let output = sandbox.run(&[&command[..], args, &["--contract", "2"]].concat());
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
 }
