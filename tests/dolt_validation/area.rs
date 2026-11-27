@@ -193,7 +193,7 @@ fn check_area_reads(collation: &str) {
     assert_eq!(roots[0]["id"], leaf);
     assert_eq!(roots[0]["children"][0]["id"], adjacent_child);
     assert_eq!(roots[1]["id"], root);
-    assert_eq!(roots[1]["name"], "Root");
+    assert_eq!(roots[1]["name"], "Uncommitted");
     assert!(roots[1].get("description").is_none());
     let children = roots[1]["children"].as_array().unwrap();
     assert_eq!(children.len(), 2);
