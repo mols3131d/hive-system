@@ -1,3 +1,4 @@
+mod conversation_v2;
 mod project_v2;
 
 use std::ffi::OsString;
@@ -14,6 +15,7 @@ use clap::{
     value_parser,
 };
 
+pub(crate) use conversation_v2::ConversationListArgs;
 pub(crate) use project_v2::ProjectRead;
 
 pub(crate) struct Invocation {
@@ -259,6 +261,8 @@ pub(crate) enum Command {
     /// Inspect preserved Queen conversations under contract 2.
     #[command(subcommand, hide = true)]
     Conversation(ConversationCommand),
+    #[command(skip)]
+    ConversationList(ConversationListArgs),
     /// Validate workspace records.
     Validate(ValidateArgs),
     /// Check the local environment and workspace.
@@ -807,6 +811,9 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             })
         },
     );
+    if let Some(conversation) = conversation_v2::parse(&cli, &args) {
+        return conversation;
+    }
     if let Some(project) = project_v2::parse(&cli, &args) {
         return project;
     }
@@ -842,7 +849,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             let partial = config_error_matches
                 .or(area_matches)
                 .or_else(|| retry_bot_failure(&cli, &args, error.kind()))
-                .or_else(|| retry_conversation_failure(&cli, &args, error.kind()))
+                .or_else(|| retry_conversation_failure(&cli, &args, error.kind(), "show"))
                 .or_else(|| {
                     cli.clone()
                         .ignore_errors(true)
@@ -1041,6 +1048,7 @@ fn retry_conversation_failure(
     cli: &clap::Command,
     args: &[OsString],
     kind: ErrorKind,
+    action: &str,
 ) -> Option<ArgMatches> {
     if !matches!(
         kind,
@@ -1054,14 +1062,18 @@ fn retry_conversation_failure(
         return None;
     }
     const SCOPED_VALUES: &[&str] = &["workspace", "project", "project-root", "at"];
-    const LEAF_VALUES: &[&str] = &["bot", "id", "workspace-id", "database", "port"];
+    let leaf_values: &[&str] = if action == "list" {
+        &["bot", "limit", "cursor", "workspace-id", "database", "port"]
+    } else {
+        &["bot", "id", "workspace-id", "database", "port"]
+    };
     let recover_metadata = |command: clap::Command, leaf: bool| {
         command.mut_args(|arg| {
             let Some(long) = arg.get_long() else {
                 return arg;
             };
             if !SCOPED_VALUES.contains(&long)
-                && !(leaf && LEAF_VALUES.contains(&long))
+                && !(leaf && leaf_values.contains(&long))
                 && long != "authority"
             {
                 return arg;
@@ -1075,7 +1087,7 @@ fn retry_conversation_failure(
     };
     let retry = recover_metadata(cli.clone(), false)
         .mut_subcommand("conversation", |conversation| {
-            conversation.mut_subcommand("show", |show| recover_metadata(show, true))
+            conversation.mut_subcommand(action, |leaf| recover_metadata(leaf, true))
         });
     // Join a split single-dash value only after a known value-taking option.
     // Clap still recognizes all long options, equals values and the -- boundary.
@@ -1092,7 +1104,7 @@ fn retry_conversation_failure(
         if arg
             .to_str()
             .and_then(|arg| arg.strip_prefix("--"))
-            .is_some_and(|name| SCOPED_VALUES.contains(&name) || LEAF_VALUES.contains(&name))
+            .is_some_and(|name| SCOPED_VALUES.contains(&name) || leaf_values.contains(&name))
             && args.peek().is_some_and(
                 |value| matches!(value.as_encoded_bytes(), [b'-', next, ..] if *next != b'-'),
             )
@@ -1104,7 +1116,7 @@ fn retry_conversation_failure(
     }
     let matches = retry.try_get_matches_from(normalized).ok()?;
     let (command, leaf) = matched_leaf(cli, &matches)?;
-    (command == "conversation show"
+    (command == format!("conversation {action}")
         && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }

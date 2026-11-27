@@ -76,7 +76,8 @@ pub(super) fn parse(
                 .ignore_errors(true)
                 .try_get_matches_from(args)
                 .ok()?;
-            let matches = recover_unknown_long(&cli, args, &partial, &error).unwrap_or(partial);
+            let matches =
+                recover_unknown_long(&cli, args, &partial, &error, "project").unwrap_or(partial);
             (matches, Some(error.kind()))
         }
     };
@@ -133,17 +134,17 @@ pub(super) fn parse(
     }))
 }
 
-fn recover_unknown_long(
+pub(super) fn recover_unknown_long(
     cli: &clap::Command,
     args: &[OsString],
     partial: &ArgMatches,
     error: &clap::Error,
+    domain: &str,
 ) -> Option<ArgMatches> {
     if error.kind() != ErrorKind::UnknownArgument {
         return None;
     }
-    let (action @ ("list" | "show"), _) = partial.subcommand_matches("project")?.subcommand()?
-    else {
+    let (action @ ("list" | "show"), _) = partial.subcommand_matches(domain)?.subcommand()? else {
         return None;
     };
     let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
@@ -157,7 +158,7 @@ fn recover_unknown_long(
     {
         return None;
     }
-    let leaf = cli.find_subcommand("project")?.find_subcommand(action)?;
+    let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
     if leaf.get_arguments().any(|arg| {
         arg.get_long() == Some(long)
             || arg
@@ -169,9 +170,9 @@ fn recover_unknown_long(
 
     // Let Clap replay the original tokens. The temporary option can take an
     // attached value, and the original parse error still determines the result.
-    const UNKNOWN_LONG: &str = "unknown_project_long";
-    let retry = cli.clone().mut_subcommand("project", |project| {
-        project.mut_subcommand(action, |leaf| {
+    const UNKNOWN_LONG: &str = "recovered_unknown_long";
+    let retry = cli.clone().mut_subcommand(domain, |command| {
+        command.mut_subcommand(action, |leaf| {
             leaf.arg(
                 Arg::new(UNKNOWN_LONG)
                     .long(long.to_owned())
@@ -184,7 +185,7 @@ fn recover_unknown_long(
     });
     let matches = retry.try_get_matches_from(args).ok()?;
     let recovered = matches
-        .subcommand_matches("project")?
+        .subcommand_matches(domain)?
         .subcommand_matches(action)?;
     (recovered.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine)).then_some(matches)
 }
