@@ -7,6 +7,8 @@ use std::path::Path;
 mod area_create;
 #[path = "runtime/artifact_create.rs"]
 mod artifact_create;
+#[path = "runtime/artifact_update.rs"]
+mod artifact_update;
 #[path = "runtime/issue_update.rs"]
 mod issue_update;
 

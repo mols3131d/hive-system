@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use super::{
     DoltSuccess, DoltTarget, Snapshot,
     area::create as area_create,
-    artifact::create as artifact_create,
+    artifact::{create as artifact_create, update as artifact_update},
     context_evidence::read_evidence_bytes,
     context_resolve::observe_time,
     context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7, issue_create,
@@ -34,6 +34,8 @@ pub(super) enum Kind {
     Update,
     #[serde(rename = "artifact.create")]
     ArtifactCreate,
+    #[serde(rename = "artifact.update")]
+    ArtifactUpdate,
     #[serde(rename = "area.create")]
     AreaCreate,
 }
@@ -45,6 +47,7 @@ impl Kind {
             Self::Create => issue_create::KIND,
             Self::Update => issue_update::KIND,
             Self::ArtifactCreate => artifact_create::KIND,
+            Self::ArtifactUpdate => artifact_update::KIND,
             Self::AreaCreate => area_create::KIND,
         }
     }
@@ -55,6 +58,7 @@ impl Kind {
             Self::Create => "Issue create",
             Self::Update => "Issue update",
             Self::ArtifactCreate => "Artifact create",
+            Self::ArtifactUpdate => "Artifact update",
             Self::AreaCreate => "Area create",
         }
     }
@@ -79,6 +83,7 @@ impl Kind {
                 ("operation_receipts", "INSERT"),
             ],
             Self::ArtifactCreate => &[("artifacts", "INSERT"), ("operation_receipts", "INSERT")],
+            Self::ArtifactUpdate => &[("artifacts", "UPDATE"), ("operation_receipts", "INSERT")],
             Self::AreaCreate if area.is_some() => &[
                 ("areas", "INSERT"),
                 ("areas", "UPDATE"),
@@ -246,7 +251,14 @@ impl Pending {
             (2, Some(kind @ (Kind::Create | Kind::Update)), Some(_), Some(_), None, None) => {
                 Ok(kind)
             }
-            (3, Some(Kind::ArtifactCreate), _, None, Some(_), None) => Ok(Kind::ArtifactCreate),
+            (
+                3,
+                Some(kind @ (Kind::ArtifactCreate | Kind::ArtifactUpdate)),
+                _,
+                None,
+                Some(_),
+                None,
+            ) => Ok(kind),
             (4, Some(Kind::AreaCreate), Some(area), None, None, parent)
                 if parent.as_ref() != Some(area) =>
             {
@@ -316,7 +328,7 @@ pub(super) fn execute(
             receipt_at(snapshot, request.request_id, &commit, None).map_err(|_| uncertain())?;
         mutation.verify_decision(observe_time()?)?;
         let (outcome, base, introduced, result) = if let Some(receipt) = existing {
-            if matches!(request.kind, Kind::ArtifactCreate | Kind::AreaCreate) {
+            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate | Kind::AreaCreate) {
                 check_fingerprint(&receipt.fingerprint, request.fingerprint, request.kind)?;
             }
             let scoped = ScopedReceipt::read(
@@ -367,7 +379,7 @@ pub(super) fn execute(
                 "policy_revision": workspace.policy_revision(),
                 "scope": match request.kind {
                     Kind::AreaCreate => json!({"area_id": result["area_id"], "parent_id": request.area_id}),
-                    Kind::ArtifactCreate => json!({"area_id": request.area_id, "artifact_id": result["artifact_id"]}),
+                    Kind::ArtifactCreate | Kind::ArtifactUpdate => json!({"area_id": request.area_id, "artifact_id": result["artifact_id"]}),
                     _ => json!({"area_id": request.area_id, "issue_id": result["issue_id"]}),
                 },
             }),
@@ -449,13 +461,15 @@ fn apply(
     let (version, kind) = match request.kind {
         Kind::Note => (1, None),
         kind @ (Kind::Create | Kind::Update) => (2, Some(kind)),
-        Kind::ArtifactCreate => (3, Some(Kind::ArtifactCreate)),
+        kind @ (Kind::ArtifactCreate | Kind::ArtifactUpdate) => (3, Some(kind)),
         Kind::AreaCreate => (4, Some(Kind::AreaCreate)),
     };
     let area_scope = request.area_id.map(str::to_owned);
     let (area_id, parent_id, issue_id, artifact_id) = match request.kind {
         Kind::AreaCreate => (Some(staged.record_id), area_scope, None, None),
-        Kind::ArtifactCreate => (area_scope, None, None, Some(staged.record_id)),
+        Kind::ArtifactCreate | Kind::ArtifactUpdate => {
+            (area_scope, None, None, Some(staged.record_id))
+        }
         _ => (area_scope, None, Some(staged.record_id), None),
     };
     let marker = Pending {
@@ -587,6 +601,7 @@ enum ScopedReceipt {
     Create(issue_create::CreateResult),
     Update(Box<issue_update::ScopedUpdate>),
     ArtifactCreate(artifact_create::ScopedCreate),
+    ArtifactUpdate(artifact_update::ScopedUpdate),
     AreaCreate(area_create::ScopedCreate),
 }
 
@@ -645,6 +660,20 @@ impl ScopedReceipt {
                 artifact_create::check_scope(snapshot, request, area, record, actor, receipt)
                     .map(Self::ArtifactCreate)
             }
+            Kind::ArtifactUpdate => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                artifact_update::check_scope(
+                    snapshot,
+                    request,
+                    area,
+                    record.ok_or_else(uncertain)?,
+                    actor,
+                    receipt,
+                )
+                .map(Self::ArtifactUpdate)
+            }
             Kind::AreaCreate => {
                 if receipt.kind != kind.name() {
                     return Err(conflict(kind));
@@ -678,6 +707,9 @@ impl ScopedReceipt {
             Self::Update(update) => issue_update::verify_effect(snapshot, commit, receipt, &update),
             Self::ArtifactCreate(scoped) => {
                 artifact_create::verify_effect(snapshot, commit, receipt, &scoped)
+            }
+            Self::ArtifactUpdate(scoped) => {
+                artifact_update::verify_effect(snapshot, commit, receipt, &scoped)
             }
             Self::AreaCreate(scoped) => {
                 area_create::verify_effect(snapshot, commit, receipt, &scoped)
@@ -843,7 +875,14 @@ mod tests {
         value["parent_id"] = area_id.clone();
         assert!(read(&value).is_err());
         value.as_object_mut().unwrap().remove("parent_id");
+        value["kind"] = json!("artifact.update");
+        let standalone = read(&value).unwrap();
+        assert!(matches!(standalone.operation(), Ok(Kind::ArtifactUpdate)));
+        assert_eq!(json!(standalone), value);
         value["area_id"] = area_id;
+        let linked = read(&value).unwrap();
+        assert!(matches!(linked.operation(), Ok(Kind::ArtifactUpdate)));
+        assert_eq!(json!(linked), value);
         value["issue_id"] = value["artifact_id"].clone();
         assert!(read(&value).is_err());
 

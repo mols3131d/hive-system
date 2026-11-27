@@ -3628,3 +3628,70 @@ fn issue_create_is_registered_only_in_v2_grammar() {
     assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
     sandbox.assert_empty();
 }
+
+#[test]
+fn dolt_artifact_update_requires_one_explicit_body_and_revision() {
+    let sandbox = Sandbox::new();
+    let target = "01900000-0000-7000-8000-000000000001";
+    let artifact = "01900000-0000-7000-8000-000000000002";
+    let expected = format!("{artifact}=artifact-r1");
+    let base = [
+        "artifact",
+        "update",
+        artifact,
+        "--contract",
+        "2",
+        "--json",
+        "--workspace",
+        WORKSPACE,
+        "--workspace-id",
+        target,
+        "--database",
+        "db",
+        "--port",
+        "3307",
+        "--actor",
+        "fixture-actor",
+        "--request-id",
+        target,
+        "--evidence-file",
+        "decision-fixture.json",
+    ];
+    for invalid in [
+        &["--if-match", &expected][..],
+        &["--file", FILE][..],
+        &[
+            "--file",
+            FILE,
+            "--if-match",
+            &expected,
+            "--if-match",
+            &expected,
+        ][..],
+        &[
+            "--file",
+            FILE,
+            "--if-match",
+            &expected,
+            "--title",
+            "fixture",
+        ][..],
+        &["--file", FILE, "--if-match", &expected, "--standalone"][..],
+    ] {
+        let args = [base.as_slice(), invalid].concat();
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?} {report}");
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "artifact update");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(report.get("data").is_none());
+    }
+    let args = [base.as_slice(), &["--file", FILE, "--if-match", &expected]].concat();
+    let output = sandbox.run(&args);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(3), "{report}");
+    assert_eq!(report["command"], "artifact update");
+    assert_eq!(report["error"]["code"], "NOT_FOUND");
+    sandbox.assert_empty();
+}
