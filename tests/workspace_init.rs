@@ -1,7 +1,9 @@
 #![cfg(target_os = "linux")]
 
 use std::fs::{self, DirBuilder};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -154,6 +156,65 @@ fn refuses_implicit_unsafe_and_existing_destinations_before_tools() {
     assert!(fixture.stages().is_empty());
     assert_eq!(fs::read_dir(empty).unwrap().count(), 0);
     assert_eq!(fs::read_to_string(used.join(".hidden")).unwrap(), "keep");
+}
+
+#[test]
+fn rejects_git_components_and_allows_unrelated_empty_git_placeholders() {
+    let fixture = Fixture::new();
+    let placeholder = fixture.dir(".git");
+    let sibling = fixture.dir("empty");
+
+    let rejected = response(fixture.init(&placeholder).output().unwrap(), 2);
+    assert_eq!(rejected["error"]["code"], "INVALID_ARGUMENT");
+    let sibling = response(fixture.init(&sibling).output().unwrap(), 7);
+    assert_eq!(sibling["error"]["code"], "RUNTIME_UNAVAILABLE");
+
+    let nested = placeholder.join("empty");
+    fs::create_dir(&nested).unwrap();
+    let rejected = response(fixture.init(&nested).output().unwrap(), 2);
+    assert_eq!(rejected["error"]["code"], "INVALID_ARGUMENT");
+    assert!(fixture.stages().is_empty());
+}
+
+#[test]
+fn config_readers_refuse_incomplete_staging_even_with_a_valid_descriptor() {
+    let fixture = Fixture::new();
+    let stage = fixture.dir(".hive-init-incomplete-synthetic");
+    let payload = stage.join("workspace");
+    fs::create_dir(&payload).unwrap();
+    fs::write(
+        payload.join("hive-workspace.yml"),
+        "version: 2\nworkspace_id: 01900000-0000-7000-8000-000000000001\nschema_version: 1\npolicy_revision: c66b3c50150e18426485d134de92c6b311dac125\n",
+    )
+    .unwrap();
+
+    for scope in ["workspace", "resolved"] {
+        let error = response(
+            fixture
+                .hive()
+                .args([
+                    "--contract",
+                    "2",
+                    "--json",
+                    "config",
+                    "show",
+                    "--scope",
+                    scope,
+                    "--workspace",
+                ])
+                .arg(&payload)
+                .output()
+                .unwrap(),
+            2,
+        );
+        assert_eq!(error["error"]["code"], "INVALID_CONFIG");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Incomplete initialization staging")
+        );
+    }
 }
 
 #[test]
@@ -320,6 +381,7 @@ fn publishes_verified_workspace_with_isolated_children() {
     let home = fixture.dir("operator-home");
     let target = home.join("work space");
     fs::create_dir(&target).unwrap();
+    let original_inode = target.metadata().unwrap().ino();
     fs::create_dir(home.join(".dolt")).unwrap();
     let global = home.join(".dolt/config_global.json");
     let global_contents = b"{\"user.name\": \"Synthetic operator\"}\n";
@@ -353,6 +415,7 @@ fn publishes_verified_workspace_with_isolated_children() {
     );
     let data = &data["data"];
     assert_eq!(data["dolt_version"], "2.7.6");
+    assert_eq!(target.metadata().unwrap().ino(), original_inode);
     let descriptor = response(
         fixture
             .hive()
@@ -473,4 +536,120 @@ fn refuses_targets_inside_a_pinned_dolt_repository() {
     assert_eq!(fs::read(state).unwrap(), state_before);
     assert_eq!(fs::read_dir(repo).unwrap().count(), 2);
     assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+}
+
+#[test]
+#[ignore = "requires installed Dolt 2.7.6 and Git"]
+fn moving_parent_cannot_redirect_real_dolt_home_or_publish_the_workspace() {
+    let fixture = Fixture::new();
+    let parent = fixture.dir("parent");
+    let target = parent.join("empty");
+    fs::create_dir(&target).unwrap();
+    let ready = fixture.0.join("ready");
+    let release = fixture.0.join("release");
+    let dolt = std::env::var("HIVE_DOLT_BIN").unwrap();
+    assert!(Path::new(&dolt).is_absolute());
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+
+    let unrelated = fs::File::open(&fixture.0).unwrap();
+    // SAFETY: Duplicate a valid descriptor into a range distinct from stdio
+    // and the scratch descriptor. It remains CLOEXEC in this test process.
+    let fd = unsafe { libc::fcntl(unrelated.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 90) };
+    assert!(fd >= 90);
+    // SAFETY: fcntl returned a new owned descriptor.
+    let inherited = unsafe { OwnedFd::from_raw_fd(fd) };
+    fixture.fake_dolt(&format!(
+        r#"
+set -eu
+if [ "$1" = init ]; then
+    [ ! -e "/proc/$$/fd/{fd}" ] || exit 90
+    printf pinned > "$HOME/witness"
+    : > {ready}
+    attempts=0
+    until [ -f {release} ]; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 500 ] || exit 91
+        /bin/sleep .01
+    done
+    [ "$DOLT_ROOT_PATH" = "$HOME" ] && [ "$TMPDIR" = "$HOME" ] || exit 92
+    [ "$XDG_CONFIG_HOME" = "$HOME" ] && [ "$XDG_DATA_HOME" = "$HOME" ] &&
+        [ "$XDG_CACHE_HOME" = "$HOME" ] && [ "$XDG_STATE_HOME" = "$HOME" ] &&
+        [ "$XDG_RUNTIME_DIR" = "$HOME" ] || exit 93
+    [ "$(/bin/cat "$HOME/witness")" = pinned ] || exit 94
+fi
+exec {dolt} "$@"
+"#,
+        ready = quote(ready.to_str().unwrap()),
+        release = quote(release.to_str().unwrap()),
+        dolt = quote(&dolt),
+    ));
+    symlink(git, fixture.0.join("bin/git")).unwrap();
+
+    let mut command = fixture.init(&target);
+    // SAFETY: Only an async-signal-safe fcntl runs before exec. The fixture
+    // retains ownership of this descriptor until the child has started.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.stdout(Stdio::piped()).spawn().unwrap();
+    drop(inherited);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("Dolt did not reach its suspended init step: {output:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let stage = fs::read_dir(&parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .find(|name| {
+            name.as_encoded_bytes()
+                .starts_with(b".hive-init-incomplete-")
+        })
+        .unwrap();
+    let moved = fixture.0.join("moved-parent");
+    fs::rename(&parent, &moved).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    let redirected = parent.join(&stage).join("scratch");
+    fs::create_dir_all(&redirected).unwrap();
+    fs::write(redirected.join("witness"), b"replacement").unwrap();
+    fs::write(release, b"go").unwrap();
+
+    let error = response(child.wait_with_output().unwrap(), 5);
+    assert_eq!(error["error"]["code"], "CONCURRENT_CHANGE");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Incomplete staging")
+    );
+    assert_eq!(
+        fs::read(redirected.join("witness")).unwrap(),
+        b"replacement"
+    );
+    assert_eq!(fs::read_dir(redirected).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(moved.join("empty")).unwrap().count(), 0);
+    assert!(
+        moved
+            .join(&stage)
+            .join("workspace/db/.dolt/repo_state.json")
+            .is_file()
+    );
+    let staged = moved.join(stage);
+    assert!(staged.join("workspace/hive-workspace.yml").is_file());
+    assert!(!staged.join("scratch").exists());
 }

@@ -49,7 +49,7 @@ Use `hive --contract 2 --json config show` for the resolved report. It reads mac
 
 ## Dolt workspace initialization
 
-Use a new, existing empty directory owned by the invoking user. Bootstrap currently supports Linux on an ext-family filesystem or tmpfs. Supply installed Dolt 2.7.6 and Git on absolute `PATH` entries.
+Use a new, existing empty directory owned by the invoking user. Bootstrap currently supports Linux 5.11 or later with procfs on an ext-family filesystem or tmpfs. Supply installed Dolt 2.7.6 and Git on absolute `PATH` entries.
 
 ```sh
 workspace=$(mktemp -d)
@@ -57,7 +57,7 @@ hive --contract 2 --json workspace init --target "$workspace"
 hive --contract 2 --json config show --scope workspace --workspace "$workspace"
 ```
 
-Init builds the Dolt and Git commits in a private sibling staging directory. It verifies the committed schema, migration ledger, workspace identity, initial Issue counter, and empty asset history before atomically replacing the empty directory. The published root contains the descriptor, `db/`, `assets/`, and a private `conversations/` directory. Init leaves the workspace inactive and leaves XDG configuration and runtime state untouched. A failed or interrupted initialization can leave a private sibling named `.hive-init-incomplete-*` for inspection.
+Init builds the Dolt and Git commits in a private sibling staging directory. It verifies the committed schema, migration ledger, workspace identity, initial Issue counter, and empty asset history before publishing. Init locks the original target directory and moves the verified entries into it without replacing existing names. It rechecks the target path and publishes the descriptor last. The published root contains the descriptor, `db/`, `assets/`, and a private `conversations/` directory. Init leaves the workspace inactive and leaves XDG configuration and runtime state untouched. A failed or interrupted initialization can leave a private sibling named `.hive-init-incomplete-*` or private entries in the original target without a valid descriptor. Workspace readers reject paths through incomplete staging even when it contains a prepared descriptor.
 
 To run the disposable init tests with the actual installed engines, supply the absolute path to Dolt 2.7.6.
 

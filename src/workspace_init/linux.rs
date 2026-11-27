@@ -1,8 +1,7 @@
 use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -16,7 +15,7 @@ use crate::error::{ErrorCode, HiveError};
 mod tools;
 
 const POLICY_REVISION: &str = "c66b3c50150e18426485d134de92c6b311dac125";
-const STAGE_PREFIX: &str = ".hive-init-incomplete-";
+const PAYLOAD_ENTRIES: [&str; 3] = ["db", "assets", "conversations"];
 
 pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
     let input = json_path(target)?;
@@ -28,29 +27,29 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
     } else {
         current_dir()?.join(target)
     };
-    let (parent, name, original) = inspect(&target)?;
+    let target_json = json_path(&target)?;
+    let (parent, original) = inspect(&target)?;
+    lock_target(&original)?;
+    require_entries(&original, &[])?;
+    let check_path = || check_target_path(&target, &parent, &original);
     let workspace_id = new_uuid().map_err(|_| {
         HiveError::new(
             ErrorCode::IoError,
             "Could not generate a workspace identity.",
         )
     })?;
-    let stage_name = format!("{STAGE_PREFIX}{workspace_id}");
-    let stage = fd_path(&parent).join(&stage_name);
-    private_dir(&stage)?;
-    let scratch = stage.join("scratch");
-    let payload = stage.join("workspace");
+    let stage_name = format!("{}{workspace_id}", config_v2::INIT_STAGE_PREFIX);
+    let stage_entry = fd_path(&parent).join(&stage_name);
+    private_dir(&stage_entry)?;
+    let stage = open_directory(&stage_entry)?;
+    let scratch = fd_path(&stage).join("scratch");
+    let payload = fd_path(&stage).join("workspace");
     let result: Result<_, HiveError> = (|| {
         private_dir(&scratch)?;
-        // The engines need an absolute HOME that also resolves after exec.
-        let home = target
-            .parent()
-            .expect("inspected target has a parent")
-            .join(&stage_name)
-            .join("scratch");
-        let tools = tools::Installed::check(&scratch, &home)?;
+        let scratch_fd = open_directory(&scratch)?;
+        let tools = tools::Installed::check(&scratch_fd)?;
         private_dir(&payload)?;
-        for name in ["db", "assets", "conversations"] {
+        for name in PAYLOAD_ENTRIES {
             private_dir(&payload.join(name))?;
         }
         let db_commit = tools.initialize_db(&payload.join("db"), &workspace_id)?;
@@ -58,51 +57,65 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
         Ok((db_commit, asset_commit))
     })();
 
-    // Keep failed payloads in a clearly marked, private sibling. Remove
-    // isolated tool state on normal exit, even when an engine fails.
+    // Keep verified or partial payloads identifiable on refusal. Clean up
+    // only our scratch tree, and remove the empty staging container on success.
+    let with_stage = |error: HiveError| {
+        HiveError::new(
+            error.code,
+            format!("{error} Incomplete staging under the original parent: {stage_name}."),
+        )
+    };
     let cleanup = fs::remove_dir_all(&scratch);
     let (db_commit, asset_commit) = match result {
         Ok(commits) => {
-            cleanup.map_err(|_| io_error("Could not remove isolated tool state."))?;
+            cleanup.map_err(|_| with_stage(io_error("Could not remove isolated tool state.")))?;
             commits
         }
         Err(error) => {
-            if !payload.exists() && fs::remove_dir(&stage).is_ok() {
-                return Err(error);
-            }
-            return Err(HiveError::new(
-                error.code,
-                format!("{error} Incomplete staging: {stage_name}."),
-            ));
+            return Err(
+                if !payload.exists() && fs::remove_dir(&stage_entry).is_ok() {
+                    error
+                } else {
+                    with_stage(error)
+                },
+            );
         }
     };
-
-    let (current_parent, _, current) = inspect(&target)?;
-    if !same_directory(&parent, &current_parent)? || !same_directory(&original, &current)? {
-        return Err(HiveError::new(
-            ErrorCode::ConcurrentChange,
-            "The workspace target or its parent changed during initialization.",
-        ));
-    }
 
     let descriptor = format!(
         "version: 2\nworkspace_id: {workspace_id}\nschema_version: {STORAGE_SCHEMA_VERSION}\npolicy_revision: {POLICY_REVISION}\n"
     );
-    let marker = payload.join(config_v2::MARKER);
-    (|| {
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&marker)?
-            .write_all(descriptor.as_bytes())
-    })()
-    .map_err(|_| io_error("Could not write the staged workspace descriptor."))?;
-    let bytes = fs::read(&marker)
-        .map_err(|_| io_error("Could not read the staged workspace descriptor."))?;
-    config_v2::verify_descriptor(&bytes)?;
-    let output = json!({
-        "workspace_root": json_path(&target)?,
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(payload.join(config_v2::MARKER))
+        .map_err(|_| {
+            with_stage(io_error(
+                "Could not create the staged workspace descriptor.",
+            ))
+        })?;
+    marker
+        .write_all(descriptor.as_bytes())
+        .map_err(|_| with_stage(io_error("Could not write the staged workspace descriptor.")))?;
+    let mut bytes = Vec::new();
+    marker
+        .rewind()
+        .and_then(|()| marker.read_to_end(&mut bytes))
+        .map_err(|_| with_stage(io_error("Could not read the staged workspace descriptor.")))?;
+    config_v2::verify_descriptor(&bytes).map_err(with_stage)?;
+
+    let payload_fd = open_directory(&payload).map_err(with_stage)?;
+    publish(&payload_fd, &original, &marker, check_path).map_err(|error| {
+        with_stage(HiveError::new(
+            error.code,
+            format!("{error} Any moved entries remain in the original target directory."),
+        ))
+    })?;
+
+    let mut output = json!({
+        "workspace_root": target_json,
         "workspace_id": workspace_id,
         "policy_revision": POLICY_REVISION,
         "storage_schema_version": STORAGE_SCHEMA_VERSION,
@@ -110,53 +123,192 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
         "db_commit": db_commit,
         "asset_commit": asset_commit,
     });
-
-    let stage_fd = open_directory(&stage)?;
-    // SAFETY: Both descriptors are pinned and both names are single components.
-    // Linux rejects replacement if the destination acquired any entries.
-    let published = unsafe {
-        libc::renameat(
-            stage_fd.as_raw_fd(),
-            c"workspace".as_ptr(),
-            parent.as_raw_fd(),
-            name.as_ptr(),
-        )
-    };
-    if published != 0 {
-        let error = io::Error::last_os_error();
-        let _ = fs::remove_file(&marker);
-        let code = match error.raw_os_error() {
-            Some(libc::ENOTEMPTY | libc::EEXIST | libc::ENOTDIR | libc::EISDIR) => {
-                ErrorCode::ConcurrentChange
-            }
-            _ => ErrorCode::IoError,
-        };
-        return Err(HiveError::new(
-            code,
-            format!(
-                "Could not publish the verified workspace ({error}). Incomplete staging: {stage_name}."
-            ),
-        ));
-    }
-    // Publication succeeded. Only the now-empty staging container may remain.
-    let mut output = output;
-    if fs::remove_dir(&stage).is_err() {
+    if fs::remove_dir(&payload)
+        .and_then(|()| fs::remove_dir(&stage_entry))
+        .is_err()
+    {
         output["staging_directory"] = json!(stage_name);
     }
     Ok(output)
 }
 
-fn inspect(target: &Path) -> Result<(File, CString, File), HiveError> {
+fn check_target_path(target: &Path, parent: &File, original: &File) -> Result<(), HiveError> {
+    let changed = || {
+        HiveError::new(
+            ErrorCode::ConcurrentChange,
+            "The workspace target or its parent changed during initialization.",
+        )
+    };
+    let (current_parent, current) = inspect(target).map_err(|_| changed())?;
+    if !same_directory(parent, &current_parent)? || !same_directory(original, &current)? {
+        return Err(changed());
+    }
+    // The safe walk pins each component. Confirm that the two names also
+    // resolve to those inodes in case they moved during the walk itself.
+    let named_parent =
+        fs::symlink_metadata(target.parent().expect("inspected target has a parent"))
+            .map_err(|_| changed())?;
+    let named_target = fs::symlink_metadata(target).map_err(|_| changed())?;
+    if !same_inode(&dir_metadata(parent)?, &named_parent)
+        || !same_inode(&dir_metadata(original)?, &named_target)
+    {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+fn lock_target(target: &File) -> Result<(), HiveError> {
+    // SAFETY: The descriptor stays open through preparation and publication.
+    if unsafe { libc::flock(target.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    Err(if error.kind() == io::ErrorKind::WouldBlock {
+        HiveError::new(
+            ErrorCode::ConcurrentChange,
+            "The workspace target is already locked for initialization.",
+        )
+    } else {
+        HiveError::new(
+            ErrorCode::IoError,
+            format!("Could not lock the workspace target ({error})."),
+        )
+    })
+}
+
+fn require_entries(target: &File, expected: &[&str]) -> Result<(), HiveError> {
+    let mut count = 0;
+    for entry in fs::read_dir(fd_path(target))
+        .map_err(|_| io_error("Could not inspect the workspace target contents."))?
+    {
+        let entry =
+            entry.map_err(|_| io_error("Could not inspect the workspace target contents."))?;
+        if !expected
+            .iter()
+            .any(|name| entry.file_name().as_encoded_bytes() == name.as_bytes())
+        {
+            return Err(HiveError::new(
+                if expected.is_empty() {
+                    ErrorCode::AlreadyExists
+                } else {
+                    ErrorCode::ConcurrentChange
+                },
+                "The workspace target contains unexpected entries.",
+            ));
+        }
+        count += 1;
+    }
+    if count != expected.len() {
+        return Err(HiveError::new(
+            ErrorCode::ConcurrentChange,
+            "A published workspace entry was removed.",
+        ));
+    }
+    Ok(())
+}
+
+fn publish(
+    payload: &File,
+    target: &File,
+    descriptor: &File,
+    mut check_path: impl FnMut() -> Result<(), HiveError>,
+) -> Result<(), HiveError> {
+    check_path()?;
+    require_entries(target, &[])?;
+    let entries = PAYLOAD_ENTRIES
+        .into_iter()
+        .map(|name| {
+            let directory = open_directory(&fd_path(payload).join(name))?;
+            Ok((name, directory))
+        })
+        .collect::<Result<Vec<_>, HiveError>>()?;
+    for (name, _) in &entries {
+        move_entry(payload, target, name)?;
+    }
+    let verify_payload = || {
+        for (name, directory) in &entries {
+            verify_entry(target, name, directory)?;
+        }
+        Ok(())
+    };
+
+    require_entries(target, &PAYLOAD_ENTRIES)?;
+    verify_payload()?;
+    check_path()?;
+    move_entry(payload, target, config_v2::MARKER)?;
+    let published = (|| {
+        let [db, assets, conversations] = PAYLOAD_ENTRIES;
+        require_entries(target, &[db, assets, conversations, config_v2::MARKER])?;
+        verify_payload()?;
+        verify_entry(target, config_v2::MARKER, descriptor)?;
+        check_path()
+    })();
+    if let Err(error) = published {
+        // Revoke only the known descriptor inode. The original directory may
+        // have moved, and the path or descriptor name may now refer elsewhere.
+        descriptor.set_len(0).map_err(|_| {
+            HiveError::new(
+                ErrorCode::UnknownWriteOutcome,
+                "The published workspace could not be verified and its descriptor could not be invalidated.",
+            )
+        })?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn verify_entry(target: &File, name: &str, expected: &File) -> Result<(), HiveError> {
+    let changed = || {
+        HiveError::new(
+            ErrorCode::ConcurrentChange,
+            "A published workspace entry was moved or replaced.",
+        )
+    };
+    let actual = fs::symlink_metadata(fd_path(target).join(name)).map_err(|_| changed())?;
+    if !same_inode(&dir_metadata(expected)?, &actual) {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+fn move_entry(source: &File, target: &File, name: &str) -> Result<(), HiveError> {
+    let name = CString::new(name).expect("fixed workspace entry names contain no NUL");
+    // SAFETY: The descriptors are pinned and the name is a single component.
+    if unsafe {
+        libc::renameat2(
+            source.as_raw_fd(),
+            name.as_ptr(),
+            target.as_raw_fd(),
+            name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    Err(HiveError::new(
+        match error.kind() {
+            io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound => ErrorCode::ConcurrentChange,
+            _ => ErrorCode::IoError,
+        },
+        format!("Could not publish a verified workspace entry ({error})."),
+    ))
+}
+
+fn inspect(target: &Path) -> Result<(File, File), HiveError> {
     let name = target
         .file_name()
         .ok_or_else(|| invalid_target("The workspace target must name an empty directory."))?;
-    let name = CString::new(name.as_encoded_bytes())
-        .map_err(|_| invalid_target("The workspace target has an invalid component."))?;
-    if target.components().any(|component| {
-        component == Component::ParentDir
-            || matches!(component, Component::Normal(name) if name == ".dolt" || name.as_encoded_bytes().starts_with(STAGE_PREFIX.as_bytes()))
-    }) {
-        return Err(invalid_target("The workspace target contains a disallowed path component."));
+    if config_v2::has_init_stage_component(target)
+        || target.components().any(|component| {
+            component == Component::ParentDir
+                || matches!(component, Component::Normal(name) if name == ".dolt" || name == ".git")
+        })
+    {
+        return Err(invalid_target(
+            "The workspace target contains a disallowed path component.",
+        ));
     }
 
     let mut directory = open_directory(Path::new("/"))?;
@@ -182,8 +334,7 @@ fn inspect(target: &Path) -> Result<(File, CString, File), HiveError> {
     }
     refuse_workspace_ancestor(&directory)?;
     require_local_filesystem(&directory)?;
-    let original =
-        open_directory(&fd_path(&directory).join(std::ffi::OsStr::from_bytes(name.to_bytes())))?;
+    let original = open_directory(&fd_path(&directory).join(name))?;
     let child = dir_metadata(&original)?;
     if child.dev() != dir_metadata(&directory)?.dev() {
         return Err(invalid_target(
@@ -196,14 +347,7 @@ fn inspect(target: &Path) -> Result<(File, CString, File), HiveError> {
             "The empty target must be owned by the invoking user and protected from other writers.",
         ));
     }
-    match fs::read_dir(fd_path(&original)).and_then(|mut entries| entries.next().transpose()) {
-        Ok(None) => Ok((directory, name, original)),
-        Ok(Some(_)) => Err(HiveError::new(
-            ErrorCode::AlreadyExists,
-            "The workspace target is not empty.",
-        )),
-        Err(_) => Err(io_error("Could not inspect the workspace target contents.")),
-    }
+    Ok((directory, original))
 }
 
 fn open_directory(path: &Path) -> Result<File, HiveError> {
@@ -236,7 +380,11 @@ fn dir_metadata(directory: &File) -> Result<Metadata, HiveError> {
 fn same_directory(left: &File, right: &File) -> Result<bool, HiveError> {
     let left = dir_metadata(left)?;
     let right = dir_metadata(right)?;
-    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    Ok(same_inode(&left, &right))
+}
+
+fn same_inode(left: &Metadata, right: &Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 fn require_trusted(
@@ -378,4 +526,164 @@ fn invalid_target(message: &str) -> HiveError {
 
 fn io_error(message: &str) -> HiveError {
     HiveError::new(ErrorCode::IoError, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Publication {
+        root: PathBuf,
+        parent: PathBuf,
+        target: PathBuf,
+        payload: PathBuf,
+    }
+
+    impl Publication {
+        fn new() -> Self {
+            let root =
+                std::env::temp_dir().join(format!("hive-publish-test-{}", new_uuid().unwrap()));
+            let parent = root.join("parent");
+            let target = parent.join("target");
+            let payload = root.join("payload");
+            for path in [&root, &parent, &target, &payload] {
+                private_dir(path).unwrap();
+            }
+            for name in PAYLOAD_ENTRIES {
+                private_dir(&payload.join(name)).unwrap();
+            }
+            fs::write(payload.join(config_v2::MARKER), b"verified descriptor").unwrap();
+            Self {
+                root,
+                parent,
+                target,
+                payload,
+            }
+        }
+
+        fn publish_with(&self, mut after_check: impl FnMut(usize)) -> Result<(), HiveError> {
+            let (parent, target) = inspect(&self.target)?;
+            lock_target(&target)?;
+            let payload = open_directory(&self.payload)?;
+            let descriptor = OpenOptions::new()
+                .write(true)
+                .open(self.payload.join(config_v2::MARKER))
+                .unwrap();
+            let mut checks = 0;
+            publish(&payload, &target, &descriptor, || {
+                check_target_path(&self.target, &parent, &target)?;
+                checks += 1;
+                after_check(checks);
+                Ok(())
+            })
+        }
+    }
+
+    impl Drop for Publication {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn target_replacement_after_last_prepublication_check_preserves_replacement() {
+        let fixture = Publication::new();
+        let moved = fixture.parent.join("moved");
+        let error = fixture
+            .publish_with(|check| {
+                if check == 2 {
+                    fs::rename(&fixture.target, &moved).unwrap();
+                    private_dir(&fixture.target).unwrap();
+                    fs::write(fixture.target.join(config_v2::MARKER), b"replacement").unwrap();
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(error.code, ErrorCode::ConcurrentChange));
+        assert_eq!(
+            fs::read(fixture.target.join(config_v2::MARKER)).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(fs::read_dir(&fixture.target).unwrap().count(), 1);
+        assert!(moved.join("db").is_dir());
+        assert_eq!(fs::read(moved.join(config_v2::MARKER)).unwrap(), b"");
+    }
+
+    #[test]
+    fn parent_move_before_descriptor_check_leaves_staging_unpublished() {
+        let fixture = Publication::new();
+        let moved = fixture.root.join("moved");
+        let error = fixture
+            .publish_with(|check| {
+                if check == 1 {
+                    fs::rename(&fixture.parent, &moved).unwrap();
+                    private_dir(&fixture.parent).unwrap();
+                    private_dir(&fixture.target).unwrap();
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(error.code, ErrorCode::ConcurrentChange));
+        assert!(fs::read_dir(&fixture.target).unwrap().next().is_none());
+        assert!(moved.join("target/db").is_dir());
+        assert!(!moved.join("target").join(config_v2::MARKER).exists());
+        assert_eq!(
+            fs::read(fixture.payload.join(config_v2::MARKER)).unwrap(),
+            b"verified descriptor"
+        );
+    }
+
+    #[test]
+    fn parent_replacement_after_last_prepublication_check_is_refused() {
+        let fixture = Publication::new();
+        let moved = fixture.root.join("moved");
+        let error = fixture
+            .publish_with(|check| {
+                if check == 2 {
+                    fs::rename(&fixture.parent, &moved).unwrap();
+                    private_dir(&fixture.parent).unwrap();
+                    private_dir(&fixture.target).unwrap();
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(error.code, ErrorCode::ConcurrentChange));
+        assert!(fs::read_dir(&fixture.target).unwrap().next().is_none());
+        assert_eq!(
+            fs::read(moved.join("target").join(config_v2::MARKER)).unwrap(),
+            b""
+        );
+    }
+
+    #[test]
+    fn competing_descriptor_is_never_clobbered() {
+        let fixture = Publication::new();
+        let error = fixture
+            .publish_with(|check| {
+                if check == 2 {
+                    fs::write(fixture.target.join(config_v2::MARKER), b"competing").unwrap();
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(error.code, ErrorCode::ConcurrentChange));
+        assert_eq!(
+            fs::read(fixture.target.join(config_v2::MARKER)).unwrap(),
+            b"competing"
+        );
+        assert_eq!(
+            fs::read(fixture.payload.join(config_v2::MARKER)).unwrap(),
+            b"verified descriptor"
+        );
+    }
+
+    #[test]
+    fn initializers_cannot_lock_the_same_directory_twice() {
+        let fixture = Publication::new();
+        let first = open_directory(&fixture.target).unwrap();
+        let second = open_directory(&fixture.target).unwrap();
+        lock_target(&first).unwrap();
+        assert!(matches!(
+            lock_target(&second).unwrap_err().code,
+            ErrorCode::ConcurrentChange
+        ));
+        drop(first);
+        lock_target(&second).unwrap();
+    }
 }

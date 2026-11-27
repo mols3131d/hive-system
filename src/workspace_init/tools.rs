@@ -1,6 +1,7 @@
 use std::env;
 use std::fs::{self, File};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -18,19 +19,19 @@ use crate::error::{ErrorCode, HiveError};
 pub(super) struct Installed<'a> {
     dolt: PathBuf,
     git: PathBuf,
-    scratch: &'a Path,
-    home: &'a Path,
+    scratch: &'a File,
+    home: PathBuf,
 }
 
 impl<'a> Installed<'a> {
-    pub(super) fn check(scratch: &'a Path, home: &'a Path) -> Result<Self, HiveError> {
+    pub(super) fn check(scratch: &'a File) -> Result<Self, HiveError> {
         let installed = Self {
             dolt: installed_path("dolt")?,
             git: installed_path("git")?,
             scratch,
-            home,
+            home: super::fd_path(scratch),
         };
-        let stdout = installed.dolt(scratch, &["version"], None)?;
+        let stdout = installed.dolt(&installed.home, &["version"], None)?;
         let version = stdout.trim().strip_prefix("dolt version ").filter(|value| {
             !value.is_empty()
                 && value.len() <= 24
@@ -49,7 +50,7 @@ impl<'a> Installed<'a> {
             ));
         }
         if !installed
-            .git(scratch, &["--version"])?
+            .git(&installed.home, &["--version"])?
             .starts_with("git version ")
         {
             return Err(HiveError::new(
@@ -83,7 +84,7 @@ impl<'a> Installed<'a> {
             INSERT INTO schema_migrations VALUES ({STORAGE_SCHEMA_VERSION}, '{digest}', UTC_TIMESTAMP(6));\n\
             INSERT INTO workspace_counters VALUES ('issue_number', 1);\n"
         ).as_bytes());
-        let script = self.scratch.join("initial.sql");
+        let script = self.home.join("initial.sql");
         fs::write(&script, sql)
             .map_err(|_| super::io_error("Could not stage the initial migration."))?;
         let input = File::open(&script)
@@ -214,7 +215,7 @@ impl<'a> Installed<'a> {
     fn dolt(&self, cwd: &Path, args: &[&str], input: Option<File>) -> Result<String, HiveError> {
         let mut command = self.command(&self.dolt, cwd);
         command
-            .env("DOLT_ROOT_PATH", self.home)
+            .env("DOLT_ROOT_PATH", &self.home)
             .env("DOLT_DISABLE_VERSION_CHECKS", "true")
             .env("DOLT_DISABLE_EVENT_FLUSH", "true")
             .args(args);
@@ -245,11 +246,13 @@ impl<'a> Installed<'a> {
         command
             .current_dir(cwd)
             .env_clear()
-            .env("HOME", self.home)
-            .env("TMPDIR", self.home)
-            .env("XDG_CONFIG_HOME", self.home)
-            .env("XDG_DATA_HOME", self.home)
-            .env("XDG_CACHE_HOME", self.home)
+            .env("HOME", &self.home)
+            .env("TMPDIR", &self.home)
+            .env("XDG_CONFIG_HOME", &self.home)
+            .env("XDG_DATA_HOME", &self.home)
+            .env("XDG_CACHE_HOME", &self.home)
+            .env("XDG_STATE_HOME", &self.home)
+            .env("XDG_RUNTIME_DIR", &self.home)
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stderr(Stdio::null());
@@ -257,9 +260,22 @@ impl<'a> Installed<'a> {
         // SAFETY: The closure calls only async-signal-safe Linux operations
         // between fork and exec. Check for a parent exit before prctl took effect.
         let parent = std::process::id() as libc::pid_t;
+        let scratch = self.scratch.as_raw_fd();
         unsafe {
             command.pre_exec(move || {
                 libc::umask(0o077);
+                // Keep only our scratch directory across exec. CLOEXEC keeps
+                // Rust's exec-error pipe usable until exec replaces the child.
+                if libc::syscall(
+                    libc::SYS_close_range,
+                    3u32,
+                    u32::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC,
+                ) != 0
+                    || libc::fcntl(scratch, libc::F_SETFD, 0) == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
                     return Err(io::Error::last_os_error());
                 }

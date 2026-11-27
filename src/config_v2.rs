@@ -12,7 +12,7 @@ mod unix {
     use crate::dolt::{STORAGE_SCHEMA_VERSION, is_uuid, is_uuid_v7};
     use crate::error::{ErrorCode, HiveError};
 
-    use super::MARKER;
+    use super::{MARKER, has_init_stage_component};
 
     mod bindings;
 
@@ -267,6 +267,7 @@ mod unix {
                 return Ok((candidate, false));
             }
             // Verify the matching spelling still traverses only real directories.
+            refuse_init_stage(&target)?;
             ScopedDirectory::open_absolute(&target)?;
             candidate
         } else {
@@ -342,7 +343,17 @@ mod unix {
         }))
     }
 
+    fn refuse_init_stage(path: &Path) -> Result<(), HiveError> {
+        if has_init_stage_component(path) {
+            return Err(invalid(
+                "Incomplete initialization staging cannot be selected as a workspace.",
+            ));
+        }
+        Ok(())
+    }
+
     fn read_candidate(path: &Path) -> Result<Candidate, HiveError> {
+        refuse_init_stage(path)?;
         let root = ScopedDirectory::open_absolute(path)?;
         if root.contains(c"hive.yml")? {
             return Err(HiveError::new(
@@ -455,6 +466,17 @@ pub(crate) fn show(
 
 #[cfg(unix)]
 pub(crate) const MARKER: &str = "hive-workspace.yml";
+
+#[cfg(unix)]
+pub(crate) const INIT_STAGE_PREFIX: &str = ".hive-init-incomplete-";
+
+#[cfg(unix)]
+pub(crate) fn has_init_stage_component(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        matches!(component, std::path::Component::Normal(name)
+            if name.as_encoded_bytes().starts_with(INIT_STAGE_PREFIX.as_bytes()))
+    })
+}
 
 #[cfg(target_os = "linux")]
 pub(crate) fn verify_descriptor(bytes: &[u8]) -> Result<(), HiveError> {
