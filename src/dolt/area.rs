@@ -118,6 +118,13 @@ fn tree_nodes(
     if rows.is_empty() {
         return Ok(Vec::new());
     }
+    // The bounded probe can expose a back edge even when no more nodes fit.
+    if rows.iter().any(|(id, ..)| !seen.insert(id.clone())) {
+        return Err(HiveError::new(
+            ErrorCode::InvalidRecord,
+            "The selected Area tree contains a cycle or duplicate Area ID.",
+        ));
+    }
     if level > MAX_TREE_LEVELS || rows.len() as u64 > *remaining {
         return Err(HiveError::new(
             ErrorCode::ContextLimit,
@@ -131,12 +138,6 @@ fn tree_nodes(
         .map(|row| {
             let mut area = area_value(row)?;
             let id = area["id"].as_str().expect("validated Area ID");
-            if !seen.insert(id.to_owned()) {
-                return Err(HiveError::new(
-                    ErrorCode::InvalidRecord,
-                    "The selected Area tree contains a cycle or duplicate Area ID.",
-                ));
-            }
             let limit = if level == MAX_TREE_LEVELS {
                 1
             } else {

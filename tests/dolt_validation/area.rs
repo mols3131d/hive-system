@@ -16,41 +16,7 @@ fn lists_and_shows_committed_areas_without_writes() {
 fn check_area_reads(collation: &str) {
     let fixture = Fixture::start_with_seed(&empty_seed_sql(collation));
     let mut writer = fixture.connect(ADMIN);
-    let run = |command: &str, options: &[&str], exit| {
-        let before = storage_state(&mut fixture.connect(ADMIN));
-        let workspace = id(1);
-        let port = fixture.port.to_string();
-        let mut args = vec![
-            "--contract",
-            "2",
-            "--json",
-            "area",
-            command,
-            "--workspace-id",
-            &workspace,
-            "--database",
-            DATABASE,
-            "--port",
-            &port,
-        ];
-        args.extend(options);
-        let output = fixture.run_hive(&args, &fixture.password);
-        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(output.status.code(), Some(exit), "{collation}: {report}");
-        assert!(output.stderr.is_empty(), "{report}");
-        assert_eq!(report["schema_version"], 2);
-        assert_eq!(report["command"], format!("area {command}"));
-        assert_eq!(report["ok"], exit == 0);
-        if exit == 0 {
-            assert_eq!(report["context"]["workspace_id"], workspace);
-            assert_eq!(report["context"]["db_commit"], before.0);
-            if command == "list" {
-                assert_eq!(report["data"]["observed_revision"], before.0);
-            }
-        }
-        assert_eq!(storage_state(&mut fixture.connect(ADMIN)), before);
-        report
-    };
+    let run = |command, options: &[&str], exit| run_area(&fixture, command, options, exit);
     let items = |report: Value| {
         report["data"]["items"]
             .as_array()
@@ -274,7 +240,33 @@ fn check_area_reads(collation: &str) {
             ).unwrap();
         }
         commit(&mut writer);
-        run("tree", &["--root", &id(100)], 0);
+        let chain = run("tree", &["--root", &id(100)], 0);
+        let mut nodes = chain["data"]["roots"].as_array().unwrap();
+        for index in 100..132 {
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0]["id"], id(index));
+            nodes = nodes[0]["children"].as_array().unwrap();
+        }
+        assert!(nodes.is_empty());
+
+        writer
+            .exec_drop(
+                "UPDATE areas SET parent_id = ? WHERE id = ?",
+                (id(131), id(100)),
+            )
+            .unwrap();
+        commit(&mut writer);
+        let boundary_cycle = run("tree", &["--root", &id(100)], 4);
+        assert_eq!(boundary_cycle["error"]["code"], "INVALID_RECORD");
+        assert!(
+            boundary_cycle["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("cycle")
+        );
+        writer
+            .exec_drop("UPDATE areas SET parent_id = NULL WHERE id = ?", (id(100),))
+            .unwrap();
         writer.exec_drop(
             "INSERT INTO areas (id, parent_id, slug, name, revision) VALUES (?, ?, 'deep', 'Deep', ?)",
             (id(132), id(131), &revision),
@@ -313,7 +305,16 @@ fn check_area_reads(collation: &str) {
             ).unwrap();
         }
         commit(&mut writer);
-        run("tree", &["--root", &id(200)], 0);
+        let wide = run("tree", &["--root", &id(200)], 0);
+        let roots = wide["data"]["roots"].as_array().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0]["id"], id(200));
+        let branches = roots[0]["children"].as_array().unwrap();
+        assert_eq!(branches.len(), 2);
+        for (index, branch) in (201..=202).zip(branches) {
+            assert_eq!(branch["id"], id(index));
+            assert_leaf_children(branch, (203..300).filter(|child| 201 + child % 2 == index));
+        }
         writer.exec_drop(
             "INSERT INTO areas (id, parent_id, slug, name, revision) VALUES (?, ?, 'wide-300', 'Wide', ?)",
             (id(300), id(201), &revision),
@@ -324,4 +325,94 @@ fn check_area_reads(collation: &str) {
             "CONTEXT_LIMIT"
         );
     }
+}
+
+#[test]
+#[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
+fn area_tree_shares_node_budget_across_roots() {
+    let fixture = Fixture::start_with_seed(&empty_seed_sql("utf8mb4_0900_bin"));
+    let mut writer = fixture.connect(ADMIN);
+    let revision = id(15);
+    for index in 400..500 {
+        let parent = match index {
+            400 | 450 => None,
+            401..450 => Some(id(400)),
+            _ => Some(id(450)),
+        };
+        writer
+            .exec_drop(
+                "INSERT INTO areas (id, parent_id, slug, name, revision) VALUES (?, ?, ?, 'Forest', ?)",
+                (id(index), parent, format!("forest-{index}"), &revision),
+            )
+            .unwrap();
+    }
+    commit(&mut writer);
+
+    let forest = run_area(&fixture, "tree", &[], 0);
+    let roots = forest["data"]["roots"].as_array().unwrap();
+    assert_eq!(roots.len(), 2);
+    for (index, root) in [400, 450].into_iter().zip(roots) {
+        assert_eq!(root["id"], id(index));
+        assert_leaf_children(root, index + 1..index + 50);
+    }
+
+    writer
+        .exec_drop(
+            "INSERT INTO areas (id, parent_id, slug, name, revision) VALUES (?, ?, 'forest-500', 'Forest', ?)",
+            (id(500), id(450), &revision),
+        )
+        .unwrap();
+    commit(&mut writer);
+    let overflow = run_area(&fixture, "tree", &[], 2);
+    assert_eq!(overflow["error"]["code"], "CONTEXT_LIMIT");
+    assert!(overflow.get("data").is_none());
+}
+
+fn assert_leaf_children(parent: &Value, expected: impl Iterator<Item = u32>) {
+    let ids = parent["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|child| {
+            assert_eq!(child["children"], json!([]));
+            child["id"].as_str().unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, expected.map(id).collect::<Vec<_>>());
+}
+
+fn run_area(fixture: &Fixture, command: &str, options: &[&str], exit: i32) -> Value {
+    let before = storage_state(&mut fixture.connect(ADMIN));
+    let workspace = id(1);
+    let port = fixture.port.to_string();
+    let mut args = vec![
+        "--contract",
+        "2",
+        "--json",
+        "area",
+        command,
+        "--workspace-id",
+        &workspace,
+        "--database",
+        DATABASE,
+        "--port",
+        &port,
+    ];
+    args.extend(options);
+    let output = fixture.run_hive(&args, &fixture.password);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(exit), "{options:?}: {report}");
+    assert!(output.stderr.is_empty(), "{report}");
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["command"], format!("area {command}"));
+    assert_eq!(report["ok"], exit == 0);
+    if exit == 0 {
+        assert_eq!(report["context"]["workspace_id"], workspace);
+        assert_eq!(report["context"]["db_commit"], before.0);
+        if command == "list" {
+            assert_eq!(report["data"]["observed_revision"], before.0);
+        }
+    }
+    assert_eq!(storage_state(&mut fixture.connect(ADMIN)), before);
+    report
 }
