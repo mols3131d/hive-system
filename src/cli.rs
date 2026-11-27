@@ -1,3 +1,5 @@
+mod project_v2;
+
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -11,6 +13,8 @@ use clap::{
     error::ErrorKind,
     value_parser,
 };
+
+pub(crate) use project_v2::ProjectRead;
 
 pub(crate) struct Invocation {
     pub(crate) common: CommonOptions,
@@ -227,6 +231,8 @@ pub(crate) enum Command {
     /// List projects or inspect a project scope.
     #[command(subcommand)]
     Project(ProjectCommand),
+    #[command(skip)]
+    ProjectRead(ProjectRead),
     /// Read or manage task records.
     #[command(subcommand)]
     Task(TaskCommand),
@@ -780,6 +786,9 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             })
         },
     );
+    if let Some(project) = project_v2::parse(&cli, &args) {
+        return project;
+    }
     let mut config_error_matches = None;
     let matches = match cli.clone().try_get_matches_from(&args).or_else(|error| {
         match error.kind() {
@@ -1212,6 +1221,7 @@ impl Command {
                     | IssueCommand::Ready(args)
                     | IssueCommand::Blocked(args),
                 ) => args.validate_dolt_selection(common),
+                Self::Project(_) => Err("Use contract 2 Project read options."),
                 Self::Bot(command) => command.validate(common),
                 _ => Ok(()),
             };

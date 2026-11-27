@@ -107,6 +107,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
+        Command::ProjectRead(args) => dolt::project_read(&args),
         Command::Bot(BotCommand::List {
             target,
             status,
