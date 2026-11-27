@@ -133,6 +133,55 @@ pub(super) fn receipt_introduction(
     Ok(introduced.clone())
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn verify_delta(
+    db: &mut impl Queryable,
+    base: &str,
+    introduced: &str,
+    expected: &[(&str, u64, u64, u64)],
+) -> Result<(), HiveError> {
+    let tables: Vec<(String, String, String, bool, bool)> = db
+        .exec(
+            "SELECT from_table_name, to_table_name, diff_type, data_change, schema_change
+         FROM DOLT_DIFF_SUMMARY(?, ?) ORDER BY from_table_name LIMIT ?",
+            (base, introduced, expected.len() + 1),
+        )
+        .map_err(read_error)?;
+    if tables.len() != expected.len()
+        || tables
+            .iter()
+            .zip(expected)
+            .any(|((from, to, kind, data, schema), (name, ..))| {
+                from != name || to != name || kind != "modified" || !data || *schema
+            })
+        || db
+            .query_first::<mysql::Row, _>("SHOW WARNINGS LIMIT 1")
+            .map_err(read_error)?
+            .is_some()
+    {
+        return Err(workflow::unverified());
+    }
+    let rows: Vec<(String, u64, u64, u64)> = db
+        .exec(
+            "SELECT table_name, rows_added, rows_deleted, rows_modified
+         FROM DOLT_DIFF_STAT(?, ?) ORDER BY table_name LIMIT ?",
+            (base, introduced, expected.len() + 1),
+        )
+        .map_err(read_error)?;
+    if !rows
+        .iter()
+        .map(|(table, added, deleted, modified)| (table.as_str(), *added, *deleted, *modified))
+        .eq(expected.iter().copied())
+        || db
+            .query_first::<mysql::Row, _>("SHOW WARNINGS LIMIT 1")
+            .map_err(read_error)?
+            .is_some()
+    {
+        return Err(workflow::unverified());
+    }
+    Ok(())
+}
+
 /// A request ID remains reserved even when its receipt has been deleted.
 #[cfg(target_os = "linux")]
 pub(super) fn has_receipt_history(

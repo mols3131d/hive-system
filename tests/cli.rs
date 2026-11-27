@@ -2432,6 +2432,159 @@ fn unknown_project_long_option_keeps_original_error_with_late_v2_json() {
 }
 
 #[test]
+fn unknown_project_write_options_keep_the_late_v2_envelope() {
+    let sandbox = Sandbox::new();
+    let project = "01900000-0000-7000-8000-000000000003";
+    let issue = "01900000-0000-7000-8000-000000000004";
+    for (command, args) in [
+        (
+            "project create",
+            &["project", "create", "--unknown=synthetic"][..],
+        ),
+        (
+            "project create",
+            &[
+                "project",
+                "create",
+                "--name",
+                "Fixture",
+                "--unknown",
+                "synthetic",
+            ],
+        ),
+        (
+            "project add-issue",
+            &[
+                "project",
+                "add-issue",
+                "--unknown=--contract=1",
+                project,
+                issue,
+            ],
+        ),
+        (
+            "project add-issue",
+            &[
+                "project",
+                "add-issue",
+                "--unknown",
+                "synthetic",
+                project,
+                issue,
+            ],
+        ),
+        (
+            "project add-issue",
+            &["project", "add-issue", "--unknown", project, issue],
+        ),
+    ] {
+        let args = [args, &["--contract", "2", "--json"]].concat();
+        let result = sandbox.run(&args);
+        assert_eq!(result.status.code(), Some(2), "{args:?}");
+        assert!(result.stderr.is_empty(), "{args:?}: {result:?}");
+        let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "schema_version": 2, "ok": false, "command": command,
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "An argument or command is not recognized.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+    let literal = sandbox.run(&["project", "create", "--unknown=--json", "--contract", "2"]);
+    assert_eq!(literal.status.code(), Some(2));
+    assert!(literal.stdout.is_empty());
+    assert!(!literal.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
+fn malformed_project_write_values_keep_the_v2_envelope() {
+    let sandbox = Sandbox::new();
+    let workspace = "01900000-0000-7000-8000-000000000001";
+    let project = "01900000-0000-7000-8000-000000000002";
+    let issue = "01900000-0000-7000-8000-000000000003";
+    let binding = [
+        "--workspace",
+        ".",
+        "--workspace-id",
+        workspace,
+        "--database",
+        "fixture",
+        "--port",
+        "3307",
+        "--actor",
+        "fixture",
+        "--request-id",
+        issue,
+        "--evidence-file",
+        "fixture.json",
+    ];
+    let create = [&["project", "create", "--name", "Fixture"][..], &binding].concat();
+    let add = [
+        &[
+            "project",
+            "add-issue",
+            project,
+            issue,
+            "--area",
+            workspace,
+            "--if-match",
+            "fixture",
+        ][..],
+        &binding,
+    ]
+    .concat();
+    for (command, invalid) in [
+        (&create, &["--project", "BAD!"][..]),
+        (&create, &["--name", "fixture-copy"]),
+        (&create, &["unexpected-position"]),
+        (&add, &["--area", workspace]),
+        (&add, &["unexpected-position"]),
+    ] {
+        for args in [
+            [&["--contract", "2", "--json"][..], command, invalid].concat(),
+            [&command[..], invalid, &["--contract", "2", "--json"]].concat(),
+        ] {
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+            assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2, "{args:?}");
+            assert_eq!(report["command"], format!("project {}", command[1]));
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        for (command, index) in [(&create, 3), (&add, 2)] {
+            let mut invalid: Vec<_> = command.iter().map(OsString::from).collect();
+            invalid[index] = OsString::from_vec(vec![255]);
+            invalid.extend(
+                ["--contract", "2", "--json"]
+                    .into_iter()
+                    .map(OsString::from),
+            );
+            let output = sandbox.run(&invalid);
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], format!("project {}", command[1]));
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        }
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn unknown_project_long_option_recovery_keeps_literals_and_legacy_boundaries() {
     let sandbox = Sandbox::new();
     for args in [

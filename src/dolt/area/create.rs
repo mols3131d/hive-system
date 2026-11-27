@@ -11,7 +11,7 @@ use crate::dolt::{
         new_uuid_v7, valid_revision, valid_title,
     },
     read_error,
-    receipt_history::HistoricalReceipt,
+    receipt_history::{HistoricalReceipt, verify_delta},
     scope::{require_active_area, require_active_area_at},
 };
 use crate::error::{ErrorCode, HiveError};
@@ -450,65 +450,14 @@ pub(in crate::dolt) fn verify_effect(
             return Err(workflow::unverified());
         }
     }
-    verify_delta(&mut snapshot.connection, base, introduced, parent.is_some())?;
-    Ok(json!(result))
-}
-
-fn verify_delta(
-    db: &mut impl Queryable,
-    base: &str,
-    introduced: &str,
-    child: bool,
-) -> Result<(), HiveError> {
-    let tables: Vec<(String, String, String, bool, bool)> = db
-        .exec(
-            "SELECT from_table_name, to_table_name, diff_type, data_change, schema_change
-         FROM DOLT_DIFF_SUMMARY(?, ?) ORDER BY from_table_name LIMIT 3",
-            (base, introduced),
-        )
-        .map_err(read_error)?;
-    if !tables
-        .iter()
-        .map(|(from, to, kind, data, schema)| {
-            (from.as_str(), to.as_str(), kind.as_str(), *data, *schema)
-        })
-        .eq([
-            ("areas", "areas", "modified", true, false),
-            (
-                "operation_receipts",
-                "operation_receipts",
-                "modified",
-                true,
-                false,
-            ),
-        ])
-        || db
-            .query_first::<mysql::Row, _>("SHOW WARNINGS LIMIT 1")
-            .map_err(read_error)?
-            .is_some()
-    {
-        return Err(workflow::unverified());
-    }
-    let rows: Vec<(String, u64, u64, u64)> = db
-        .exec(
-            "SELECT table_name, rows_added, rows_deleted, rows_modified
-         FROM DOLT_DIFF_STAT(?, ?) ORDER BY table_name LIMIT 3",
-            (base, introduced),
-        )
-        .map_err(read_error)?;
-    if !rows
-        .iter()
-        .map(|(name, added, deleted, modified)| (name.as_str(), *added, *deleted, *modified))
-        .eq([
-            ("areas", 1, 0, u64::from(child)),
+    verify_delta(
+        &mut snapshot.connection,
+        base,
+        introduced,
+        &[
+            ("areas", 1, 0, u64::from(parent.is_some())),
             ("operation_receipts", 1, 0, 0),
-        ])
-        || db
-            .query_first::<mysql::Row, _>("SHOW WARNINGS LIMIT 1")
-            .map_err(read_error)?
-            .is_some()
-    {
-        return Err(workflow::unverified());
-    }
-    Ok(())
+        ],
+    )?;
+    Ok(json!(result))
 }

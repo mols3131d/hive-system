@@ -11,7 +11,7 @@ use crate::dolt::{
         new_uuid_v7, valid_revision, valid_title,
     },
     read_error,
-    receipt_history::{HistoricalReceipt, valid_sha256},
+    receipt_history::{HistoricalReceipt, valid_sha256, verify_delta},
     records::is_artifact_kind,
     scope::{require_active_area, require_active_area_at},
 };
@@ -19,7 +19,7 @@ use crate::error::{ErrorCode, HiveError};
 
 use super::{
     MAX_BODY_BYTES, ScopeKind,
-    writes::{read_body, verify_delta, verify_links},
+    writes::{read_body, verify_links},
 };
 
 pub(in crate::dolt) const KIND: &str = "artifact.create";

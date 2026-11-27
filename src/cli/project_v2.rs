@@ -1,9 +1,10 @@
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use clap::{Arg, ArgAction, Args, FromArgMatches, Subcommand};
 
 use super::{
-    Command, CommonArgs, Contract, DoltTargetArgs, Invocation, ParseFailure, matched_leaf,
+    Command, CommonArgs, Contract, DoltTargetArgs, Invocation, ParseFailure, View, matched_leaf,
     requested_contract, requested_format, safe_parse_message,
 };
 
@@ -16,6 +17,60 @@ pub(crate) enum ProjectRead {
     List(ProjectListArgs),
     /// Show a committed Project and its direct member Issue IDs.
     Show(ProjectShowArgs),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ProjectWrite {
+    /// Create an active Project.
+    Create(ProjectCreateArgs),
+    /// Add an Issue directly to an active Project.
+    AddIssue(ProjectAddIssueArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ProjectCreateArgs {
+    #[arg(long)]
+    pub(crate) name: String,
+    #[command(flatten)]
+    pub(crate) request: ProjectRequestArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct ProjectAddIssueArgs {
+    #[arg(value_name = "PROJECT-ID")]
+    pub(crate) project_id: String,
+    #[arg(value_name = "ISSUE-ID")]
+    pub(crate) issue_id: String,
+    /// Exact owning Area UUIDv7.
+    #[arg(long)]
+    pub(crate) area: String,
+    /// Expected revision as ID=REV. Supply once for the Project and once for the Issue.
+    #[arg(long, required = true)]
+    pub(crate) if_match: Vec<String>,
+    #[command(flatten)]
+    pub(crate) request: ProjectRequestArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct ProjectRequestArgs {
+    #[arg(long)]
+    pub(crate) actor: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+impl ProjectWrite {
+    pub(crate) fn request(&self) -> &ProjectRequestArgs {
+        match self {
+            Self::Create(args) => &args.request,
+            Self::AddIssue(args) => &args.request,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -61,9 +116,9 @@ pub(super) fn parse(
     // Both grammars use Clap so values and the -- delimiter retain their
     // meaning. Opt into the replacement only after parsing contract 2.
     let cli = legacy.clone().mut_subcommand("project", |_| {
-        ProjectRead::augment_subcommands(
-            clap::Command::new("project").about("Inspect committed Projects."),
-        )
+        ProjectWrite::augment_subcommands(ProjectRead::augment_subcommands(
+            clap::Command::new("project").about("Inspect and plan Projects."),
+        ))
         .mut_subcommands(add_options)
     });
     let (matches, parse_error) = match cli.clone().try_get_matches_from(args) {
@@ -74,13 +129,21 @@ pub(super) fn parse(
                 .ignore_errors(true)
                 .try_get_matches_from(args)
                 .ok()?;
-            let matches =
-                recover_unknown_long(&cli, args, &partial, &error, "project").unwrap_or(partial);
+            let matches = super::retry_write_failure(
+                &cli,
+                args,
+                error.kind(),
+                "project",
+                &["create", "add-issue"],
+            )
+            .or_else(|| recover_unknown_long(&cli, args, &partial, &error, "project"))
+            .unwrap_or(partial);
             (matches, Some(error.kind()))
         }
     };
     let (name, leaf) = matched_leaf(&cli, &matches)?;
-    if !matches!(name.as_str(), "project list" | "project show")
+    let writes = matches!(name.as_str(), "project create" | "project add-issue");
+    if !(writes || matches!(name.as_str(), "project list" | "project show"))
         || requested_contract(Some(&matches), Some(leaf)) != Contract::V2
     {
         return None;
@@ -96,6 +159,28 @@ pub(super) fn parse(
             CommonArgs::from_arg_matches(leaf).map_err(|error| safe_parse_message(error.kind()))?;
         let common = root.resolve(options)?;
         let (_, project) = matches.subcommand().expect("matched project command");
+        if writes {
+            let command = ProjectWrite::from_arg_matches(project)
+                .map_err(|error| safe_parse_message(error.kind()))?;
+            if common.workspace.is_none() || !command.request().target.has_all() {
+                return Err(
+                    "Project mutations require --workspace, --workspace-id, --database, and --port.",
+                );
+            }
+            if common.project.is_some()
+                || common.project_root.is_some()
+                || !matches!(common.view, View::WorkingTree)
+            {
+                return Err(
+                    "Project mutations require an explicit current workspace and positional record IDs.",
+                );
+            }
+            return Ok(Invocation {
+                common,
+                command: Command::ProjectWrite(command),
+                command_name: name.clone(),
+            });
+        }
         let command = ProjectRead::from_arg_matches(project)
             .map_err(|error| safe_parse_message(error.kind()))?;
         let target = command.target();
@@ -112,7 +197,11 @@ pub(super) fn parse(
             command_name: name.clone(),
         })
     };
-    if parse_error.is_none() && leaf.get_flag("help") {
+    if matches!(
+        parse_error,
+        None | Some(clap::error::ErrorKind::MissingRequiredArgument)
+    ) && leaf.get_flag("help")
+    {
         let (_, action) = name.split_once(' ').expect("matched project action");
         let help = cli.mut_subcommand("project", |project| {
             project.mut_subcommand(action, |leaf| {
@@ -133,9 +222,10 @@ pub(super) fn parse(
 }
 
 fn add_options(command: clap::Command) -> clap::Command {
+    let read = matches!(command.get_name(), "list" | "show");
     // Keep parsing through --help so contract selection can appear after it.
     CommonArgs::augment_args(command.disable_help_flag(true))
-        .mut_arg("workspace", |arg| arg.hide(true))
+        .mut_arg("workspace", |arg| arg.hide(read))
         .mut_arg("project", |arg| arg.hide(true))
         .mut_arg("project_root", |arg| arg.hide(true))
         .mut_arg("at", |arg| arg.hide(true))

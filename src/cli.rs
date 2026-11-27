@@ -17,7 +17,7 @@ use clap::{
 };
 
 pub(crate) use conversation_v2::{ConversationImportArgs, ConversationListArgs};
-pub(crate) use project_v2::ProjectRead;
+pub(crate) use project_v2::{ProjectRead, ProjectWrite};
 
 pub(crate) struct Invocation {
     pub(crate) common: CommonOptions,
@@ -236,6 +236,8 @@ pub(crate) enum Command {
     Project(ProjectCommand),
     #[command(skip)]
     ProjectRead(ProjectRead),
+    #[command(skip)]
+    ProjectWrite(ProjectWrite),
     /// Read or manage task records.
     #[command(subcommand)]
     Task(TaskCommand),
@@ -1347,7 +1349,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             let partial = extension_matches
                 .or(config_error_matches)
                 .or(area_matches)
-                .or_else(|| retry_area_create_failure(&cli, &args, error.kind()))
+                .or_else(|| retry_write_failure(&cli, &args, error.kind(), "area", &["create"]))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "context"))
@@ -1938,6 +1940,7 @@ fn recover_unknown_long(
             "workspace",
             "init" | "status" | "start" | "stop" | "recover"
         ) | ("artifact" | "area", "create")
+            | ("project", "create" | "add-issue")
             | (_, "list" | "show")
     ) {
         return None;
@@ -1948,36 +1951,43 @@ fn recover_unknown_long(
     let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
     let long = unknown_long_name(leaf, invalid)?;
 
-    // Let Clap replay the original tokens. These selected leaves take no
-    // positionals, so the temporary option can take one plain separated
-    // value. The original parse error still determines the result.
     let workspace_init = (domain, action) == ("workspace", "init");
-    let area_create = (domain, action) == ("area", "create");
-    let allow_separated_value = workspace_init
+    let allow_incomplete = matches!(
+        (domain, action),
+        ("area", "create") | ("project", "create" | "add-issue")
+    );
+    let accept_value = workspace_init
         || matches!(
             (domain, action),
-            ("label", "list") | ("artifact" | "area", "create")
+            ("label", "list") | ("artifact" | "area", "create") | ("project", "create")
         );
+    // When the command has positional IDs, first let those slots consume
+    // ordinary tokens. Try a separated unknown-option value if that fails.
+    let modes: &[bool] = if (domain, action) == ("project", "add-issue") {
+        &[false, true]
+    } else {
+        &[accept_value]
+    };
     const UNKNOWN_LONG: &str = "recovered_unknown_long";
-    let retry = cli.clone().mut_subcommand(domain, |command| {
-        command.mut_subcommand(action, |leaf| {
-            // A missing init target must not prevent recovery of the original
-            // unknown-option error and its explicit output flags.
-            let leaf = if workspace_init {
-                leaf.mut_arg("target", |arg| arg.required(false))
-            } else {
-                leaf
-            };
-            leaf.arg(
-                Arg::new(UNKNOWN_LONG)
-                    .long(long.to_owned())
-                    .num_args(0..=1)
-                    .require_equals(!allow_separated_value)
-                    .value_parser(OsStringValueParser::new())
-                    .hide(true),
-            )
+    let build_retry = |accept_value: bool| {
+        cli.clone().mut_subcommand(domain, |command| {
+            command.mut_subcommand(action, |leaf| {
+                let leaf = if workspace_init {
+                    leaf.mut_arg("target", |arg| arg.required(false))
+                } else {
+                    leaf
+                };
+                leaf.arg(
+                    Arg::new(UNKNOWN_LONG)
+                        .long(long.to_owned())
+                        .num_args(0..=1)
+                        .require_equals(!accept_value)
+                        .value_parser(OsStringValueParser::new())
+                        .hide(true),
+                )
+            })
         })
-    });
+    };
     let end = if workspace_init {
         args.iter()
             .enumerate()
@@ -1987,18 +1997,32 @@ fn recover_unknown_long(
     } else {
         args.len()
     };
-    let matches = match retry.clone().try_get_matches_from(&args[..end]) {
-        Ok(matches) => matches,
-        Err(error) if area_create && error.kind() == ErrorKind::MissingRequiredArgument => retry
-            .ignore_errors(true)
-            .try_get_matches_from(&args[..end])
-            .ok()?,
-        Err(_) => return None,
+    let recognized = |matches: &ArgMatches| {
+        matches
+            .subcommand_matches(domain)
+            .and_then(|command| command.subcommand_matches(action))
+            .is_some_and(|leaf| leaf.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine))
     };
-    let recovered = matches
-        .subcommand_matches(domain)?
-        .subcommand_matches(action)?;
-    (recovered.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine)).then_some(matches)
+    let mut missing = None;
+    for &accept_value in modes {
+        let retry = build_retry(accept_value);
+        match retry.clone().try_get_matches_from(&args[..end]) {
+            Ok(matches) if recognized(&matches) => return Some(matches),
+            Err(error)
+                if allow_incomplete
+                    && missing.is_none()
+                    && error.kind() == ErrorKind::MissingRequiredArgument =>
+            {
+                missing = retry
+                    .ignore_errors(true)
+                    .try_get_matches_from(&args[..end])
+                    .ok()
+                    .filter(recognized);
+            }
+            _ => {}
+        }
+    }
+    missing
 }
 
 struct ExtendedParse {
@@ -2245,7 +2269,14 @@ fn extended_error_options(command: clap::Command) -> clap::Command {
 }
 
 fn extended_help_probe(command: clap::Command) -> clap::Command {
-    command.disable_help_flag(true).arg(
+    let command = command.disable_help_flag(true);
+    if command
+        .get_arguments()
+        .any(|arg| arg.get_long() == Some("help"))
+    {
+        return command;
+    }
+    command.arg(
         Arg::new("extended_help_probe")
             .short('h')
             .long("help")
@@ -2517,10 +2548,12 @@ fn retry_conversation_failure(
         .then_some(matches)
 }
 
-fn retry_area_create_failure(
+fn retry_write_failure(
     cli: &clap::Command,
     args: &[OsString],
     kind: ErrorKind,
+    domain: &str,
+    actions: &[&str],
 ) -> Option<ArgMatches> {
     if !matches!(
         kind,
@@ -2535,33 +2568,41 @@ fn retry_area_create_failure(
     }
     let recover_values = |command| {
         extended_error_options(command).mut_args(|arg| {
-            if arg.get_long().is_some()
+            if (arg.get_long().is_some() || arg.is_positional())
                 && !matches!(
                     arg.get_id().as_str(),
                     "contract" | "format" | "json" | "extended_help_probe"
                 )
             {
-                arg.value_parser(OsStringValueParser::new())
+                arg.required(false).value_parser(OsStringValueParser::new())
             } else {
                 arg
             }
         })
     };
-    let retry =
-        recover_values(cli.clone().disable_help_subcommand(true)).mut_subcommand("area", |area| {
-            extended_help_probe(area).mut_subcommand("create", |create| {
-                recover_values(create).arg(
-                    Arg::new("area_create_extra_values")
+    let retry = recover_values(cli.clone().disable_help_subcommand(true)).mut_subcommand(
+        domain,
+        |command| {
+            extended_help_probe(command).mut_subcommands(|leaf| {
+                if !actions.contains(&leaf.get_name()) {
+                    return leaf;
+                }
+                recover_values(leaf).arg(
+                    Arg::new("write_error_extra_values")
                         .num_args(0..)
                         .action(ArgAction::Append)
                         .value_parser(OsStringValueParser::new())
                         .hide(true),
                 )
             })
-        });
+        },
+    );
     let matches = retry.try_get_matches_from(args).ok()?;
     let (command, leaf) = matched_leaf(cli, &matches)?;
-    (command == "area create" && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+    let (actual_domain, action) = command.split_once(' ')?;
+    (actual_domain == domain
+        && actions.contains(&action)
+        && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }
 
