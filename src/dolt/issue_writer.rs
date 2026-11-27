@@ -90,6 +90,8 @@ impl Kind {
             Self::BotRegister => "Bot register",
             Self::Transition(issue_transition::Operation::Select) => "Issue select",
             Self::Transition(issue_transition::Operation::Claim) => "Issue claim",
+            Self::Transition(issue_transition::Operation::Cancel) => "Issue cancel",
+            Self::Transition(issue_transition::Operation::Reopen) => "Issue reopen",
             Self::SetParent => "Issue set-parent",
             Self::Transition(operation) => operation.name(),
         }
@@ -112,13 +114,19 @@ impl Kind {
                 issue_transition::Operation::Select
                 | issue_transition::Operation::SubmitEpic
                 | issue_transition::Operation::RequestChanges
-                | issue_transition::Operation::Accept,
+                | issue_transition::Operation::Accept
+                | issue_transition::Operation::Cancel
+                | issue_transition::Operation::Reopen,
             ) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
                 ("operation_receipts", "INSERT"),
             ],
-            Self::Transition(_) => &[
+            Self::Transition(
+                issue_transition::Operation::Release
+                | issue_transition::Operation::Recover
+                | issue_transition::Operation::Submit,
+            ) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
                 ("issue_claims", "DELETE"),
@@ -235,7 +243,7 @@ pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
     .map_err(|_| workflow::unverified())
 }
 
-// Version 1 has no kind field and always denotes a progress note. Version 2
+// Version 1 has no kind field and always denotes a holder-scoped Issue note. Version 2
 // carries an Issue kind. Version 3 carries an Artifact ID and optional Area.
 // Version 4 carries a typed transition or the Area, Project or Bot registration identifiers.
 #[derive(Serialize, Deserialize)]
@@ -921,7 +929,7 @@ impl ScopedReceipt {
                     commit,
                     receipt,
                     &note,
-                    Some("progress"),
+                    Some(super::issue_note::HOLDER_NOTE_KINDS),
                 )?;
                 Ok(json!(note.result))
             }
@@ -1158,6 +1166,8 @@ mod tests {
                 issue_transition::Operation::RequestChanges,
             ),
             ("issue.accept", issue_transition::Operation::Accept),
+            ("issue.cancel", issue_transition::Operation::Cancel),
+            ("issue.reopen", issue_transition::Operation::Reopen),
         ] {
             transition["kind"] = json!(name);
             let marker = read(&transition).unwrap();

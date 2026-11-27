@@ -32,7 +32,7 @@ pub(super) fn write(
         crate::config_v2::read_explicit(common.workspace.as_deref().expect("validated workspace"))?;
     let request = Request::read(args, workspace.workspace_id())?;
     let decision: Decision<NoteEvidence> = issue_writer::read_decision(&args.evidence_file)?;
-    issue_writer::execute(&workspace, target, &Progress { request, decision })
+    issue_writer::execute(&workspace, target, &Note { request, decision })
 }
 
 impl<'a> Request<'a> {
@@ -196,12 +196,12 @@ fn verify_issue(
     Ok(())
 }
 
-struct Progress<'a> {
+struct Note<'a> {
     request: Request<'a>,
     decision: Decision<NoteEvidence>,
 }
 
-impl Mutation for Progress<'_> {
+impl Mutation for Note<'_> {
     type Guard = ();
 
     fn identity(&self) -> WriteIdentity<'_> {
@@ -270,10 +270,11 @@ impl Mutation for Progress<'_> {
         }
         tx.exec_drop(
             "INSERT INTO issue_updates (id, issue_id, kind, body, author_ref, created_at)
-         VALUES (?, ?, 'progress', ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?)",
             (
                 &result.note_id,
                 &args.issue,
+                &args.kind,
                 &request.body,
                 &args.actor,
                 sql_time,
