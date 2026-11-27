@@ -407,6 +407,15 @@ mod filesystem {
             })
         }
 
+        pub(crate) fn open_child_directory(&self, name: &OsStr) -> Result<Option<Self>, HiveError> {
+            Ok(
+                open_child(&self.file, name, libc::O_DIRECTORY)?.map(|file| Self {
+                    file,
+                    path: self.path.join(name),
+                }),
+            )
+        }
+
         #[cfg(target_os = "linux")]
         pub(crate) fn open_child_directory(&self, name: &OsStr) -> Result<Self, HiveError> {
             let file = open_child(&self.file, name, libc::O_DIRECTORY)?.ok_or_else(|| {
