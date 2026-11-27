@@ -4,7 +4,7 @@ description: "Choose reusable Markdown scaffolds for workspace scope entrypoints
 
 # Workspace Templates
 
-Copy only applicable templates into the explicitly selected data workspace; never save actual records in the system repository. These are optional authoring sources, not authoritative instructions or permissions. Replace placeholders and remove comments, unused sections and invented defaults before saving records. The [workspace guides](../../docs/policies/workspace/README.md) own the actual rules. Follow the [frontmatter contract](../../docs/policies/workspace/frontmatter.md) for required, conditional and optional fields. Optional fields are omitted by default, except a known artifact kind.
+Copy only applicable templates into the explicitly selected data workspace; never save actual records in the system repository. These are optional authoring sources for the pinned **v1** Markdown/Git workspace contract, not authoritative instructions or permissions (Dolt v2 workspace layout and storage rules are specified separately in the [v2 workspace contract](../../docs/architecture/dolt-workspace-contract.md) and are not yet implemented for live workspaces). Replace placeholders and remove comments, unused sections and invented defaults before saving records. The [workspace guides](../../docs/policies/workspace/README.md) own the actual rules. Follow the [frontmatter contract](../../docs/policies/workspace/frontmatter.md) for required, conditional and optional fields. Optional fields are omitted by default, except a known artifact kind.
 
 | Template | Use |
 | --- | --- |
