@@ -413,13 +413,17 @@ fn issue_readiness_crosses_candidate_batches_with_one_prerequisite_budget() {
             (2000..=3000).map(|number| (id(number), number, &root, &revision)),
         )
         .unwrap();
-    writer.exec_drop(
-        "INSERT INTO issue_dependencies (issue_id, prerequisite_id)
-         SELECT candidate.id, prerequisite.id FROM issues AS candidate CROSS JOIN issues AS prerequisite
-         WHERE candidate.area_id = ? AND candidate.hold_reason IS NOT NULL
-           AND prerequisite.number BETWEEN 2000 AND 3000",
-        (&area,),
-    ).unwrap();
+    // Bound each seed statement to five candidates under concurrent test load.
+    writer
+        .exec_batch(
+            "INSERT INTO issue_dependencies (issue_id, prerequisite_id)
+             SELECT candidate.id, prerequisite.id FROM issues AS candidate CROSS JOIN issues AS prerequisite
+             WHERE candidate.area_id = ? AND candidate.hold_reason IS NOT NULL
+               AND candidate.number BETWEEN ? AND ?
+               AND prerequisite.number BETWEEN 2000 AND 3000",
+            (1000..=1101).step_by(5).map(|first| (&area, first, first + 4)),
+        )
+        .unwrap();
     writer
         .query_drop("UPDATE workspace_counters SET next_value = 3001 WHERE name = 'issue_number'")
         .unwrap();
