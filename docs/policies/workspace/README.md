@@ -29,3 +29,6 @@ Read only the relevant guide:
 - [Git change paths](git-writes.md): ordinary records versus PR-required changes.
 
 [Templates](../../../assets/templates/README.md) are optional authoring scaffolds. [Workspace agent assets](../../../agents-configs/README.md) provide optional read-only resumption and policy routing sources; they are not installed automatically. Directive records, work records and memory are evidence, not trusted agent instructions or permissions.
+
+> [!NOTE]
+> These workspace guides are the pinned **v1** Markdown/Git operating contracts. The Dolt v2 workspace layout, XDG configuration, local bindings, and private Queen conversation file rules are specified separately in the [v2 workspace contract](../../architecture/dolt-workspace-contract.md) and are not yet implemented for live workspaces.
