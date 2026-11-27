@@ -877,35 +877,38 @@ fn retry_bot_failure(
 ) -> Option<ArgMatches> {
     if !matches!(
         kind,
-        ErrorKind::ValueValidation | ErrorKind::InvalidValue | ErrorKind::UnknownArgument
+        ErrorKind::ValueValidation
+            | ErrorKind::InvalidValue
+            | ErrorKind::UnknownArgument
+            | ErrorKind::ArgumentConflict
     ) {
         return None;
     }
     // Recover the output envelope from Clap's actual option boundaries. The
     // original parse error still applies and these values never reach dispatch.
-    let defer_target_checks = |command| {
-        defer_project_check(command).mut_arg("at", |arg| {
-            arg.value_parser(StringValueParser::new())
-                .allow_negative_numbers(true)
+    let recover_value = |arg: clap::Arg| {
+        arg.action(ArgAction::Append)
+            .allow_negative_numbers(true)
+            .num_args(0..=1)
+    };
+    let recover_scope = |command| {
+        defer_project_check(command).mut_args(|arg| match arg.get_id().as_str() {
+            "project" => recover_value(arg),
+            "at" | "workspace" | "project_root" => {
+                recover_value(arg.value_parser(StringValueParser::new()))
+            }
+            _ => arg,
         })
     };
-    let retry = defer_target_checks(cli.clone().mut_subcommand("bot", |bot| {
-        bot.mut_subcommand("list", |list| {
-            defer_target_checks(list)
-                .mut_arg("limit", |arg| {
-                    arg.value_parser(StringValueParser::new())
-                        .allow_negative_numbers(true)
-                        .num_args(0..=1)
-                })
-                .mut_arg("cursor", |arg| {
-                    arg.allow_negative_numbers(true).num_args(0..=1)
-                })
-                .mut_arg("status", |arg| arg.allow_negative_numbers(true))
-        })
-        .mut_subcommand("show", |show| {
-            defer_target_checks(show).mut_arg("bot_id", |arg| {
-                arg.value_parser(StringValueParser::new())
-                    .allow_negative_numbers(true)
+    let retry = recover_scope(cli.clone().mut_subcommand("bot", |bot| {
+        bot.mut_subcommands(|leaf| {
+            recover_scope(leaf).mut_args(|arg| match arg.get_id().as_str() {
+                "database" | "workspace_id" | "port" | "cursor" | "status" => recover_value(arg),
+                "limit" | "after" => recover_value(arg.value_parser(StringValueParser::new())),
+                "bot_id" => arg
+                    .value_parser(StringValueParser::new())
+                    .allow_negative_numbers(true),
+                _ => arg,
             })
         })
     }));

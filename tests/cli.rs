@@ -1084,6 +1084,7 @@ fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
         assert_eq!(report["command"], format!("bot {leaf}"));
         assert_eq!(report["error"]["code"], code);
         assert!(report.get("context").is_none(), "{args:?}");
+        report
     };
     for (options, code, exit) in [
         (
@@ -1107,6 +1108,7 @@ fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
         (&["list", "--cursor=-1"], "STALE_CURSOR", 5),
         (&["list", "--status", "-1"], "INVALID_ARGUMENT", 2),
         (&["list", "--status=-1"], "INVALID_ARGUMENT", 2),
+        (&["list", "--after="], "INVALID_ARGUMENT", 2),
     ] {
         let (leaf, options) = options.split_first().unwrap();
         let args = [
@@ -1117,6 +1119,48 @@ fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
         ]
         .concat();
         check(&args, leaf, code, exit);
+    }
+
+    let command = ["bot", "list"];
+    let trailing = ["--contract", "2", "--json"];
+    for (flag, value) in [
+        ("--database", "fixture_db"),
+        ("--workspace-id", "01900000-0000-7000-8000-000000000001"),
+        ("--port", "3307"),
+        ("--status", "active"),
+        ("--cursor", "cursor-fixture"),
+        ("--limit", "25"),
+        ("--after", "legacy-key"),
+    ] {
+        let other = target
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter(|pair| pair[0] != flag)
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        for invalid in [&[flag][..], &[flag, "-1"]] {
+            let args = [&command[..], &other, invalid, &trailing].concat();
+            check(&args, "list", "INVALID_ARGUMENT", 2);
+        }
+        let duplicate = [flag, value, flag, value];
+        let args = [&command[..], &other, &duplicate, &trailing].concat();
+        let report = check(&args, "list", "INVALID_ARGUMENT", 2);
+        assert_eq!(
+            report["error"]["message"], "Arguments conflict.",
+            "{args:?}"
+        );
+    }
+
+    for flag in ["--project", "--at", "--workspace", "--project-root"] {
+        let empty = format!("{flag}=");
+        for invalid in [&[flag][..], &[flag, "-1"], &[empty.as_str()]] {
+            let root = [invalid, &trailing, &command, &target].concat();
+            let leaf = [&command[..], &target, invalid, &trailing].concat();
+            check(&root, "list", "INVALID_ARGUMENT", 2);
+            check(&leaf, "list", "INVALID_ARGUMENT", 2);
+        }
     }
 
     for at in [
@@ -1153,6 +1197,9 @@ fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
         ("--cursor=--json", 5),
         ("--status=--json", 2),
         ("--at=--json", 2),
+        ("--after=--json", 2),
+        ("--database=--json", 2),
+        ("--workspace-id=--json", 2),
     ] {
         let command = ["bot", "list"];
         let trailing = ["--contract", "2"];
@@ -1161,7 +1208,7 @@ fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
         assert_eq!(output.status.code(), Some(exit), "{args:?}");
         assert!(output.stdout.is_empty(), "{args:?}");
         assert!(!output.stderr.is_empty(), "{args:?}");
-        if literal.starts_with("--at=") {
+        if matches!(literal, "--at=--json" | "--project=--json") {
             let args = [&[literal][..], &command, &target, &trailing].concat();
             let output = sandbox.run(&args);
             assert_eq!(output.status.code(), Some(exit), "{args:?}");
