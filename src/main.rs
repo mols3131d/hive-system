@@ -118,7 +118,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Bot(BotCommand::Show { target, bot_id }) => dolt::bot::show(&target, &bot_id),
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
         Command::Conversation(ConversationCommand::Show(args)) => {
-            dolt::conversation::show(&invocation.common, &args)
+            dolt::conversation_show(&invocation.common, &args)
         }
         Command::Issue(IssueCommand::List(args)) => dolt::issue_list(
             &args,
