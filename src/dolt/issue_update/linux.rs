@@ -15,13 +15,14 @@ use crate::dolt::{
     },
     read_error,
     receipt_history::{HistoricalReceipt, valid_sha256},
-    scope::require_active_area,
+    scope::{require_active_area, require_active_area_at},
 };
 use crate::error::{ErrorCode, HiveError};
 
 pub(in crate::dolt) const KIND: &str = "issue.update";
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_TEXT_BYTES: usize = 65_535;
+const ARCHIVED_AREA: &str = "Issue updates require active Area ancestry.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -329,11 +330,7 @@ impl Mutation for Update<'_> {
     }
 
     fn guard(&self, db: &mut Transaction<'_>, _: &mut Snapshot) -> Result<(), HiveError> {
-        require_active_area(
-            db,
-            self.scope.area,
-            "Issue updates require active Area ancestry.",
-        )?;
+        require_active_area(db, self.scope.area, ARCHIVED_AREA)?;
         let issue = Issue::read(db, self.scope.issue, None)?;
         if issue.area != self.scope.area {
             return Err(workflow::unverified());
@@ -595,6 +592,8 @@ pub(in crate::dolt) fn verify_effect(
     {
         return Err(workflow::unverified());
     }
+
+    require_active_area_at(db, &result.area_id, base, ARCHIVED_AREA)?;
 
     let old_values = before.values();
     let new_values = after.values();

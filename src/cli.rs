@@ -857,6 +857,16 @@ pub(crate) enum BackupCommand {
         #[arg(long)]
         include_conversations: bool,
     },
+    /// Restore a local backup into a separate inactive workspace.
+    Restore {
+        #[arg(long, value_name = "SNAPSHOT")]
+        source: PathBuf,
+        #[arg(long, value_name = "EMPTY_DIR")]
+        target: PathBuf,
+        /// Request private conversation restoration (currently unavailable).
+        #[arg(long)]
+        include_conversations: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1420,9 +1430,9 @@ fn backup_parser(legacy: &clap::Command, args: &[OsString]) -> Option<clap::Comm
         return None;
     }
     let cli = legacy.clone().subcommand(
-        BackupCommand::augment_subcommands(
-            clap::Command::new("backup").about("Create a local v2 workspace backup."),
-        )
+        BackupCommand::augment_subcommands(clap::Command::new("backup").about(
+            "Create a local v2 workspace backup. Restore a backup to an inactive workspace.",
+        ))
         .subcommand_required(true)
         .mut_subcommands(add_leaf_options),
     );
@@ -2666,7 +2676,19 @@ impl Command {
                     }
                     Ok(())
                 }
-                Self::Backup(_) => {
+                Self::Backup(BackupCommand::Restore { .. }) => {
+                    if common.workspace.is_some()
+                        || common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Backup restore accepts only --source and --target for selection.",
+                        );
+                    }
+                    Ok(())
+                }
+                Self::Backup(BackupCommand::Create { .. }) => {
                     if common.workspace.is_none()
                         || common.project.is_some()
                         || common.project_root.is_some()

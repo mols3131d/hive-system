@@ -9,6 +9,9 @@ pub(super) use relations::is_canonical_label_name;
 
 use std::collections::{BTreeSet, HashMap, VecDeque, hash_map::Entry};
 
+use mysql::prelude::FromRow;
+use serde::de::DeserializeOwned;
+
 use crate::cli::is_slug;
 use crate::error::{HiveError, RecordDiagnostic};
 
@@ -148,7 +151,72 @@ impl Diagnostics {
     }
 }
 
-pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError> {
+pub(super) enum RecordReader<'a> {
+    Online(&'a mut Snapshot),
+    #[cfg(target_os = "linux")]
+    Offline {
+        installed: &'a crate::workspace_init::Installed<'a>,
+        db: &'a std::path::Path,
+        commit: &'a str,
+    },
+}
+
+impl RecordReader<'_> {
+    pub(super) fn records<T: FromRow + DeserializeOwned>(
+        &mut self,
+        table: &'static str,
+        columns: &'static str,
+        order: &'static str,
+    ) -> Result<Vec<T>, HiveError> {
+        match self {
+            Self::Online(snapshot) => snapshot.records(table, columns, order),
+            #[cfg(target_os = "linux")]
+            Self::Offline { .. } => {
+                let limit = super::MAX_ROWS_PER_TABLE;
+                let rows = self.rows(
+                    table,
+                    columns,
+                    &format!("ORDER BY {order} LIMIT {}", limit + 1),
+                )?;
+                if rows.len() > limit {
+                    return Err(HiveError::new(
+                        crate::error::ErrorCode::ContextLimit,
+                        format!("Validation exceeds the limit of {limit} rows in {table}."),
+                    ));
+                }
+                Ok(rows)
+            }
+        }
+    }
+
+    fn rows<T: FromRow + DeserializeOwned>(
+        &mut self,
+        table: &'static str,
+        columns: &'static str,
+        suffix: &str,
+    ) -> Result<Vec<T>, HiveError> {
+        match self {
+            Self::Online(snapshot) => snapshot.rows(table, columns, suffix),
+            #[cfg(target_os = "linux")]
+            Self::Offline { installed, db, commit } => installed
+                .query(
+                    db,
+                    &format!("SELECT JSON_ARRAY({columns}) AS record FROM {table} AS OF '{commit}' {suffix}"),
+                )?
+                .into_iter()
+                .map(|mut row| {
+                    serde_json::from_value(row["record"].take()).map_err(|_| {
+                        super::incompatible_schema(format!(
+                            "The restored {table} table returned unexpected column types."
+                        ))
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
+pub(super) fn validate(snapshot: &mut RecordReader<'_>) -> Result<Diagnostics, HiveError> {
     let areas: Vec<_> = snapshot
         .records::<(String, Option<String>, String, bool)>(
             "areas",
@@ -168,7 +236,7 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
             String,
             String,
             Option<String>,
-            u64,
+            String,
             String,
             String,
             bool,
@@ -176,25 +244,25 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
             bool,
         )>(
             "issues",
-            "id, area_id, parent_id, number, type, status, closed_at IS NOT NULL,
+            "id, area_id, parent_id, CAST(number AS CHAR), type, status, closed_at IS NOT NULL,
              closed_by_ref IS NOT NULL, resolution_note IS NOT NULL",
             "id",
         )?
         .into_iter()
         .map(
             |(id, area_id, parent_id, number, kind, status, closed_at, closed_by, resolution)| {
-                IssueRow {
+                Ok(IssueRow {
                     id,
                     area_id,
                     parent_id,
-                    number,
+                    number: parse_unsigned(&number, "issues.number")?,
                     kind,
                     status: IssueStatus::parse(&status),
                     closure_fields_present: [closed_at, closed_by, resolution],
-                }
+                })
             },
         )
-        .collect();
+        .collect::<Result<Vec<_>, HiveError>>()?;
     let claims: Vec<_> = snapshot
         .records("issue_claims", "issue_id, claim_id", "issue_id, claim_id")?
         .into_iter()
@@ -212,11 +280,20 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
             prerequisite_id,
         })
         .collect();
-    let counters: Vec<(String, u64)> = snapshot.rows(
-        "workspace_counters",
-        "name, next_value",
-        "WHERE name = 'issue_number' LIMIT 2",
-    )?;
+    let counters = snapshot
+        .rows::<(String, String)>(
+            "workspace_counters",
+            "name, CAST(next_value AS CHAR)",
+            "WHERE name = 'issue_number' LIMIT 2",
+        )?
+        .into_iter()
+        .map(|(name, value)| {
+            Ok((
+                name,
+                parse_unsigned(&value, "workspace_counters.next_value")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, HiveError>>()?;
     let highest_number = issues.iter().map(|issue| issue.number).max().unwrap_or(0);
     let mut diagnostics = validate_rows(&areas, &issues, &claims, &dependencies);
     // Compare the spelling explicitly because the counter table may use a case-insensitive collation.
@@ -236,6 +313,15 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
     bots::validate(snapshot, &mut diagnostics)?;
     receipts::validate(snapshot, &mut diagnostics)?;
     Ok(diagnostics)
+}
+
+fn parse_unsigned(value: &str, column: &str) -> Result<u64, HiveError> {
+    // Decimal text avoids the floating-point conversion in Dolt's JSON_ARRAY.
+    value.parse().map_err(|_| {
+        super::incompatible_schema(format!(
+            "The {column} column returned an invalid unsigned integer."
+        ))
+    })
 }
 
 fn validate_rows(

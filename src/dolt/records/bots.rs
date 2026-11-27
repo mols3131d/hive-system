@@ -1,11 +1,11 @@
 use crate::cli::is_slug;
 
-use super::{Diagnostics, HiveError, Snapshot};
+use super::{Diagnostics, HiveError, RecordReader};
 
 const TABLE: &str = "bots";
 
 pub(super) fn validate(
-    snapshot: &mut Snapshot,
+    snapshot: &mut RecordReader<'_>,
     diagnostics: &mut Diagnostics,
 ) -> Result<(), HiveError> {
     let rows = snapshot.records::<(String, String)>(TABLE, "id, slug", "id")?;
