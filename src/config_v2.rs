@@ -1,6 +1,7 @@
 #[cfg(unix)]
 mod unix {
     use std::ffi::OsStr;
+    use std::os::fd::AsRawFd;
     use std::path::{Component, Path, PathBuf};
 
     use serde::Deserialize;
@@ -12,7 +13,7 @@ mod unix {
     use crate::dolt::{STORAGE_SCHEMA_VERSION, is_uuid, is_uuid_v7};
     use crate::error::{ErrorCode, HiveError};
 
-    use super::{INIT_PENDING, MARKER, has_init_stage_component};
+    use super::{BOOTSTRAP_LAYOUT, INIT_PENDING, MARKER, has_init_stage_component};
 
     mod bindings;
 
@@ -44,6 +45,8 @@ mod unix {
         schema_version: Value,
         #[serde(deserialize_with = "untagged")]
         policy_revision: String,
+        #[serde(default, deserialize_with = "present")]
+        bootstrap_layout: Option<String>,
     }
 
     pub(crate) struct Candidate {
@@ -393,10 +396,45 @@ mod unix {
                 )
             })?;
         let descriptor = parse_descriptor(&bytes)?;
+        if descriptor.bootstrap_layout.is_some() {
+            // Init holds the exclusive lock through its post-publication check.
+            // Re-read under the shared lock in case it invalidated the descriptor
+            // between the initial read and lock acquisition.
+            root.try_lock_shared()?;
+            if root.read(OsStr::new(MARKER))?.as_deref() != Some(bytes.as_slice()) {
+                return Err(HiveError::new(
+                    ErrorCode::ConcurrentChange,
+                    "The workspace descriptor changed during selection.",
+                ));
+            }
+            verify_bootstrap_layout(&root)?;
+        }
         // A reader may open the directory before init installs the sentinel,
         // then read the descriptor after it appears. Check again on the same FD.
         refuse_incomplete_publication(&root)?;
         Ok(Candidate { root, descriptor })
+    }
+
+    pub(crate) fn verify_bootstrap_layout(root: &impl AsRawFd) -> Result<(), HiveError> {
+        let db = OsStr::new("db");
+        let dolt = OsStr::new(".dolt");
+        let noms = OsStr::new("noms");
+        let invalid_layout =
+            || invalid("The bootstrap Dolt repository layout is missing or unsafe.");
+        let dolt_directory = config_file::open_scoped_directory(root, db, &[dolt])
+            .map_err(|_| invalid_layout())?
+            .ok_or_else(invalid_layout)?;
+        let noms_directory = config_file::open_scoped_directory(&dolt_directory, noms, &[])
+            .map_err(|_| invalid_layout())?
+            .ok_or_else(invalid_layout)?;
+        if !config_file::has_nonempty_regular(&dolt_directory, c"repo_state.json")
+            .map_err(|_| invalid_layout())?
+            || !config_file::has_nonempty_regular(&noms_directory, c"manifest")
+                .map_err(|_| invalid_layout())?
+        {
+            return Err(invalid_layout());
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -425,6 +463,16 @@ mod unix {
         {
             return Err(invalid(
                 "Workspace descriptor policy revision must be a lowercase Git commit SHA.",
+            ));
+        }
+        if descriptor
+            .bootstrap_layout
+            .as_deref()
+            .is_some_and(|layout| layout != BOOTSTRAP_LAYOUT)
+        {
+            return Err(HiveError::new(
+                ErrorCode::SchemaIncompatible,
+                "The workspace bootstrap layout is unsupported.",
             ));
         }
         Ok(descriptor)
@@ -459,6 +507,9 @@ mod unix {
 #[cfg(unix)]
 pub(crate) use unix::read_explicit;
 
+#[cfg(target_os = "linux")]
+pub(crate) use unix::verify_bootstrap_layout;
+
 use crate::cli::{CommonOptions, ConfigShowArgs, Format};
 use crate::error::HiveError;
 use serde_json::Value;
@@ -489,6 +540,9 @@ pub(crate) const MARKER: &str = "hive-workspace.yml";
 
 #[cfg(unix)]
 pub(crate) const INIT_PENDING: &std::ffi::CStr = c".hive-init-publication-incomplete";
+
+#[cfg(unix)]
+pub(crate) const BOOTSTRAP_LAYOUT: &str = "dolt-native-v1";
 
 #[cfg(unix)]
 pub(crate) const INIT_STAGE_PREFIX: &str = ".hive-init-incomplete-";

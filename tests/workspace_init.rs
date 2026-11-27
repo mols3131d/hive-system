@@ -297,6 +297,60 @@ fn config_and_conversation_readers_refuse_the_publication_sentinel() {
 }
 
 #[test]
+fn bootstrap_layout_refuses_missing_empty_and_symlinked_native_markers() {
+    let fixture = Fixture::new();
+    let target = fixture.dir("workspace");
+    fs::write(
+        target.join("hive-workspace.yml"),
+        "version: 2\nworkspace_id: 01900000-0000-7000-8000-000000000001\nschema_version: 1\npolicy_revision: c66b3c50150e18426485d134de92c6b311dac125\nbootstrap_layout: dolt-native-v1\n",
+    )
+    .unwrap();
+    let show = || {
+        fixture
+            .hive()
+            .args([
+                "--contract",
+                "2",
+                "--json",
+                "config",
+                "show",
+                "--scope",
+                "workspace",
+                "--workspace",
+            ])
+            .arg(&target)
+            .output()
+            .unwrap()
+    };
+    let assert_missing_layout = || {
+        let error = response(show(), 2);
+        assert_eq!(error["error"]["code"], "INVALID_CONFIG");
+        assert_eq!(
+            error["error"]["message"],
+            "The bootstrap Dolt repository layout is missing or unsafe."
+        );
+    };
+    assert_missing_layout();
+    let dolt = target.join("db/.dolt");
+    fs::create_dir_all(dolt.join("noms")).unwrap();
+    fs::write(dolt.join("repo_state.json"), b"fixture state").unwrap();
+    let manifest = dolt.join("noms/manifest");
+    fs::write(&manifest, b"").unwrap();
+    assert_missing_layout();
+    fs::remove_file(&manifest).unwrap();
+    let other = fixture.0.join("manifest");
+    fs::write(&other, b"fixture manifest").unwrap();
+    symlink(&other, &manifest).unwrap();
+    assert_missing_layout();
+    fs::remove_file(&manifest).unwrap();
+    fs::rename(&other, &manifest).unwrap();
+    assert_eq!(
+        response(show(), 0)["data"]["verification"]["descriptor"],
+        "verified"
+    );
+}
+
+#[test]
 fn refuses_unsafe_dolt_markers_without_following_them() {
     let fixture = Fixture::new();
     let elsewhere = fixture.dir("elsewhere");

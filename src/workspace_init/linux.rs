@@ -2,7 +2,7 @@ use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -83,7 +83,8 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
     };
 
     let descriptor = format!(
-        "version: 2\nworkspace_id: {workspace_id}\nschema_version: {STORAGE_SCHEMA_VERSION}\npolicy_revision: {POLICY_REVISION}\n"
+        "version: 2\nworkspace_id: {workspace_id}\nschema_version: {STORAGE_SCHEMA_VERSION}\npolicy_revision: {POLICY_REVISION}\nbootstrap_layout: {}\n",
+        config_v2::BOOTSTRAP_LAYOUT,
     );
     let mut marker = OpenOptions::new()
         .write(true)
@@ -107,7 +108,7 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
     config_v2::verify_descriptor(&bytes).map_err(with_stage)?;
 
     let payload_fd = open_directory(&payload).map_err(with_stage)?;
-    publish(&payload_fd, &original, &marker, check_path).map_err(|error| {
+    publish(&payload_fd, &original, &marker, &bytes, check_path).map_err(|error| {
         with_stage(HiveError::new(
             error.code,
             format!("{error} Any moved entries remain in the original target directory."),
@@ -211,6 +212,7 @@ fn publish(
     payload: &File,
     target: &File,
     descriptor: &File,
+    descriptor_bytes: &[u8],
     mut check_path: impl FnMut() -> Result<(), HiveError>,
 ) -> Result<(), HiveError> {
     check_path()?;
@@ -242,15 +244,17 @@ fn publish(
     check_path()?;
     verify_entry(target, pending_name, &pending)?;
     move_entry(payload, target, config_v2::MARKER)?;
+    let mut sentinel_removed = false;
     let verified = (|| {
         check_path()?;
         require_entries(
             target,
             &[db, assets, conversations, config_v2::MARKER, pending_name],
         )?;
-        check_path()?;
         verify_payload()?;
+        config_v2::verify_bootstrap_layout(target)?;
         verify_entry(target, config_v2::MARKER, descriptor)?;
+        check_path()?;
         verify_entry(target, pending_name, &pending)?;
         // SAFETY: The target FD is pinned and the sentinel name is a single component.
         if unsafe { libc::unlinkat(target.as_raw_fd(), config_v2::INIT_PENDING.as_ptr(), 0) } != 0 {
@@ -258,11 +262,25 @@ fn publish(
                 "Could not clear the incomplete workspace publication sentinel.",
             ));
         }
+        sentinel_removed = true;
+
+        // Bootstrap readers take a shared lock, so removing the sentinel
+        // does not expose the target until this check finishes under our lock.
+        check_path()?;
+        require_entries(target, &[db, assets, conversations, config_v2::MARKER])?;
+        verify_payload()?;
+        config_v2::verify_bootstrap_layout(target)?;
+        verify_entry(target, config_v2::MARKER, descriptor)?;
+        verify_descriptor_bytes(descriptor, descriptor_bytes)?;
+        check_path()?;
         Ok(())
     })();
     if let Err(error) = verified {
-        // Preserve the sentinel and invalidate only our pinned descriptor.
-        // This also fails closed if someone removed the sentinel itself.
+        if sentinel_removed {
+            // Preserve any intervening entry. Even if we cannot restore our
+            // sentinel, invalidate the exact descriptor before unlocking.
+            let _ = create_publication_sentinel(target, pending_name);
+        }
         descriptor.set_len(0).map_err(|_| {
             HiveError::new(
                 ErrorCode::UnknownWriteOutcome,
@@ -272,6 +290,20 @@ fn publish(
         return Err(error);
     }
     Ok(())
+}
+
+fn verify_descriptor_bytes(descriptor: &File, expected: &[u8]) -> Result<(), HiveError> {
+    let mut bytes = vec![0; expected.len()];
+    if dir_metadata(descriptor)?.len() == expected.len() as u64
+        && descriptor.read_exact_at(&mut bytes, 0).is_ok()
+        && bytes == expected
+    {
+        return Ok(());
+    }
+    Err(HiveError::new(
+        ErrorCode::ConcurrentChange,
+        "The published workspace descriptor contents changed.",
+    ))
 }
 
 fn create_publication_sentinel(target: &File, name: &str) -> Result<File, HiveError> {
@@ -579,6 +611,7 @@ mod tests {
         "workspace_id: 01900000-0000-7000-8000-000000000001\n",
         "schema_version: 1\n",
         "policy_revision: c66b3c50150e18426485d134de92c6b311dac125\n",
+        "bootstrap_layout: dolt-native-v1\n",
     );
 
     struct Publication {
@@ -601,6 +634,9 @@ mod tests {
             for name in PAYLOAD_ENTRIES {
                 private_dir(&payload.join(name)).unwrap();
             }
+            fs::create_dir_all(payload.join("db/.dolt/noms")).unwrap();
+            fs::write(payload.join("db/.dolt/repo_state.json"), b"fixture state").unwrap();
+            fs::write(payload.join("db/.dolt/noms/manifest"), b"fixture manifest").unwrap();
             fs::write(payload.join(config_v2::MARKER), FIXTURE_DESCRIPTOR).unwrap();
             Self {
                 root,
@@ -624,16 +660,23 @@ mod tests {
         lock_target(&target)?;
         let payload = open_directory(source)?;
         let descriptor = OpenOptions::new()
+            .read(true)
             .write(true)
             .open(source.join(config_v2::MARKER))
             .unwrap();
         let mut checks = 0;
-        publish(&payload, &target, &descriptor, || {
-            check_target_path(path, &parent, &target)?;
-            checks += 1;
-            after_check(checks);
-            Ok(())
-        })
+        publish(
+            &payload,
+            &target,
+            &descriptor,
+            FIXTURE_DESCRIPTOR.as_bytes(),
+            || {
+                check_target_path(path, &parent, &target)?;
+                checks += 1;
+                after_check(checks);
+                Ok(())
+            },
+        )
     }
 
     impl Drop for Publication {
@@ -747,8 +790,59 @@ mod tests {
     }
 
     #[test]
+    fn post_publication_check_catches_changes_at_sentinel_removal() {
+        for move_parent in [true, false] {
+            let fixture = Publication::new();
+            let moved = fixture.root.join("moved");
+            let pending_name = config_v2::INIT_PENDING.to_str().unwrap();
+            let mut original_sentinel = None;
+            let error = fixture
+                .publish_with(|check| {
+                    if check == 4 {
+                        original_sentinel =
+                            Some(fixture.target.join(pending_name).metadata().unwrap().ino());
+                        if move_parent {
+                            fs::rename(&fixture.parent, &moved).unwrap();
+                            private_dir(&fixture.parent).unwrap();
+                            private_dir(&fixture.target).unwrap();
+                            fs::write(fixture.target.join("keep"), b"keep").unwrap();
+                        } else {
+                            fs::rename(fixture.target.join("db"), &moved).unwrap();
+                            private_dir(&fixture.target.join("db")).unwrap();
+                            fs::write(fixture.target.join("db/keep"), b"keep").unwrap();
+                        }
+                    }
+                })
+                .unwrap_err();
+            assert!(matches!(error.code, ErrorCode::ConcurrentChange));
+            let original = if move_parent {
+                assert_eq!(fs::read(fixture.target.join("keep")).unwrap(), b"keep");
+                assert_eq!(fs::read_dir(&fixture.target).unwrap().count(), 1);
+                moved.join("target")
+            } else {
+                assert_eq!(fs::read(fixture.target.join("db/keep")).unwrap(), b"keep");
+                fixture.target.clone()
+            };
+            // The reopened sentinel has a new inode while the old sentinel FD
+            // was still pinned, proving the check ran after actual removal.
+            let restored_sentinel = original.join(pending_name).metadata().unwrap().ino();
+            assert_ne!(Some(restored_sentinel), original_sentinel);
+            assert_incomplete(&original);
+        }
+    }
+
+    #[test]
     fn readers_refuse_paused_and_killed_publications() {
-        for mode in ["complete", "moved", "replaced", "killed"] {
+        for (pause, mode) in [
+            (3, "complete"),
+            (3, "moved"),
+            (3, "replaced"),
+            (3, "killed"),
+            (5, "complete"),
+            (5, "moved"),
+            (5, "replaced"),
+            (5, "killed"),
+        ] {
             let fixture = Publication::new();
             let ready = fixture.root.join("ready");
             let mut writer = Command::new(std::env::current_exe().unwrap())
@@ -760,6 +854,7 @@ mod tests {
                 .env_clear()
                 .env("HIVE_TEST_PUBLICATION_ROOT", &fixture.root)
                 .env("HIVE_TEST_PUBLICATION_MODE", mode)
+                .env("HIVE_TEST_PUBLICATION_PAUSE", pause.to_string())
                 .stdout(Stdio::piped())
                 .spawn()
                 .unwrap();
@@ -768,10 +863,14 @@ mod tests {
                 let output = writer.wait_with_output().unwrap();
                 panic!("Writer never reached its final path check: {output:?}");
             }
-            let moved = fixture.parent.join("moved");
+            let moved = fixture.root.join("moved");
+            let moved_target = moved.join("target");
             let observed = if mode == "moved" {
-                fs::rename(&fixture.target, &moved).unwrap();
-                &moved
+                fs::rename(&fixture.parent, &moved).unwrap();
+                private_dir(&fixture.parent).unwrap();
+                private_dir(&fixture.target).unwrap();
+                fs::write(fixture.target.join("keep"), b"replacement parent").unwrap();
+                &moved_target
             } else {
                 &fixture.target
             };
@@ -779,7 +878,19 @@ mod tests {
                 fs::read(observed.join(config_v2::MARKER)).unwrap(),
                 FIXTURE_DESCRIPTOR.as_bytes()
             );
-            assert_incomplete(observed);
+            let pending = observed.join(config_v2::INIT_PENDING.to_str().unwrap());
+            if pause == 3 {
+                assert!(pending.is_file());
+                assert_incomplete(observed);
+            } else {
+                assert!(!pending.exists());
+                let error = selection_error(observed);
+                assert!(matches!(error.code, ErrorCode::ConcurrentChange));
+                assert_eq!(
+                    error.to_string(),
+                    "Workspace initialization is still being verified."
+                );
+            }
 
             if matches!(mode, "replaced" | "killed") {
                 fs::rename(observed.join("db"), fixture.root.join("original-db")).unwrap();
@@ -805,8 +916,24 @@ mod tests {
                     candidate.workspace_id(),
                     "01900000-0000-7000-8000-000000000001"
                 );
+            } else if pause == 5 && mode == "killed" {
+                assert!(!pending.exists());
+                let error = selection_error(observed);
+                assert!(matches!(error.code, ErrorCode::InvalidConfig));
+                assert_eq!(
+                    error.to_string(),
+                    "The bootstrap Dolt repository layout is missing or unsafe."
+                );
             } else {
+                assert!(pending.is_file());
                 assert_incomplete(observed);
+            }
+            if mode == "moved" {
+                assert_eq!(
+                    fs::read(fixture.target.join("keep")).unwrap(),
+                    b"replacement parent"
+                );
+                assert_eq!(fs::read_dir(&fixture.target).unwrap().count(), 1);
             }
             if matches!(mode, "replaced" | "killed") {
                 assert_eq!(fs::read(observed.join("db/keep")).unwrap(), b"replacement");
@@ -814,10 +941,14 @@ mod tests {
         }
     }
 
-    fn assert_incomplete(path: &Path) {
-        let error = config_v2::read_explicit(path)
+    fn selection_error(path: &Path) -> HiveError {
+        config_v2::read_explicit(path)
             .err()
-            .expect("workspace must be hidden");
+            .expect("workspace must be hidden")
+    }
+
+    fn assert_incomplete(path: &Path) {
+        let error = selection_error(path);
         assert!(matches!(error.code, ErrorCode::InvalidConfig));
         assert_eq!(error.to_string(), "Workspace initialization is incomplete.");
     }
@@ -839,12 +970,16 @@ mod tests {
         let Some(root) = std::env::var_os("HIVE_TEST_PUBLICATION_ROOT").map(PathBuf::from) else {
             return;
         };
+        let pause = std::env::var("HIVE_TEST_PUBLICATION_PAUSE")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
         let result = publish_fixture(
             &root.join("parent/target"),
             &root.join("payload"),
             |check| {
-                if check == 3 {
-                    fs::write(root.join("ready"), b"descriptor installed").unwrap();
+                if check == pause {
+                    fs::write(root.join("ready"), b"writer paused").unwrap();
                     assert!(
                         wait_for(&root.join("release")),
                         "publication witness timed out"
