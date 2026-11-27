@@ -14,7 +14,9 @@ use super::{
     context_evidence::read_evidence_bytes,
     context_resolve::observe_time,
     context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7, issue_create,
-    issue_note_receipt, issue_update, read_error,
+    issue_note_receipt, issue_update,
+    project::planning,
+    read_error,
     receipt_history::{
         HistoricalReceipt, has_receipt_history, receipt_at, receipt_introduction, valid_sha256,
     },
@@ -33,15 +35,21 @@ pub(super) enum Kind {
     Update,
     #[serde(rename = "artifact.create")]
     ArtifactCreate,
+    #[serde(rename = "project.create")]
+    ProjectCreate,
+    #[serde(rename = "project.add-issue")]
+    ProjectAddIssue,
 }
 
 impl Kind {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Note => super::issue_note_fingerprint::KIND,
             Self::Create => issue_create::KIND,
             Self::Update => issue_update::KIND,
             Self::ArtifactCreate => artifact_create::KIND,
+            Self::ProjectCreate => planning::CREATE,
+            Self::ProjectAddIssue => planning::ADD_ISSUE,
         }
     }
 
@@ -51,6 +59,8 @@ impl Kind {
             Self::Create => "Issue create",
             Self::Update => "Issue update",
             Self::ArtifactCreate => "Artifact create",
+            Self::ProjectCreate => "Project create",
+            Self::ProjectAddIssue => "Project add-issue",
         }
     }
 
@@ -74,7 +84,18 @@ impl Kind {
                 ("operation_receipts", "INSERT"),
             ],
             Self::ArtifactCreate => &[("artifacts", "INSERT"), ("operation_receipts", "INSERT")],
+            Self::ProjectCreate => &[("projects", "INSERT"), ("operation_receipts", "INSERT")],
+            Self::ProjectAddIssue => &[
+                ("issues", "UPDATE"),
+                ("projects", "UPDATE"),
+                ("project_issues", "INSERT"),
+                ("operation_receipts", "INSERT"),
+            ],
         }
+    }
+
+    fn is_project(self) -> bool {
+        matches!(self, Self::ProjectCreate | Self::ProjectAddIssue)
     }
 }
 
@@ -143,6 +164,7 @@ pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
 
 // Version 1 has no kind field and always denotes a progress note. Version 2
 // carries an Issue kind. Version 3 carries an Artifact ID and optional Area.
+// Version 4 carries a Project ID and, for membership, its Issue's owning Area.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Pending {
@@ -177,6 +199,12 @@ pub(crate) struct Pending {
         deserialize_with = "present_id"
     )]
     artifact_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_id"
+    )]
+    project_id: Option<String>,
     receipt_digest: String,
 }
 
@@ -222,10 +250,17 @@ impl Pending {
             &self.area_id,
             &self.issue_id,
             &self.artifact_id,
+            &self.project_id,
         ) {
-            (1, None, Some(_), Some(_), None) => Ok(Kind::Note),
-            (2, Some(kind @ (Kind::Create | Kind::Update)), Some(_), Some(_), None) => Ok(kind),
-            (3, Some(Kind::ArtifactCreate), _, None, Some(_)) => Ok(Kind::ArtifactCreate),
+            (1, None, Some(_), Some(_), None, None) => Ok(Kind::Note),
+            (2, Some(kind @ (Kind::Create | Kind::Update)), Some(_), Some(_), None, None) => {
+                Ok(kind)
+            }
+            (3, Some(Kind::ArtifactCreate), _, None, Some(_), None) => Ok(Kind::ArtifactCreate),
+            (4, Some(Kind::ProjectCreate), None, None, None, Some(_)) => Ok(Kind::ProjectCreate),
+            (4, Some(Kind::ProjectAddIssue), Some(_), None, None, Some(_)) => {
+                Ok(Kind::ProjectAddIssue)
+            }
             _ => Err(uncertain()),
         }
     }
@@ -237,10 +272,15 @@ impl Pending {
             || self.session_id == 0
             || !is_uuid(&self.request_id)
             || !is_commit_hash(&self.base_commit)
-            || [&self.area_id, &self.issue_id, &self.artifact_id]
-                .into_iter()
-                .flatten()
-                .any(|id| !is_uuid_v7(id))
+            || [
+                &self.area_id,
+                &self.issue_id,
+                &self.artifact_id,
+                &self.project_id,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|id| !is_uuid_v7(id))
             || !valid_sha256(&self.fingerprint)
             || !valid_sha256(&self.receipt_digest)
         {
@@ -270,7 +310,7 @@ pub(super) fn execute(
             receipt_at(snapshot, request.request_id, &commit, None).map_err(|_| uncertain())?;
         mutation.verify_decision(observe_time()?)?;
         let (outcome, base, introduced, result) = if let Some(receipt) = existing {
-            if matches!(request.kind, Kind::ArtifactCreate) {
+            if matches!(request.kind, Kind::ArtifactCreate) || request.kind.is_project() {
                 check_fingerprint(&receipt.fingerprint, request.fingerprint, request.kind)?;
             }
             let scoped = ScopedReceipt::read(
@@ -318,6 +358,9 @@ pub(super) fn execute(
                 "policy_revision": workspace.policy_revision(),
                 "scope": if matches!(request.kind, Kind::ArtifactCreate) {
                     json!({"area_id": request.area_id, "artifact_id": result["artifact_id"]})
+                } else if request.kind.is_project() {
+                    json!({"project_id": result["project_id"], "area_id": request.area_id,
+                           "issue_id": result["membership"]["issue_id"]})
                 } else {
                     json!({"area_id": request.area_id, "issue_id": result["issue_id"]})
                 },
@@ -401,10 +444,12 @@ fn apply(
         Kind::Note => (1, None),
         kind @ (Kind::Create | Kind::Update) => (2, Some(kind)),
         Kind::ArtifactCreate => (3, Some(Kind::ArtifactCreate)),
+        kind @ (Kind::ProjectCreate | Kind::ProjectAddIssue) => (4, Some(kind)),
     };
-    let (issue_id, artifact_id) = match request.kind {
-        Kind::ArtifactCreate => (None, Some(staged.record_id)),
-        _ => (Some(staged.record_id), None),
+    let (issue_id, artifact_id, project_id) = match request.kind {
+        Kind::ArtifactCreate => (None, Some(staged.record_id), None),
+        Kind::ProjectCreate | Kind::ProjectAddIssue => (None, None, Some(staged.record_id)),
+        _ => (Some(staged.record_id), None, None),
     };
     let marker = Pending {
         version,
@@ -418,6 +463,7 @@ fn apply(
         area_id: request.area_id.map(str::to_owned),
         issue_id,
         artifact_id,
+        project_id,
         receipt_digest: receipt_digest(&receipt),
     };
     let entry = runtime
@@ -474,7 +520,7 @@ fn open_verified_writer(
             "SELECT GRANTEE, TABLE_NAME, PRIVILEGE_TYPE FROM information_schema.TABLE_PRIVILEGES
          WHERE TABLE_SCHEMA = 'db' AND GRANTEE = ?
          AND TABLE_NAME IN ('issues', 'issue_updates', 'workspace_counters', 'operation_receipts',
-                            'artifacts', 'artifact_areas', 'areas')",
+                            'artifacts', 'artifact_areas', 'areas', 'projects', 'project_issues')",
             (&grantee,),
         )
         .map_err(read_error)?;
@@ -519,7 +565,11 @@ fn confirm(
         marker.operation()?,
         &marker.request_id,
         marker.area_id.as_deref(),
-        marker.issue_id.as_deref().or(marker.artifact_id.as_deref()),
+        marker
+            .issue_id
+            .as_deref()
+            .or(marker.artifact_id.as_deref())
+            .or(marker.project_id.as_deref()),
         &receipt.actor_ref,
         &receipt,
     )?;
@@ -537,6 +587,7 @@ enum ScopedReceipt {
     Create(issue_create::CreateResult),
     Update(Box<issue_update::ScopedUpdate>),
     ArtifactCreate(artifact_create::ScopedCreate),
+    Project(Box<planning::ScopedProject>),
 }
 
 impl ScopedReceipt {
@@ -594,6 +645,13 @@ impl ScopedReceipt {
                 artifact_create::check_scope(snapshot, request, area, record, actor, receipt)
                     .map(Self::ArtifactCreate)
             }
+            Kind::ProjectCreate | Kind::ProjectAddIssue => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                planning::check_scope(snapshot, kind, request, area, record, actor, receipt)
+                    .map(|scoped| Self::Project(Box::new(scoped)))
+            }
         }
     }
 
@@ -621,6 +679,7 @@ impl ScopedReceipt {
             Self::ArtifactCreate(scoped) => {
                 artifact_create::verify_effect(snapshot, commit, receipt, &scoped)
             }
+            Self::Project(scoped) => planning::verify_effect(snapshot, commit, receipt, *scoped),
             Self::Create(result) => {
                 issue_create::verify_effect(snapshot, commit, receipt, &result)?;
                 Ok(json!(result))
@@ -790,5 +849,27 @@ mod tests {
         let legacy_bytes = serde_json::to_string(&legacy).unwrap();
         let duplicate = legacy_bytes.replacen(r#""version":1"#, r#""version":1,"version":1"#, 1);
         assert!(Pending::read(duplicate.as_bytes(), "workspace", "launch").is_err());
+
+        let mut project = value;
+        project["version"] = json!(4);
+        project["project_id"] = project
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_id")
+            .unwrap();
+        project.as_object_mut().unwrap().remove("issue_id");
+        project["kind"] = json!("project.add-issue");
+        let linked = read(&project).unwrap();
+        assert!(matches!(linked.operation(), Ok(Kind::ProjectAddIssue)));
+        assert_eq!(json!(linked), project);
+
+        project["kind"] = json!("project.create");
+        assert!(read(&project).is_err());
+        project.as_object_mut().unwrap().remove("area_id");
+        let created = read(&project).unwrap();
+        assert!(matches!(created.operation(), Ok(Kind::ProjectCreate)));
+        assert_eq!(json!(created), project);
+        project["version"] = json!(3);
+        assert!(read(&project).is_err());
     }
 }

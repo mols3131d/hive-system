@@ -54,6 +54,7 @@ use crate::error::{ErrorCode, HiveError};
 pub(crate) use issue::show as issue_show;
 pub(crate) use issue_list::{IssueView, list as issue_list};
 pub(crate) use project::read as project_read;
+pub(crate) use project::write as project_write;
 #[cfg(unix)]
 pub(crate) use scope::{ScopeRef, verify_scope};
 

@@ -17,7 +17,7 @@ use clap::{
 };
 
 pub(crate) use conversation_v2::{ConversationImportArgs, ConversationListArgs};
-pub(crate) use project_v2::ProjectRead;
+pub(crate) use project_v2::{ProjectRead, ProjectWrite};
 
 pub(crate) struct Invocation {
     pub(crate) common: CommonOptions,
@@ -236,6 +236,8 @@ pub(crate) enum Command {
     Project(ProjectCommand),
     #[command(skip)]
     ProjectRead(ProjectRead),
+    #[command(skip)]
+    ProjectWrite(ProjectWrite),
     /// Read or manage task records.
     #[command(subcommand)]
     Task(TaskCommand),

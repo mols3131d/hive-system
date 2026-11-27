@@ -7,6 +7,8 @@ use std::path::Path;
 mod artifact_create;
 #[path = "runtime/issue_update.rs"]
 mod issue_update;
+#[path = "runtime/project_planning.rs"]
+mod project_planning;
 
 fn random_uuid() -> String {
     fs::read_to_string("/proc/sys/kernel/random/uuid")
@@ -2071,6 +2073,8 @@ fn issue_create_writer_fixture(
             "issue_updates",
             "issues",
             "operation_receipts",
+            "project_issues",
+            "projects",
         ]
     );
     let mut prior = connect("writer");

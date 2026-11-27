@@ -168,6 +168,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Resource(ResourceCommand::List(args)) => dolt::resource::list(&args),
         Command::Resource(ResourceCommand::Show(args)) => dolt::resource::show(&args),
         Command::ProjectRead(args) => dolt::project_read(&args),
+        Command::ProjectWrite(args) => dolt::project_write(&invocation.common, &args),
         Command::Bot(BotCommand::List {
             target,
             status,
