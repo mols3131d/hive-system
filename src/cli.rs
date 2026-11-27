@@ -1115,7 +1115,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                         .try_get_matches_from(&args)
                         .ok()?;
                     recover_unknown_long(&cli, &args, &partial, &error, "workspace")
-                        .or_else(|| recover_unknown_long(&cli, &args, &partial, &error, "context"))
+                        .or_else(|| recover_context_resolve(&cli, &args, &partial, &error))
                         .or(Some(partial))
                 });
             let root = partial.as_ref();
@@ -1464,6 +1464,101 @@ fn parse_dolt_artifact(
     })())
 }
 
+fn unknown_long_name<'a>(leaf: &clap::Command, invalid: &'a str) -> Option<&'a str> {
+    let long = invalid.strip_prefix("--")?.split('=').next()?;
+    (long.starts_with(|ch: char| ch.is_ascii_alphanumeric())
+        && long
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && !leaf.get_arguments().any(|arg| {
+            arg.get_long() == Some(long)
+                || arg
+                    .get_all_aliases()
+                    .is_some_and(|aliases| aliases.contains(&long))
+        }))
+    .then_some(long)
+}
+
+fn recover_context_resolve(
+    cli: &clap::Command,
+    args: &[OsString],
+    partial: &ArgMatches,
+    error: &clap::Error,
+) -> Option<ArgMatches> {
+    let ("context", context) = partial.subcommand()? else {
+        return None;
+    };
+    let ("resolve", _) = context.subcommand()? else {
+        return None;
+    };
+    let mut retry = cli.clone();
+    let mut error = error;
+    let mut next_error;
+    let mut recovered_ids = Vec::new();
+    // Each replay adds one distinct option. Cap reparsing even for very long
+    // argument lists and retain the original error and partial matches on failure.
+    const MAX_RECOVERED_OPTIONS: usize = 32;
+    for _ in 0..MAX_RECOVERED_OPTIONS {
+        if error.kind() != ErrorKind::UnknownArgument {
+            return None;
+        }
+        let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
+            return None;
+        };
+        let leaf = retry
+            .find_subcommand("context")?
+            .find_subcommand("resolve")?;
+        let option = if let Some(long) = unknown_long_name(leaf, invalid) {
+            Arg::new(format!("recovered_unknown_--{long}")).long(long.to_owned())
+        } else {
+            let mut chars = invalid.strip_prefix('-')?.chars();
+            let flag = chars.next()?;
+            if chars.next().is_some()
+                || matches!(flag, '-' | '=')
+                || flag.is_whitespace()
+                || flag.is_control()
+                || leaf.get_arguments().any(|arg| {
+                    arg.get_short() == Some(flag)
+                        || arg
+                            .get_all_short_aliases()
+                            .is_some_and(|aliases| aliases.contains(&flag))
+                })
+            {
+                return None;
+            }
+            Arg::new(format!("recovered_unknown_-{flag}")).short(flag)
+        };
+        recovered_ids.push(option.get_id().clone());
+        // Clap keeps equals values opaque, walks short clusters, and
+        // leaves separated values and the option terminator in place.
+        let option = option
+            .action(ArgAction::Append)
+            .num_args(0..=1)
+            .require_equals(true)
+            .value_parser(OsStringValueParser::new())
+            .hide(true);
+        retry = retry.mut_subcommand("context", |context| {
+            context.mut_subcommand("resolve", |resolve| resolve.arg(option))
+        });
+        match retry.clone().try_get_matches_from(args) {
+            Ok(matches) => {
+                let leaf = matches
+                    .subcommand_matches("context")?
+                    .subcommand_matches("resolve")?;
+                return recovered_ids
+                    .iter()
+                    .all(|id| leaf.value_source(id.as_str()) == Some(ValueSource::CommandLine))
+                    .then_some(matches);
+            }
+            Err(error) => {
+                next_error = error;
+            }
+        }
+        error = &next_error;
+    }
+    None
+}
+
 fn recover_unknown_long(
     cli: &clap::Command,
     args: &[OsString],
@@ -1481,32 +1576,15 @@ fn recover_unknown_long(
     let (action, _) = matched.subcommand()?;
     if !matches!(
         (domain, action),
-        ("workspace", "init" | "status" | "start" | "stop")
-            | ("context", "resolve")
-            | (_, "list" | "show")
+        ("workspace", "init" | "status" | "start" | "stop") | (_, "list" | "show")
     ) {
         return None;
     }
     let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
         return None;
     };
-    let long = invalid.strip_prefix("--")?.split('=').next()?;
-    if !long.starts_with(|ch: char| ch.is_ascii_alphanumeric())
-        || !long
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return None;
-    }
     let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
-    if leaf.get_arguments().any(|arg| {
-        arg.get_long() == Some(long)
-            || arg
-                .get_all_aliases()
-                .is_some_and(|aliases| aliases.contains(&long))
-    }) {
-        return None;
-    }
+    let long = unknown_long_name(leaf, invalid)?;
 
     // Let Clap replay the original tokens. Init and Label list take no
     // positionals, so the temporary option can take one plain separated
@@ -1777,7 +1855,7 @@ fn has_context_v2_selection(cli: &clap::Command, args: &[OsString]) -> bool {
                 .ignore_errors(true)
                 .try_get_matches_from(args)
                 .ok()?;
-            recover_unknown_long(&probe, args, &partial, &error, "context").or(Some(partial))
+            recover_context_resolve(&probe, args, &partial, &error).or(Some(partial))
         }),
     };
     matches.as_ref().is_some_and(|matches| {
