@@ -2,6 +2,10 @@
 mod artifacts;
 #[path = "dolt_validation/directives.rs"]
 mod directives;
+#[path = "dolt_validation/issue_updates.rs"]
+mod issue_updates;
+#[path = "dolt_validation/receipts.rs"]
+mod receipts;
 #[path = "dolt_validation/relations.rs"]
 mod relations;
 

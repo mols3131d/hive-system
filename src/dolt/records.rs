@@ -1,5 +1,7 @@
 mod artifacts;
 mod directives;
+mod issue_updates;
+mod receipts;
 mod relations;
 
 use std::collections::{BTreeSet, HashMap, VecDeque, hash_map::Entry};
@@ -7,7 +9,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque, hash_map::Entry};
 use crate::cli::is_slug;
 use crate::error::{HiveError, RecordDiagnostic};
 
-use super::{Snapshot, graph::Graph, is_uuid_v7};
+use super::{Snapshot, graph::Graph, is_uuid, is_uuid_v7};
 
 const MAX_DIAGNOSTICS: usize = 100;
 
@@ -92,16 +94,32 @@ impl Diagnostics {
         ids: &[&str],
         message: &'static str,
     ) {
+        self.push(code, table, ids.iter().filter(|id| is_uuid_v7(id)), message);
+    }
+
+    fn add_uuid(
+        &mut self,
+        code: &'static str,
+        table: &'static str,
+        ids: &[&str],
+        message: &'static str,
+    ) {
+        self.push(code, table, ids.iter().filter(|id| is_uuid(id)), message);
+    }
+
+    fn push<'a>(
+        &mut self,
+        code: &'static str,
+        table: &'static str,
+        ids: impl Iterator<Item = &'a &'a str>,
+        message: &'static str,
+    ) {
         if self.items.len() == MAX_DIAGNOSTICS {
             self.truncated = true;
             return;
         }
         // Invalid ID values can contain arbitrary text. Report only verified identifiers.
-        let record_ids = ids
-            .iter()
-            .filter(|id| is_uuid_v7(id))
-            .map(|id| (*id).to_owned())
-            .collect();
+        let record_ids = ids.map(|id| (*id).to_owned()).collect();
         self.items.push(RecordDiagnostic {
             code,
             severity: "error",
@@ -207,6 +225,8 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
     let area_ids = areas.iter().map(|area| area.id.as_str()).collect();
     let issue_ids = issues.iter().map(|issue| issue.id.as_str()).collect();
     relations::validate(snapshot, &area_ids, &issue_ids, &mut diagnostics)?;
+    issue_updates::validate(snapshot, &issue_ids, &mut diagnostics)?;
+    receipts::validate(snapshot, &mut diagnostics)?;
     Ok(diagnostics)
 }
 
