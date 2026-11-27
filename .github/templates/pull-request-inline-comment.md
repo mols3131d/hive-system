@@ -13,15 +13,3 @@
 {% if evidence %}
 **Evidence:** {{ evidence }}
 {% endif %}
-
-(*Required when an agent substantially authored or rewrote the inline comment.*)
-{% if author %}
-
-```yaml
-author:
-{% for identity in author %}
-  - {{ identity }}
-{% endfor %}
-```
-
-{% endif %}
