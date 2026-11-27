@@ -123,3 +123,92 @@ fn linked_area(
         _ => Err(HiveError::ambiguous_areas(candidates, truncated)),
     }
 }
+
+#[cfg(target_os = "linux")]
+pub(super) fn require_active_area(
+    db: &mut impl mysql::prelude::Queryable,
+    area: &str,
+) -> Result<(), HiveError> {
+    verify_area_ancestry(area, |id| {
+        db.exec_first(
+            "SELECT parent_id, slug, archived_at IS NOT NULL FROM areas
+             WHERE CAST(id AS BINARY) = ?",
+            (id,),
+        )
+        .map_err(super::read_error)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn verify_area_ancestry(
+    area: &str,
+    mut read: impl FnMut(&str) -> Result<Option<(Option<String>, String, bool)>, HiveError>,
+) -> Result<(), HiveError> {
+    let invalid = || {
+        HiveError::new(
+            ErrorCode::InvalidRecord,
+            "The selected Area ancestry is invalid.",
+        )
+    };
+    let mut visited = std::collections::HashSet::new();
+    let mut current = area.to_owned();
+    let mut archived = false;
+    loop {
+        if !is_uuid_v7(&current)
+            || visited.len() == super::MAX_ROWS_PER_TABLE
+            || !visited.insert(current.clone())
+        {
+            return Err(invalid());
+        }
+        let (parent, slug, is_archived) = read(&current)?.ok_or_else(invalid)?;
+        if !is_slug(&slug) {
+            return Err(invalid());
+        }
+        archived |= is_archived;
+        let Some(parent) = parent else { break };
+        current = parent;
+    }
+    if archived {
+        return Err(HiveError::new(
+            ErrorCode::InvalidTransition,
+            "A progress note requires active Area ancestry.",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requires_a_complete_active_area_chain() {
+        let root = "01900000-0000-7000-8000-000000000001";
+        let parent = "01900000-0000-7000-8000-000000000002";
+        let leaf = "01900000-0000-7000-8000-000000000003";
+        let verify = |root_row: Option<(Option<&str>, bool)>| {
+            verify_area_ancestry(leaf, |id| {
+                Ok(match id {
+                    id if id == leaf => Some((Some(parent), false)),
+                    id if id == parent => Some((Some(root), false)),
+                    id if id == root => root_row,
+                    _ => None,
+                }
+                .map(|(parent, archived)| {
+                    (parent.map(ToOwned::to_owned), "synthetic".into(), archived)
+                }))
+            })
+        };
+        verify(Some((None, false))).unwrap();
+        assert!(matches!(
+            verify(Some((None, true))).unwrap_err().code,
+            ErrorCode::InvalidTransition
+        ));
+        for root_row in [None, Some((Some(leaf), false))] {
+            assert!(matches!(
+                verify(root_row).unwrap_err().code,
+                ErrorCode::InvalidRecord
+            ));
+        }
+    }
+}

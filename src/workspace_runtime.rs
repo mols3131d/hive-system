@@ -255,7 +255,7 @@ fn start(
             ))
             .arg("sql");
         let sql = format!(
-            "CREATE USER '{reader_user}'@'127.0.0.1' IDENTIFIED BY '{reader}';\n             CREATE USER '{writer_user}'@'127.0.0.1' IDENTIFIED BY '{writer}';\n             GRANT SELECT ON db.* TO '{reader_user}'@'127.0.0.1';\n             GRANT SELECT ON db.* TO '{writer_user}'@'127.0.0.1';\n             GRANT UPDATE ON db.workspace_counters TO '{writer_user}'@'127.0.0.1';\n             DROP USER 'root'@'localhost';"
+            "CREATE USER '{reader_user}'@'127.0.0.1' IDENTIFIED BY '{reader}';\n             CREATE USER '{writer_user}'@'127.0.0.1' IDENTIFIED BY '{writer}';\n             GRANT SELECT ON db.* TO '{reader_user}'@'127.0.0.1';\n             GRANT SELECT ON db.* TO '{writer_user}'@'127.0.0.1';\n             GRANT UPDATE ON db.workspace_counters TO '{writer_user}'@'127.0.0.1';\n             GRANT UPDATE ON db.issues TO '{writer_user}'@'127.0.0.1';\n             GRANT INSERT ON db.issue_updates TO '{writer_user}'@'127.0.0.1';\n             GRANT INSERT ON db.operation_receipts TO '{writer_user}'@'127.0.0.1';\n             DROP USER 'root'@'localhost';"
         );
         run_checked(&mut provision, Some(sql.as_bytes()))?;
         for (name, contents) in [
@@ -399,6 +399,90 @@ pub(crate) fn with_owned_snapshot<T>(
     target: DoltTarget<'_>,
     read: impl FnOnce(&mut Snapshot) -> Result<T, HiveError>,
 ) -> Result<T, HiveError> {
+    with_owned_snapshot_inner(
+        workspace,
+        target,
+        libc::LOCK_SH,
+        false,
+        |snapshot, _| read(snapshot),
+        Ok,
+    )
+}
+
+/// Inspection reads committed history even while a pending marker is retained.
+pub(crate) fn with_operation_snapshot<T>(
+    workspace: &Candidate,
+    target: DoltTarget<'_>,
+    read: impl FnOnce(&mut Snapshot, bool) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
+    with_owned_snapshot_inner(workspace, target, libc::LOCK_SH, true, read, Ok)
+}
+
+/// Validate at a committed snapshot, then publish while still holding the
+/// lifecycle lock. All runtime and selection checks precede publication.
+pub(crate) fn with_exclusive_owned_snapshot<T, U>(
+    workspace: &Candidate,
+    target: DoltTarget<'_>,
+    read: impl FnOnce(&mut Snapshot) -> Result<T, HiveError>,
+    publish: impl FnOnce(T) -> Result<U, HiveError>,
+) -> Result<U, HiveError> {
+    with_owned_snapshot_inner(
+        workspace,
+        target,
+        libc::LOCK_EX,
+        false,
+        |snapshot, _| read(snapshot),
+        publish,
+    )
+}
+
+fn with_owned_snapshot_inner<T, U>(
+    workspace: &Candidate,
+    target: DoltTarget<'_>,
+    lock_mode: libc::c_int,
+    inspect_pending: bool,
+    read: impl FnOnce(&mut Snapshot, bool) -> Result<T, HiveError>,
+    finish: impl FnOnce(T) -> Result<U, HiveError>,
+) -> Result<U, HiveError> {
+    with_selected_runtime(
+        workspace,
+        target,
+        lock_mode,
+        inspect_pending,
+        |runtime, snapshot, pending| {
+            let result = read(snapshot, pending);
+            runtime.check()?;
+            if pending != runtime.has_pending()? {
+                return Err(unverified(
+                    "The pending request state changed during inspection.",
+                ));
+            }
+            finish(result?)
+        },
+    )
+}
+
+pub(crate) fn with_writer_runtime<T>(
+    workspace: &Candidate,
+    target: DoltTarget<'_>,
+    write: impl FnOnce(&WriterRuntime<'_>, &mut Snapshot) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
+    with_selected_runtime(
+        workspace,
+        target,
+        libc::LOCK_EX,
+        true,
+        |runtime, snapshot, _| write(runtime, snapshot),
+    )
+}
+
+fn with_selected_runtime<T>(
+    workspace: &Candidate,
+    target: DoltTarget<'_>,
+    lock_mode: libc::c_int,
+    inspect_pending: bool,
+    operation: impl FnOnce(&WriterRuntime<'_>, &mut Snapshot, bool) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
     let id = workspace.workspace_id();
     let root = json_path(&workspace.root.path)?;
     let state = find_state(id, &workspace.root.path)?
@@ -410,8 +494,8 @@ pub(crate) fn with_owned_snapshot<T>(
             "The existing workspace lifecycle lock is unavailable.",
         ));
     }
-    let lock = lock_file(regular(&state, "lock")?, libc::LOCK_SH)?;
-    let check_selection = || -> Result<(), HiveError> {
+    let lock = lock_file(regular(&state, "lock")?, lock_mode)?;
+    let check_selection = || -> Result<bool, HiveError> {
         let selected = read_explicit(&workspace.root.path)?;
         let lock_now = regular(&state, "lock")?.metadata().map_err(io_error)?;
         let held = lock.metadata().map_err(io_error)?;
@@ -435,14 +519,15 @@ pub(crate) fn with_owned_snapshot<T>(
             id,
             root,
         )?;
-        if state.contains(c"starting")? || state.contains(c"pending-request.json")? {
+        let pending = state.contains(c"pending-request.json")?;
+        if state.contains(c"starting")? || (!inspect_pending && pending) {
             return Err(unverified(
                 "The workspace has an unresolved runtime or write intent.",
             ));
         }
-        Ok(())
+        Ok(pending)
     };
-    check_selection()?;
+    let pending = check_selection()?;
     let server: Server = read_json(Some(&state), "server.json")?
         .ok_or_else(|| unverified("No owned server is recorded."))?;
     check_server(&server, id, root)?;
@@ -462,10 +547,83 @@ pub(crate) fn with_owned_snapshot<T>(
     let run = child_dir(&state, &format!("run-{}", server.nonce))?;
     require_private_dir(&run)?;
     let handle = pidfd(server.pid)?;
-    let result = verify_with(&server, &state, &run, &noms, &handle, read);
-    check_selection()?;
-    result
+    verify_with(
+        &server,
+        &state,
+        &run,
+        &noms,
+        &handle,
+        |snapshot, check_process| {
+            let check = || {
+                check_selection()?;
+                if read_json::<Server>(Some(&state), "server.json")?.as_ref() != Some(&server) {
+                    return Err(unverified("The selected Dolt launch changed."));
+                }
+                check_process()
+            };
+            let runtime = WriterRuntime {
+                state: &state,
+                run: &run,
+                server: &server,
+                check: &check,
+            };
+            runtime.check()?;
+            operation(&runtime, snapshot, pending)
+        },
+    )
 }
+
+pub(crate) struct WriterRuntime<'a> {
+    state: &'a ScopedDirectory,
+    run: &'a ScopedDirectory,
+    server: &'a Server,
+    check: &'a dyn Fn() -> Result<(), HiveError>,
+}
+
+impl WriterRuntime<'_> {
+    pub(crate) fn check(&self) -> Result<(), HiveError> {
+        (self.check)()
+    }
+
+    pub(crate) fn launch_nonce(&self) -> &str {
+        &self.server.nonce
+    }
+
+    pub(crate) fn writer_grantee(&self) -> String {
+        format!(
+            "'{}'@'127.0.0.1'",
+            credential_name("writer", &self.server.nonce)
+        )
+    }
+
+    pub(crate) fn has_pending(&self) -> Result<bool, HiveError> {
+        self.state.contains(c"pending-request.json")
+    }
+
+    pub(crate) fn open(&self, writer: bool) -> Result<Snapshot, HiveError> {
+        self.check()?;
+        let role = if writer { "writer" } else { "reader" };
+        let password = read_private(self.run, &format!("{role}-password"))?;
+        if !is_uuid(&password) {
+            return Err(unverified("The private launch credential is invalid."));
+        }
+        let target = DoltTarget {
+            workspace_id: &self.server.workspace_id,
+            database: DATABASE,
+            port: self.server.endpoint.port,
+        };
+        let snapshot = Snapshot::open_runtime(
+            target,
+            &credential_name(role, &self.server.nonce),
+            &password,
+        )?;
+        self.check()?;
+        Ok(snapshot)
+    }
+}
+
+#[path = "workspace_runtime/pending.rs"]
+mod pending;
 
 fn verify(
     server: &Server,
@@ -474,7 +632,8 @@ fn verify(
     noms: &ScopedDirectory,
     handle: &OwnedFd,
 ) -> Result<Value, HiveError> {
-    verify_with(server, state, run, noms, handle, |snapshot| {
+    verify_with(server, state, run, noms, handle, |snapshot, check| {
+        check()?;
         Ok(snapshot.runtime_identity())
     })
 }
@@ -485,7 +644,7 @@ fn verify_with<T>(
     run: &ScopedDirectory,
     noms: &ScopedDirectory,
     handle: &OwnedFd,
-    read: impl FnOnce(&mut Snapshot) -> Result<T, HiveError>,
+    read: impl FnOnce(&mut Snapshot, &dyn Fn() -> Result<(), HiveError>) -> Result<T, HiveError>,
 ) -> Result<T, HiveError> {
     let proc = proc_dir(server.pid);
     let root = Path::new(&server.workspace_root).join(DATABASE);
@@ -538,9 +697,7 @@ fn verify_with<T>(
     };
     let mut snapshot = Snapshot::open_runtime(target, &reader_name(&server.nonce), &password)?;
     check()?;
-    let result = read(&mut snapshot);
-    check()?;
-    result
+    read(&mut snapshot, &check)
 }
 
 fn owns_store(proc: &Path, noms: &ScopedDirectory, pid: i32) -> Result<bool, HiveError> {
@@ -693,7 +850,7 @@ fn boot() -> Result<String, HiveError> {
     read_uuid("/proc/sys/kernel/random/boot_id")
 }
 
-fn token() -> Result<String, HiveError> {
+pub(crate) fn token() -> Result<String, HiveError> {
     read_uuid("/proc/sys/kernel/random/uuid")
 }
 

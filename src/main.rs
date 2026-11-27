@@ -145,6 +145,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::DoltArtifact(DoltArtifactCommand::List(args)) => dolt::artifact::list(&args),
         Command::DoltArtifact(DoltArtifactCommand::Show(args)) => dolt::artifact::show(&args),
         Command::Validate(args) => dolt::validate(&args),
+        Command::Operation(cli::OperationCommand::Show(args)) => {
+            dolt::operation::show(&invocation.common, &args)
+        }
         Command::Context(ContextArgs {
             command: Some(ContextCommand::Resolve(args)),
         }) => dolt::context_resolve::resolve(&invocation.common, &args),
@@ -193,6 +196,8 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
             dolt::directive::show(&selection, invocation.common.project.as_ref(), &id)
         }
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
+        Command::IssueNote(args) => dolt::issue_note::write(&invocation.common, &args),
+        Command::ConversationImport(args) => dolt::conversation_import(&invocation.common, &args),
         Command::Conversation(ConversationCommand::Show(args)) => {
             dolt::conversation_read(&invocation.common, &args, None)
         }
@@ -230,11 +235,24 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
                 Some(&report.context),
                 &report.data,
             );
-            if status != ExitCode::SUCCESS && name == "conversation export" {
-                let _ = writeln!(
-                    std::io::stderr().lock(),
-                    "error: The conversation export was published, but its success response could not be written."
-                );
+            if status != ExitCode::SUCCESS {
+                let mut stderr = std::io::stderr().lock();
+                match name.as_str() {
+                    "conversation export" => {
+                        let _ = writeln!(
+                            stderr,
+                            "error: The conversation export was published, but its success response could not be written."
+                        );
+                    }
+                    "conversation import" => {
+                        let _ = writeln!(
+                            stderr,
+                            "error: Conversation {} for Queen {} was published, but its success response could not be written.",
+                            report.data["conversation_id"], report.data["bot_id"],
+                        );
+                    }
+                    _ => {}
+                }
             }
             status
         }

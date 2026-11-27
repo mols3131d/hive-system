@@ -81,33 +81,7 @@ impl CheckedEvidence<'_> {
 
 impl EvidenceFile {
     pub(super) fn read(path: &Path) -> Result<Self, HiveError> {
-        let path = resolve_path(path, &current_dir()?, absolute_env("HOME").as_deref())?;
-        // Scope the descriptor open to every named component and refuse traversal.
-        if path.components().any(|part| part == Component::ParentDir) {
-            return Err(invalid(
-                "The context evidence path cannot traverse parent directories.",
-            ));
-        }
-        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-            return Err(invalid("Select an explicit context evidence file."));
-        };
-        let directory = ScopedDirectory::open_absolute(parent).map_err(evidence_io)?;
-        let file = directory
-            .open_regular(name)
-            .map_err(evidence_io)?
-            .ok_or_else(file_unavailable)?;
-        let mut bytes = Vec::new();
-        file.take(MAX_EVIDENCE_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| {
-                HiveError::new(
-                    ErrorCode::IoError,
-                    "Could not read the context evidence file.",
-                )
-            })?;
-        if bytes.len() > MAX_EVIDENCE_BYTES {
-            return Err(limit("The context evidence file exceeds 256 KiB."));
-        }
+        let bytes = read_evidence_bytes(path, MAX_EVIDENCE_BYTES)?;
         if bytes
             .iter()
             .copied()
@@ -244,6 +218,37 @@ impl EvidenceFile {
         }
         Ok(checked)
     }
+}
+
+pub(super) fn read_evidence_bytes(path: &Path, max_bytes: usize) -> Result<Vec<u8>, HiveError> {
+    let path = resolve_path(path, &current_dir()?, absolute_env("HOME").as_deref())?;
+    // Scope the descriptor open to every named component and refuse traversal.
+    if path.components().any(|part| part == Component::ParentDir) {
+        return Err(invalid(
+            "The context evidence path cannot traverse parent directories.",
+        ));
+    }
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(invalid("Select an explicit context evidence file."));
+    };
+    let directory = ScopedDirectory::open_absolute(parent).map_err(evidence_io)?;
+    let file = directory
+        .open_regular(name)
+        .map_err(evidence_io)?
+        .ok_or_else(file_unavailable)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            HiveError::new(
+                ErrorCode::IoError,
+                "Could not read the context evidence file.",
+            )
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(limit("The workflow evidence file exceeds its byte limit."));
+    }
+    Ok(bytes)
 }
 
 fn evidence_io(error: HiveError) -> HiveError {

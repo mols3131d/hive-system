@@ -20,6 +20,7 @@ pub(crate) enum ErrorCode {
     SchemaIncompatible,
     ConstraintViolation,
     AlreadyExists,
+    RequestConflict,
     AlreadyClaimed,
     ClaimMismatch,
     StaleRevision,
@@ -36,6 +37,7 @@ pub(crate) enum ErrorCode {
     IoError,
     NotImplemented,
     UnknownWriteOutcome,
+    CommitUncertain,
 }
 
 impl ErrorCode {
@@ -53,6 +55,7 @@ impl ErrorCode {
             | Self::SchemaIncompatible
             | Self::ConstraintViolation => 4,
             Self::AlreadyExists
+            | Self::RequestConflict
             | Self::AlreadyClaimed
             | Self::ClaimMismatch
             | Self::StaleRevision
@@ -68,7 +71,7 @@ impl ErrorCode {
             | Self::PolicyUnavailable
             | Self::IoError
             | Self::NotImplemented => 7,
-            Self::UnknownWriteOutcome => 8,
+            Self::UnknownWriteOutcome | Self::CommitUncertain => 8,
         }
     }
 }

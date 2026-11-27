@@ -210,8 +210,13 @@ impl Fixture {
     }
 
     fn local(&self, args: &[&str], input: Option<&str>) -> String {
+        self.local_at(&self.root.join(DATABASE), args, input)
+    }
+
+    fn local_at(&self, directory: &std::path::Path, args: &[&str], input: Option<&str>) -> String {
         let mut child = self
             .dolt_command()
+            .current_dir(directory)
             .args(args)
             .stdin(if input.is_some() {
                 Stdio::piped()

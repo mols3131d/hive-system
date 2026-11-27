@@ -575,3 +575,261 @@ fn conversation_list_pages_the_selected_queen_metadata_and_preserves_state() {
     assert_eq!(storage_state(&mut admin), storage);
     assert!(!fixture.root.join("home/.local/state").exists());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn conversation_import_requires_explicit_input_and_an_unblocked_runtime_lock() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let workspace_id = id(1);
+    let bot = id(15);
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::write(
+        workspace.join("hive-workspace.yml"),
+        descriptor(&workspace_id),
+    )
+    .unwrap();
+    let state = root.path().join("hive/v2/workspaces").join(&workspace_id);
+    fs::create_dir_all(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = fs::File::create(state.join("lock")).unwrap();
+    lock.set_permissions(fs::Permissions::from_mode(0o600))
+        .unwrap();
+    fs::write(
+        state.join("active-root.json"),
+        serde_json::json!({
+            "version": 2,
+            "workspace_id": workspace_id,
+            "workspace_root": workspace,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let invoke = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_hive"))
+            .env_clear()
+            .env("HOME", root.path())
+            .env("XDG_STATE_HOME", root.path())
+            .args(["conversation", "import", "--workspace"])
+            .arg(&workspace)
+            .args([
+                "--workspace-id",
+                &workspace_id,
+                "--database",
+                "db",
+                "--port",
+                "3307",
+                "--bot",
+                &bot,
+            ])
+            .args(args)
+            .args(["--contract", "2", "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stderr.is_empty());
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    for args in [&[][..], &["--stdin", "--file", "synthetic.md"]] {
+        let error = invoke(args);
+        assert_eq!(error["command"], "conversation import");
+        assert_eq!(error["error"]["code"], "INVALID_ARGUMENT");
+    }
+
+    // Hold a shared lock to distinguish exclusive import from a snapshot read.
+    // SAFETY: The file descriptor belongs to lock and is valid throughout.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
+        0
+    );
+    assert_eq!(invoke(&["--stdin"])["error"]["code"], "LOCK_BUSY");
+    drop(lock);
+
+    for marker in ["pending-request.json", "starting"] {
+        let path = state.join(marker);
+        fs::write(&path, b"synthetic").unwrap();
+        let result = invoke(&["--stdin"]);
+        assert_eq!(result["error"]["code"], "AUTHORITY_UNVERIFIED");
+        assert!(
+            result["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unresolved")
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"synthetic");
+        fs::remove_file(path).unwrap();
+    }
+    assert!(!workspace.join("conversations").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires pinned Dolt at HIVE_DOLT_BIN, local TCP and Linux pidfds"]
+fn conversation_import_uses_the_committed_registry_of_the_owned_runtime() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+
+    let workspace_id = id(1);
+    let active = id(15);
+    let retired = id(16);
+    let fixture = Fixture::initialize(&format!(
+        "{}\nINSERT INTO bots VALUES
+        ('{active}', 'fixture-active', 'Synthetic active Queen', '{}', NULL),
+        ('{retired}', 'fixture-retired', 'Synthetic retired Queen', '{}', '2026-01-01');",
+        empty_seed_sql(CASE_INSENSITIVE),
+        id(2),
+        id(3)
+    ));
+    // The working set disagrees with the committed active Queen.
+    fixture.local(
+        &["sql"],
+        Some("UPDATE bots SET retired_at = '2026-01-01' WHERE slug = 'fixture-active';"),
+    );
+    let workspace = fixture.root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::rename(fixture.root.join(DATABASE), workspace.join("db")).unwrap();
+    fs::write(
+        workspace.join("hive-workspace.yml"),
+        descriptor(&workspace_id),
+    )
+    .unwrap();
+    let state_home = fixture.root.join("state");
+    let state = state_home.join("hive/v2/workspaces").join(&workspace_id);
+    fs::create_dir_all(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        state.join("active-root.json"),
+        serde_json::json!({
+            "version": 2,
+            "workspace_id": workspace_id,
+            "workspace_root": workspace,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let listener = TcpListener::bind((HOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hive"));
+        command
+            .env_clear()
+            .env("HOME", fixture.root.join("home"))
+            .env("XDG_STATE_HOME", &state_home)
+            .current_dir(&fixture.root)
+            .args(["--contract", "2", "--json", "--workspace"])
+            .arg(&workspace);
+        command
+    };
+    let report = |output: Output, ok: bool| {
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.success(), ok, "{report}");
+        assert!(output.stderr.is_empty());
+        report
+    };
+    let started = command()
+        .args(["workspace", "start", "--port", &port, "--dolt-bin"])
+        .arg(&fixture.dolt)
+        .output()
+        .unwrap();
+    let checks = std::panic::catch_unwind(|| {
+        let started = report(started, true);
+        let import = |bot: &str| {
+            let mut command = command();
+            command.args([
+                "conversation",
+                "import",
+                "--workspace-id",
+                &workspace_id,
+                "--database",
+                "db",
+                "--port",
+                &port,
+                "--bot",
+                bot,
+                "--session-ref",
+                "fixture-session",
+            ]);
+            command
+        };
+        assert_eq!(
+            report(import(&retired).arg("--stdin").output().unwrap(), false)["error"]["code"],
+            "NOT_FOUND"
+        );
+        let input = fixture.root.join("fixture.md");
+        fs::write(&input, BODY).unwrap();
+        let mut first = import(&active);
+        first.args(["--file", "fixture.md"]);
+        // SAFETY: umask is async-signal-safe and changes only the child process.
+        unsafe {
+            first.pre_exec(|| {
+                libc::umask(0o200);
+                Ok(())
+            });
+        }
+        let first = report(first.output().unwrap(), true);
+        let mut second = import(&active)
+            .arg("--stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        second
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(BODY.as_bytes())
+            .unwrap();
+        let second = report(second.wait_with_output().unwrap(), true);
+        let first_id = first["data"]["conversation_id"].as_str().unwrap();
+        let second_id = second["data"]["conversation_id"].as_str().unwrap();
+        assert_ne!(first_id, second_id);
+        let storage = workspace.join("conversations");
+        let bots = storage.join("bots");
+        let directory = bots.join(&active);
+        for path in [&storage, &bots, &directory] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                0o700
+            );
+        }
+        for (result, id, source) in [(&first, first_id, "file"), (&second, second_id, "stdin")] {
+            let file = directory.join(format!("{id}.md"));
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o7777,
+                0o600
+            );
+            let stored = fs::read_to_string(file).unwrap();
+            let (header, body) = stored
+                .strip_prefix("---\n")
+                .unwrap()
+                .split_once("\n---\n")
+                .unwrap();
+            let header: Value = serde_saphyr::from_str(header).unwrap();
+            assert_eq!(header["provenance"]["source"], source);
+            assert_eq!(header["provenance"]["session_ref"], "fixture-session");
+            assert_eq!(header["bot_slug"], "fixture-active");
+            assert_eq!(body.as_bytes(), BODY.as_bytes());
+            assert_eq!(
+                result["context"]["db_commit"],
+                started["data"]["committed_identity"]["dolt_commit"]
+            );
+            assert!(!result.to_string().contains(PRIVATE_BODY_MARKER));
+        }
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 2);
+        assert_eq!(fs::read(&input).unwrap(), BODY.as_bytes());
+        assert!(!state.join("pending-request.json").exists());
+    });
+    let stopped = command().args(["workspace", "stop"]).output().unwrap();
+    if !stopped.status.success() && state.join("server.json").exists() {
+        let root = fixture.root.clone();
+        std::mem::forget(fixture);
+        panic!("Cleanup of {} was uncertain: {stopped:?}", root.display());
+    }
+    checks.unwrap_or_else(|error| std::panic::resume_unwind(error));
+    report(stopped, true);
+}
