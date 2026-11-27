@@ -407,6 +407,11 @@ mod filesystem {
             })
         }
 
+        #[cfg(target_os = "linux")]
+        pub(crate) fn handle(&self) -> &File {
+            &self.file
+        }
+
         pub(crate) fn contains(&self, name: &std::ffi::CStr) -> Result<bool, HiveError> {
             let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
             // SAFETY: The directory descriptor, name, and output buffer are valid.
