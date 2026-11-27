@@ -680,6 +680,10 @@ pub(crate) enum IssueCommand {
     Show(IssueShowArgs),
     /// List committed Issue summaries under contract 2.
     List(IssueListArgs),
+    /// List committed executable todo Issues that are ready.
+    Ready(IssueListArgs),
+    /// List committed executable todo Issues with readiness blockers.
+    Blocked(IssueListArgs),
 }
 
 #[derive(Args)]
@@ -754,7 +758,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     );
     let matches = match cli.clone().try_get_matches_from(&args).or_else(|error| {
         if error.kind() == ErrorKind::ValueValidation {
-            retry_issue_list(&cli, &args).ok_or(error)
+            retry_issue_query(&cli, &args).ok_or(error)
         } else {
             Err(error)
         }
@@ -848,15 +852,21 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     }
 }
 
-fn retry_issue_list(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {
+fn retry_issue_query(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {
     // A malformed Project must reach the v2 UUID check after Clap has read
     // the contract and format. Keep the original parser for all other commands.
     let retry = defer_project_check(cli.clone().mut_subcommand("issue", |issue| {
-        issue.mut_subcommand("list", defer_project_check)
+        issue
+            .mut_subcommand("list", defer_project_check)
+            .mut_subcommand("ready", defer_project_check)
+            .mut_subcommand("blocked", defer_project_check)
     }));
     let matches = retry.try_get_matches_from(args).ok()?;
     let (command, leaf) = matched_leaf(cli, &matches)?;
-    (command == "issue list" && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+    (matches!(
+        command.as_str(),
+        "issue list" | "issue ready" | "issue blocked"
+    ) && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }
 
@@ -1097,7 +1107,11 @@ impl Command {
                 Self::Validate(args) => args.validate_dolt_selection(common),
                 Self::Area(command) => command.validate_dolt_selection(common),
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
-                Self::Issue(IssueCommand::List(args)) => args.validate_dolt_selection(common),
+                Self::Issue(
+                    IssueCommand::List(args)
+                    | IssueCommand::Ready(args)
+                    | IssueCommand::Blocked(args),
+                ) => args.validate_dolt_selection(common),
                 Self::Bot(command) => command.validate(common),
                 _ => Ok(()),
             };
