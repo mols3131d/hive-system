@@ -1942,6 +1942,14 @@ fn workspace_status_resolves_offline_without_creating_state() {
             .unwrap()
             .contains("database name")
     );
+    let report = status_report(command(), &database_target(AREA, "fixture_db", "0"), 2);
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Dolt port")
+    );
     let late_options = fixture.hive(
         &fixture.0.join("invocation"),
         &[
@@ -1994,13 +2002,17 @@ fn workspace_status_explicit_root_does_not_require_a_binding_workspace() {
 }
 
 fn invalid_database_target() -> [&'static str; 6] {
+    database_target(STATUS_WORKSPACE_ID, "invalid.name", "3307")
+}
+
+fn database_target<'a>(workspace_id: &'a str, database: &'a str, port: &'a str) -> [&'a str; 6] {
     [
         "--workspace-id",
-        STATUS_WORKSPACE_ID,
+        workspace_id,
         "--database",
-        "invalid.name",
+        database,
         "--port",
-        "3307",
+        port,
     ]
 }
 
@@ -2162,4 +2174,23 @@ fn workspace_status_checks_process_start_and_endpoint_independently() {
     write(&server_path, server.to_string());
     let report = status_report(command(), &[], 7);
     assert_eq!(report["error"]["code"], "AUTHORITY_UNVERIFIED");
+    for (target, syntax_error) in [
+        (
+            database_target("synthetic-private", "fixture_db", "3307"),
+            "lowercase UUID",
+        ),
+        (
+            database_target(STATUS_WORKSPACE_ID, "fixture_db", "0"),
+            "Dolt port",
+        ),
+    ] {
+        let report = status_report(command(), &target, 2);
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(
+            report["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(syntax_error)
+        );
+    }
 }

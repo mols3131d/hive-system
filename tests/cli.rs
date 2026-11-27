@@ -2752,9 +2752,11 @@ fn workspace_status_recovers_output_flags_after_a_duplicate_target() {
     let command = ["workspace", "status"];
     let duplicate = ["--database", "a", "--database", "b"];
     let options = ["--contract", "2", "--json"];
+    let mut original_error = None;
     for args in [
         [&options[..], &command, &duplicate].concat(),
         [&command[..], &duplicate, &options].concat(),
+        [&command[..], &duplicate, &options, &["--", "--database=c"]].concat(),
     ] {
         let output = sandbox.run(&args);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
@@ -2763,6 +2765,10 @@ fn workspace_status_recovers_output_flags_after_a_duplicate_target() {
         assert_eq!(report["schema_version"], 2);
         assert_eq!(report["command"], "workspace status");
         assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(
+            original_error.get_or_insert_with(|| report["error"].clone()),
+            &report["error"]
+        );
     }
 
     let output = sandbox.run(&[
@@ -2773,6 +2779,8 @@ fn workspace_status_recovers_output_flags_after_a_duplicate_target() {
         "b",
         "--contract",
         "2",
+        "--",
+        "--json",
     ]);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());

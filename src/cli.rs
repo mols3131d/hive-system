@@ -1151,7 +1151,14 @@ fn retry_workspace_conflict(
     }
     cli.find_subcommand("workspace")?;
     // Accept repeated target options only to recover contract and output flags.
-    // Keep Clap's value boundaries and use the original parse error.
+    // Status takes no positional values. A standalone -- ends options, while
+    // attached values stay intact for Clap. Keep the original parse error.
+    let end = args
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, arg)| *arg == "--")
+        .map_or(args.len(), |(index, _)| index);
     cli.clone()
         .mut_subcommand("workspace", |workspace| {
             workspace.mut_subcommand("status", |status| {
@@ -1161,7 +1168,7 @@ fn retry_workspace_conflict(
                 })
             })
         })
-        .try_get_matches_from(args)
+        .try_get_matches_from(&args[..end])
         .ok()
 }
 
@@ -2144,7 +2151,7 @@ impl BotCommand {
 }
 
 impl DoltTargetArgs {
-    fn has_any(&self) -> bool {
+    pub(crate) fn has_any(&self) -> bool {
         self.workspace_id.is_some() || self.database.is_some() || self.port.is_some()
     }
 
