@@ -51,11 +51,18 @@ Use `hive --contract 2 --json config show` for the resolved report. It reads mac
 
 Use a new, existing empty directory owned by the invoking user. Bootstrap currently supports Linux 5.11 or later with procfs on an ext-family filesystem or tmpfs. Supply installed Dolt 2.7.6 and Git on absolute `PATH` entries.
 
+Run the read-only preflight against the explicit empty directory before init.
+
 ```sh
 workspace=$(mktemp -d)
+hive --contract 2 --json workspace doctor --target "$workspace"
 hive --contract 2 --json workspace init --target "$workspace"
 hive --contract 2 --json config show --scope workspace --workspace "$workspace"
 ```
+
+Preflight uses init's target and ancestry checks. It reports the filesystem, available blocks and block size, the running Hive version, the observed Git version, and the verified Dolt 2.7.6 version. Git version reporting accepts numeric dotted releases. Dolt's version command runs with a disposable home and working directory under `/tmp` because it initializes global config and event files. The probe removes that directory after use. The target, user config, and XDG directories stay untouched. Preflight defers descriptor, runtime, and committed identity checks. The block count is a point-in-time observation. Init separately checks locking and publication when invoked.
+
+For an initialized workspace, use `hive --contract 2 --json workspace doctor --workspace "$workspace"`. This reports the versions and [workspace status observations](../architecture/dolt-workspace-contract.md#workspace-status). It defers committed identity unless you also supply all of `--workspace-id`, `--database`, and `--port` with the status reader credentials in the environment. The authenticated read verifies committed identity at the selected endpoint. Endpoint ownership, a clean working set, and runtime readiness require separate evidence.
 
 Init builds and verifies the Dolt and Git commits in private sibling staging. It locks the original target directory, installs a private `.hive-init-publication-incomplete` sentinel, and moves the verified payload without replacing existing names. After removing the sentinel, it rechecks the named target and parent, the prepared repository directories, the initial Git HEAD, commit and empty tree, and the staged descriptor. The pinned Dolt engine re-verifies the committed main revision, migration ledger, workspace identity, counter, and schema in the moved database before the payload sync. Init syncs the payload and descriptor before moving the descriptor into place as the final readiness event, then syncs the target directory. The published workspace is inactive, with private `conversations/` storage, and XDG configuration and runtime state stay untouched.
 

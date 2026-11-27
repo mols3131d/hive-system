@@ -736,6 +736,14 @@ pub(crate) enum WorkspaceCommand {
     },
     /// Observe the selected workspace and local runtime evidence.
     Status(DoltTargetArgs),
+    /// Check an empty init target or inspect an explicit workspace without changes.
+    Doctor {
+        /// Existing empty directory to check before initialization.
+        #[arg(long, value_name = "EMPTY_DIR")]
+        target: Option<PathBuf>,
+        #[command(flatten)]
+        endpoint: DoltTargetArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2025,6 +2033,27 @@ impl Command {
                     if target.has_any() && !target.has_all() {
                         return Err(
                             "Database inspection requires --workspace-id, --database, and --port.",
+                        );
+                    }
+                    Ok(())
+                }
+                Self::Workspace(WorkspaceCommand::Doctor { target, endpoint }) => {
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Workspace doctor accepts only target, workspace, database, and output selection.",
+                        );
+                    }
+                    if target.is_some() == common.workspace.is_some() {
+                        return Err(
+                            "Workspace doctor requires exactly one of --target or --workspace.",
+                        );
+                    }
+                    if endpoint.has_any() && (target.is_some() || !endpoint.has_all()) {
+                        return Err(
+                            "Database inspection requires --workspace, --workspace-id, --database, and --port.",
                         );
                     }
                     Ok(())

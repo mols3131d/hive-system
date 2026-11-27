@@ -25,13 +25,45 @@ pub(super) struct Installed<'a> {
 
 impl<'a> Installed<'a> {
     pub(super) fn check(scratch: &'a File) -> Result<Self, HiveError> {
-        let installed = Self {
+        let installed = Self::locate(scratch)?;
+        installed.check_dolt_version()?;
+        if !installed
+            .git(&installed.home, &["--version"])?
+            .starts_with("git version ")
+        {
+            return Err(unrecognized_git_version());
+        }
+        Ok(installed)
+    }
+
+    pub(super) fn locate(scratch: &'a File) -> Result<Self, HiveError> {
+        Ok(Self {
             dolt: installed_path("dolt")?,
             git: installed_path("git")?,
             scratch,
             home: super::fd_path(scratch),
-        };
-        let stdout = installed.dolt(&installed.home, &["version"], None)?;
+        })
+    }
+
+    pub(super) fn doctor_versions(&self) -> Result<(String, &'static str), HiveError> {
+        let dolt = self.check_dolt_version()?;
+        let stdout = self.git(&self.home, &["--version"])?;
+        let git = stdout
+            .trim()
+            .strip_prefix("git version ")
+            .filter(|version| {
+                version.len() <= 64
+                    && version.split('.').count() >= 3
+                    && version.split('.').all(|part| {
+                        !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+            .ok_or_else(unrecognized_git_version)?;
+        Ok((git.to_owned(), dolt))
+    }
+
+    fn check_dolt_version(&self) -> Result<&'static str, HiveError> {
+        let stdout = self.dolt(&self.home, &["version"], None)?;
         let version = stdout.trim().strip_prefix("dolt version ").filter(|value| {
             !value.is_empty()
                 && value.len() <= 24
@@ -49,16 +81,7 @@ impl<'a> Installed<'a> {
                 format!("Workspace initialization requires Dolt {DOLT_VERSION}. {detected}"),
             ));
         }
-        if !installed
-            .git(&installed.home, &["--version"])?
-            .starts_with("git version ")
-        {
-            return Err(HiveError::new(
-                ErrorCode::RuntimeUnavailable,
-                "The installed Git executable returned an unrecognized version.",
-            ));
-        }
-        Ok(installed)
+        Ok(DOLT_VERSION)
     }
 
     pub(super) fn initialize_db(
@@ -309,6 +332,13 @@ impl<'a> Installed<'a> {
         }
         command
     }
+}
+
+fn unrecognized_git_version() -> HiveError {
+    HiveError::new(
+        ErrorCode::RuntimeUnavailable,
+        "The installed Git executable returned an unrecognized version.",
+    )
 }
 
 // Dolt 2.7.6 explicitly sets broad permissions on some internal files.

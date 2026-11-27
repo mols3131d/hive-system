@@ -89,6 +89,119 @@ fn response(output: Output, status: i32) -> Value {
 }
 
 #[test]
+fn doctor_checks_an_explicit_empty_target_and_leaves_it_empty() {
+    let fixture = Fixture::new();
+    let target = fixture.dir("empty");
+    let xdg = fixture.0.join("state");
+    fixture.fake_dolt(
+        "[ \"$#\" = 1 ] && [ \"$1\" = version ] && [ \"$DOLT_ROOT_PATH\" = \"$HOME\" ] && \
+         [ \"$DOLT_DISABLE_EVENT_FLUSH\" = true ] && echo 'dolt version 2.7.6'",
+    );
+    fixture.fake_git_version();
+    let doctor = || {
+        let mut command = fixture.hive();
+        command
+            .args([
+                "--contract",
+                "2",
+                "--json",
+                "workspace",
+                "doctor",
+                "--target",
+            ])
+            .arg(&target)
+            .env("XDG_STATE_HOME", &xdg);
+        command
+    };
+    let result = response(doctor().output().unwrap(), 0);
+    assert_eq!(result["command"], "workspace doctor");
+    let data = &result["data"];
+    assert_eq!(data["versions"]["hive"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(data["versions"]["git"], "2.56.1");
+    assert_eq!(data["versions"]["dolt"], "2.7.6");
+    assert!(data["available_blocks"].as_u64().unwrap() > 0);
+    assert_eq!(
+        data["deferred"]["committed_identity"],
+        "workspace_uninitialized"
+    );
+    assert!(fs::read_dir(&target).unwrap().next().is_none());
+    assert!(fixture.stages().is_empty());
+    assert!(!xdg.exists());
+
+    fs::write(
+        fixture.0.join("bin/dolt"),
+        "#!/bin/sh\necho 'dolt version 2.7.60'\n",
+    )
+    .unwrap();
+    let result = response(doctor().output().unwrap(), 4);
+    assert_eq!(result["error"]["code"], "SCHEMA_INCOMPATIBLE");
+    assert!(fs::read_dir(&target).unwrap().next().is_none());
+
+    fs::write(target.join(".keep"), "untouched").unwrap();
+    let result = response(doctor().output().unwrap(), 5);
+    assert_eq!(result["error"]["code"], "ALREADY_EXISTS");
+    assert_eq!(
+        fs::read_to_string(target.join(".keep")).unwrap(),
+        "untouched"
+    );
+}
+
+#[test]
+fn doctor_uses_status_for_initialized_inspection_and_requires_explicit_selection() {
+    let fixture = Fixture::new();
+    let target = fixture.dir("initialized");
+    let state = fixture.0.join("state");
+    let descriptor = "version: 2\nworkspace_id: 01900000-0000-7000-8000-000000000001\nschema_version: 1\npolicy_revision: c66b3c50150e18426485d134de92c6b311dac125\n";
+    fs::write(target.join("hive-workspace.yml"), descriptor).unwrap();
+    fixture.fake_dolt("[ \"$1\" = version ] && echo 'dolt version 2.7.6'");
+    fixture.fake_git_version();
+    let doctor = || {
+        let mut command = fixture.hive();
+        command
+            .args(["--contract", "2", "--json", "workspace", "doctor"])
+            .env("XDG_STATE_HOME", &state);
+        command
+    };
+    let result = response(doctor().output().unwrap(), 2);
+    assert_eq!(result["error"]["code"], "INVALID_ARGUMENT");
+    let result = response(
+        doctor().arg("--workspace").arg(&target).output().unwrap(),
+        0,
+    );
+    let data = &result["data"];
+    assert_eq!(data["initialized"], true);
+    assert_eq!(data["sources"]["workspace"], "cli");
+    assert_eq!(data["workspace_id"], "01900000-0000-7000-8000-000000000001");
+    assert_eq!(data["runtime"]["endpoint_ownership"], "unverified");
+    assert_eq!(
+        data["deferred"]["committed_identity"],
+        "authenticated_endpoint_not_supplied"
+    );
+    let wrong_identity = response(
+        doctor()
+            .arg("--workspace")
+            .arg(&target)
+            .args([
+                "--workspace-id",
+                "01900000-0000-7000-8000-000000000002",
+                "--database",
+                "fixture_db",
+                "--port",
+                "3307",
+            ])
+            .output()
+            .unwrap(),
+        7,
+    );
+    assert_eq!(wrong_identity["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert!(!state.exists());
+    assert_eq!(
+        fs::read_to_string(target.join("hive-workspace.yml")).unwrap(),
+        descriptor
+    );
+}
+
+#[test]
 fn refuses_implicit_unsafe_and_existing_destinations_before_tools() {
     let fixture = Fixture::new();
     let empty = fixture.dir("empty");

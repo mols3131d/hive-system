@@ -6,6 +6,7 @@ mod config_v2;
 mod dolt;
 mod error;
 mod output;
+mod workspace_doctor;
 mod workspace_init;
 mod workspace_status;
 
@@ -94,6 +95,14 @@ fn dispatch(invocation: Invocation) -> ExitCode {
 fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let name = &invocation.command_name;
     let format = invocation.common.format.unwrap_or_default();
+    if let Command::Workspace(WorkspaceCommand::Doctor { target, endpoint }) = &invocation.command {
+        let (format, result) =
+            workspace_doctor::observe(&invocation.common, target.as_deref(), endpoint);
+        return match result {
+            Ok(data) => output::success(Contract::V2, format, name, None, &data),
+            Err(error) => output::failure(Contract::V2, format, Some(name), None, error),
+        };
+    }
     if let Command::Workspace(WorkspaceCommand::Init { target }) = &invocation.command {
         return match workspace_init::run(target) {
             Ok(data) => output::success(Contract::V2, format, name, None, &data),
