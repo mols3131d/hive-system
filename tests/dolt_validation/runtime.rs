@@ -557,6 +557,10 @@ fn workspace_runtime_cli_stops_legacy_launch_and_preserves_its_config() {
     let workspace_id = id(1);
     let state = state_home.join("hive/v2/workspaces").join(&workspace_id);
     register_fixture(&fixture, &workspace, &state);
+    // The prior Hive launcher created this stable lock before starting Dolt.
+    let lock = state.join("lock");
+    fs::write(&lock, b"").unwrap();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
     let db = workspace.join("db");
     let artifact = db.join("config.yaml");
     let run = state.join(format!("run-{nonce}"));
