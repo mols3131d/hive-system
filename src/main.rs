@@ -10,8 +10,8 @@ mod output;
 use std::process::ExitCode;
 
 use cli::{
-    AreaCommand, BotCommand, Command, ConfigCommand, Contract, Invocation, IssueCommand,
-    ParseFailure,
+    AreaCommand, BotCommand, Command, ConfigCommand, Contract, DirectiveCommand, Invocation,
+    IssueCommand, ParseFailure,
 };
 use error::{ErrorCode, HiveError};
 
@@ -116,6 +116,21 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
             ..
         }) => dolt::bot::list(&target, status.as_deref(), page.limit, cursor.as_deref()),
         Command::Bot(BotCommand::Show { target, bot_id }) => dolt::bot::show(&target, &bot_id),
+        Command::Directive(DirectiveCommand::List {
+            selection,
+            status,
+            page,
+            cursor,
+        }) => dolt::directive::list(
+            &selection,
+            invocation.common.project.as_ref(),
+            status,
+            page.limit,
+            cursor.as_deref(),
+        ),
+        Command::Directive(DirectiveCommand::Show { selection, id }) => {
+            dolt::directive::show(&selection, invocation.common.project.as_ref(), &id)
+        }
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
         Command::Issue(IssueCommand::List(args)) => dolt::issue_list(
             &args,

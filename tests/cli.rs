@@ -1437,3 +1437,84 @@ fn dolt_area_option_recovery_preserves_literals_and_v1_errors() {
     }
     sandbox.assert_empty();
 }
+
+#[test]
+fn directive_preserves_v1_help_and_reports_late_v2_known_option_errors() {
+    let sandbox = Sandbox::new();
+    for operation in ["list", "show"] {
+        let help = sandbox.run(&["directive", operation, "--help"]);
+        assert!(help.status.success());
+        let help = String::from_utf8(help.stdout).unwrap();
+        for option in [
+            "--workspace-scope",
+            "--area",
+            "--workspace-id",
+            "--database",
+            "--port",
+            "--cursor",
+        ] {
+            assert!(!help.contains(option), "{help}");
+        }
+    }
+    for args in [
+        vec!["directive", "list", "--status", "ACTIVE"],
+        vec!["directive", "list", "--project", "BAD_SCOPE"],
+        vec!["directive", "list", "--limit", "-1"],
+        vec![
+            "directive",
+            "list",
+            "--workspace-scope",
+            "--area",
+            "malformed",
+        ],
+        vec![
+            "directive",
+            "list",
+            "--database",
+            "first",
+            "--database",
+            "second",
+        ],
+        vec!["directive", "list", "--limit"],
+        vec!["directive", "list", "--workspace-scope=false"],
+        vec![
+            "directive",
+            "list",
+            "--workspace-scope",
+            "--workspace-scope",
+        ],
+        vec!["directive", "list", "--authority=false"],
+        vec!["directive", "list", "--at", "bad-commit"],
+        vec!["directive", "show", "BAD_ID"],
+        vec!["directive", "show", "--workspace-scope"],
+    ] {
+        let mut command = args.clone();
+        command.extend(["--contract", "2", "--json"]);
+        let output = sandbox.run(&command);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["command"], format!("directive {}", args[1]));
+        assert_eq!(value["error"]["code"], "INVALID_ARGUMENT");
+    }
+
+    for args in [
+        &["--contract", "2", "directive", "show", "--", "--json"][..],
+        &["--contract", "2", "directive", "list", "--status=--json"],
+        &["--contract", "2", "directive", "list", "--limit=--json"],
+        &["--contract", "2", "directive", "list", "--project=--json"],
+        &[
+            "--contract",
+            "2",
+            "directive",
+            "list",
+            "--workspace-scope=--json",
+        ],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+    sandbox.assert_empty();
+}
