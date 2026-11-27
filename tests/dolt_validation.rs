@@ -12,6 +12,8 @@ mod issue_show;
 mod issue_updates;
 #[path = "dolt_validation/migration.rs"]
 mod migration;
+#[path = "dolt_validation/project.rs"]
+mod project;
 #[path = "dolt_validation/receipts.rs"]
 mod receipts;
 #[path = "dolt_validation/relations.rs"]

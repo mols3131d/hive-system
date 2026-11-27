@@ -917,3 +917,74 @@ fn malformed_dolt_list_project_preserves_late_v2_and_json_options() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8(output.stderr).unwrap().contains("UUIDv7"));
 }
+
+#[test]
+fn project_reads_parse_late_v2_flags_and_preserve_literal_values() {
+    let sandbox = Sandbox::new();
+    let target = [
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+    ];
+    for (index, (action, options)) in [
+        ("list", &["--status", "ACTIVE"][..]),
+        ("list", &["--status"]),
+        ("list", &["--status=--json"]),
+        ("list", &["--limit", "-1"]),
+        ("list", &["--limit", "101"]),
+        ("show", &["project/fixture"]),
+        ("show", &["-1"]),
+        ("show", &[]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut args = vec!["project", action];
+        args.extend(target);
+        args.extend(options);
+        args.extend([
+            "--contract=2",
+            if index % 2 == 0 {
+                "--json"
+            } else {
+                "--format=json"
+            },
+        ]);
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], format!("project {action}"), "{args:?}");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT", "{args:?}");
+        assert!(report.get("context").is_none(), "{args:?}");
+    }
+    let literal_contract = sandbox.run(&["--json", "project", "list", "--after=--contract=2"]);
+    assert_json_failure(
+        &literal_contract,
+        &["--json", "project", "list", "--after=--contract=2"],
+        "project list",
+        "NOT_IMPLEMENTED",
+        7,
+    );
+
+    for options in [&["list", "--status=--json"][..], &["show", "--", "--json"]] {
+        let mut args = vec!["--contract", "2"];
+        args.push("project");
+        args.push(options[0]);
+        args.extend(target);
+        args.extend_from_slice(&options[1..]);
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+    let output = sandbox.run(&["project", "list", "--help", "--contract", "2"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--status"));
+    assert!(output.stderr.is_empty());
+    sandbox.assert_empty();
+}
