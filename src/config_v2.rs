@@ -12,7 +12,7 @@ mod unix {
     use crate::dolt::{STORAGE_SCHEMA_VERSION, is_uuid, is_uuid_v7};
     use crate::error::{ErrorCode, HiveError};
 
-    use super::{MARKER, has_init_stage_component};
+    use super::{INIT_PENDING, MARKER, has_init_stage_component};
 
     mod bindings;
 
@@ -361,9 +361,17 @@ mod unix {
         Ok(())
     }
 
+    fn refuse_incomplete_publication(root: &ScopedDirectory) -> Result<(), HiveError> {
+        if root.contains(INIT_PENDING)? {
+            return Err(invalid("Workspace initialization is incomplete."));
+        }
+        Ok(())
+    }
+
     fn read_candidate(path: &Path) -> Result<Candidate, HiveError> {
         refuse_init_stage(path)?;
         let root = ScopedDirectory::open_absolute(path)?;
+        refuse_incomplete_publication(&root)?;
         if root.contains(c"hive.yml")? {
             return Err(HiveError::new(
                 ErrorCode::SchemaIncompatible,
@@ -385,6 +393,9 @@ mod unix {
                 )
             })?;
         let descriptor = parse_descriptor(&bytes)?;
+        // A reader may open the directory before init installs the sentinel,
+        // then read the descriptor after it appears. Check again on the same FD.
+        refuse_incomplete_publication(&root)?;
         Ok(Candidate { root, descriptor })
     }
 
@@ -475,6 +486,9 @@ pub(crate) fn show(
 
 #[cfg(unix)]
 pub(crate) const MARKER: &str = "hive-workspace.yml";
+
+#[cfg(unix)]
+pub(crate) const INIT_PENDING: &std::ffi::CStr = c".hive-init-publication-incomplete";
 
 #[cfg(unix)]
 pub(crate) const INIT_STAGE_PREFIX: &str = ".hive-init-incomplete-";

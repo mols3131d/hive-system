@@ -49,7 +49,7 @@ A v2 workspace root (`<workspace-root>/`) separates the nonsecret descriptor, au
 ```
 
 - `db/` and `conversations/` must never be tracked in ordinary Git worktrees or placed inside `assets/`.
-- Credentials, local endpoints, PIDs, locks, recovery markers, and machine-local bindings must never be stored inside `<workspace-root>/` or any shared/tracked file.
+- Credentials, local endpoints, PIDs, runtime locks, runtime recovery markers, and machine-local bindings must never be stored inside `<workspace-root>/` or any shared/tracked file.
 
 ## Shared YAML and filesystem validation
 
@@ -80,6 +80,7 @@ policy_revision: c66b3c50150e18426485d134de92c6b311dac125
 | `policy_revision` | string | Required; 40-character lowercase hexadecimal `hive-system` commit SHA pinning the reviewed v2 policy revision. |
 
 - Reject `hive-workspace.yml` if it contains credentials, machine-local paths, endpoints, bindings, or unknown fields.
+- Workspace initialization creates a private, nonsecret `.hive-init-publication-incomplete` sentinel before publishing workspace entries and removes it after the final checks. V2 workspace readers refuse any entry with this name in the root, including a symlink, even when the descriptor is valid. Existing roots with a valid descriptor require no publication sentinel.
 - A v2 workspace has `hive-workspace.yml` and no v1 `hive.yml`. V2 selection returns `SCHEMA_INCOMPATIBLE` for a v1-only root or a root with both markers. A standalone v2-only root lacks the reviewed v1 workspace policy. V1 keeps its existing Git and policy checks, including its legacy rules for `hive.yml`.
 - A mismatch between `hive-workspace.yml` `workspace_id` and `workspace_meta.workspace_id` in `db/` returns `AUTHORITY_UNVERIFIED` and leaves all targets untouched.
 

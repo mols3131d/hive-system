@@ -218,6 +218,85 @@ fn config_readers_refuse_incomplete_staging_even_with_a_valid_descriptor() {
 }
 
 #[test]
+fn config_and_conversation_readers_refuse_the_publication_sentinel() {
+    let fixture = Fixture::new();
+    let target = fixture.dir("workspace");
+    let uuid = "01900000-0000-7000-8000-000000000001";
+    fs::write(
+        target.join("hive-workspace.yml"),
+        format!("version: 2\nworkspace_id: {uuid}\nschema_version: 1\npolicy_revision: c66b3c50150e18426485d134de92c6b311dac125\n"),
+    )
+    .unwrap();
+    let sentinel = target.join(".hive-init-publication-incomplete");
+    symlink(fixture.0.join("missing"), &sentinel).unwrap();
+
+    for scope in ["workspace", "resolved"] {
+        let error = response(
+            fixture
+                .hive()
+                .args([
+                    "--contract",
+                    "2",
+                    "--json",
+                    "config",
+                    "show",
+                    "--scope",
+                    scope,
+                    "--workspace",
+                ])
+                .arg(&target)
+                .output()
+                .unwrap(),
+            2,
+        );
+        assert_eq!(error["error"]["code"], "INVALID_CONFIG");
+        let message = if scope == "resolved" {
+            "CLI workspace: Workspace initialization is incomplete."
+        } else {
+            "Workspace initialization is incomplete."
+        };
+        assert_eq!(error["error"]["message"], message);
+    }
+    let error = response(
+        fixture
+            .hive()
+            .env_clear()
+            .args([
+                "--contract",
+                "2",
+                "--json",
+                "conversation",
+                "show",
+                "--workspace",
+            ])
+            .arg(&target)
+            .args([
+                "--workspace-id",
+                uuid,
+                "--database",
+                "fixture",
+                "--port",
+                "1",
+                "--bot",
+                uuid,
+                "--id",
+                uuid,
+            ])
+            .output()
+            .unwrap(),
+        2,
+    );
+    assert_eq!(error["error"]["code"], "INVALID_CONFIG");
+    assert_eq!(
+        error["error"]["message"],
+        "Workspace initialization is incomplete."
+    );
+    assert!(error["context"].is_null());
+    assert!(error["data"].is_null());
+    assert_eq!(fs::read_link(sentinel).unwrap(), fixture.0.join("missing"));
+}
+
+#[test]
 fn refuses_unsafe_dolt_markers_without_following_them() {
     let fixture = Fixture::new();
     let elsewhere = fixture.dir("elsewhere");

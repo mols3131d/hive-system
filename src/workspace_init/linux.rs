@@ -222,6 +222,10 @@ fn publish(
             Ok((name, directory))
         })
         .collect::<Result<Vec<_>, HiveError>>()?;
+    let pending_name = config_v2::INIT_PENDING
+        .to_str()
+        .expect("ASCII publication sentinel name");
+    let pending = create_publication_sentinel(target, pending_name)?;
     for (name, _) in &entries {
         move_entry(payload, target, name)?;
     }
@@ -232,20 +236,33 @@ fn publish(
         Ok(())
     };
 
-    require_entries(target, &PAYLOAD_ENTRIES)?;
+    let [db, assets, conversations] = PAYLOAD_ENTRIES;
+    require_entries(target, &[db, assets, conversations, pending_name])?;
     verify_payload()?;
     check_path()?;
+    verify_entry(target, pending_name, &pending)?;
     move_entry(payload, target, config_v2::MARKER)?;
-    let published = (|| {
-        let [db, assets, conversations] = PAYLOAD_ENTRIES;
-        require_entries(target, &[db, assets, conversations, config_v2::MARKER])?;
+    let verified = (|| {
+        check_path()?;
+        require_entries(
+            target,
+            &[db, assets, conversations, config_v2::MARKER, pending_name],
+        )?;
+        check_path()?;
         verify_payload()?;
         verify_entry(target, config_v2::MARKER, descriptor)?;
-        check_path()
+        verify_entry(target, pending_name, &pending)?;
+        // SAFETY: The target FD is pinned and the sentinel name is a single component.
+        if unsafe { libc::unlinkat(target.as_raw_fd(), config_v2::INIT_PENDING.as_ptr(), 0) } != 0 {
+            return Err(io_error(
+                "Could not clear the incomplete workspace publication sentinel.",
+            ));
+        }
+        Ok(())
     })();
-    if let Err(error) = published {
-        // Revoke only the known descriptor inode. The original directory may
-        // have moved, and the path or descriptor name may now refer elsewhere.
+    if let Err(error) = verified {
+        // Preserve the sentinel and invalidate only our pinned descriptor.
+        // This also fails closed if someone removed the sentinel itself.
         descriptor.set_len(0).map_err(|_| {
             HiveError::new(
                 ErrorCode::UnknownWriteOutcome,
@@ -255,6 +272,27 @@ fn publish(
         return Err(error);
     }
     Ok(())
+}
+
+fn create_publication_sentinel(target: &File, name: &str) -> Result<File, HiveError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(fd_path(target).join(name))
+        .map_err(|error| {
+            HiveError::new(
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    ErrorCode::ConcurrentChange
+                } else {
+                    ErrorCode::IoError
+                },
+                format!(
+                    "Could not create the incomplete workspace publication sentinel ({error})."
+                ),
+            )
+        })
 }
 
 fn verify_entry(target: &File, name: &str, expected: &File) -> Result<(), HiveError> {
@@ -531,6 +569,17 @@ fn io_error(message: &str) -> HiveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const FIXTURE_DESCRIPTOR: &str = concat!(
+        "version: 2\n",
+        "workspace_id: 01900000-0000-7000-8000-000000000001\n",
+        "schema_version: 1\n",
+        "policy_revision: c66b3c50150e18426485d134de92c6b311dac125\n",
+    );
 
     struct Publication {
         root: PathBuf,
@@ -552,7 +601,7 @@ mod tests {
             for name in PAYLOAD_ENTRIES {
                 private_dir(&payload.join(name)).unwrap();
             }
-            fs::write(payload.join(config_v2::MARKER), b"verified descriptor").unwrap();
+            fs::write(payload.join(config_v2::MARKER), FIXTURE_DESCRIPTOR).unwrap();
             Self {
                 root,
                 parent,
@@ -561,22 +610,30 @@ mod tests {
             }
         }
 
-        fn publish_with(&self, mut after_check: impl FnMut(usize)) -> Result<(), HiveError> {
-            let (parent, target) = inspect(&self.target)?;
-            lock_target(&target)?;
-            let payload = open_directory(&self.payload)?;
-            let descriptor = OpenOptions::new()
-                .write(true)
-                .open(self.payload.join(config_v2::MARKER))
-                .unwrap();
-            let mut checks = 0;
-            publish(&payload, &target, &descriptor, || {
-                check_target_path(&self.target, &parent, &target)?;
-                checks += 1;
-                after_check(checks);
-                Ok(())
-            })
+        fn publish_with(&self, after_check: impl FnMut(usize)) -> Result<(), HiveError> {
+            publish_fixture(&self.target, &self.payload, after_check)
         }
+    }
+
+    fn publish_fixture(
+        path: &Path,
+        source: &Path,
+        mut after_check: impl FnMut(usize),
+    ) -> Result<(), HiveError> {
+        let (parent, target) = inspect(path)?;
+        lock_target(&target)?;
+        let payload = open_directory(source)?;
+        let descriptor = OpenOptions::new()
+            .write(true)
+            .open(source.join(config_v2::MARKER))
+            .unwrap();
+        let mut checks = 0;
+        publish(&payload, &target, &descriptor, || {
+            check_target_path(path, &parent, &target)?;
+            checks += 1;
+            after_check(checks);
+            Ok(())
+        })
     }
 
     impl Drop for Publication {
@@ -627,7 +684,7 @@ mod tests {
         assert!(!moved.join("target").join(config_v2::MARKER).exists());
         assert_eq!(
             fs::read(fixture.payload.join(config_v2::MARKER)).unwrap(),
-            b"verified descriptor"
+            FIXTURE_DESCRIPTOR.as_bytes()
         );
     }
 
@@ -669,8 +726,145 @@ mod tests {
         );
         assert_eq!(
             fs::read(fixture.payload.join(config_v2::MARKER)).unwrap(),
-            b"verified descriptor"
+            FIXTURE_DESCRIPTOR.as_bytes()
         );
+    }
+
+    #[test]
+    fn publication_sentinel_creation_never_follows_or_replaces_a_symlink() {
+        let fixture = Publication::new();
+        let sentinel_name = config_v2::INIT_PENDING.to_str().unwrap();
+        let sentinel = fixture.target.join(sentinel_name);
+        let other = fixture.root.join("keep");
+        fs::write(&other, b"keep").unwrap();
+        symlink(&other, &sentinel).unwrap();
+        let target = open_directory(&fixture.target).unwrap();
+
+        let error = create_publication_sentinel(&target, sentinel_name).unwrap_err();
+        assert!(matches!(error.code, ErrorCode::ConcurrentChange));
+        assert_eq!(fs::read_link(&sentinel).unwrap(), other);
+        assert_eq!(fs::read(other).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn readers_refuse_paused_and_killed_publications() {
+        for mode in ["complete", "moved", "replaced", "killed"] {
+            let fixture = Publication::new();
+            let ready = fixture.root.join("ready");
+            let mut writer = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "workspace_init::linux::tests::publication_witness_child",
+                    "--ignored",
+                ])
+                .env_clear()
+                .env("HIVE_TEST_PUBLICATION_ROOT", &fixture.root)
+                .env("HIVE_TEST_PUBLICATION_MODE", mode)
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            if !wait_for(&ready) {
+                let _ = writer.kill();
+                let output = writer.wait_with_output().unwrap();
+                panic!("Writer never reached its final path check: {output:?}");
+            }
+            let moved = fixture.parent.join("moved");
+            let observed = if mode == "moved" {
+                fs::rename(&fixture.target, &moved).unwrap();
+                &moved
+            } else {
+                &fixture.target
+            };
+            assert_eq!(
+                fs::read(observed.join(config_v2::MARKER)).unwrap(),
+                FIXTURE_DESCRIPTOR.as_bytes()
+            );
+            assert_incomplete(observed);
+
+            if matches!(mode, "replaced" | "killed") {
+                fs::rename(observed.join("db"), fixture.root.join("original-db")).unwrap();
+                fs::create_dir(observed.join("db")).unwrap();
+                fs::write(observed.join("db/keep"), b"replacement").unwrap();
+            }
+            if mode == "killed" {
+                writer.kill().unwrap();
+                assert!(!writer.wait().unwrap().success());
+                assert_eq!(
+                    fs::read(observed.join(config_v2::MARKER)).unwrap(),
+                    FIXTURE_DESCRIPTOR.as_bytes()
+                );
+                assert_eq!(fs::read(observed.join("db/keep")).unwrap(), b"replacement");
+            } else {
+                fs::write(fixture.root.join("release"), b"go").unwrap();
+                let output = writer.wait_with_output().unwrap();
+                assert!(output.status.success(), "{output:?}");
+            }
+            if mode == "complete" {
+                let candidate = config_v2::read_explicit(observed).unwrap();
+                assert_eq!(
+                    candidate.workspace_id(),
+                    "01900000-0000-7000-8000-000000000001"
+                );
+            } else {
+                assert_incomplete(observed);
+            }
+            if matches!(mode, "replaced" | "killed") {
+                assert_eq!(fs::read(observed.join("db/keep")).unwrap(), b"replacement");
+            }
+        }
+    }
+
+    fn assert_incomplete(path: &Path) {
+        let error = config_v2::read_explicit(path)
+            .err()
+            .expect("workspace must be hidden");
+        assert!(matches!(error.code, ErrorCode::InvalidConfig));
+        assert_eq!(error.to_string(), "Workspace initialization is incomplete.");
+    }
+
+    fn wait_for(path: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    #[ignore = "subprocess witness invoked by the publication test"]
+    fn publication_witness_child() {
+        let Some(root) = std::env::var_os("HIVE_TEST_PUBLICATION_ROOT").map(PathBuf::from) else {
+            return;
+        };
+        let result = publish_fixture(
+            &root.join("parent/target"),
+            &root.join("payload"),
+            |check| {
+                if check == 3 {
+                    fs::write(root.join("ready"), b"descriptor installed").unwrap();
+                    assert!(
+                        wait_for(&root.join("release")),
+                        "publication witness timed out"
+                    );
+                }
+            },
+        );
+        if matches!(
+            std::env::var("HIVE_TEST_PUBLICATION_MODE")
+                .unwrap()
+                .as_str(),
+            "moved" | "replaced"
+        ) {
+            assert!(matches!(
+                result.unwrap_err().code,
+                ErrorCode::ConcurrentChange
+            ));
+        } else {
+            result.unwrap();
+        }
     }
 
     #[test]
