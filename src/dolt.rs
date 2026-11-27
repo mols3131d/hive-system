@@ -25,6 +25,8 @@ mod project;
 mod receipt_history;
 mod records;
 pub(crate) mod resource;
+#[cfg(unix)]
+mod scope;
 
 use std::ffi::OsStr;
 use std::num::NonZeroU16;
@@ -45,6 +47,8 @@ use crate::error::{ErrorCode, HiveError};
 pub(crate) use issue::show as issue_show;
 pub(crate) use issue_list::{IssueView, list as issue_list};
 pub(crate) use project::read as project_read;
+#[cfg(unix)]
+pub(crate) use scope::{ScopeRef, verify_scope};
 
 pub(crate) const DOLT_VERSION: &str = "2.7.6";
 pub(crate) const STORAGE_SCHEMA_VERSION: u32 = 1;

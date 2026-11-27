@@ -1372,6 +1372,79 @@ const AREA: &str = "0195f1b2-4000-7000-8000-000000000001";
 const PROJECT_V2: &str = "0195f1b2-4000-7000-8000-000000000020";
 const OVERRIDE: &str = "0195f1b2-4000-7000-8000-000000000021";
 
+#[test]
+fn v2_resolved_verification_target_is_all_or_nothing_and_scope_specific() {
+    let fixture = Sandbox::new();
+    let invocation = fixture.0.join("invocation");
+    for options in [
+        vec!["--workspace-id", RESOURCE],
+        vec!["--database", "fixture_db", "--port", "1"],
+        vec!["--database", "fixture_db", "--port"],
+        vec![
+            "--scope",
+            "workspace",
+            "--workspace-id",
+            RESOURCE,
+            "--database",
+            "fixture_db",
+            "--port",
+            "1",
+        ],
+        vec![
+            "--scope",
+            "user",
+            "--workspace-id",
+            RESOURCE,
+            "--database",
+            "fixture_db",
+            "--port",
+            "1",
+        ],
+    ] {
+        let output = fixture
+            .hive(&invocation, &[V2_RESOLVED, &options].concat())
+            .output()
+            .unwrap();
+        v2_error(output, 2, "INVALID_ARGUMENT");
+    }
+}
+
+#[test]
+fn v2_resolved_verification_compares_descriptor_before_requesting_credentials() {
+    let fixture = Sandbox::new();
+    let invocation = fixture.0.join("invocation");
+    let workspace = fixture.0.join("workspace");
+    write(&workspace.join("hive-workspace.yml"), V2_DESCRIPTOR);
+    let run = |workspace_id| {
+        let mut args = V2_RESOLVED.to_vec();
+        args.extend([
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--workspace-id",
+            workspace_id,
+            "--database",
+            "fixture_db",
+            "--port",
+            "1",
+        ]);
+        fixture
+            .hive(&invocation, &args)
+            .env_remove("HIVE_DOLT_USER")
+            .env_remove("HIVE_DOLT_PASSWORD")
+            .output()
+            .unwrap()
+    };
+    v2_error(run(RESOURCE), 7, "AUTHORITY_UNVERIFIED");
+    let matched = v2_json(run("0195f1b2-3c4d-7e8f-9a0b-1c2d3e4f5a6b"), 2);
+    assert_eq!(matched["error"]["code"], "INVALID_ARGUMENT");
+    assert_eq!(matched["error"]["input"]["kind"], "dolt_target");
+    assert_eq!(matched["error"]["input"]["source"], "cli");
+    assert_eq!(
+        matched["error"]["message"],
+        "Set HIVE_DOLT_USER for the selected Dolt reader."
+    );
+}
+
 fn v2_binding(path: &str, workspace: &str) -> String {
     format!("  - path: {path}\n    workspace: {workspace}\n    resource_id: {RESOURCE}\n")
 }

@@ -47,6 +47,8 @@ An explicit workspace takes precedence. Without one, the CLI uses the v2 user co
 
 Use `hive --contract 2 --json config show` for the resolved report. It reads machine-local `bindings.yml` and selects the longest registered directory that contains the invocation directory. Use `--resource PATH` after `show` to require an exact bound directory. An explicit workspace takes precedence over the binding, and explicit `--area UUID` and `--project UUID` override the applicable binding defaults. Both IDs must be canonical lowercase UUIDv7 values. The report includes the contributing paths and marks Dolt scope membership, committed identity, and runtime as unverified.
 
+Supply `--workspace-id UUID --database NAME --port PORT` together on the resolved report to verify the selected scope at one committed Dolt revision. The reader uses `HIVE_DOLT_USER` and `HIVE_DOLT_PASSWORD` on loopback. The report adds the verified commit as `data.dolt_commit`. Hive checks the selected Resource and its direct link to the selected Area, and checks that the selected Project exists. If the Resource has one linked Area and no Area was selected, Hive infers it. Multiple links without an Area selection return `AMBIGUOUS_SCOPE` with up to 16 candidate Area IDs and slugs. Treat this report as evidence of committed scope membership. Runtime ownership requires process and store verification.
+
 ## Dolt workspace initialization
 
 Use a new, existing empty directory owned by the invoking user. Bootstrap currently supports Linux 5.11 or later with procfs on an ext-family filesystem or tmpfs. Supply installed Dolt 2.7.6 and Git on absolute `PATH` entries.

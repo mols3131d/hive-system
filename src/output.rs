@@ -121,6 +121,19 @@ pub(crate) fn failure(
 
 fn write_failure(mut output: impl Write, error: &HiveError) -> io::Result<()> {
     writeln!(output, "error: {error}")?;
+    #[cfg(unix)]
+    if let Some(input) = &error.input {
+        writeln!(output, "Selected input {} ({})", input.kind, input.source)?;
+    }
+    #[cfg(unix)]
+    if let Some((candidates, truncated)) = error.area_candidates() {
+        for area in candidates {
+            writeln!(output, "{} ({})", area.id, area.slug)?;
+        }
+        if truncated {
+            writeln!(output, "More linked Areas were found.")?;
+        }
+    }
     let Some((diagnostics, truncated)) = error.record_diagnostics() else {
         return Ok(());
     };
