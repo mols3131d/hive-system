@@ -393,8 +393,12 @@ fn workspace_runtime_cli_starts_and_stops_registered_workspace() {
     let port = available.local_addr().unwrap().port().to_string();
     drop(available);
 
-    let workspace = fixture.root.join("work $HOME");
-    let state_home = fixture.root.join("state ${HOME}");
+    let workspace = fixture
+        .root
+        .join("work $HOME $$ \u{7f}\u{85}\u{2028}\u{2029}");
+    let state_home = fixture
+        .root
+        .join("state ${HOME} $$ \u{7f}\u{85}\u{2028}\u{2029}");
     let workspace_id = id(1);
     let state = state_home.join("hive/v2/workspaces").join(&workspace_id);
     let registered_root = register_fixture(&fixture, &workspace, &state);
@@ -446,6 +450,7 @@ fn workspace_runtime_cli_starts_and_stops_registered_workspace() {
         assert_eq!(fs::metadata(run).unwrap().mode() & 0o777, 0o700);
         for name in [
             "server-config.yaml",
+            "config-id",
             "reader-password",
             "writer-password",
             "privileges.db",
