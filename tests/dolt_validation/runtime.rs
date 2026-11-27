@@ -3,12 +3,18 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
+#[path = "runtime/area_create.rs"]
+mod area_create;
 #[path = "runtime/artifact_create.rs"]
 mod artifact_create;
+#[path = "runtime/artifact_update.rs"]
+mod artifact_update;
 #[path = "runtime/issue_dependency.rs"]
 mod issue_dependency;
 #[path = "runtime/issue_update.rs"]
 mod issue_update;
+#[path = "runtime/project_planning.rs"]
+mod project_planning;
 
 fn random_uuid() -> String {
     fs::read_to_string("/proc/sys/kernel/random/uuid")
@@ -2069,12 +2075,15 @@ fn issue_create_writer_fixture(
     assert_eq!(
         insert_tables,
         [
+            "areas",
             "artifact_areas",
             "artifacts",
             "issue_dependencies",
             "issue_updates",
             "issues",
             "operation_receipts",
+            "project_issues",
+            "projects",
         ]
     );
     let mut prior = connect("writer");

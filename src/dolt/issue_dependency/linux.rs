@@ -601,51 +601,21 @@ impl ScopedDependency {
         if count != Some(u64::from(self.add)) {
             return Err(workflow::unverified());
         }
-        verify_delta(db, base, introduced, self.add)?;
+        crate::dolt::receipt_history::verify_delta(
+            db,
+            base,
+            introduced,
+            &[
+                (
+                    "issue_dependencies",
+                    u64::from(self.add),
+                    u64::from(!self.add),
+                    0,
+                ),
+                ("issues", 0, 0, 2),
+                ("operation_receipts", 1, 0, 0),
+            ],
+        )?;
         Ok(json!(self.result))
     }
-}
-
-fn verify_delta(
-    db: &mut impl Queryable,
-    base: &str,
-    introduced: &str,
-    add: bool,
-) -> Result<(), HiveError> {
-    let tables: Vec<(String, String, String, bool, bool)> = db
-        .exec(
-            "SELECT from_table_name, to_table_name, diff_type, data_change, schema_change
-         FROM DOLT_DIFF_SUMMARY(?, ?) ORDER BY from_table_name LIMIT 4",
-            (base, introduced),
-        )
-        .map_err(read_error)?;
-    let expected_tables = ["issue_dependencies", "issues", "operation_receipts"];
-    if tables.len() != expected_tables.len()
-        || !tables
-            .iter()
-            .zip(expected_tables)
-            .all(|((old, new, kind, data, schema), table)| {
-                old == table && new == table && kind == "modified" && *data && !schema
-            })
-    {
-        return Err(workflow::unverified());
-    }
-    let rows: Vec<(String, u64, u64, u64)> = db
-        .exec(
-            "SELECT table_name, rows_added, rows_deleted, rows_modified
-         FROM DOLT_DIFF_STAT(?, ?) ORDER BY table_name LIMIT 4",
-            (base, introduced),
-        )
-        .map_err(read_error)?;
-    if !matches!(rows.as_slice(), [(edge, added, removed, 0), (issues, 0, 0, 2), (receipts, 1, 0, 0)]
-        if edge == "issue_dependencies" && *added == u64::from(add) && *removed == u64::from(!add)
-            && issues == "issues" && receipts == "operation_receipts")
-        || db
-            .query_first::<mysql::Row, _>("SHOW WARNINGS LIMIT 1")
-            .map_err(read_error)?
-            .is_some()
-    {
-        return Err(workflow::unverified());
-    }
-    Ok(())
 }
