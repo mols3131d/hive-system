@@ -2,7 +2,7 @@ use std::ffi::{CString, OsStr};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -71,6 +71,13 @@ fn absolute_target(target: &Path) -> Result<PathBuf, HiveError> {
 pub(crate) fn inspect_empty_target(target: &Path) -> Result<Value, HiveError> {
     let target = absolute_target(target)?;
     let (parent, original) = inspect(&target)?;
+    lock_target(&original).map_err(|error| {
+        if matches!(error.code, ErrorCode::ConcurrentChange) {
+            HiveError::new(ErrorCode::LockBusy, error.to_string())
+        } else {
+            error
+        }
+    })?;
     require_entries(&original, &[])?;
 
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -112,6 +119,7 @@ pub(crate) fn inspect_empty_target(target: &Path) -> Result<Value, HiveError> {
         "filesystem": filesystem,
         "available_blocks": stat.f_bavail,
         "block_size_bytes": stat.f_frsize,
+        "directory_lock": "acquired",
     }))
 }
 
@@ -120,14 +128,29 @@ pub(crate) fn probe_versions() -> Result<Value, HiveError> {
     // directory. Keep them outside any workspace and the user's home/XDG.
     let scratch = tempfile::Builder::new()
         .prefix("hive-doctor-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in("/tmp")
         .map_err(|_| io_error("Could not isolate the local version probes."))?;
-    let directory = open_directory(scratch.path())?;
-    let (git, dolt) = tools::Installed::locate(&directory)?.doctor_versions()?;
-    drop(directory);
+    // O_PATH works even if a restrictive umask removed owner access.
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(scratch.path())
+        .map_err(|_| io_error("Could not open the isolated version probe directory."))?;
+    let original = dir_metadata(&directory)?;
+    let versions = (|| {
+        fs::set_permissions(fd_path(&directory), fs::Permissions::from_mode(0o700))
+            .map_err(|_| io_error("Could not secure the isolated version probe directory."))?;
+        tools::Installed::locate(&directory)?.doctor_versions()
+    })();
+    if !fs::symlink_metadata(scratch.path()).is_ok_and(|current| same_inode(&original, &current)) {
+        let _ = scratch.keep();
+        return Err(io_error("The isolated version probe directory changed."));
+    }
     scratch
         .close()
         .map_err(|_| io_error("Could not remove the isolated version probe directory."))?;
+    let (git, dolt) = versions?;
     Ok(json!({"hive": env!("CARGO_PKG_VERSION"), "git": git, "dolt": dolt}))
 }
 

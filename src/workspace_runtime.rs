@@ -34,7 +34,7 @@ pub(super) fn run(
     command: &WorkspaceCommand,
     format: &mut Format,
 ) -> Result<Value, HiveError> {
-    let (workspace, _) = select_workspace(options, format)?;
+    let workspace = select_workspace(options, format)?.candidate;
     let id = workspace.workspace_id();
     let root = json_path(&workspace.root.path)?;
     let state = find_state(id, &workspace.root.path)?

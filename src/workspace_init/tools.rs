@@ -1,11 +1,12 @@
 use std::env;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -26,7 +27,7 @@ pub(super) struct Installed<'a> {
 impl<'a> Installed<'a> {
     pub(super) fn check(scratch: &'a File) -> Result<Self, HiveError> {
         let installed = Self::locate(scratch)?;
-        installed.check_dolt_version()?;
+        check_dolt_version(&installed.dolt(&installed.home, &["version"], None)?)?;
         if !installed
             .git(&installed.home, &["--version"])?
             .starts_with("git version ")
@@ -46,8 +47,12 @@ impl<'a> Installed<'a> {
     }
 
     pub(super) fn doctor_versions(&self) -> Result<(String, &'static str), HiveError> {
-        let dolt = self.check_dolt_version()?;
-        let stdout = self.git(&self.home, &["--version"])?;
+        let mut command = self.dolt_command(&self.home);
+        command.arg("version");
+        let dolt = check_dolt_version(&run_version(command, "Dolt")?)?;
+        let mut command = self.git_command(&self.home);
+        command.arg("--version");
+        let stdout = run_version(command, "Git")?;
         let git = stdout
             .trim()
             .strip_prefix("git version ")
@@ -60,28 +65,6 @@ impl<'a> Installed<'a> {
             })
             .ok_or_else(unrecognized_git_version)?;
         Ok((git.to_owned(), dolt))
-    }
-
-    fn check_dolt_version(&self) -> Result<&'static str, HiveError> {
-        let stdout = self.dolt(&self.home, &["version"], None)?;
-        let version = stdout.trim().strip_prefix("dolt version ").filter(|value| {
-            !value.is_empty()
-                && value.len() <= 24
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || byte == b'.')
-        });
-        if version != Some(DOLT_VERSION) {
-            let detected = version.map_or_else(
-                || "The executable returned an unrecognized version.".to_owned(),
-                |value| format!("Installed version is {value}."),
-            );
-            return Err(HiveError::new(
-                ErrorCode::SchemaIncompatible,
-                format!("Workspace initialization requires Dolt {DOLT_VERSION}. {detected}"),
-            ));
-        }
-        Ok(DOLT_VERSION)
     }
 
     pub(super) fn initialize_db(
@@ -257,19 +240,30 @@ impl<'a> Installed<'a> {
     }
 
     fn dolt(&self, cwd: &Path, args: &[&str], input: Option<File>) -> Result<String, HiveError> {
-        let mut command = self.command(&self.dolt, cwd);
-        command
-            .env("DOLT_ROOT_PATH", &self.home)
-            .env("DOLT_DISABLE_VERSION_CHECKS", "true")
-            .env("DOLT_DISABLE_EVENT_FLUSH", "true")
-            .args(args);
+        let mut command = self.dolt_command(cwd);
+        command.args(args);
         if let Some(input) = input {
             command.stdin(input);
         }
         run(command, "Dolt", args[0])
     }
 
+    fn dolt_command(&self, cwd: &Path) -> Command {
+        let mut command = self.command(&self.dolt, cwd);
+        command
+            .env("DOLT_ROOT_PATH", &self.home)
+            .env("DOLT_DISABLE_VERSION_CHECKS", "true")
+            .env("DOLT_DISABLE_EVENT_FLUSH", "true");
+        command
+    }
+
     fn git(&self, cwd: &Path, args: &[&str]) -> Result<String, HiveError> {
+        let mut command = self.git_command(cwd);
+        command.args(args);
+        run(command, "Git", args[0])
+    }
+
+    fn git_command(&self, cwd: &Path) -> Command {
         let mut command = self.command(&self.git, cwd);
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -281,9 +275,8 @@ impl<'a> Installed<'a> {
             .env("GIT_AUTHOR_EMAIL", "bootstrap@hive.invalid")
             .env("GIT_COMMITTER_NAME", "Hive")
             .env("GIT_COMMITTER_EMAIL", "bootstrap@hive.invalid")
-            .args(["-c", "core.hooksPath=/dev/null"])
-            .args(args);
-        run(command, "Git", args[0])
+            .args(["-c", "core.hooksPath=/dev/null"]);
+        command
     }
 
     fn command(&self, executable: &Path, cwd: &Path) -> Command {
@@ -332,6 +325,104 @@ impl<'a> Installed<'a> {
         }
         command
     }
+}
+
+fn check_dolt_version(stdout: &str) -> Result<&'static str, HiveError> {
+    let version = stdout.trim().strip_prefix("dolt version ").filter(|value| {
+        !value.is_empty()
+            && value.len() <= 24
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    });
+    if version != Some(DOLT_VERSION) {
+        let detected = version.map_or_else(
+            || "The executable returned an unrecognized version.".to_owned(),
+            |value| format!("Installed version is {value}."),
+        );
+        return Err(HiveError::new(
+            ErrorCode::SchemaIncompatible,
+            format!("Workspace initialization requires Dolt {DOLT_VERSION}. {detected}"),
+        ));
+    }
+    Ok(DOLT_VERSION)
+}
+
+fn run_version(mut command: Command, engine: &str) -> Result<String, HiveError> {
+    const LIMIT: usize = 1024;
+    const TIMEOUT: Duration = Duration::from_secs(3);
+    let failed = |reason| {
+        HiveError::new(
+            ErrorCode::RuntimeUnavailable,
+            format!("{engine} version probe {reason}."),
+        )
+    };
+    let deadline = Instant::now() + TIMEOUT;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|_| failed("could not start"))?;
+    let mut stdout = child.stdout.take().expect("version stdout is piped");
+    let result = (|| {
+        let mut output = Vec::new();
+        let mut buffer = [0; 256];
+        let mut poll_fd = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(failed("timed out"));
+            }
+            // SAFETY: poll_fd is initialized and stdout owns the live descriptor.
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, remaining.as_millis().max(1) as i32) };
+            if ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            match ready {
+                0 => return Err(failed("timed out")),
+                ..0 => return Err(failed("could not read output")),
+                _ => {}
+            }
+            // The pipe has readable bytes or EOF, and there is no other reader.
+            let capacity = buffer.len().min(LIMIT + 1 - output.len());
+            let count = match stdout.read(&mut buffer[..capacity]) {
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(failed("could not read output")),
+            };
+            if count == 0 {
+                break;
+            }
+            if output.len() + count > LIMIT {
+                return Err(failed("exceeded its output limit"));
+            }
+            output.extend_from_slice(&buffer[..count]);
+        }
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(failed("timed out"));
+            }
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|_| failed("could not be reaped"))?
+            {
+                if !status.success() {
+                    return Err(failed("failed"));
+                }
+                return String::from_utf8(output).map_err(|_| failed("returned invalid output"));
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
 }
 
 fn unrecognized_git_version() -> HiveError {
