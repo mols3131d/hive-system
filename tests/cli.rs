@@ -2792,3 +2792,88 @@ fn conversation_list_recovers_scoped_v2_output_without_consuming_values_as_flags
     assert_ne!(legacy["command"], "conversation list");
     sandbox.assert_empty();
 }
+
+#[test]
+fn conversation_export_preserves_v2_error_and_literal_boundaries() {
+    let sandbox = Sandbox::new();
+    let uuid = "01900000-0000-7000-8000-000000000001";
+    let command = [
+        "conversation",
+        "export",
+        "--workspace",
+        ".",
+        "--workspace-id",
+        uuid,
+        "--database",
+        "fixture",
+        "--port",
+        "3306",
+        "--bot",
+        uuid,
+        "--id",
+        uuid,
+    ];
+    let late = ["--contract", "2", "--json"];
+    for destination in [
+        &[][..],
+        &["--destination"],
+        &["--destination="],
+        &["--destination", "-synthetic-path"],
+        &["--destination", "first.md", "--destination=--json"],
+        &["--destination", "list", "--destination=--json"],
+        &["--destination=--json", "--bot", "synthetic-invalid"],
+    ] {
+        let args = [&command[..], destination, &late].concat();
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{args:?}: {error}\n{output:?}"));
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], "conversation export");
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(report.get("data").is_none());
+        assert!(
+            !String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("synthetic-")
+        );
+    }
+
+    for suffix in [
+        &[
+            "--destination=--json",
+            "--bot",
+            "synthetic-invalid",
+            "--contract",
+            "2",
+        ][..],
+        &[
+            "--destination",
+            "-synthetic-path",
+            "--",
+            "--contract",
+            "2",
+            "--json",
+        ],
+    ] {
+        let output = sandbox.run(&[&command[..], suffix].concat());
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-"));
+    }
+
+    let legacy = [&command[..], &["--destination=--contract", "--json"]].concat();
+    let output = sandbox.run(&legacy);
+    assert_json_failure(
+        &output,
+        &legacy,
+        "conversation export",
+        "INVALID_ARGUMENT",
+        2,
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    sandbox.assert_empty();
+}

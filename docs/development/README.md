@@ -248,6 +248,17 @@ hive --contract 2 --json conversation list --workspace /example/hive-v2-userdata
 
 List returns metadata in descending conversation UUID order for one active or retired Queen. The default page size is 25 and the maximum is 100. To continue, pass `next_cursor` as `--cursor` with the same selection and page size. The observed revision is a digest of the published frontmatter. A different workspace copy, Dolt target, committed snapshot, Queen, page size, or published metadata set returns `STALE_CURSOR`. List stops at the closing frontmatter delimiter of each file and skips unpublished staging files. It returns `CONTEXT_LIMIT` if the full scan exceeds 4,096 directory entries (including staging) or 4 MiB of frontmatter, including delimiters.
 
+On Linux, export the validated Markdown body for an active or retired Queen to a new file. Supply `--destination PATH` as an absolute path or a path relative to the current directory. Its parent directory must already exist outside the selected workspace's `conversations/` tree. Hive refuses symlink traversal. Publication requires procfs and a local filesystem with `O_TMPFILE` support.
+
+```sh
+hive --contract 2 --json conversation export --workspace /example/hive-v2-userdata \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001 \
+  --bot 01900000-0000-7000-8000-00000000000a --id 01900000-0000-7000-8000-00000000000b \
+  --destination /example/exports/conversation.md
+```
+
+The export writes the exact body bytes to the selected path with owner-only permissions. An existing destination returns `ALREADY_EXISTS`. The JSON response identifies the Queen and conversation. If stdout fails after publication, Hive reports the completed export on stderr and leaves the file in place. Export is local and performs no external publication.
+
 ## Agent-assisted development
 
 Use [instruction ownership](agents/rule-ownership.md) to place scoped guidance, [asset lifecycle](agents/assets.md) when selecting or updating reusable Agent Assets, and [harness verification](agents/harness.md) to distinguish configuration from observed runtime behavior.

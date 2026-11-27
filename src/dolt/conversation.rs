@@ -5,6 +5,7 @@ mod list;
 pub(super) use list::run as list;
 
 use std::ffi::OsStr;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -13,7 +14,7 @@ use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::{DoltSuccess, Snapshot, is_uuid, unverified_authority};
-use crate::cli::{CommonOptions, ConversationShowArgs, DoltTargetArgs, is_slug};
+use crate::cli::{CommonOptions, ConversationSelectionArgs, DoltTargetArgs, is_slug};
 use crate::config_file::{MAX_FILE_BYTES, parse_v2, present, untagged};
 use crate::config_v2;
 use crate::error::{ErrorCode, HiveError};
@@ -149,9 +150,10 @@ fn select(
 
 pub(super) fn read(
     common: &CommonOptions,
-    args: &ConversationShowArgs,
+    args: &ConversationSelectionArgs,
     bot_id: &str,
     conversation_id: &str,
+    destination: Option<&Path>,
 ) -> Result<DoltSuccess, HiveError> {
     let selection = select(common, &args.target, bot_id)?;
     let candidate = &selection.candidate;
@@ -166,10 +168,138 @@ pub(super) fn read(
             HiveError::new(ErrorCode::NotFound, "The selected conversation is missing.")
         })?;
     let (metadata, body) = validate_file(&bytes, workspace_id, bot_id, bot_slug, conversation_id)?;
+    let data = if let Some(destination) = destination {
+        publish_export(&candidate.root.path, destination, body.as_bytes())?;
+        json!({ "bot_id": bot_id, "conversation_id": conversation_id })
+    } else {
+        json!({ "metadata": metadata, "body": body })
+    };
     Ok(DoltSuccess {
         context: selection.context(),
-        data: json!({ "metadata": metadata, "body": body }),
+        data,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn publish_export(workspace: &Path, destination: &Path, body: &[u8]) -> Result<(), HiveError> {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    use crate::config_file::ScopedDirectory;
+
+    let invalid_destination = || {
+        HiveError::new(
+            ErrorCode::InvalidArgument,
+            "Supply --destination as a path to a new file.",
+        )
+    };
+    let raw = destination.as_os_str().as_bytes();
+    let basename = raw.rsplit(|byte| *byte == b'/').next().unwrap_or_default();
+    if matches!(basename, b"" | b"." | b"..") || raw.contains(&0) {
+        return Err(invalid_destination());
+    }
+    let name = CString::new(basename).map_err(|_| invalid_destination())?;
+    let parent = destination.parent().ok_or_else(invalid_destination)?;
+    let parent = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| {
+                HiveError::new(ErrorCode::IoError, "Could not locate the export directory.")
+            })?
+            .join(parent)
+    };
+    let directory = ScopedDirectory::open_absolute(&parent).map_err(|error| {
+        HiveError::new(
+            error.code,
+            "Could not open the export directory without following symlinks.",
+        )
+    })?;
+    // Compare the component paths resolved by the no-follow directory walk.
+    if directory.path.starts_with(workspace.join("conversations")) {
+        return Err(HiveError::new(
+            ErrorCode::InvalidArgument,
+            "The export destination must be outside the selected conversation storage.",
+        ));
+    }
+    let parent = directory.handle();
+    let parent_fd = parent.as_raw_fd();
+
+    // An unnamed inode belongs to this descriptor until publication. Closing it
+    // on any prepublication failure removes it without a pathname cleanup race.
+    // SAFETY: parent_fd is open, "." is NUL-terminated, and the creation mode is supplied.
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            c".".as_ptr(),
+            libc::O_TMPFILE | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600 as libc::mode_t,
+        )
+    };
+    if fd == -1 {
+        return Err(HiveError::new(
+            ErrorCode::IoError,
+            "Could not create a private temporary file in the export directory.",
+        ));
+    }
+    // SAFETY: openat returned a newly owned descriptor.
+    let mut temporary = unsafe { File::from_raw_fd(fd) };
+    temporary
+        .write_all(body)
+        .and_then(|()| temporary.sync_all())
+        .map_err(|_| {
+            HiveError::new(
+                ErrorCode::IoError,
+                "Could not write the conversation export.",
+            )
+        })?;
+
+    // The source is the kernel's link to our open descriptor. The destination
+    // is a single component under the pinned directory and linkat never replaces it.
+    let source = CString::new(format!("/proc/self/fd/{}", temporary.as_raw_fd()))
+        .expect("a decimal file descriptor cannot contain NUL");
+    // SAFETY: Both names are NUL-terminated and the descriptors remain open.
+    let result = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            parent_fd,
+            name.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if result == -1 {
+        return Err(
+            if Error::last_os_error().kind() == ErrorKind::AlreadyExists {
+                HiveError::new(
+                    ErrorCode::AlreadyExists,
+                    "The export destination already exists.",
+                )
+            } else {
+                HiveError::new(
+                    ErrorCode::IoError,
+                    "Could not publish the conversation export.",
+                )
+            },
+        );
+    }
+    parent.sync_all().map_err(|_| {
+        HiveError::new(
+            ErrorCode::UnknownWriteOutcome,
+            "The export was published, but its directory could not be synchronized.",
+        )
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn publish_export(_workspace: &Path, _destination: &Path, _body: &[u8]) -> Result<(), HiveError> {
+    Err(HiveError::new(
+        ErrorCode::NotImplemented,
+        "Conversation export is unavailable on this platform.",
+    ))
 }
 
 fn validate_file<'a>(
@@ -303,6 +433,90 @@ mod tests {
 
     fn parse(bytes: &[u8]) -> Result<(Metadata, &str), HiveError> {
         validate_file(bytes, WORKSPACE, BOT, SLUG, CONVERSATION)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conversation_export_publishes_complete_private_bytes_without_clobber() {
+        use std::fs;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::path::PathBuf;
+
+        struct Sandbox(PathBuf);
+
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let mut template = std::env::temp_dir()
+            .join("hive-export-XXXXXX")
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        template.push(0);
+        // SAFETY: The template is writable and NUL-terminated.
+        assert!(!unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) }.is_null());
+        let sandbox = Sandbox(PathBuf::from(OsStr::from_bytes(
+            &template[..template.len() - 1],
+        )));
+        let root = &sandbox.0;
+        let destination = root.join("copy.md");
+        let body = "\r\n# 합성\r\n---\nno final newline".as_bytes();
+
+        let results = std::thread::scope(|scope| {
+            let first = scope.spawn(|| publish_export(root, &destination, body));
+            let second = scope.spawn(|| publish_export(root, &destination, body));
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        let ([Ok(()), Err(error)] | [Err(error), Ok(())]) = results else {
+            panic!("Expected exactly one publisher to succeed");
+        };
+        assert!(matches!(error.code, ErrorCode::AlreadyExists));
+        let error = publish_export(root, &destination, b"replacement").unwrap_err();
+        assert!(matches!(error.code, ErrorCode::AlreadyExists));
+        assert_eq!(fs::read(&destination).unwrap(), body);
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(root).unwrap().count(), 1);
+
+        let dangling = root.join("dangling.md");
+        symlink("missing.md", &dangling).unwrap();
+        let error = publish_export(root, &dangling, body).unwrap_err();
+        assert!(matches!(error.code, ErrorCode::AlreadyExists));
+        assert_eq!(fs::read_link(&dangling).unwrap(), Path::new("missing.md"));
+        assert!(!root.join("missing.md").exists());
+
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        let redirect = root.join("redirect");
+        symlink(&real, &redirect).unwrap();
+        for path in [redirect.join("escaped.md"), redirect.join("../escaped.md")] {
+            let error = publish_export(root, &path, body).unwrap_err();
+            assert!(matches!(error.code, ErrorCode::InvalidConfig));
+        }
+        assert_eq!(fs::read_dir(&real).unwrap().count(), 0);
+        assert!(!root.join("escaped.md").exists());
+
+        for path in [root.join("missing/"), root.join("."), root.join("..")] {
+            let error = publish_export(root, &path, body).unwrap_err();
+            assert!(matches!(error.code, ErrorCode::InvalidArgument));
+        }
+        let empty = root.join("empty.md");
+        publish_export(root, &empty, b"").unwrap();
+        assert!(fs::read(&empty).unwrap().is_empty());
+        assert_eq!(fs::read_dir(root).unwrap().count(), 5);
+
+        let storage = root.join("conversations");
+        fs::create_dir(&storage).unwrap();
+        let blocked = root.join("real/../conversations/copy.md");
+        let error = publish_export(root, &blocked, body).unwrap_err();
+        assert!(matches!(error.code, ErrorCode::InvalidArgument));
+        assert_eq!(fs::read_dir(&storage).unwrap().count(), 0);
     }
 
     #[test]
