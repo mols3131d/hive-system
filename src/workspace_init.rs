@@ -11,14 +11,14 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{inspect_empty_target, probe_versions};
 
-pub(crate) fn run(target: &Path) -> Result<Value, HiveError> {
+pub(crate) fn run(target: &Path, register_runtime: bool) -> Result<Value, HiveError> {
     #[cfg(target_os = "linux")]
     {
-        linux::run(target)
+        linux::run(target, register_runtime)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = target;
+        let _ = (target, register_runtime);
         Err(HiveError::new(
             crate::error::ErrorCode::NotImplemented,
             "Workspace initialization is supported only on Linux.",

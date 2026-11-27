@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::Registration;
 use super::unix::{
-    Loopback, Registration, Server, check_identity, check_server, find_state, process_evidence,
-    process_start, read_json,
+    Loopback, Server, check_identity, check_server, find_state, process_evidence, process_start,
+    read_json,
 };
 use crate::cli::{CommonOptions, DoltTargetArgs, Format, WorkspaceCommand};
 use crate::config::json_path;

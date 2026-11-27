@@ -733,6 +733,9 @@ pub(crate) enum WorkspaceAction {
     Init {
         #[arg(long, value_name = "EMPTY_DIR")]
         target: PathBuf,
+        /// Register this new workspace for the local runtime.
+        #[arg(long)]
+        register_runtime: bool,
     },
     /// Check an empty init target or inspect an explicit workspace without changes.
     Doctor {
