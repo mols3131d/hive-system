@@ -18,7 +18,8 @@ mod runtime;
 
 #[cfg(target_os = "linux")]
 pub(crate) use runtime::{
-    with_exclusive_owned_snapshot, with_operation_snapshot, with_owned_snapshot,
+    WriterRuntime, token, with_exclusive_owned_snapshot, with_operation_snapshot,
+    with_owned_snapshot, with_writer_runtime,
 };
 
 pub(crate) fn run(
@@ -92,7 +93,7 @@ mod unix {
     };
     use crate::error::{ErrorCode, HiveError};
 
-    #[derive(Deserialize, Serialize)]
+    #[derive(Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub(super) struct Server {
         pub(super) version: u32,
@@ -105,7 +106,7 @@ mod unix {
         pub(super) endpoint: Loopback,
     }
 
-    #[derive(Deserialize, Serialize)]
+    #[derive(Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub(super) struct Loopback {
         pub(super) port: NonZeroU16,

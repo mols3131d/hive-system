@@ -668,8 +668,8 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
     drop(listener);
     let fixture_root = fixture.root.clone();
     let dolt = fixture.dolt.clone();
-    let invoke = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_hive"))
+    let invoke_as = |binary: &std::ffi::OsStr, args: &[&str]| {
+        Command::new(binary)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap())
             .env("HOME", fixture_root.join("home"))
@@ -685,6 +685,7 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
             .args(args)
             .output()
     };
+    let invoke = |args: &[&str]| invoke_as(std::ffi::OsStr::new(env!("CARGO_BIN_EXE_hive")), args);
     let run = |args: &[&str], exit| {
         let output = invoke(args).unwrap();
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -1016,5 +1017,384 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
     assert_eq!(still_confirmed["data"]["confirmed_commit"], note_commit);
     assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
 
+    let restart = |change: Option<&str>, baseline: Option<&std::ffi::OsStr>| {
+        let stopped = run(&["workspace", "stop"], 0);
+        assert_eq!(stopped["data"]["process_exit"], "pidfd_verified");
+        if let Some(change) = change {
+            let fixture = cleanup.fixture.as_ref().expect("armed runtime fixture");
+            let db = root.join("db");
+            fixture.local_at(&db, &["sql"], Some(change));
+            fixture.local_at(&db, &["add", "."], None);
+            fixture.local_at(
+                &db,
+                &[
+                    "commit",
+                    "-m",
+                    "Synthetic retained-history or ancestry change",
+                ],
+                None,
+            );
+        }
+        let start = [
+            "workspace",
+            "start",
+            "--dolt-bin",
+            dolt.to_str().unwrap(),
+            "--port",
+            &port,
+        ];
+        if let Some(binary) = baseline {
+            let output = invoke_as(binary, &start).unwrap();
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(output.status.success(), "{report}");
+        } else {
+            run(&start, 0);
+        }
+    };
+    issue_note_writer_fixture(
+        &state,
+        &fixture_root,
+        &port,
+        &revision,
+        &run,
+        &restart,
+        &dolt,
+    );
     assert!(cleanup.finish(), "Verified runtime fixture stop failed");
+}
+
+fn issue_note_writer_fixture(
+    state: &Path,
+    fixture_root: &Path,
+    port: &str,
+    revision: &str,
+    run: &impl Fn(&[&str], i32) -> Value,
+    restart: &impl Fn(Option<&str>, Option<&std::ffi::OsStr>),
+    dolt: &Path,
+) {
+    use sha2::{Digest, Sha256};
+    let workspace = id(1);
+    let area = id(3);
+    let issue = id(11);
+    let claim = id(14);
+    let body_path = fixture_root.join("progress.txt");
+    let decision_path = fixture_root.join("decision.json");
+    let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    let note = |request: &str, actor: &str, expected: &str, body: &str, exit| {
+        let payload = serde_json::json!([
+            1,
+            "issue.note",
+            workspace,
+            area,
+            issue,
+            actor,
+            claim,
+            expected,
+            "progress",
+            digest(body.as_bytes()),
+        ]);
+        let now = time::OffsetDateTime::from_unix_timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+        )
+        .unwrap();
+        let stamp = |at: time::OffsetDateTime| {
+            format!(
+                "{}T{:02}:{:02}:{:02}Z",
+                at.date(),
+                at.hour(),
+                at.minute(),
+                at.second()
+            )
+        };
+        let evidence = serde_json::json!({
+            "decision": "allow",
+            "evidence": {
+                "version": 1, "operation": "issue.note", "workspace_id": workspace,
+                "request_id": request, "fingerprint": digest(payload.to_string().as_bytes()),
+                "actor_ref": actor, "bot_id": null, "area_id": area, "issue_id": issue,
+                "expected_issue_revision": expected, "claim_id": claim,
+                "authorization_ref": "fixture-write-authorization",
+                "evidence_id": "fixture-write-evidence", "revision": "r1",
+                "source_ref": "fixture-write-source", "issuer_ref": "fixture-write-issuer",
+                "valid_from": stamp(now - time::Duration::seconds(10)),
+                "expires_at": stamp(now + time::Duration::hours(1)), "withdrawn": false,
+            }
+        });
+        fs::write(&body_path, body).unwrap();
+        fs::write(&decision_path, evidence.to_string()).unwrap();
+        let report = run(
+            &[
+                "issue",
+                "note",
+                &issue,
+                "--kind",
+                "progress",
+                "--workspace-id",
+                &workspace,
+                "--database",
+                "db",
+                "--port",
+                port,
+                "--area",
+                &area,
+                "--claim",
+                &claim,
+                "--actor",
+                actor,
+                "--if-match",
+                &format!("{issue}={expected}"),
+                "--request-id",
+                request,
+                "--file",
+                body_path.to_str().unwrap(),
+                "--evidence-file",
+                decision_path.to_str().unwrap(),
+            ],
+            exit,
+        );
+        assert_eq!(report["command"], "issue note");
+        assert!(!report.to_string().contains("fixture-write-authorization"));
+        report
+    };
+
+    let marker = state.join("pending-request.json");
+    let blocked = note(
+        &id(60),
+        "fixture-holder",
+        revision,
+        "Synthetic progress\r\n",
+        8,
+    );
+    assert_eq!(blocked["error"]["code"], "COMMIT_UNCERTAIN");
+    assert_eq!(
+        fs::read(&marker).unwrap(),
+        b"synthetic incomplete pending intent"
+    );
+    // The preceding inspection fixture created this deliberately malformed marker.
+    fs::remove_file(&marker).unwrap();
+
+    let holder = note(&id(61), "fixture-other", revision, "Synthetic progress", 5);
+    assert_eq!(holder["error"]["code"], "CLAIM_MISMATCH");
+    let body = "Synthetic progress\r\nλ\n";
+    let written = note(&id(60), "fixture-holder", revision, body, 0);
+    assert_eq!(written["data"]["outcome"], "confirmed");
+    assert!(!written.to_string().contains("Synthetic progress"));
+    assert!(!marker.exists());
+
+    let replayed = note(&id(60), "fixture-holder", revision, body, 0);
+    assert_eq!(replayed["data"]["outcome"], "replayed");
+    for key in ["base_commit", "confirmed_commit", "result"] {
+        assert_eq!(written["data"][key], replayed["data"][key]);
+    }
+    let changed = note(
+        &id(60),
+        "fixture-holder",
+        revision,
+        "Synthetic progress\nλ\n",
+        5,
+    );
+    assert_eq!(changed["error"]["code"], "REQUEST_CONFLICT");
+    let stale = note(&id(62), "fixture-holder", revision, body, 5);
+    assert_eq!(stale["error"]["code"], "STALE_REVISION");
+
+    let launch_nonce = || {
+        let server: Value =
+            serde_json::from_slice(&fs::read(state.join("server.json")).unwrap()).unwrap();
+        server["nonce"].as_str().unwrap().to_owned()
+    };
+    let nonce = launch_nonce();
+    let connect = |role: &str| {
+        let nonce = launch_nonce();
+        let password =
+            fs::read_to_string(state.join(format!("run-{nonce}/{role}-password"))).unwrap();
+        let user = format!("{role}_{}", &nonce.replace('-', "")[..24]);
+        Conn::new(
+            OptsBuilder::new()
+                .ip_or_hostname(Some(HOST))
+                .tcp_port(port.parse().unwrap())
+                .prefer_socket(false)
+                .user(Some(user))
+                .pass(Some(password))
+                .db_name(Some("db")),
+        )
+        .unwrap_or_else(|_| panic!("Could not connect the synthetic independent client."))
+    };
+    let mut reader = connect("reader");
+    let head: String = reader
+        .query_first("SELECT DOLT_HASHOF('HEAD')")
+        .unwrap()
+        .unwrap();
+    assert_eq!(written["data"]["confirmed_commit"], head);
+    let actual: (String, Vec<u8>, String, u64, u64) = reader
+        .exec_first(
+            format!(
+                "SELECT i.revision, CAST(u.body AS BINARY), r.base_commit,
+             (SELECT COUNT(*) FROM issue_updates AS OF '{head}'),
+             (SELECT COUNT(*) FROM operation_receipts AS OF '{head}')
+         FROM issues AS OF '{head}' i
+         JOIN issue_updates AS OF '{head}' u ON u.issue_id = i.id
+         JOIN operation_receipts AS OF '{head}' r ON r.request_id = ?
+         WHERE i.id = ? AND u.id = ?"
+            ),
+            (
+                id(60),
+                &issue,
+                written["data"]["result"]["note_id"].as_str().unwrap(),
+            ),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(written["data"]["result"]["issue_revision"], actual.0);
+    assert_eq!(actual.1, body.as_bytes());
+    assert_eq!(written["data"]["base_commit"], actual.2);
+    // Compare with the committed base so other fixture receipts can coexist.
+    let base = actual.2;
+    let before: (u64, u64) = reader
+        .query_first(format!(
+            "SELECT (SELECT COUNT(*) FROM issue_updates AS OF '{base}'),
+                (SELECT COUNT(*) FROM operation_receipts AS OF '{base}')"
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!((actual.3, actual.4), (before.0 + 1, before.1 + 1));
+
+    let mut prior = connect("writer");
+    prior.query_drop("START TRANSACTION").unwrap();
+    let session: u64 = prior
+        .query_first("SELECT CONNECTION_ID()")
+        .unwrap()
+        .unwrap();
+    let pending = serde_json::json!({
+        "version": 1, "workspace_id": workspace, "launch_nonce": nonce,
+        "session_id": session, "request_id": id(63), "base_commit": head,
+        "fingerprint": "a".repeat(64), "area_id": area, "issue_id": issue,
+        "receipt_digest": "b".repeat(64),
+    })
+    .to_string();
+    fs::write(&marker, &pending).unwrap();
+    fs::set_permissions(&marker, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let waiting = note(&id(60), "fixture-holder", revision, body, 8);
+    assert_eq!(waiting["error"]["code"], "COMMIT_UNCERTAIN");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), pending);
+
+    prior.query_drop("ROLLBACK").unwrap();
+    drop(prior);
+    let mut observer = connect("writer");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while observer
+        .exec_first::<u64, _, _>(
+            "SELECT ID FROM information_schema.PROCESSLIST WHERE ID = ?",
+            (session,),
+        )
+        .unwrap()
+        .is_some()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Synthetic session did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let recovered = note(&id(60), "fixture-holder", revision, body, 0);
+    assert_eq!(recovered["data"], replayed["data"]);
+    assert!(!marker.exists());
+
+    drop(reader);
+    drop(observer);
+    let owner_parent = id(2);
+    let archived_root = id(70);
+    restart(Some(&format!(
+        "INSERT INTO areas (id, slug, name, revision, archived_at)
+            VALUES ('{archived_root}', 'archive-fixture', 'Archive fixture', '{}', UTC_TIMESTAMP(6));
+         UPDATE areas SET parent_id = '{archived_root}' WHERE id = '{owner_parent}';", id(4)
+    )), None);
+    let mut reader = connect("reader");
+    let archived_base = storage_state(&mut reader);
+    let current_revision = written["data"]["result"]["issue_revision"]
+        .as_str()
+        .unwrap();
+    let archived = note(&id(64), "fixture-holder", current_revision, body, 4);
+    assert_eq!(archived["error"]["code"], "INVALID_TRANSITION");
+    let archived_replay = note(&id(60), "fixture-holder", revision, body, 0);
+    assert_eq!(archived_replay["data"], replayed["data"]);
+    let other_actor = note(&id(60), "fixture-other", revision, body, 7);
+    assert_eq!(other_actor["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert_eq!(storage_state(&mut reader), archived_base);
+    assert!(!marker.exists());
+
+    drop(reader);
+    restart(
+        Some(&format!(
+            "UPDATE areas SET archived_at = NULL WHERE id = '{archived_root}';
+         DELETE FROM operation_receipts WHERE request_id = '{}';",
+            id(60)
+        )),
+        None,
+    );
+    let mut reader = connect("reader");
+    let deleted_base = storage_state(&mut reader);
+    let effect =
+        |db: &mut Conn| -> (u64, u64, String) {
+            db.exec_first(
+            "SELECT (SELECT COUNT(*) FROM operation_receipts WHERE CAST(request_id AS BINARY) = ?),
+                    (SELECT COUNT(*) FROM issue_updates WHERE CAST(issue_id AS BINARY) = ?),
+                    revision FROM issues WHERE CAST(id AS BINARY) = ?",
+            (id(60), &issue, &issue),
+        ).unwrap().unwrap()
+        };
+    let deleted_effect = effect(&mut reader);
+    assert_eq!(deleted_effect.0, 0);
+    assert_eq!(deleted_effect.2, current_revision);
+    let reused = note(&id(60), "fixture-holder", current_revision, body, 8);
+    assert_eq!(reused["error"]["code"], "COMMIT_UNCERTAIN");
+    assert_eq!(storage_state(&mut reader), deleted_base);
+    assert_eq!(effect(&mut reader), deleted_effect);
+    assert!(!marker.exists());
+
+    if let Some(baseline) = std::env::var_os("HIVE_ISSUE_NOTE_BASELINE_BIN") {
+        drop(reader);
+        restart(None, Some(&baseline));
+        let mut reader = connect("reader");
+        let legacy_base = storage_state(&mut reader);
+        let legacy = note(&id(65), "fixture-holder", current_revision, body, 7);
+        assert_eq!(legacy["error"]["code"], "RUNTIME_UNAVAILABLE");
+        let message = legacy["error"]["message"].as_str().unwrap();
+        assert!(message.contains("lacks the required Issue note writer grants"));
+        assert!(message.contains("workspace stop") && message.contains("workspace start"));
+        assert!(!message.contains("writer_") && !message.contains(&launch_nonce()));
+        assert!(!marker.exists());
+
+        let old_pending = b"synthetic unresolved pending request";
+        fs::write(&marker, old_pending).unwrap();
+        let legacy = note(&id(65), "fixture-holder", current_revision, body, 7);
+        assert_eq!(legacy["error"]["code"], "RUNTIME_UNAVAILABLE");
+        assert!(
+            legacy["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reviewed recovery")
+        );
+        assert_eq!(storage_state(&mut reader), legacy_base);
+        drop(reader);
+        let stopped = run(&["workspace", "stop"], 0);
+        assert_eq!(stopped["data"]["pending_request"], "recorded");
+        assert_eq!(fs::read(&marker).unwrap(), old_pending);
+        let start = [
+            "workspace",
+            "start",
+            "--dolt-bin",
+            dolt.to_str().unwrap(),
+            "--port",
+            port,
+        ];
+        let blocked = run(&start, 7);
+        assert_eq!(blocked["error"]["code"], "AUTHORITY_UNVERIFIED");
+        assert_eq!(fs::read(&marker).unwrap(), old_pending);
+        // Only the fixture removes its deliberately fabricated marker.
+        fs::remove_file(&marker).unwrap();
+        run(&start, 0);
+    }
 }

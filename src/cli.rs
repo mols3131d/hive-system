@@ -262,6 +262,8 @@ pub(crate) enum Command {
     #[command(subcommand, hide = true)]
     Issue(IssueCommand),
     #[command(skip)]
+    IssueNote(IssueNoteArgs),
+    #[command(skip)]
     Resource(ResourceCommand),
     #[command(skip)]
     Workspace(WorkspaceAction),
@@ -1001,6 +1003,37 @@ pub(crate) enum IssueCommand {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueNoteArgs {
+    /// Exact Issue UUIDv7.
+    pub(crate) issue: String,
+    /// Note kind. This writer supports progress.
+    #[arg(long)]
+    pub(crate) kind: String,
+    /// Exact Area UUIDv7.
+    #[arg(long)]
+    pub(crate) area: String,
+    /// Exact active Claim UUIDv7.
+    #[arg(long)]
+    pub(crate) claim: String,
+    /// Actor reference of the Claim holder.
+    #[arg(long)]
+    pub(crate) actor: String,
+    /// Expected Issue revision as ISSUE=REV.
+    #[arg(long)]
+    pub(crate) if_match: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// UTF-8 progress note file.
+    #[arg(long)]
+    pub(crate) file: PathBuf,
+    /// Fresh, request-bound operator decision file.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueListArgs {
     /// Select Issues across the workspace.
     #[arg(long)]
@@ -1091,6 +1124,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     let mut config_error_matches = None;
     let extension = resource_parser(&cli, &args)
         .or_else(|| label_parser(&cli, &args))
+        .or_else(|| issue_note_parser(&cli, &args))
         .or_else(|| operation_parser(&cli, &args));
     let (parsed, extension_matches) = if let Some(extension) = extension {
         cli = extension.cli;
@@ -1205,6 +1239,12 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             CommonArgs::from_arg_matches(leaf).map_err(|error| safe_parse_message(error.kind()))?;
         let common = root.resolve(leaf_options)?;
         let mut command = match matches.subcommand() {
+            Some(("issue", issue)) if issue.subcommand_name() == Some("note") => {
+                Command::IssueNote(
+                    IssueNoteArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
             Some(("resource", resource)) => Command::Resource(
                 ResourceCommand::from_arg_matches(resource)
                     .map_err(|error| safe_parse_message(error.kind()))?,
@@ -1671,6 +1711,52 @@ struct ExtendedParse {
     cli: clap::Command,
     parsed: Result<ArgMatches, clap::Error>,
     partial: Option<ArgMatches>,
+}
+
+fn issue_note_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedParse> {
+    if !args.iter().skip(1).any(|arg| arg == "issue") {
+        return None;
+    }
+    let extended = cli.clone().mut_subcommand("issue", |issue| {
+        issue.subcommand(add_leaf_options(IssueNoteArgs::augment_args(
+            clap::Command::new("note")
+                .about("Append a scoped progress note with a current operator decision."),
+        )))
+    });
+    // Probe contract selection through Clap so a file name or an actor that
+    // resembles a switch does not introduce the new leaf into the v1 grammar.
+    let recovery = extended_error_options(extended.clone().disable_help_subcommand(true))
+        .mut_subcommand("issue", |issue| {
+            extended_help_probe(issue).mut_subcommand("note", extended_error_options)
+        });
+    let partial = match recovery.clone().try_get_matches_from(args) {
+        Ok(matches) => matches,
+        Err(error) => {
+            let partial = recovery
+                .clone()
+                .ignore_errors(true)
+                .try_get_matches_from(args)
+                .ok()?;
+            recover_unknown_long(&recovery, args, &partial, &error, "issue").unwrap_or(partial)
+        }
+    };
+    let leaf = match partial.subcommand() {
+        Some(("issue", issue)) => match issue.subcommand() {
+            Some(("note", leaf)) => Some(leaf),
+            None => None,
+            _ => return None,
+        },
+        None => None,
+        _ => return None,
+    };
+    if requested_contract(Some(&partial), leaf) != Contract::V2 {
+        return None;
+    }
+    Some(ExtendedParse {
+        parsed: extended.clone().try_get_matches_from(args),
+        cli: extended,
+        partial: Some(partial),
+    })
 }
 
 fn operation_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedParse> {
@@ -2453,6 +2539,23 @@ impl Command {
                     Ok(())
                 }
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
+                Self::IssueNote(args) => {
+                    if args.kind != "progress" {
+                        return Err("Issue note requires --kind progress.");
+                    }
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Issue note requires --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err("Issue note requires exact current Area and Issue scope.");
+                    }
+                    Ok(())
+                }
                 Self::Conversation(command) => {
                     let (selection, destination) = match command {
                         ConversationCommand::Show(selection) => (selection, None),
@@ -2529,7 +2632,7 @@ impl Command {
             }
             Self::Operation(_) => Err("Operation show requires --contract 2."),
             Self::Area(_) => Err("Area commands require --contract 2."),
-            Self::Issue(_) => Err("Issue commands require --contract 2."),
+            Self::Issue(_) | Self::IssueNote(_) => Err("Issue commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),
             Self::Conversation(_) => Err("Conversation commands require --contract 2."),
             Self::Bot(command) => command.validate(common),

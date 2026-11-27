@@ -15,40 +15,40 @@ use crate::error::HiveError;
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct NoteResult {
-    version: u8,
-    area_id: String,
-    issue_id: String,
-    note_id: String,
-    issue_revision: String,
+    pub(super) version: u8,
+    pub(super) area_id: String,
+    pub(super) issue_id: String,
+    pub(super) note_id: String,
+    pub(super) issue_revision: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NoteEvidence {
-    version: u8,
-    operation: String,
-    workspace_id: String,
-    request_id: String,
-    fingerprint: String,
-    actor_ref: String,
-    bot_id: Option<String>,
-    area_id: String,
-    issue_id: String,
-    expected_issue_revision: String,
-    claim_id: Option<String>,
-    authorization_ref: String,
-    evidence_id: String,
-    revision: String,
-    source_ref: String,
-    issuer_ref: String,
-    valid_from: String,
-    expires_at: String,
-    withdrawn: bool,
+pub(super) struct NoteEvidence {
+    pub(super) version: u8,
+    pub(super) operation: String,
+    pub(super) workspace_id: String,
+    pub(super) request_id: String,
+    pub(super) fingerprint: String,
+    pub(super) actor_ref: String,
+    pub(super) bot_id: Option<String>,
+    pub(super) area_id: String,
+    pub(super) issue_id: String,
+    pub(super) expected_issue_revision: String,
+    pub(super) claim_id: Option<String>,
+    pub(super) authorization_ref: String,
+    pub(super) evidence_id: String,
+    pub(super) revision: String,
+    pub(super) source_ref: String,
+    pub(super) issuer_ref: String,
+    pub(super) valid_from: String,
+    pub(super) expires_at: String,
+    pub(super) withdrawn: bool,
 }
 
 pub(super) struct ScopedNote {
     pub(super) result: NoteResult,
-    evidence: NoteEvidence,
+    pub(super) evidence: NoteEvidence,
 }
 
 pub(super) fn check_scope(
@@ -114,6 +114,7 @@ pub(super) fn verify_effect(
     introduced: &str,
     receipt: &HistoricalReceipt,
     note: &ScopedNote,
+    expected_kind: Option<&str>,
 ) -> Result<(), HiveError> {
     let result = &note.result;
     // Both literals have been validated by receipt_introduction.
@@ -159,6 +160,7 @@ pub(super) fn verify_effect(
             kind.as_str(),
             "progress" | "review" | "handoff" | "evidence" | "comment"
         )
+        || expected_kind.is_some_and(|expected| expected != kind)
         || !valid_sha256(body_sha256)
     {
         return Err(workflow::unverified());

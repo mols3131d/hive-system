@@ -178,6 +178,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
             dolt::directive::show(&selection, invocation.common.project.as_ref(), &id)
         }
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
+        Command::IssueNote(args) => dolt::issue_note::write(&invocation.common, &args),
         Command::ConversationImport(args) => dolt::conversation_import(&invocation.common, &args),
         Command::Conversation(ConversationCommand::Show(args)) => {
             dolt::conversation_read(&invocation.common, &args, None)

@@ -171,7 +171,7 @@ fn inspect(
     )?;
     let introduced = receipt_history::receipt_introduction(snapshot, selected.request, &receipt)
         .map_err(|_| uncertain())?;
-    super::issue_note_receipt::verify_effect(snapshot, &introduced, &receipt, &result)
+    super::issue_note_receipt::verify_effect(snapshot, &introduced, &receipt, &result, None)
         .map_err(|_| uncertain())?;
     let claim = current_claim(snapshot, selected.issue, status)?;
     let observed_at = workflow::format_observed_at(observed);
