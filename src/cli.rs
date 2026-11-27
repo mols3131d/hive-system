@@ -967,6 +967,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
                 .or_else(|| retry_conversation_failure(&cli, &args, error.kind(), "show"))
+                .or_else(|| retry_workspace_conflict(&cli, &args, error.kind()))
                 .or_else(|| {
                     let partial = cli
                         .clone()
@@ -1094,7 +1095,9 @@ fn workspace_parser(legacy: &clap::Command, args: &[OsString]) -> Option<clap::C
                 .ignore_errors(true)
                 .try_get_matches_from(args)
                 .ok()?;
-            recover_unknown_long(&probe, args, &partial, &error, "workspace").unwrap_or(partial)
+            retry_workspace_conflict(&probe, args, error.kind())
+                .or_else(|| recover_unknown_long(&probe, args, &partial, &error, "workspace"))
+                .unwrap_or(partial)
         }
     };
     let ("workspace", _) = matches.subcommand()? else {
@@ -1103,6 +1106,30 @@ fn workspace_parser(legacy: &clap::Command, args: &[OsString]) -> Option<clap::C
     let leaf = matched_leaf(&cli, &matches);
     (requested_contract(Some(&matches), leaf.as_ref().map(|(_, leaf)| *leaf)) == Contract::V2)
         .then_some(cli)
+}
+
+fn retry_workspace_conflict(
+    cli: &clap::Command,
+    args: &[OsString],
+    kind: ErrorKind,
+) -> Option<ArgMatches> {
+    if kind != ErrorKind::ArgumentConflict {
+        return None;
+    }
+    cli.find_subcommand("workspace")?;
+    // Accept repeated target options only to recover contract and output flags.
+    // Keep Clap's value boundaries and use the original parse error.
+    cli.clone()
+        .mut_subcommand("workspace", |workspace| {
+            workspace.mut_subcommand("status", |status| {
+                status.mut_args(|arg| match arg.get_id().as_str() {
+                    "workspace_id" | "database" | "port" => arg.action(ArgAction::Append),
+                    _ => arg,
+                })
+            })
+        })
+        .try_get_matches_from(args)
+        .ok()
 }
 
 fn parse_dolt_artifact(

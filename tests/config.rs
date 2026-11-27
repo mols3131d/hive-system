@@ -1934,6 +1934,14 @@ fn workspace_status_resolves_offline_without_creating_state() {
     );
     let report = status_report(command(), &["--port", "3307"], 2);
     assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    let report = status_report(command(), &invalid_database_target(), 2);
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("database name")
+    );
     let late_options = fixture.hive(
         &fixture.0.join("invocation"),
         &[
@@ -1950,6 +1958,50 @@ fn workspace_status_resolves_offline_without_creating_state() {
     let report = status_report(command(), &["--workspace", "../missing"], 3);
     assert_eq!(report["error"]["code"], "NOT_FOUND");
     assert_eq!(snapshot(&fixture.0), before);
+}
+
+#[test]
+fn workspace_status_explicit_root_does_not_require_a_binding_workspace() {
+    let fixture = Sandbox::new();
+    let root = fixture.0.join("workspace");
+    write(&root.join("hive-workspace.yml"), V2_DESCRIPTOR);
+    write(
+        &fixture.0.join("xdg/hive/v2/bindings.yml"),
+        format!(
+            "version: 2\nbindings:\n  - path: ../../../invocation\n    resource_id: {RESOURCE}\n"
+        ),
+    );
+    let before = snapshot(&fixture.0);
+    let explicit = ["--workspace", "../workspace"];
+    let command = fixture.hive(
+        &fixture.0.join("invocation"),
+        &["--contract", "2", "--json", "workspace", "status"],
+    );
+    let report = status_report(command, &explicit, 0);
+    assert_eq!(report["data"]["workspace_source"], "cli");
+    assert_eq!(report["data"]["workspace_root"], root.to_str().unwrap());
+
+    let output = fixture.run(&[V2_RESOLVED, &explicit].concat());
+    let report = v2_json(output, 2);
+    assert_eq!(report["error"]["code"], "INVALID_CONFIG");
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("binding without a workspace")
+    );
+    assert_eq!(snapshot(&fixture.0), before);
+}
+
+fn invalid_database_target() -> [&'static str; 6] {
+    [
+        "--workspace-id",
+        STATUS_WORKSPACE_ID,
+        "--database",
+        "invalid.name",
+        "--port",
+        "3307",
+    ]
 }
 
 #[test]
@@ -2074,6 +2126,15 @@ fn workspace_status_checks_process_start_and_endpoint_independently() {
         "unverified"
     );
     assert_eq!(report["data"]["state"], "unknown");
+
+    let report = status_report(command(), &invalid_database_target(), 2);
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("database name")
+    );
 
     let target = [
         "--workspace-id",

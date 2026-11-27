@@ -40,6 +40,7 @@ mod unix {
     use crate::config_v2::{select_workspace, xdg_root};
     use crate::dolt::{
         STORAGE_SCHEMA_VERSION, committed_identity, is_database_name, is_uuid, parse_port,
+        validate_database_name,
     };
     use crate::error::{ErrorCode, HiveError};
 
@@ -77,6 +78,9 @@ mod unix {
         format: &mut Format,
     ) -> Result<Value, HiveError> {
         let (workspace, source) = select_workspace(options, format)?;
+        if let Some(database) = &target.database {
+            validate_database_name(database)?;
+        }
         let workspace_id = workspace.workspace_id();
         let root = json_path(&workspace.root.path)?;
         // An absent DB is valid for descriptor-only inspection. An existing

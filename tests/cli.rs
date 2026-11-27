@@ -2660,3 +2660,48 @@ fn conversation_list_recovers_scoped_v2_output_without_consuming_values_as_flags
     assert_ne!(legacy["command"], "conversation list");
     sandbox.assert_empty();
 }
+
+#[test]
+fn workspace_status_recovers_output_flags_after_a_duplicate_target() {
+    let sandbox = Sandbox::new();
+    let command = ["workspace", "status"];
+    let duplicate = ["--database", "a", "--database", "b"];
+    let options = ["--contract", "2", "--json"];
+    for args in [
+        [&options[..], &command, &duplicate].concat(),
+        [&command[..], &duplicate, &options].concat(),
+    ] {
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "workspace status");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    }
+
+    let output = sandbox.run(&[
+        "workspace",
+        "status",
+        "--database=--json",
+        "--database",
+        "b",
+        "--contract",
+        "2",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("workspace status"));
+
+    for tail in [
+        &["--database=--contract", "--database", "b"][..],
+        &[&duplicate[..], &["--", "--contract", "2", "--json"]].concat(),
+    ] {
+        let output = sandbox.run(&[&["--json"][..], &command, tail].concat());
+        assert_eq!(output.status.code(), Some(2));
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert_ne!(report["command"], "workspace status");
+    }
+    sandbox.assert_empty();
+}

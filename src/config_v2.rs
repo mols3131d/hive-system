@@ -169,7 +169,12 @@ mod unix {
     ) -> Result<(Candidate, &'static str), HiveError> {
         let args = ConfigShowArgs {
             target: crate::cli::ConfigScopeArgs {
-                scope: ConfigScope::Resolved,
+                scope: if options.workspace.is_some() {
+                    // Status uses the explicit descriptor without pairing it to Resource scope.
+                    ConfigScope::Workspace
+                } else {
+                    ConfigScope::Resolved
+                },
             },
             area: None,
             resource: None,

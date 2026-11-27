@@ -196,6 +196,16 @@ pub(crate) fn is_database_name(database: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+pub(crate) fn validate_database_name(database: &str) -> Result<(), HiveError> {
+    if !is_database_name(database) {
+        return Err(HiveError::new(
+            ErrorCode::InvalidArgument,
+            "Supply a Dolt database name using letters, digits, underscores, or hyphens.",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_port(port: &std::ffi::OsStr) -> Result<NonZeroU16, HiveError> {
     port.to_str()
         .and_then(|value| value.parse().ok())
@@ -239,12 +249,7 @@ impl Snapshot {
                 "The expected workspace ID must be a lowercase UUID.",
             ));
         }
-        if !is_database_name(database) {
-            return Err(HiveError::new(
-                ErrorCode::InvalidArgument,
-                "Supply a Dolt database name using letters, digits, underscores, or hyphens.",
-            ));
-        }
+        validate_database_name(database)?;
 
         let user = reader_credential("HIVE_DOLT_USER")?;
         let password = reader_credential("HIVE_DOLT_PASSWORD")?;
