@@ -264,7 +264,12 @@ fn bot_register_checks_soul_and_confirms_replays_and_recovers() {
 
         let mut writer = connect_owned(&state, &port, "writer");
         let grants: Vec<String> = writer.query("SELECT PRIVILEGE_TYPE FROM information_schema.TABLE_PRIVILEGES WHERE TABLE_SCHEMA='db' AND TABLE_NAME='bots'").unwrap();
-        assert_eq!(grants, ["INSERT"]);
+        assert_eq!(
+            grants
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["INSERT".to_owned(), "UPDATE".to_owned()].into()
+        );
         let session = writer
             .query_first::<u64, _>("SELECT CONNECTION_ID()")
             .unwrap()

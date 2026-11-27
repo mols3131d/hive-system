@@ -848,6 +848,9 @@ pub(crate) enum BotCommand {
     /// Register a Queen from a reviewed, committed Soul (contract 2).
     #[command(skip)]
     Register(BotRegisterArgs),
+    /// Retire an execution-reconciled Queen (contract 2).
+    #[command(skip)]
+    Retire(BotRetireArgs),
     /// List registered Manager Bots.
     List {
         #[command(flatten)]
@@ -888,6 +891,24 @@ pub(crate) struct BotRegisterArgs {
     #[arg(long)]
     pub(crate) request_id: String,
     /// Current request-bound operator decision.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct BotRetireArgs {
+    /// Exact lowercase Queen UUIDv7.
+    pub(crate) bot_id: String,
+    /// Expected active Queen revision.
+    #[arg(long)]
+    pub(crate) if_match: String,
+    #[arg(long)]
+    pub(crate) actor: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound review of the execution reconciliation.
     #[arg(long)]
     pub(crate) evidence_file: PathBuf,
     #[command(flatten)]
@@ -1650,6 +1671,12 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 ))
             }
+            Some(("bot", bot)) if bot.subcommand_name() == Some("retire") => {
+                Command::Bot(BotCommand::Retire(
+                    BotRetireArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                ))
+            }
             Some(("issue", issue)) if issue.subcommand_name() == Some("note") => {
                 Command::IssueNote(
                     IssueNoteArgs::from_arg_matches(leaf)
@@ -2290,6 +2317,7 @@ fn recover_unknown_long(
                     | "accept"
                     | "set-parent"
             )
+            | ("bot", "retire")
     );
     if !(named_write
         || positional_write
@@ -2594,18 +2622,29 @@ fn bot_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedP
             clap::Command::new("register")
                 .about("Register a Queen from a reviewed, committed Soul."),
         )))
+        .subcommand(add_leaf_options(BotRetireArgs::augment_args(
+            clap::Command::new("retire").about("Retire an execution-reconciled Queen."),
+        )))
     });
-    let register_help = || CommonArgs::augment_args(clap::Command::new("register"));
+    let help = |command: clap::Command| {
+        command
+            .subcommand(CommonArgs::augment_args(clap::Command::new("register")))
+            .subcommand(CommonArgs::augment_args(clap::Command::new("retire")))
+    };
+    let actions = ["register", "retire"];
     let recovery = extended_error_options(extended.clone().disable_help_subcommand(true))
         .mut_subcommand("bot", |bot| {
             extended_help_probe(bot.disable_help_subcommand(true))
-                .mut_subcommand("register", extended_error_options)
-                .subcommand(clap::Command::new("help").subcommand(register_help()))
+                .mut_subcommands(|leaf| {
+                    if actions.contains(&leaf.get_name()) {
+                        extended_error_options(leaf)
+                    } else {
+                        leaf
+                    }
+                })
+                .subcommand(help(clap::Command::new("help")))
         })
-        .subcommand(
-            clap::Command::new("help")
-                .subcommand(clap::Command::new("bot").subcommand(register_help())),
-        );
+        .subcommand(clap::Command::new("help").subcommand(help(clap::Command::new("bot"))));
     let (partial, complete) = match recovery.clone().try_get_matches_from(args) {
         Ok(matches) => (matches, true),
         Err(error) => {
@@ -2614,39 +2653,39 @@ fn bot_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedP
                 .ignore_errors(true)
                 .try_get_matches_from(args)
                 .ok()?;
-            let matches = retry_write_failure(&extended, args, error.kind(), "bot", &["register"])
+            let matches = retry_write_failure(&extended, args, error.kind(), "bot", &actions)
                 .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "bot"))
                 .unwrap_or(partial);
             (matches, false)
         }
     };
     let help_leaf = if complete {
-        writer_help_domain(&partial, "bot").and_then(|help| help.subcommand_matches("register"))
+        writer_help_domain(&partial, "bot").and_then(ArgMatches::subcommand)
     } else {
         None
     };
     let help_requested = help_leaf.is_some();
-    let leaf = help_leaf.or_else(|| {
-        partial
-            .subcommand_matches("bot")?
-            .subcommand_matches("register")
-    })?;
-    (requested_contract(Some(&partial), Some(leaf)) == Contract::V2).then(|| {
-        let parsed = if help_requested {
-            extended.clone().try_get_matches_from([
-                args[0].clone(),
-                OsString::from("bot"),
-                OsString::from("register"),
-                OsString::from("--help"),
-            ])
-        } else {
-            extended.clone().try_get_matches_from(args)
-        };
-        ExtendedParse {
-            parsed,
-            cli: extended,
-            partial: Some(partial),
-        }
+    let (action, leaf) = help_leaf.or_else(|| partial.subcommand_matches("bot")?.subcommand())?;
+    if !actions.contains(&action) {
+        return None;
+    }
+    if requested_contract(Some(&partial), Some(leaf)) != Contract::V2 {
+        return None;
+    }
+    let parsed = if help_requested {
+        extended.clone().try_get_matches_from([
+            args[0].clone(),
+            OsString::from("bot"),
+            OsString::from(action),
+            OsString::from("--help"),
+        ])
+    } else {
+        extended.clone().try_get_matches_from(args)
+    };
+    Some(ExtendedParse {
+        parsed,
+        cli: extended,
+        partial: Some(partial),
     })
 }
 
@@ -3831,6 +3870,20 @@ impl BotCommand {
                 }
                 if common.project.is_some() || common.project_root.is_some() {
                     return Err("Bot register applies to the selected workspace.");
+                }
+                return common.require_working_tree();
+            }
+            Self::Retire(args) => {
+                if common.contract != Contract::V2 {
+                    return Err("Bot retire requires --contract 2.");
+                }
+                if common.workspace.is_none() || !args.target.has_all() {
+                    return Err(
+                        "Bot retire requires --workspace, --workspace-id, --database, and --port.",
+                    );
+                }
+                if common.project.is_some() || common.project_root.is_some() {
+                    return Err("Bot retire applies to the selected workspace.");
                 }
                 return common.require_working_tree();
             }
