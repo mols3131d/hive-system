@@ -178,3 +178,208 @@ fn checks_missing_artifact_link_endpoints_at_the_committed_snapshot() {
     assert_diagnostics(&report, &expected);
     assert_eq!(fixture.check(4, &mut admin), report);
 }
+
+#[test]
+#[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
+fn reads_artifact_metadata_and_gates_committed_bodies_by_exact_scope() {
+    let fixture = Fixture::start();
+    let mut writer = fixture.connect(ADMIN);
+    seed_targets(&mut writer);
+    let (cross, standalone, direct, neighboring, large, malformed) =
+        (id(0x5a), id(0x5b), id(0x5c), id(0x5d), id(0x5e), id(0x5f));
+    let accented = id(0x6a);
+    for artifact in [
+        &cross,
+        &standalone,
+        &direct,
+        &neighboring,
+        &large,
+        &malformed,
+        &accented,
+    ] {
+        insert_artifact(&mut writer, artifact, "report");
+    }
+    let private_marker = "artifact-body-private-marker";
+    let fixture_body =
+        format!("Committed café\n{private_marker}\n[reference](file:///unread-fixture)");
+    writer.exec_drop(
+        "UPDATE artifacts SET title='Cross-linked', body=?, source_ref='hidden-source' WHERE id=?",
+        (&fixture_body, &cross),
+    ).unwrap();
+    writer
+        .exec_drop(
+            "UPDATE artifacts SET title='Hidden neighboring title' WHERE id=?",
+            (&neighboring,),
+        )
+        .unwrap();
+    writer
+        .exec_drop(
+            "UPDATE artifacts SET body=REPEAT('é', 32769) WHERE id=?",
+            (&large,),
+        )
+        .unwrap();
+    let scopes: Vec<_> = LINKS
+        .iter()
+        .zip(["area", "project", "issue", "resource"])
+        .map(|((table, endpoint), kind)| {
+            insert_link(&mut writer, table, &cross, &id(*endpoint));
+            format!("{kind}:{}", id(*endpoint))
+        })
+        .collect();
+    insert_link(&mut writer, "artifact_areas", &cross, &id(3));
+    insert_link(&mut writer, "artifact_areas", &direct, &id(2));
+    insert_link(&mut writer, "artifact_areas", &neighboring, &id(3));
+    insert_link(
+        &mut writer,
+        "artifact_areas",
+        &malformed.to_ascii_uppercase(),
+        &id(2),
+    );
+    let accented_alias = format!("{}á", accented.strip_suffix('a').unwrap());
+    insert_link(&mut writer, "artifact_areas", &accented_alias, &id(2));
+    commit(&mut writer);
+
+    writer
+        .exec_drop(
+            "DELETE FROM artifact_resources WHERE artifact_id=?",
+            (&cross,),
+        )
+        .unwrap();
+    writer
+        .query_drop("CALL DOLT_ADD('artifact_resources')")
+        .unwrap();
+    writer
+        .exec_drop(
+            "UPDATE artifacts SET body='Dirty body', title='Dirty title' WHERE id=?",
+            (&cross,),
+        )
+        .unwrap();
+    let working_resource = id(0xff);
+    writer
+        .exec_drop(
+            "INSERT INTO resources (id, kind, name, revision) VALUES (?, 'fixture', 'Working only', 'fixture-revision')",
+            (&working_resource,),
+        )
+        .unwrap();
+    let before = storage_state(&mut writer);
+
+    let port = fixture.port.to_string();
+    let workspace = id(1);
+    let run = |leaf: &str, options: &[&str], expected_exit| {
+        let args = [
+            &[
+                "--contract",
+                "2",
+                "--json",
+                "artifact",
+                leaf,
+                "--database",
+                super::DATABASE,
+                "--workspace-id",
+                &workspace,
+                "--port",
+                &port,
+            ][..],
+            options,
+        ]
+        .concat();
+        let output = fixture.run_hive(&args, &fixture.password);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{error}: {:?}", output));
+        assert_eq!(output.status.code(), Some(expected_exit), "{report}");
+        assert!(output.stderr.is_empty(), "{report}");
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], format!("artifact {leaf}"));
+        assert_eq!(report["context"]["db_commit"], before.0);
+        report
+    };
+
+    let page = run("list", &["--scope", &scopes[0], "--limit", "1"], 0);
+    assert_eq!(
+        page["data"]["items"],
+        serde_json::json!([{
+            "id": cross, "kind": "report", "title": "Cross-linked", "revision": "fixture-revision"
+        }])
+    );
+    for hidden in [
+        "Hidden neighboring title",
+        private_marker,
+        "hidden-source",
+        &id(3),
+        &id(RESOURCE),
+    ] {
+        assert!(!page.to_string().contains(hidden));
+    }
+    assert_eq!(page["data"]["truncated"], true);
+    let cursor = page["data"]["next_cursor"].as_str().unwrap();
+    let second = run(
+        "list",
+        &["--scope", &scopes[0], "--limit", "1", "--cursor", cursor],
+        0,
+    );
+    assert_eq!(second["data"]["items"][0]["id"], direct);
+    assert_eq!(second["data"]["next_cursor"], serde_json::Value::Null);
+    for scope in &scopes[1..] {
+        let page = run("list", &["--scope", scope], 0);
+        assert_eq!(page["data"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["data"]["items"][0]["id"], cross);
+    }
+    assert_eq!(
+        run(
+            "list",
+            &["--scope", &scopes[1], "--limit", "1", "--cursor", cursor],
+            5
+        )["error"]["code"],
+        "STALE_CURSOR"
+    );
+    let unknown = format!("resource:{working_resource}");
+    assert_eq!(
+        run("list", &["--scope", &unknown], 3)["error"]["code"],
+        "NOT_FOUND"
+    );
+    assert_eq!(
+        run("show", &[&standalone, "--scope", &unknown], 3)["error"]["code"],
+        "NOT_FOUND"
+    );
+
+    let area_three = format!("area:{}", id(3));
+    let mut selection = vec![cross.as_str(), "--scope", area_three.as_str()];
+    for scope in &scopes[..3] {
+        selection.extend(["--scope", scope]);
+    }
+    let denial = run("show", &selection, 6);
+    assert_eq!(denial["error"]["code"], "UNAUTHORIZED");
+    assert!(denial.get("data").is_none_or(serde_json::Value::is_null));
+    for hidden in [
+        &id(RESOURCE),
+        "Cross-linked",
+        private_marker,
+        "hidden-source",
+    ] {
+        assert!(!denial.to_string().contains(hidden));
+    }
+    assert_eq!(run("show", &[&cross], 6)["error"]["code"], "UNAUTHORIZED");
+    selection.extend(["--scope", &scopes[3]]);
+    let shown = run("show", &selection, 0);
+    assert_eq!(
+        shown["data"]["artifact"],
+        serde_json::json!({
+            "id": cross, "title": "Cross-linked", "kind": "report", "revision": "fixture-revision",
+            "body": fixture_body, "body_bytes": fixture_body.len(),
+        })
+    );
+    assert_eq!(
+        run("show", &[&standalone], 0)["data"]["artifact"]["body"],
+        "Synthetic Artifact body"
+    );
+    assert_eq!(run("show", &[&large], 2)["error"]["code"], "CONTEXT_LIMIT");
+    assert_eq!(
+        run("show", &[&malformed, "--scope", &scopes[0]], 6)["error"]["code"],
+        "UNAUTHORIZED"
+    );
+    assert_eq!(
+        run("show", &[&accented], 6)["error"]["code"],
+        "UNAUTHORIZED"
+    );
+    assert_eq!(storage_state(&mut writer), before);
+}

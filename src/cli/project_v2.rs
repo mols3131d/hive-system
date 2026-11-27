@@ -72,7 +72,7 @@ pub(super) fn parse(
                 .try_get_matches_from(args)
                 .ok()?;
             let matches =
-                recover_unknown_long(&cli, args, &partial, &error, "project").unwrap_or(partial);
+                recover_unknown_long(&cli, args, "project", &partial, &error).unwrap_or(partial);
             (matches, Some(error.kind()))
         }
     };
