@@ -1973,15 +1973,22 @@ fn recover_unknown_long(
         return None;
     }
     let (action, _) = matched.subcommand()?;
-    if !matches!(
+    let named_write = matches!((domain, action), ("area" | "project", "create"));
+    let positional_write = matches!(
         (domain, action),
-        (
-            "workspace",
-            "init" | "status" | "start" | "stop" | "recover"
-        ) | ("artifact" | "area", "create")
-            | ("project", "create" | "add-issue")
-            | (_, "list" | "show")
-    ) {
+        ("project", "add-issue") | ("issue", "add-dependency" | "remove-dependency")
+    );
+    if !(named_write
+        || positional_write
+        || matches!(
+            (domain, action),
+            (
+                "workspace",
+                "init" | "status" | "start" | "stop" | "recover"
+            ) | ("artifact", "create")
+                | (_, "list" | "show")
+        ))
+    {
         return None;
     }
     let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
@@ -1991,18 +1998,13 @@ fn recover_unknown_long(
     let long = unknown_long_name(leaf, invalid)?;
 
     let workspace_init = (domain, action) == ("workspace", "init");
-    let allow_incomplete = matches!(
-        (domain, action),
-        ("area", "create") | ("project", "create" | "add-issue")
-    );
+    let allow_incomplete = named_write || positional_write;
     let accept_value = workspace_init
-        || matches!(
-            (domain, action),
-            ("label", "list") | ("artifact" | "area", "create") | ("project", "create")
-        );
+        || named_write
+        || matches!((domain, action), ("label", "list") | ("artifact", "create"));
     // When the command has positional IDs, first let those slots consume
     // ordinary tokens. Try a separated unknown-option value if that fails.
-    let modes: &[bool] = if (domain, action) == ("project", "add-issue") {
+    let modes: &[bool] = if positional_write {
         &[false, true]
     } else {
         &[accept_value]

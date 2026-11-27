@@ -2349,6 +2349,53 @@ fn unknown_project_long_option_keeps_original_error_with_late_v2_json() {
 }
 
 #[test]
+fn unknown_dependency_options_keep_the_late_v2_envelope() {
+    let sandbox = Sandbox::new();
+    let issue = "01900000-0000-7000-8000-000000000003";
+    let prerequisite = "01900000-0000-7000-8000-000000000004";
+    for (action, unknown) in [
+        ("add-dependency", &["--unknown=--contract=1"][..]),
+        ("remove-dependency", &["--unknown", "fixture-value"]),
+    ] {
+        let args = [
+            &["issue", action][..],
+            unknown,
+            &[issue, prerequisite, "--contract", "2", "--json"],
+        ]
+        .concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "schema_version": 2, "ok": false, "command": format!("issue {action}"),
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "An argument or command is not recognized.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+    let literal = sandbox.run(&[
+        "issue",
+        "add-dependency",
+        "--unknown=--json",
+        issue,
+        prerequisite,
+        "--contract",
+        "2",
+    ]);
+    assert_eq!(literal.status.code(), Some(2));
+    assert!(literal.stdout.is_empty());
+    assert!(!literal.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
 fn unknown_project_write_options_keep_the_late_v2_envelope() {
     let sandbox = Sandbox::new();
     let project = "01900000-0000-7000-8000-000000000003";
