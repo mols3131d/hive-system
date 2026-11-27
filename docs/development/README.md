@@ -96,6 +96,20 @@ hive --contract 2 --json issue show '#42' \
 
 The result includes the verified workspace and Dolt commit, the selected Issue, and bounded direct relation IDs. A missing Issue returns `NOT_FOUND` at the verified commit. Each relation list returns up to 25 IDs and sets `truncated` if more exist. Use explicit selection to inspect other records as their read commands become available.
 
+`issue list` uses the same verified committed snapshot. Select exactly one of `--all`, `--area UUID`, or `--project UUID`. Area and Project selectors use canonical lowercase UUIDv7 IDs. Area selection covers only Issues owned by that Area. Project selection covers only direct members of that Project, including members across Areas.
+
+```sh
+hive --contract 2 --json issue list --area 01900000-0000-7000-8000-000000000002 \
+  --status todo --limit 10 --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+The optional filters are `--status`, `--type`, `--priority` (0–3), and `--label` (exact stored name). The response contains summary fields and the observed Dolt commit. Pages are ordered by priority ascending with unspecified priority last, then oldest creation timestamp, then ascending Issue ID. The default page size is 25 and the maximum is 100. When `truncated` is true, pass `next_cursor` as `--cursor` with the same arguments. A changed workspace, commit, scope, filter, page size, or sort returns `STALE_CURSOR` (exit 5). Restart the list to read the new snapshot.
+
+A selected Issue with malformed summary fields returns `INVALID_RECORD` at the verified commit.
+
+Recursive Area listing, global discovery, readiness and blocker queries, and context resolution are follow-up work.
+
 ## Agent-assisted development
 
 Use [instruction ownership](agents/rule-ownership.md) to place scoped guidance, [asset lifecycle](agents/assets.md) when selecting or updating reusable Agent Assets, and [harness verification](agents/harness.md) to distinguish configuration from observed runtime behavior.

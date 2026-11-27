@@ -1,5 +1,6 @@
 mod graph;
 mod issue;
+mod issue_list;
 mod records;
 
 use std::num::NonZeroU16;
@@ -14,6 +15,7 @@ use crate::cli::{DoltTargetArgs, IssueShowArgs, ValidateArgs};
 use crate::error::{ErrorCode, HiveError};
 
 pub(crate) use issue::show as issue_show;
+pub(crate) use issue_list::list as issue_list;
 
 const DOLT_VERSION: &str = "2.7.6";
 pub(crate) const STORAGE_SCHEMA_VERSION: u32 = 1;

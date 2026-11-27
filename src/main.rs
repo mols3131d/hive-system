@@ -103,6 +103,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let result = match invocation.command {
         Command::Validate(args) => dolt::validate(&args),
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
+        Command::Issue(IssueCommand::List(args)) => {
+            dolt::issue_list(&args, invocation.common.project.as_ref())
+        }
         _ => Err(dolt::DoltFailure::without_context(HiveError::new(
             ErrorCode::NotImplemented,
             "This operation is unavailable under contract 2.",

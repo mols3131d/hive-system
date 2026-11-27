@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use crate::error::{ErrorCode, HiveError};
 
-use super::records::{Diagnostics, IssueStatus};
+use super::records::{Diagnostics, IssueStatus, is_issue_type};
 use super::{DoltFailure, DoltSuccess, IssueShowArgs, Snapshot, is_uuid_v7};
 
 const RELATION_REF_LIMIT: usize = 25;
@@ -393,7 +393,7 @@ fn validate_issue(issue: &IssueDetail, diagnostics: &mut Diagnostics) {
             );
         }
     }
-    if !matches!(issue.kind.as_str(), "epic" | "feature" | "task" | "bug") {
+    if !is_issue_type(&issue.kind) {
         diagnostics.add(
             "INVALID_ISSUE_TYPE",
             "issues",
