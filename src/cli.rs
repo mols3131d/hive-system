@@ -2192,7 +2192,7 @@ fn recover_unknown_long(
     let (action, _) = matched.subcommand()?;
     if matches!(
         (domain, action),
-        ("issue", "release" | "recover" | "submit")
+        ("issue", "set-parent" | "release" | "recover" | "submit")
     ) {
         return [true, false].into_iter().find_map(|equals| {
             replay_unknown_options(cli, args, error, (domain, action), equals, true)
@@ -2368,9 +2368,28 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
     });
     // Probe contract selection through Clap so a file name or an actor that
     // resembles a switch does not introduce the new leaf into the v1 grammar.
+    let issue_help = |parent| {
+        [
+            "note",
+            "create",
+            "update",
+            "select",
+            "claim",
+            "set-parent",
+            "release",
+            "recover",
+            "submit",
+            "add-dependency",
+            "remove-dependency",
+        ]
+        .into_iter()
+        .fold(clap::Command::new(parent), |help, action| {
+            help.subcommand(CommonArgs::augment_args(clap::Command::new(action)))
+        })
+    };
     let recovery = extended_error_options(extended.clone().disable_help_subcommand(true))
         .mut_subcommand("issue", |issue| {
-            extended_help_probe(issue)
+            extended_help_probe(issue.disable_help_subcommand(true))
                 .mut_subcommand("note", extended_error_options)
                 .mut_subcommand("create", extended_error_options)
                 .mut_subcommand("update", extended_error_options)
@@ -2384,16 +2403,18 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .mut_subcommand("submit", extended_error_options)
                 .mut_subcommand("add-dependency", extended_error_options)
                 .mut_subcommand("remove-dependency", extended_error_options)
-        });
-    let partial = match recovery.clone().try_get_matches_from(args) {
-        Ok(matches) => matches,
+                .subcommand(issue_help("help"))
+        })
+        .subcommand(clap::Command::new("help").subcommand(issue_help("issue")));
+    let (partial, complete) = match recovery.clone().try_get_matches_from(args) {
+        Ok(matches) => (matches, true),
         Err(error) => {
             let partial = recovery
                 .clone()
                 .ignore_errors(true)
                 .try_get_matches_from(args)
                 .ok()?;
-            retry_write_failure(
+            let matches = retry_write_failure(
                 &extended,
                 args,
                 error.kind(),
@@ -2414,10 +2435,17 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 ],
             )
             .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "issue"))
-            .unwrap_or(partial)
+            .unwrap_or(partial);
+            (matches, false)
         }
     };
+    let help_leaf = if complete {
+        writer_help_domain(&partial, "issue").and_then(ArgMatches::subcommand)
+    } else {
+        None
+    };
     let leaf = match partial.subcommand() {
+        Some(("help", _)) => help_leaf.map(|(_, leaf)| leaf),
         Some(("issue", issue)) => match issue.subcommand() {
             Some((
                 "note" | "create" | "update" | "select" | "claim" | "release" | "recover"
@@ -2425,6 +2453,7 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 | "set-parent",
                 leaf,
             )) => Some(leaf),
+            Some(("help", _)) => help_leaf.map(|(_, leaf)| leaf),
             None => None,
             _ => return None,
         },
@@ -2434,11 +2463,32 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
     if requested_contract(Some(&partial), leaf) != Contract::V2 {
         return None;
     }
+    let parsed = if let Some((action, _)) = help_leaf {
+        extended.clone().try_get_matches_from([
+            args[0].clone(),
+            OsString::from("issue"),
+            OsString::from(action),
+            OsString::from("--help"),
+        ])
+    } else {
+        extended.clone().try_get_matches_from(args)
+    };
     Some(ExtendedParse {
-        parsed: extended.clone().try_get_matches_from(args),
+        parsed,
         cli: extended,
         partial: Some(partial),
     })
+}
+
+fn writer_help_domain<'a>(partial: &'a ArgMatches, domain: &str) -> Option<&'a ArgMatches> {
+    partial
+        .subcommand_matches("help")
+        .and_then(|help| help.subcommand_matches(domain))
+        .or_else(|| {
+            partial
+                .subcommand_matches(domain)?
+                .subcommand_matches("help")
+        })
 }
 
 fn bot_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedParse> {
@@ -2477,15 +2527,7 @@ fn bot_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedP
         }
     };
     let help_leaf = if complete {
-        partial
-            .subcommand_matches("help")
-            .and_then(|help| help.subcommand_matches("bot"))
-            .or_else(|| {
-                partial
-                    .subcommand_matches("bot")?
-                    .subcommand_matches("help")
-            })
-            .and_then(|help| help.subcommand_matches("register"))
+        writer_help_domain(&partial, "bot").and_then(|help| help.subcommand_matches("register"))
     } else {
         None
     };
