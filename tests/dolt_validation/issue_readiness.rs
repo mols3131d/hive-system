@@ -23,7 +23,11 @@ fn run_view(fixture: &Fixture, view: &str, options: &[&str], exit: i32) -> Value
     args.extend(options);
     let output = fixture.run_hive(&args, &fixture.password);
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(exit), "{report}");
+    assert_eq!(
+        output.status.code(),
+        Some(exit),
+        "{view} {options:?}: {report}"
+    );
     assert!(output.stderr.is_empty(), "{report}");
     assert_eq!(report["schema_version"], 2);
     assert_eq!(report["command"], format!("issue {view}"));
@@ -313,7 +317,7 @@ fn issue_readiness_uses_exact_committed_scopes_and_filters_before_paging() {
     let cancelled = id(45);
     for (scope, update, restore, number, reason) in [
         (
-            ["--project", project.as_str(), "--priority", "1"],
+            &["--project", project.as_str(), "--priority", "1"][..],
             format!(
                 "INSERT INTO issue_claims VALUES ('{accepted}', '{}', 'private fixture holder', UTC_TIMESTAMP(6))",
                 id(53)
@@ -323,14 +327,14 @@ fn issue_readiness_uses_exact_committed_scopes_and_filters_before_paging() {
             "INVALID_PREREQUISITE",
         ),
         (
-            ["--label", "selected", "--type", "bug"],
+            &["--all", "--label", "selected", "--type", "bug"],
             "UPDATE issues SET hold_reason = 'private fixture hold' WHERE number = 6".to_owned(),
             "UPDATE issues SET hold_reason = NULL WHERE number = 6".to_owned(),
             6,
             "HOLD",
         ),
         (
-            ["--label", "selected", "--type", "bug"],
+            &["--all", "--label", "selected", "--type", "bug"],
             format!(
                 "INSERT INTO issue_claims VALUES ('{candidate}', '{}', 'private fixture holder', UTC_TIMESTAMP(6))",
                 id(52)
@@ -340,18 +344,18 @@ fn issue_readiness_uses_exact_committed_scopes_and_filters_before_paging() {
             "CURRENT_CLAIM",
         ),
         (
-            ["--label", "selected", "--type", "bug"],
+            &["--all", "--label", "selected", "--type", "bug"],
             format!("INSERT INTO issue_dependencies VALUES ('{candidate}', '{cancelled}')"),
             format!("DELETE FROM issue_dependencies WHERE issue_id = '{candidate}'"),
             6,
             "PREREQUISITE_NOT_DONE",
         ),
     ] {
-        assert_eq!(numbers(&run("ready", &scope, 0)), [number]);
+        assert_eq!(numbers(&run("ready", scope, 0)), [number]);
         writer.query_drop(update).unwrap();
         commit(&mut writer);
-        assert!(numbers(&run("ready", &scope, 0)).is_empty());
-        let report = run("blocked", &scope, 0);
+        assert!(numbers(&run("ready", scope, 0)).is_empty());
+        let report = run("blocked", scope, 0);
         assert_eq!(report["data"]["items"][0]["number"], number);
         assert_eq!(report["data"]["items"][0]["reasons"], json!([reason]));
         writer.query_drop(restore).unwrap();
