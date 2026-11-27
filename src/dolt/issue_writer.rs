@@ -278,7 +278,7 @@ impl Pending {
     fn record_id(&self, kind: Kind) -> Option<&str> {
         match kind {
             Kind::AreaCreate => self.area_id.as_deref(),
-            Kind::ArtifactCreate => self.artifact_id.as_deref(),
+            Kind::ArtifactCreate | Kind::ArtifactUpdate => self.artifact_id.as_deref(),
             _ => self.issue_id.as_deref(),
         }
     }
@@ -878,6 +878,10 @@ mod tests {
         value["kind"] = json!("artifact.update");
         let standalone = read(&value).unwrap();
         assert!(matches!(standalone.operation(), Ok(Kind::ArtifactUpdate)));
+        assert_eq!(
+            standalone.record_id(Kind::ArtifactUpdate),
+            value["artifact_id"].as_str(),
+        );
         assert_eq!(json!(standalone), value);
         value["area_id"] = area_id;
         let linked = read(&value).unwrap();
