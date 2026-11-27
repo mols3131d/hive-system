@@ -989,3 +989,131 @@ fn dolt_area_reads_require_contract_2_and_an_explicit_target() {
     }
     sandbox.assert_empty();
 }
+
+#[test]
+fn malformed_dolt_area_options_preserve_v2_json_at_root_and_leaf() {
+    let sandbox = Sandbox::new();
+    let target = [
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+    ];
+    let selectors = ["--contract", "2", "--json"];
+    let project = ["--project", "BAD!"];
+    let cursor = ["--cursor", "-1"];
+    let cases = [
+        ("area list", &["area", "list"][..], &cursor[..], false),
+        ("area list", &["area", "list"][..], &project[..], false),
+        ("area list", &["area", "list"][..], &project[..], true),
+        (
+            "area show",
+            &["area", "show", target[1]][..],
+            &project[..],
+            false,
+        ),
+        (
+            "area show",
+            &["area", "show", target[1]][..],
+            &project[..],
+            true,
+        ),
+    ];
+    for (name, command, invalid, at_root) in cases {
+        let command = [command, &target].concat();
+        let invalid_command = if at_root {
+            [invalid, &command].concat()
+        } else {
+            [&command[..], invalid].concat()
+        };
+        let early = [&selectors[..], &invalid_command].concat();
+        let late = [&invalid_command[..], &selectors].concat();
+        let output = sandbox.run(&early);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{early:?}");
+        assert_eq!(report["schema_version"], 2, "{early:?}");
+        assert_eq!(report["command"], name, "{early:?}");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT", "{early:?}");
+        assert!(!report.to_string().contains(invalid[1]), "{early:?}");
+        assert!(output.stderr.is_empty(), "{early:?}");
+
+        let trailing = sandbox.run(&late);
+        assert_eq!(trailing.status.code(), output.status.code(), "{late:?}");
+        assert_eq!(trailing.stdout, output.stdout, "{late:?}");
+        assert!(trailing.stderr.is_empty(), "{late:?}");
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn dolt_area_option_recovery_preserves_literals_and_v1_errors() {
+    let sandbox = Sandbox::new();
+    for args in [
+        &["--project=--json", "area", "list", "--contract", "2"][..],
+        &[
+            "area",
+            "list",
+            "--cursor=--json",
+            "--project",
+            "BAD!",
+            "--contract",
+            "2",
+        ],
+        &[
+            "area",
+            "show",
+            "--project=--json",
+            "--contract",
+            "2",
+            "01900000-0000-7000-8000-000000000001",
+        ],
+        &[
+            "--contract",
+            "2",
+            "area",
+            "show",
+            "--workspace-id",
+            "01900000-0000-7000-8000-000000000001",
+            "--database",
+            "fixture_db",
+            "--port",
+            "3307",
+            "--",
+            "--json",
+        ],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+
+    for invalid in [
+        &["--project=--contract", "area", "list"][..],
+        &["area", "list", "--project=--contract"],
+        &["area", "list", "--cursor", "-1"],
+    ] {
+        let default = ["--json"]
+            .iter()
+            .chain(invalid)
+            .copied()
+            .collect::<Vec<_>>();
+        let v1 = ["--contract", "1"]
+            .iter()
+            .chain(&default)
+            .copied()
+            .collect::<Vec<_>>();
+        let output = sandbox.run(&default);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{default:?}");
+        assert_eq!(report["schema_version"], 1, "{default:?}");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT", "{default:?}");
+        let explicit = sandbox.run(&v1);
+        assert_eq!(explicit.status.code(), output.status.code(), "{v1:?}");
+        assert_eq!(explicit.stdout, output.stdout, "{v1:?}");
+        assert_eq!(explicit.stderr, output.stderr, "{v1:?}");
+    }
+    sandbox.assert_empty();
+}
