@@ -4212,8 +4212,15 @@ fn reviewed_issue_commands_preserve_contract_and_literal_boundaries() {
         ("request-changes", "--submission"),
         ("accept", "--approval"),
     ] {
-        let help = sandbox.run(&["--contract", "2", "issue", action, "--help"]);
-        assert!(help.status.success(), "{help:?}");
+        for args in [
+            ["--contract", "2", "issue", action, "--help"],
+            ["help", "issue", action, "--contract", "2"],
+            ["issue", "help", action, "--contract", "2"],
+        ] {
+            let help = sandbox.run(&args);
+            assert!(help.status.success(), "{help:?}");
+            assert!(String::from_utf8_lossy(&help.stdout).contains(required));
+        }
         let v1 = sandbox.run(&["--contract", "1", "issue", action, "--help"]);
         assert!(!v1.status.success(), "{v1:?}");
         for invalid in [
@@ -4221,6 +4228,7 @@ fn reviewed_issue_commands_preserve_contract_and_literal_boundaries() {
             &[issue, required, "x", required, "y"],
             &["--unknown=--contract=1", issue],
             &["-Z", issue],
+            &["-Z", issue, "--unknown=--contract=1"],
         ] {
             let command = ["issue", action];
             let options = ["--contract", "2", "--json"];
