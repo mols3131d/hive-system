@@ -1,12 +1,11 @@
 use std::ffi::{CString, OsStr};
-use std::fs::{self, File, Permissions};
+use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 
-use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, openat, statat};
+use rustix::fs::{AtFlags, Mode, mkdirat, statat};
 use rustix::io::Errno;
 
 use super::{
@@ -309,50 +308,35 @@ fn outside_git(directory: &ScopedDirectory) -> Result<(), HiveError> {
 }
 
 fn private_child(parent: &ScopedDirectory, name: &str) -> Result<ScopedDirectory, HiveError> {
+    private_child_with(parent, name, || {})
+}
+
+fn private_child_with(
+    parent: &ScopedDirectory,
+    name: &str,
+    after_create: impl FnOnce(),
+) -> Result<ScopedDirectory, HiveError> {
     let name = OsStr::new(name);
-    let created = match mkdirat(parent.handle(), name, Mode::RWXU) {
-        Ok(()) => {
-            // O_PATH pins the new directory even when umask removed all access.
-            let pinned = openat(
-                parent.handle(),
-                name,
-                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map(File::from)
-            .map_err(|_| io_error("Could not open the new private conversation directory."))?;
-            let info = directory_metadata(&pinned)?;
-            // SAFETY: geteuid takes no pointers and has no preconditions.
-            if info.uid() != unsafe { libc::geteuid() } {
-                return Err(unsafe_directory());
-            }
-            // As in workspace initialization, chmod the kernel link to our descriptor.
-            let fd_path = format!("/proc/self/fd/{}", pinned.as_raw_fd());
-            fs::set_permissions(fd_path, Permissions::from_mode(0o700)).map_err(|_| {
-                io_error("Could not secure the new private conversation directory.")
-            })?;
-            Some((pinned, info))
-        }
-        Err(Errno::EXIST) => None,
+    match create_private_directory(parent.handle(), name) {
+        Ok(()) => after_create(),
+        Err(Errno::EXIST) => {}
         Err(_) => {
             return Err(io_error(
                 "Could not create a private conversation directory.",
             ));
         }
-    };
-    let directory = parent.require_child_directory(name)?;
-    let info = directory_metadata(directory.handle())?;
-    if created.is_some_and(|(_pinned, created)| {
-        (created.dev(), created.ino()) != (info.dev(), info.ino())
-    }) {
-        return Err(HiveError::new(
-            ErrorCode::ConcurrentChange,
-            "The new private conversation directory changed during import.",
-        ));
     }
+    let directory = parent.require_child_directory(name)?;
+    let info = directory
+        .handle()
+        .metadata()
+        .map_err(|_| io_error("Could not inspect a conversation directory."))?;
     // SAFETY: geteuid takes no pointers and has no preconditions.
     if info.uid() != unsafe { libc::geteuid() } || info.mode() & 0o7777 != 0o700 {
-        return Err(unsafe_directory());
+        return Err(HiveError::new(
+            ErrorCode::InvalidConfig,
+            "Conversation directories must be owned by the caller with mode 0700.",
+        ));
     }
     outside_git(&directory)?;
     parent
@@ -362,17 +346,21 @@ fn private_child(parent: &ScopedDirectory, name: &str) -> Result<ScopedDirectory
     Ok(directory)
 }
 
-fn directory_metadata(directory: &File) -> Result<fs::Metadata, HiveError> {
-    directory
-        .metadata()
-        .map_err(|_| io_error("Could not inspect a conversation directory."))
-}
+fn create_private_directory(parent: &File, name: &OsStr) -> rustix::io::Result<()> {
+    struct RestoreUmask(libc::mode_t);
+    impl Drop for RestoreUmask {
+        fn drop(&mut self) {
+            // SAFETY: This restores the mask saved in the same process.
+            unsafe { libc::umask(self.0) };
+        }
+    }
 
-fn unsafe_directory() -> HiveError {
-    HiveError::new(
-        ErrorCode::InvalidConfig,
-        "Conversation directories must be owned by the caller with mode 0700.",
-    )
+    // Set the mode at creation. A later open can reach a replacement even
+    // with no-follow traversal. Only the import CLI (or an isolated test
+    // subprocess) changes its mask, and only for this mkdirat.
+    // SAFETY: umask takes no pointers and has no preconditions.
+    let _restore = RestoreUmask(unsafe { libc::umask(0o077) });
+    mkdirat(parent, name, Mode::RWXU)
 }
 
 fn io_error(message: &'static str) -> HiveError {
@@ -384,8 +372,10 @@ mod tests {
     use super::*;
     use crate::dolt::conversation::validate_file;
     use crate::dolt::is_uuid_v7;
-    use std::os::unix::fs::symlink;
+    use std::fs::{self, Permissions};
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::os::unix::process::CommandExt;
+    use std::path::PathBuf;
     use std::process::Command;
 
     fn fixture_metadata(source: Source, body: &[u8]) -> Metadata {
@@ -406,17 +396,88 @@ mod tests {
         }
     }
 
+    fn isolated_fixture(test: &str, umask: libc::mode_t) -> Option<PathBuf> {
+        const FIXTURE: &str = "HIVE_IMPORT_UMASK_FIXTURE";
+        if let Some(path) = std::env::var_os(FIXTURE) {
+            return Some(PathBuf::from(path));
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.env(FIXTURE, temp.path()).args([
+            "--exact",
+            &format!("dolt::conversation::import::tests::{test}"),
+        ]);
+        // SAFETY: umask is async-signal-safe and changes only the child process.
+        unsafe {
+            child.pre_exec(move || {
+                libc::umask(umask);
+                Ok(())
+            });
+        }
+        let output = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        None
+    }
+
+    #[test]
+    fn substituted_directory_keeps_its_mode_and_data() {
+        let Some(temp) = isolated_fixture("substituted_directory_keeps_its_mode_and_data", 0o077)
+        else {
+            return;
+        };
+        let path = temp.as_path();
+        let root = ScopedDirectory::open_absolute(path).unwrap();
+        let expected = path.join("conversations");
+        let created = path.join("created");
+        let unrelated = path.join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        fs::set_permissions(&unrelated, Permissions::from_mode(0o755)).unwrap();
+        let sentinel = b"unrelated synthetic data";
+        fs::write(unrelated.join("keep"), sentinel).unwrap();
+        let original = fs::metadata(&unrelated).unwrap();
+
+        let result = private_child_with(&root, "conversations", || {
+            assert_eq!(fs::metadata(&expected).unwrap().mode() & 0o7777, 0o700);
+            fs::rename(&expected, &created).unwrap();
+            fs::rename(&unrelated, &expected).unwrap();
+        });
+
+        let Err(error) = result else {
+            panic!("A substituted directory with mode 0755 was accepted.");
+        };
+        assert!(matches!(error.code, ErrorCode::InvalidConfig));
+        let replacement = fs::metadata(&expected).unwrap();
+        assert_eq!(
+            (replacement.dev(), replacement.ino()),
+            (original.dev(), original.ino())
+        );
+        assert_eq!(replacement.mode() & 0o7777, 0o755);
+        assert_eq!(fs::read(expected.join("keep")).unwrap(), sentinel);
+        assert_eq!(fs::read_dir(&expected).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&created).unwrap().count(), 0);
+    }
+
     #[test]
     fn import_reports_uncertainty_when_the_parent_moves_at_link() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = ScopedDirectory::open_absolute(temp.path()).unwrap();
+        let Some(temp) = isolated_fixture(
+            "import_reports_uncertainty_when_the_parent_moves_at_link",
+            0o077,
+        ) else {
+            return;
+        };
+        let path = temp.as_path();
+        let root = ScopedDirectory::open_absolute(path).unwrap();
         let body = b"synthetic conversation";
         let metadata = fixture_metadata(Source::Stdin, body);
-        let canonical = temp
-            .path()
-            .join("conversations/bots")
-            .join(&metadata.bot_id);
-        let relocated = temp.path().join("relocated");
+        let canonical = path.join("conversations/bots").join(&metadata.bot_id);
+        let relocated = path.join("relocated");
         let error = publish_with(&root, &metadata, body, || {
             fs::rename(&canonical, &relocated).unwrap();
             fs::create_dir(&canonical).unwrap();
@@ -426,7 +487,7 @@ mod tests {
         assert!(matches!(error.code, ErrorCode::UnknownWriteOutcome));
         let diagnostic = error.to_string();
         assert!(diagnostic.contains(&metadata.conversation_id));
-        assert!(!diagnostic.contains(temp.path().to_str().unwrap()));
+        assert!(!diagnostic.contains(path.to_str().unwrap()));
         let name = format!("{}.md", metadata.conversation_id);
         assert!(!canonical.join(&name).exists());
         assert!(fs::read(relocated.join(&name)).unwrap().ends_with(body));
@@ -434,63 +495,56 @@ mod tests {
 
     #[test]
     fn first_import_sets_private_modes_under_restrictive_umask() {
-        const FIXTURE: &str = "HIVE_IMPORT_UMASK_FIXTURE";
-        if let Some(path) = std::env::var_os(FIXTURE) {
-            let root = ScopedDirectory::open_absolute(Path::new(&path)).unwrap();
-            let body = b"synthetic conversation";
-            let metadata = fixture_metadata(Source::Stdin, body);
-            publish(&root, &metadata, body).unwrap();
-
-            let storage = root.path.join("conversations");
-            let bots = storage.join("bots");
-            let queen = bots.join(&metadata.bot_id);
-            for directory in [&storage, &bots, &queen] {
-                assert_eq!(fs::metadata(directory).unwrap().mode() & 0o7777, 0o700);
-            }
-            let file = queen.join(format!("{}.md", metadata.conversation_id));
-            assert_eq!(fs::metadata(&file).unwrap().mode() & 0o7777, 0o600);
-            assert!(fs::read(file).unwrap().ends_with(body));
-
-            fs::set_permissions(&bots, Permissions::from_mode(0o755)).unwrap();
-            let replacement = fixture_metadata(Source::Stdin, body);
-            let error = publish(&root, &replacement, body).unwrap_err();
-            assert!(matches!(error.code, ErrorCode::InvalidConfig));
-            assert_eq!(fs::metadata(&bots).unwrap().mode() & 0o7777, 0o755);
-            assert_eq!(fs::read_dir(&queen).unwrap().count(), 1);
+        let Some(temp) = isolated_fixture(
+            "first_import_sets_private_modes_under_restrictive_umask",
+            0o777,
+        ) else {
             return;
-        }
+        };
+        let path = temp.as_path();
+        let root = ScopedDirectory::open_absolute(path).unwrap();
+        let body = b"synthetic conversation";
+        let metadata = fixture_metadata(Source::Stdin, body);
+        publish(&root, &metadata, body).unwrap();
 
-        let temp = tempfile::tempdir().unwrap();
-        let mut child = Command::new(std::env::current_exe().unwrap());
-        child.env(FIXTURE, temp.path()).args([
-            "--exact",
-            "dolt::conversation::import::tests::first_import_sets_private_modes_under_restrictive_umask",
-        ]);
-        // SAFETY: umask is async-signal-safe and changes only the child process.
-        unsafe {
-            child.pre_exec(|| {
-                libc::umask(0o777);
-                Ok(())
-            });
+        let storage = root.path.join("conversations");
+        let bots = storage.join("bots");
+        let queen = bots.join(&metadata.bot_id);
+        for directory in [&storage, &bots, &queen] {
+            assert_eq!(fs::metadata(directory).unwrap().mode() & 0o7777, 0o700);
         }
-        let output = child.output().unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{stdout}");
-        assert!(stdout.contains("1 passed"), "{stdout}");
+        let file = queen.join(format!("{}.md", metadata.conversation_id));
+        assert_eq!(fs::metadata(&file).unwrap().mode() & 0o7777, 0o600);
+        assert!(fs::read(file).unwrap().ends_with(body));
+
+        fs::set_permissions(&bots, Permissions::from_mode(0o755)).unwrap();
+        let replacement = fixture_metadata(Source::Stdin, body);
+        let error = publish(&root, &replacement, body).unwrap_err();
+        assert!(matches!(error.code, ErrorCode::InvalidConfig));
+        assert_eq!(fs::metadata(&bots).unwrap().mode() & 0o7777, 0o755);
+        assert_eq!(fs::read_dir(&queen).unwrap().count(), 1);
+
+        let probe = path.join("restored-mask");
+        File::create(&probe).unwrap();
+        assert_eq!(fs::metadata(probe).unwrap().mode() & 0o7777, 0);
     }
 
     #[test]
     fn imports_preserve_bytes_and_refuse_unsafe_paths() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = ScopedDirectory::open_absolute(temp.path()).unwrap();
-        let input = temp.path().join("input.md");
+        let Some(temp) = isolated_fixture("imports_preserve_bytes_and_refuse_unsafe_paths", 0o077)
+        else {
+            return;
+        };
+        let path = temp.as_path();
+        let root = ScopedDirectory::open_absolute(path).unwrap();
+        let input = path.join("input.md");
         let bytes = "\u{feff}---\r\n# 합성\r\n---\nno final newline".as_bytes();
         fs::write(&input, bytes).unwrap();
-        let redirected = temp.path().join("redirected.md");
+        let redirected = path.join("redirected.md");
         symlink(&input, &redirected).unwrap();
         assert!(read_input(Some(&redirected)).is_err());
-        assert!(read_input(Some(&temp.path().join("../input.md"))).is_err());
-        assert!(read_input(Some(temp.path())).is_err());
+        assert!(read_input(Some(&path.join("../input.md"))).is_err());
+        assert!(read_input(Some(path)).is_err());
         for invalid in [&[0xff][..], b"zero\0byte", &vec![b'a'; MAX_BODY_BYTES + 1]] {
             fs::write(&input, invalid).unwrap();
             assert!(read_input(Some(&input)).is_err());
@@ -500,15 +554,15 @@ mod tests {
         let (source, body) = read_input(Some(&input)).unwrap();
         let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
         let mut metadata = fixture_metadata(source, &body);
-        let storage = temp.path().join("conversations");
-        let elsewhere = temp.path().join("elsewhere");
+        let storage = path.join("conversations");
+        let elsewhere = path.join("elsewhere");
         fs::create_dir(&elsewhere).unwrap();
         symlink(&elsewhere, &storage).unwrap();
         assert!(publish(&root, &metadata, &body).is_err());
         assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
         fs::remove_file(&storage).unwrap();
 
-        let marker = temp.path().join(".git");
+        let marker = path.join(".git");
         fs::write(&marker, "gitdir: synthetic\n").unwrap();
         assert!(publish(&root, &metadata, &body).is_err());
         assert!(!storage.exists());
