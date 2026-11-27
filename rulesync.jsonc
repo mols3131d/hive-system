@@ -22,5 +22,13 @@
   },
   "outputRoots": ["."],
   "delete": true,
-  "sources": []
+  "sources": [
+    {
+      "source": "mols3131d/mols-agent-assets",
+      "skills": ["mols-coding-context", "mols-test-design", "review-changes"],
+      "transport": "github",
+      "ref": "0a3e41016e8266276f2a5124a19a229844bd7a98",
+      "path": "src/rulesync/.rulesync/skills"
+    }
+  ]
 }
