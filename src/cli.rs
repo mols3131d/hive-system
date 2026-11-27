@@ -274,6 +274,10 @@ pub(crate) enum Command {
     #[command(skip)]
     IssueClaim(IssueClaimArgs),
     #[command(skip)]
+    IssueCancel(IssueReconcileArgs),
+    #[command(skip)]
+    IssueReopen(IssueReconcileArgs),
+    #[command(skip)]
     IssueRelease(IssueReleaseArgs, bool),
     #[command(skip)]
     IssueSubmit(IssueSubmitArgs),
@@ -1345,6 +1349,15 @@ pub(crate) struct IssueClaimArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueReconcileArgs {
+    #[command(flatten)]
+    pub(crate) transition: IssueTransitionArgs,
+    /// Reviewed reason for the lifecycle change.
+    #[arg(long)]
+    pub(crate) reason: String,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueStopArgs {
     #[command(flatten)]
     pub(crate) claim_args: IssueClaimArgs,
@@ -1624,6 +1637,17 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                     IssueClaimArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
+            }
+            Some(("issue", issue))
+                if matches!(issue.subcommand_name(), Some("cancel" | "reopen")) =>
+            {
+                let args = IssueReconcileArgs::from_arg_matches(leaf)
+                    .map_err(|error| safe_parse_message(error.kind()))?;
+                if issue.subcommand_name() == Some("cancel") {
+                    Command::IssueCancel(args)
+                } else {
+                    Command::IssueReopen(args)
+                }
             }
             Some(("issue", issue)) if issue.subcommand_name() == Some("set-parent") => {
                 Command::IssueParent(
@@ -2085,6 +2109,17 @@ fn recover_context_resolve(
     let ("resolve", _) = context.subcommand()? else {
         return None;
     };
+    replay_unknown_options(cli, args, error, ("context", "resolve"), true, false)
+}
+
+fn replay_unknown_options(
+    cli: &clap::Command,
+    args: &[OsString],
+    error: &clap::Error,
+    (domain, action): (&str, &str),
+    require_equals: bool,
+    allow_missing: bool,
+) -> Option<ArgMatches> {
     let mut retry = cli.clone();
     let mut error = error;
     let mut next_error;
@@ -2099,9 +2134,7 @@ fn recover_context_resolve(
         let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
             return None;
         };
-        let leaf = retry
-            .find_subcommand("context")?
-            .find_subcommand("resolve")?;
+        let leaf = retry.find_subcommand(domain)?.find_subcommand(action)?;
         let option = if let Some(long) = unknown_long_name(leaf, invalid) {
             Arg::new(format!("recovered_unknown_--{long}")).long(long.to_owned())
         } else {
@@ -2114,27 +2147,30 @@ fn recover_context_resolve(
         let option = option
             .action(ArgAction::Append)
             .num_args(0..=1)
-            .require_equals(true)
+            .require_equals(require_equals)
             .value_parser(OsStringValueParser::new())
             .hide(true);
-        retry = retry.mut_subcommand("context", |context| {
-            context.mut_subcommand("resolve", |resolve| resolve.arg(option))
+        retry = retry.mut_subcommand(domain, |command| {
+            command.mut_subcommand(action, |leaf| leaf.arg(option))
         });
-        match retry.clone().try_get_matches_from(args) {
-            Ok(matches) => {
-                let leaf = matches
-                    .subcommand_matches("context")?
-                    .subcommand_matches("resolve")?;
-                return recovered_ids
-                    .iter()
-                    .all(|id| leaf.value_source(id.as_str()) == Some(ValueSource::CommandLine))
-                    .then_some(matches);
+        let matches = match retry.clone().try_get_matches_from(args) {
+            Ok(matches) => matches,
+            Err(error) if allow_missing && error.kind() == ErrorKind::MissingRequiredArgument => {
+                retry.ignore_errors(true).try_get_matches_from(args).ok()?
             }
-            Err(error) => {
-                next_error = error;
+            Err(failure) => {
+                next_error = failure;
+                error = &next_error;
+                continue;
             }
-        }
-        error = &next_error;
+        };
+        let leaf = matches
+            .subcommand_matches(domain)?
+            .subcommand_matches(action)?;
+        return recovered_ids
+            .iter()
+            .all(|id| leaf.value_source(id.as_str()) == Some(ValueSource::CommandLine))
+            .then_some(matches);
     }
     None
 }
@@ -2154,6 +2190,14 @@ fn recover_unknown_long(
         return None;
     }
     let (action, _) = matched.subcommand()?;
+    if matches!(
+        (domain, action),
+        ("issue", "release" | "recover" | "submit")
+    ) {
+        return [true, false].into_iter().find_map(|equals| {
+            replay_unknown_options(cli, args, error, (domain, action), equals, true)
+        });
+    }
     let named_write = matches!(
         (domain, action),
         ("area" | "project", "create") | ("bot", "register")
@@ -2170,6 +2214,8 @@ fn recover_unknown_long(
                     | "release"
                     | "recover"
                     | "submit"
+                    | "cancel"
+                    | "reopen"
                     | "set-parent"
             )
     );
@@ -2191,16 +2237,7 @@ fn recover_unknown_long(
     };
     let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
     const UNKNOWN_OPTION: &str = "recovered_unknown_long";
-    let recovered = if let Some(long) = unknown_long_name(leaf, invalid) {
-        Arg::new(UNKNOWN_OPTION).long(long.to_owned())
-    } else if matches!(
-        (domain, action),
-        ("issue", "release" | "recover" | "submit")
-    ) {
-        Arg::new(UNKNOWN_OPTION).short(unknown_short_name(leaf, invalid)?)
-    } else {
-        return None;
-    };
+    let recovered = Arg::new(UNKNOWN_OPTION).long(unknown_long_name(leaf, invalid)?.to_owned());
 
     let workspace_init = (domain, action) == ("workspace", "init");
     let allow_incomplete = named_write || positional_write;
@@ -2301,6 +2338,12 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             .subcommand(add_leaf_options(IssueClaimArgs::augment_args(
                 clap::Command::new("claim").about("Record an exclusive Claim for a ready Issue."),
             )))
+            .subcommand(add_leaf_options(IssueReconcileArgs::augment_args(
+                clap::Command::new("cancel").about("Cancel an Issue after execution has stopped."),
+            )))
+            .subcommand(add_leaf_options(IssueReconcileArgs::augment_args(
+                clap::Command::new("reopen").about("Return a reconciled terminal Issue to todo."),
+            )))
             .subcommand(add_leaf_options(IssueReleaseArgs::augment_args(
                 clap::Command::new("release").about("Release the exact stopped execution Claim."),
             )))
@@ -2333,6 +2376,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .mut_subcommand("update", extended_error_options)
                 .mut_subcommand("select", extended_error_options)
                 .mut_subcommand("claim", extended_error_options)
+                .mut_subcommand("cancel", extended_error_options)
+                .mut_subcommand("reopen", extended_error_options)
                 .mut_subcommand("set-parent", extended_error_options)
                 .mut_subcommand("release", extended_error_options)
                 .mut_subcommand("recover", extended_error_options)
@@ -2358,10 +2403,14 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                     "remove-dependency",
                     "select",
                     "claim",
+                    "cancel",
+                    "reopen",
                     "set-parent",
                     "release",
                     "recover",
                     "submit",
+                    "cancel",
+                    "reopen",
                 ],
             )
             .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "issue"))
@@ -2372,7 +2421,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
         Some(("issue", issue)) => match issue.subcommand() {
             Some((
                 "note" | "create" | "update" | "select" | "claim" | "release" | "recover"
-                | "submit" | "add-dependency" | "remove-dependency" | "set-parent",
+                | "submit" | "cancel" | "reopen" | "add-dependency" | "remove-dependency"
+                | "set-parent",
                 leaf,
             )) => Some(leaf),
             None => None,
@@ -2401,30 +2451,66 @@ fn bot_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedP
                 .about("Register a Queen from a reviewed, committed Soul."),
         )))
     });
+    let register_help = || CommonArgs::augment_args(clap::Command::new("register"));
     let recovery = extended_error_options(extended.clone().disable_help_subcommand(true))
         .mut_subcommand("bot", |bot| {
-            extended_help_probe(bot).mut_subcommand("register", extended_error_options)
-        });
-    let partial = match recovery.clone().try_get_matches_from(args) {
-        Ok(matches) => matches,
+            extended_help_probe(bot.disable_help_subcommand(true))
+                .mut_subcommand("register", extended_error_options)
+                .subcommand(clap::Command::new("help").subcommand(register_help()))
+        })
+        .subcommand(
+            clap::Command::new("help")
+                .subcommand(clap::Command::new("bot").subcommand(register_help())),
+        );
+    let (partial, complete) = match recovery.clone().try_get_matches_from(args) {
+        Ok(matches) => (matches, true),
         Err(error) => {
             let partial = recovery
                 .clone()
                 .ignore_errors(true)
                 .try_get_matches_from(args)
                 .ok()?;
-            retry_write_failure(&extended, args, error.kind(), "bot", &["register"])
+            let matches = retry_write_failure(&extended, args, error.kind(), "bot", &["register"])
                 .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "bot"))
-                .unwrap_or(partial)
+                .unwrap_or(partial);
+            (matches, false)
         }
     };
-    let leaf = partial
-        .subcommand_matches("bot")?
-        .subcommand_matches("register")?;
-    (requested_contract(Some(&partial), Some(leaf)) == Contract::V2).then(|| ExtendedParse {
-        parsed: extended.clone().try_get_matches_from(args),
-        cli: extended,
-        partial: Some(partial),
+    let help_leaf = if complete {
+        partial
+            .subcommand_matches("help")
+            .and_then(|help| help.subcommand_matches("bot"))
+            .or_else(|| {
+                partial
+                    .subcommand_matches("bot")?
+                    .subcommand_matches("help")
+            })
+            .and_then(|help| help.subcommand_matches("register"))
+    } else {
+        None
+    };
+    let help_requested = help_leaf.is_some();
+    let leaf = help_leaf.or_else(|| {
+        partial
+            .subcommand_matches("bot")?
+            .subcommand_matches("register")
+    })?;
+    (requested_contract(Some(&partial), Some(leaf)) == Contract::V2).then(|| {
+        let parsed = if help_requested {
+            extended.clone().try_get_matches_from([
+                args[0].clone(),
+                OsString::from("bot"),
+                OsString::from("register"),
+                OsString::from("--help"),
+            ])
+        } else {
+            extended.clone().try_get_matches_from(args)
+        };
+        ExtendedParse {
+            parsed,
+            cli: extended,
+            partial: Some(partial),
+        }
     })
 }
 
@@ -3329,6 +3415,12 @@ impl Command {
                 }
                 Self::IssueSelect(args)
                 | Self::IssueClaim(IssueClaimArgs {
+                    transition: args, ..
+                })
+                | Self::IssueCancel(IssueReconcileArgs {
+                    transition: args, ..
+                })
+                | Self::IssueReopen(IssueReconcileArgs {
                     transition: args, ..
                 })
                 | Self::IssueRelease(

@@ -2676,6 +2676,21 @@ fn malformed_bot_register_keeps_the_late_v2_envelope() {
         assert!(String::from_utf8_lossy(&help.stdout).contains("--asset-revision"));
         assert!(help.stderr.is_empty());
     }
+    for command in [["help", "bot", "register"], ["bot", "help", "register"]] {
+        let implicit = sandbox.run(&command);
+        assert_eq!(implicit.status.code(), Some(2), "{command:?}: {implicit:?}");
+        let legacy = sandbox.run(&[&["--contract", "1"][..], &command].concat());
+        assert_eq!(legacy.status.code(), Some(2), "{command:?}: {legacy:?}");
+        for args in [
+            [&["--contract", "2"][..], &command].concat(),
+            [&command[..], &["--contract", "2"]].concat(),
+        ] {
+            let help = sandbox.run(&args);
+            assert!(help.status.success(), "{args:?}: {help:?}");
+            assert!(String::from_utf8_lossy(&help.stdout).contains("--asset-revision"));
+            assert!(help.stderr.is_empty());
+        }
+    }
     let command = ["bot", "register", "--slug", "fixture"];
     let selectors = ["--contract", "2", "--json"];
     for invalid in [
@@ -4138,6 +4153,8 @@ fn stopped_issue_transitions_keep_output_options_and_literal_boundaries() {
         for invalid in [
             &["--unknown=--contract=1", issue][..],
             &["-Z", issue],
+            &[issue, "--unknown", "--another"],
+            &["--unknown=--json", issue, "-Z", "--another=--contract=1"],
             &[issue, "--claim"],
             &[issue, "--holder", "a", "--holder", "b"],
         ] {
@@ -4159,6 +4176,7 @@ fn stopped_issue_transitions_keep_output_options_and_literal_boundaries() {
         for literal in [
             &["--contract", "2", "--stop-evidence=--json", issue][..],
             &["--contract", "2", "--unknown=--json", issue],
+            &["--contract", "2", "--unknown=--json", issue, "--another"],
             &["--contract", "2", "--", "--json"],
         ] {
             let report = sandbox.run(&[&command[..], literal].concat());
@@ -4292,5 +4310,58 @@ fn issue_set_parent_keeps_late_v2_errors_and_literal_argument_boundaries() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["schema_version"], 1);
     assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    sandbox.assert_empty();
+}
+
+#[test]
+fn issue_reconciliation_preserves_contract_selection_and_structured_errors() {
+    let sandbox = Sandbox::new();
+    let id = "01900000-0000-7000-8000-000000000001";
+    let revision = format!("{id}=fixture-r1");
+    for action in ["cancel", "reopen"] {
+        let command = [
+            "issue",
+            action,
+            id,
+            "--area",
+            id,
+            "--actor",
+            "fixture",
+            "--request-id",
+            id,
+            "--if-match",
+            &revision,
+            "--workspace",
+            ".",
+            "--workspace-id",
+            id,
+            "--database",
+            "db",
+            "--port",
+            "3306",
+            "--evidence-file",
+            "fixture.json",
+        ];
+        for suffix in [
+            &[][..],
+            &["--reason", "fixture-reason", "--reason", "fixture-reason"][..],
+            &["--reason=--json", "--unknown", "fixture-value"][..],
+        ] {
+            let output =
+                sandbox.run(&[&command[..], suffix, &["--contract", "2", "--json"]].concat());
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], format!("issue {action}"));
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+            assert!(!report.to_string().contains("fixture-reason"));
+        }
+        let output =
+            sandbox.run(&[&["--json"][..], &command[..], &["--reason=--contract=2"]].concat());
+        assert_eq!(output.status.code(), Some(2));
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 1);
+    }
     sandbox.assert_empty();
 }

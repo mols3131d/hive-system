@@ -1,3 +1,6 @@
+mod reconcile;
+
+use super::Input;
 use mysql::{Transaction, prelude::Queryable};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -35,6 +38,10 @@ pub(in crate::dolt) enum Operation {
     Recover,
     #[serde(rename = "issue.submit")]
     Submit,
+    #[serde(rename = "issue.cancel")]
+    Cancel,
+    #[serde(rename = "issue.reopen")]
+    Reopen,
 }
 
 impl Operation {
@@ -45,6 +52,8 @@ impl Operation {
             "issue.release" => Some(Self::Release),
             "issue.recover" => Some(Self::Recover),
             "issue.submit" => Some(Self::Submit),
+            "issue.cancel" => Some(Self::Cancel),
+            "issue.reopen" => Some(Self::Reopen),
             _ => None,
         }
     }
@@ -56,16 +65,24 @@ impl Operation {
             Self::Submit => "issue.submit",
             Self::Recover => "issue.recover",
             Self::Release => "issue.release",
+            Self::Cancel => "issue.cancel",
+            Self::Reopen => "issue.reopen",
         }
     }
 
-    fn states(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Select => ("backlog", "todo"),
-            Self::Claim => ("todo", "in-progress"),
-            Self::Release | Self::Recover => ("in-progress", "todo"),
-            Self::Submit => ("in-progress", "review"),
+    fn next_status(self, previous: &str) -> Option<&'static str> {
+        match (self, IssueStatus::parse(previous)?) {
+            (Self::Select, IssueStatus::Backlog) => Some("todo"),
+            (Self::Claim, IssueStatus::Todo) => Some("in-progress"),
+            (Self::Release | Self::Recover, IssueStatus::InProgress) => Some("todo"),
+            (Self::Submit, IssueStatus::InProgress) => Some("review"),
+            (Self::Cancel | Self::Reopen, status) => reconcile::next_status(self, status),
+            _ => None,
         }
+    }
+
+    fn is_reconciliation(self) -> bool {
+        matches!(self, Self::Cancel | Self::Reopen)
     }
 }
 
@@ -199,6 +216,10 @@ enum Effect {
         stopped: Stopped,
         result_evidence_ref: String,
     },
+    #[serde(rename = "issue.cancel")]
+    Cancel { reason_sha256: String },
+    #[serde(rename = "issue.reopen")]
+    Reopen { reason_sha256: String },
 }
 
 impl Effect {
@@ -209,6 +230,8 @@ impl Effect {
             Self::Release { .. } => Operation::Release,
             Self::Recover { .. } => Operation::Recover,
             Self::Submit { .. } => Operation::Submit,
+            Self::Cancel { .. } => Operation::Cancel,
+            Self::Reopen { .. } => Operation::Reopen,
         }
     }
 
@@ -227,7 +250,7 @@ impl Effect {
             Self::Release { stopped }
             | Self::Recover { stopped }
             | Self::Submit { stopped, .. } => Some(stopped),
-            Self::Select { .. } | Self::Claim { .. } => None,
+            _ => None,
         }
     }
 
@@ -237,6 +260,13 @@ impl Effect {
                 result_evidence_ref,
                 ..
             } => Some(result_evidence_ref),
+            _ => None,
+        }
+    }
+
+    fn reason_sha256(&self) -> Option<&str> {
+        match self {
+            Self::Cancel { reason_sha256 } | Self::Reopen { reason_sha256 } => Some(reason_sha256),
             _ => None,
         }
     }
@@ -270,6 +300,7 @@ struct Request<'a> {
     holder: Option<&'a str>,
     stopped: Option<&'a Stopped>,
     result_evidence_ref: Option<&'a str>,
+    reason_sha256: Option<&'a str>,
 }
 
 impl Request<'_> {
@@ -301,7 +332,7 @@ impl Request<'_> {
                 self.issue,
                 self.actor,
                 self.expected,
-                self.holder,
+                self.holder.or(self.reason_sha256),
             ])
             .to_string()
             .as_bytes(),
@@ -391,14 +422,15 @@ struct Transition<'a> {
 pub(super) fn write(
     common: &CommonOptions,
     args: &IssueTransitionArgs,
-    holder: Option<&str>,
+    input: Input<'_>,
 ) -> Result<DoltSuccess, HiveError> {
-    let operation = if holder.is_some() {
-        Operation::Claim
-    } else {
-        Operation::Select
+    let (operation, holder, reason) = match input {
+        Input::Select => (Operation::Select, None, None),
+        Input::Claim(holder) => (Operation::Claim, Some(holder), None),
+        Input::Cancel(reason) => (Operation::Cancel, None, Some(reason)),
+        Input::Reopen(reason) => (Operation::Reopen, None, Some(reason)),
     };
-    execute(common, args, holder, operation, None)
+    execute(common, args, holder, operation, None, reason)
 }
 
 struct StoppedInput<'a> {
@@ -478,6 +510,7 @@ fn execute_stopped(
         Some(&args.holder),
         operation,
         Some(input),
+        None,
     )
 }
 
@@ -487,10 +520,12 @@ fn execute(
     holder: Option<&str>,
     operation: Operation,
     input: Option<StoppedInput<'_>>,
+    reason: Option<&str>,
 ) -> Result<DoltSuccess, HiveError> {
     let target = DoltTarget::parse(&args.target)?;
     let workspace =
         crate::config_v2::read_explicit(common.workspace.as_deref().expect("validated workspace"))?;
+    let reason_sha256 = reason.map(reconcile::reason_digest).transpose()?;
     if !is_uuid_v7(&args.area)
         || !is_uuid_v7(&args.issue)
         || !is_uuid(&args.request_id)
@@ -542,18 +577,21 @@ fn execute(
         holder,
         stopped: stopped.as_ref(),
         result_evidence_ref: input.as_ref().and_then(|input| input.result_evidence_ref),
+        reason_sha256: reason_sha256.as_deref(),
     };
     let transition = Transition {
         fingerprint: request.fingerprint(),
         request,
         decision,
-        body: input.map(|input| input.body).unwrap_or_default(),
+        body: input
+            .map(|input| input.body)
+            .unwrap_or_else(|| reason.unwrap_or("").to_owned()),
     };
     issue_writer::execute(&workspace, target, &transition)
 }
 
 impl Mutation for Transition<'_> {
-    type Guard = Option<Claim>;
+    type Guard = (Issue, Option<Claim>);
 
     fn identity(&self) -> WriteIdentity<'_> {
         WriteIdentity {
@@ -597,7 +635,11 @@ impl Mutation for Transition<'_> {
         }
     }
 
-    fn guard(&self, db: &mut Transaction<'_>, _: &mut Snapshot) -> Result<Self::Guard, HiveError> {
+    fn guard(
+        &self,
+        db: &mut Transaction<'_>,
+        snapshot: &mut Snapshot,
+    ) -> Result<Self::Guard, HiveError> {
         let request = &self.request;
         let issue = Issue::read(db, request.issue, None)?;
         request.check_issue(&issue)?;
@@ -607,18 +649,29 @@ impl Mutation for Transition<'_> {
             None
         };
         request.check_readiness(db, &issue, None)?;
-        Ok(claim)
+        if request.operation.is_reconciliation() {
+            reconcile::check_closure(db, request, None)?;
+            reconcile::check_graph(
+                &mut super::super::records::RecordReader::Online(snapshot),
+                request,
+            )?;
+        }
+        Ok((issue, claim))
     }
 
     fn stage(
         &self,
         db: &mut Transaction<'_>,
-        claim: Self::Guard,
+        (before, claim): Self::Guard,
         now: OffsetDateTime,
         sql_time: &str,
     ) -> Result<StagedMutation, HiveError> {
         let request = &self.request;
-        let (previous_status, status) = request.operation.states();
+        let previous_status = &before.status;
+        let status = request
+            .operation
+            .next_status(previous_status)
+            .ok_or_else(workflow::unverified)?;
         let effect = if let Some(stopped) = request.stopped {
             request.check_stop(claim.as_ref(), now)?;
             let stopped = stopped.clone();
@@ -634,6 +687,8 @@ impl Mutation for Transition<'_> {
                 },
                 _ => return Err(workflow::unverified()),
             }
+        } else if request.operation.is_reconciliation() {
+            reconcile::effect(request)?
         } else if let Some(holder) = request.holder {
             Effect::Claim {
                 claim_id: new_uuid_v7(now)?,
@@ -657,21 +712,25 @@ impl Mutation for Transition<'_> {
             effect,
         };
         record.require_new_ids(db, None)?;
-        db.exec_drop(
-            "UPDATE issues SET status = ?, revision = ?, updated_at = ?
+        if request.operation.is_reconciliation() {
+            reconcile::stage_issue(db, request, &record, sql_time, &self.body)?;
+        } else {
+            db.exec_drop(
+                "UPDATE issues SET status = ?, revision = ?, updated_at = ?
              WHERE CAST(id AS BINARY) = ? AND CAST(area_id AS BINARY) = ?
                AND CAST(revision AS BINARY) = ? AND CAST(status AS BINARY) = ?",
-            (
-                status,
-                &record.issue_revision,
-                sql_time,
-                request.issue,
-                request.area,
-                request.expected,
-                previous_status,
-            ),
-        )
-        .map_err(read_error)?;
+                (
+                    status,
+                    &record.issue_revision,
+                    sql_time,
+                    request.issue,
+                    request.area,
+                    request.expected,
+                    previous_status,
+                ),
+            )
+            .map_err(read_error)?;
+        }
         if db.affected_rows() != 1 {
             return Err(stale());
         }
@@ -721,7 +780,8 @@ struct Issue {
     acceptance: bool,
     hold: Option<String>,
     claimed: bool,
-    valid_open_fields: bool,
+    valid_metadata: bool,
+    open_fields: bool,
     unchanged_fields: String,
 }
 
@@ -736,7 +796,7 @@ fn as_of(commit: Option<&str>) -> Result<String, HiveError> {
 impl Issue {
     fn read(db: &mut impl Queryable, issue: &str, commit: Option<&str>) -> Result<Self, HiveError> {
         let at = as_of(commit)?;
-        let (area, kind, status, revision, updated_at, acceptance, hold, claimed, valid_open_fields, unchanged_fields) =
+        let (area, kind, status, revision, updated_at, acceptance, hold, claimed, valid_metadata, open_fields, unchanged_fields) =
             db.exec_first(
                 format!(
                     "SELECT i.area_id, i.type, i.status, i.revision,
@@ -744,11 +804,10 @@ impl Issue {
                      COALESCE(i.acceptance_criteria REGEXP ?, FALSE), i.hold_reason,
                      EXISTS(SELECT 1 FROM issue_claims{at} c WHERE c.issue_id = i.id),
                      i.number > 0 AND i.title REGEXP ? AND YEAR(i.created_at) > 0 AND YEAR(i.updated_at) > 0
-                         AND (i.priority IS NULL OR i.priority BETWEEN 0 AND 3)
-                         AND i.closed_at IS NULL AND i.closed_by_ref IS NULL AND i.resolution_note IS NULL,
+                         AND (i.priority IS NULL OR i.priority BETWEEN 0 AND 3),
+                     i.closed_at IS NULL AND i.closed_by_ref IS NULL AND i.resolution_note IS NULL,
                      JSON_ARRAY(i.number, i.parent_id, i.title, LOWER(SHA2(CAST(i.body AS BINARY), 256)),
-                                i.acceptance_criteria, i.priority, i.hold_reason, i.created_at,
-                                i.closed_at, i.closed_by_ref, i.resolution_note)
+                                i.acceptance_criteria, i.priority, i.hold_reason, i.created_at)
                      FROM issues{at} i WHERE CAST(i.id AS BINARY) = ?"
                 ),
                 (NON_WHITESPACE, NON_WHITESPACE, issue),
@@ -762,7 +821,8 @@ impl Issue {
             acceptance,
             hold,
             claimed,
-            valid_open_fields,
+            valid_metadata,
+            open_fields,
             unchanged_fields,
         })
     }
@@ -841,15 +901,19 @@ impl Request<'_> {
         if issue.revision != self.expected {
             return Err(stale());
         }
-        if issue.status != self.operation.states().0
-            || (self.operation != Operation::Select && issue.kind == "epic")
+        if self.operation.next_status(&issue.status).is_none()
+            || (matches!(
+                self.operation,
+                Operation::Claim | Operation::Release | Operation::Recover | Operation::Submit
+            ) && issue.kind == "epic")
         {
             return Err(HiveError::new(
                 ErrorCode::InvalidTransition,
                 "The current Issue state or type does not permit this transition.",
             ));
         }
-        if !issue.valid_open_fields
+        if !issue.valid_metadata
+            || (!status.is_some_and(IssueStatus::is_terminal) && !issue.open_fields)
             || issue
                 .hold
                 .as_deref()
@@ -894,7 +958,7 @@ impl Request<'_> {
             Some(commit) => require_active_area_at(db, self.area, commit, archived),
             None => require_active_area(db, self.area, archived),
         };
-        if self.operation == Operation::Select {
+        if !matches!(self.operation, Operation::Claim | Operation::Submit) {
             return active;
         }
         let mut blockers = Vec::new();
@@ -993,6 +1057,10 @@ impl Record {
             && is_uuid_v7(&self.issue_revision)
             && self.issue_revision != self.previous_issue_revision
             && self.transition_id != self.issue_revision
+            && self
+                .effect
+                .reason_sha256()
+                .is_none_or(super::super::receipt_history::valid_sha256)
             && self.effect.claim().is_none_or(|(id, holder)| {
                 is_uuid_v7(id)
                     && id != self.transition_id
@@ -1051,6 +1119,7 @@ impl Record {
             }),
             stopped: self.effect.stopped(),
             result_evidence_ref: self.effect.result_evidence_ref(),
+            reason_sha256: self.effect.reason_sha256(),
         }
     }
 }
@@ -1082,7 +1151,6 @@ pub(in crate::dolt) fn check_scope(
         serde_json::from_str(&receipt.result).map_err(|_| workflow::unverified())?;
     let evidence: Evidence =
         serde_json::from_str(&receipt.workflow_evidence).map_err(|_| workflow::unverified())?;
-    let (before, after) = operation.states();
     if receipt.kind != operation.name()
         || receipt.actor_ref != actor
         || record.version != 1
@@ -1091,8 +1159,7 @@ pub(in crate::dolt) fn check_scope(
         || record.area_id != area
         || record.issue_id != issue
         || record.actor_ref != actor
-        || record.previous_status != before
-        || record.status != after
+        || operation.next_status(&record.previous_status) != Some(record.status.as_str())
         || !record.valid_ids()
         || !valid_revision(&record.previous_issue_revision)
         || evidence.authorization_ref != receipt.authorization_ref
@@ -1106,6 +1173,13 @@ pub(in crate::dolt) fn check_scope(
     }
     let created = workflow::parse_time(&receipt.created_at).ok_or_else(workflow::unverified)?;
     binding.verify(&evidence, &receipt.fingerprint, created)?;
+    if operation.is_reconciliation()
+        && (issue_writer::encode(&record, Kind::Transition(operation))? != receipt.result
+            || issue_writer::encode(&evidence, Kind::Transition(operation))?
+                != receipt.workflow_evidence)
+    {
+        return Err(workflow::unverified());
+    }
     Ok(record)
 }
 
@@ -1122,6 +1196,14 @@ pub(in crate::dolt) fn verify_effect(
     let after = Issue::read(db, binding.issue, Some(introduced))?;
     binding.check_issue(&before)?;
     binding.check_readiness(db, &before, Some(base))?;
+    if before.status != record.previous_status {
+        return Err(workflow::unverified());
+    }
+    if binding.operation.is_reconciliation() {
+        reconcile::verify_issue(db, &binding, introduced, receipt)?;
+    } else if !after.open_fields {
+        return Err(workflow::unverified());
+    }
     record.require_new_ids(db, Some(base))?;
 
     if binding.stopped.is_some() {
@@ -1155,7 +1237,7 @@ pub(in crate::dolt) fn verify_effect(
         format!("SELECT issue_id, kind, CASE WHEN OCTET_LENGTH(body) <= ? THEN body END, author_ref, DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'),
                  CASE WHEN OCTET_LENGTH(transition_json) <= ? THEN transition_json END
                  FROM issue_updates{at} WHERE CAST(id AS BINARY) = ?"),
-        (if binding.operation == Operation::Submit { MAX_RESULT_BYTES } else { MAX_REASON_BYTES },
+        (if binding.operation == Operation::Submit { MAX_RESULT_BYTES } else { MAX_REASON_BYTES.max(reconcile::MAX_REASON_BYTES) },
          workflow::MAX_DECLARATION_BYTES, &record.transition_id),
     ).map_err(read_error)?;
     if !matches!(update, Some((issue, kind, Some(body), actor, created, Some(typed)))
@@ -1164,7 +1246,10 @@ pub(in crate::dolt) fn verify_effect(
        && match binding.stopped {
             Some(stopped) => digest(body.as_bytes()) == stopped.body_sha256
                 && if binding.operation == Operation::Submit { valid_result(&body) } else { valid_reason(&body) },
-            None => body.is_empty(),
+            None => match binding.reason_sha256 {
+                Some(expected) => reconcile::reason_digest(&body).is_ok_and(|digest| digest == expected),
+                None => body.is_empty(),
+            },
        })
     {
         return Err(workflow::unverified());

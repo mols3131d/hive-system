@@ -4,18 +4,25 @@ use crate::cli::{CommonOptions, IssueReleaseArgs, IssueSubmitArgs, IssueTransiti
 
 use super::{DoltFailure, DoltSuccess};
 
+pub(crate) enum Input<'a> {
+    Select,
+    Claim(&'a str),
+    Cancel(&'a str),
+    Reopen(&'a str),
+}
+
 pub(crate) fn write(
     common: &CommonOptions,
     args: &IssueTransitionArgs,
-    holder: Option<&str>,
+    input: Input<'_>,
 ) -> Result<DoltSuccess, Box<DoltFailure>> {
     #[cfg(target_os = "linux")]
     {
-        linux::write(common, args, holder).map_err(DoltFailure::without_context)
+        linux::write(common, args, input).map_err(DoltFailure::without_context)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (common, args, holder);
+        let _ = (common, args, input);
         unavailable()
     }
 }
