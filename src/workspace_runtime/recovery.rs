@@ -5,7 +5,7 @@ use crate::dolt::issue_note::{Pending, uncertain};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const PROOF: &str = "stopped-request.json";
+pub(super) const PROOF: &str = "stopped-request.json";
 const MAX_PROOF_BYTES: usize = 64 * 1024;
 // Dolt 2.7.6 can publish roots through the chunk journal without replacing
 // the manifest. Bind both the stable manifest and the mutable journal files.

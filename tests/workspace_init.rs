@@ -1499,6 +1499,23 @@ Two lines.
         expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
         fs::remove_file(state.join(marker)).unwrap();
     }
+    let proof = state.join("stopped-request.json");
+    symlink(state.join("active-root.json"), &proof).unwrap();
+    expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
+    fs::remove_file(&proof).unwrap();
+    let proof_bytes = b"synthetic orphaned recovery proof";
+    fs::write(&proof, proof_bytes).unwrap();
+    fs::set_permissions(&proof, fs::Permissions::from_mode(0o600)).unwrap();
+    response(run_backup("with-stale-proof"), 0);
+    assert_eq!(fs::read(&proof).unwrap(), proof_bytes);
+    assert!(
+        !fixture
+            .0
+            .join("with-stale-proof/stopped-request.json")
+            .exists()
+    );
+    fs::remove_file(&proof).unwrap();
+
     let native_server = db.join(".dolt/sql-server.info");
     fs::write(&native_server, b"unknown").unwrap();
     expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");

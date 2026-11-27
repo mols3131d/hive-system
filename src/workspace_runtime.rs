@@ -172,13 +172,21 @@ pub(super) fn backup(
                 }
                 for entry in fs::read_dir(at(state, "")).map_err(io_error)? {
                     let entry = entry.map_err(io_error)?;
-                    if !matches!(
-                        entry.file_name().to_str(),
-                        Some("lock" | "active-root.json")
-                    ) {
-                        return Err(unverified(
-                            "Unrecognized workspace runtime state requires inspection.",
-                        ));
+                    match entry.file_name().to_str() {
+                        Some("lock" | "active-root.json") => {}
+                        // Recovery clears the marker durably before removing this proof.
+                        // A leftover proof cannot authorize recovery without that marker.
+                        Some(recovery::PROOF) => {
+                            let proof = regular(state, recovery::PROOF).map_err(|_| {
+                                unverified("The retained recovery proof is unsafe.")
+                            })?;
+                            require_private_file(&proof)?;
+                        }
+                        _ => {
+                            return Err(unverified(
+                                "Unrecognized workspace runtime state requires inspection.",
+                            ));
+                        }
                     }
                 }
                 // Dolt takes its native lock when opening the store. Probe it
