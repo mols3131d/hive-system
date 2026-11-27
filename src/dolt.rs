@@ -1,3 +1,4 @@
+pub(crate) mod bot;
 mod graph;
 mod issue;
 mod issue_list;

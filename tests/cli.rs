@@ -917,3 +917,203 @@ fn malformed_dolt_list_project_preserves_late_v2_and_json_options() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8(output.stderr).unwrap().contains("UUIDv7"));
 }
+
+#[test]
+fn bot_metadata_has_explicit_v2_selection_and_preserves_v1_parsing() {
+    let sandbox = Sandbox::new();
+    for (command, args) in [
+        ("bot list", &["bot", "list"][..]),
+        (
+            "bot list",
+            &["bot", "list", "--limit", "500", "--after", "legacy-key"][..],
+        ),
+        ("bot show", &["bot", "show", BOT]),
+        ("memory show", &["memory", "show", BOT]),
+    ] {
+        let mut flags = vec!["--json"];
+        flags.extend(args);
+        assert_json_failure(&sandbox.run(&flags), &flags, command, "NOT_IMPLEMENTED", 7);
+    }
+
+    for (command, args) in [
+        ("bot list", &["bot", "list", "--limit", "501"][..]),
+        ("bot list", &["bot", "list", "--after="]),
+        ("bot show", &["bot", "show", "Invalid_Bot"]),
+    ] {
+        let mut flags = vec!["--contract", "1", "--json"];
+        flags.extend(args);
+        assert_json_failure(&sandbox.run(&flags), &flags, command, "INVALID_ARGUMENT", 2);
+    }
+
+    for (command, args) in [
+        ("bot list", &["bot", "list", "--status", "retired"][..]),
+        (
+            "bot show",
+            &["bot", "show", BOT, "--database", "fixture_db"],
+        ),
+    ] {
+        let mut flags = vec!["--json"];
+        flags.extend(args);
+        assert_json_failure(&sandbox.run(&flags), &flags, command, "INVALID_ARGUMENT", 2);
+    }
+
+    let target = [
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+    ];
+    for (args, explicit_target) in [
+        (&["list"][..], false),
+        (&["list", "--status", "Active"], true),
+        (&["list", "--limit", "0"], true),
+        (&["list", "--limit", "101"], true),
+        (&["list", "--after", "legacy-key"], true),
+        (&["list", "--workspace", "fixture"], true),
+        (&["list", "--project", "project-fixture"], true),
+        (&["list", "--at", REVISION], true),
+        (&["list", "--authority"], true),
+        (&["show", BOT], true),
+        (&["show", "01900000-0000-4000-8000-00000000000a"], true),
+        (&["show", "01900000-0000-7000-8000-00000000000A"], true),
+    ] {
+        let mut flags = vec!["--contract", "2", "--json", "bot"];
+        flags.extend(args);
+        if explicit_target {
+            flags.extend(target);
+        }
+        let output = sandbox.run(&flags);
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{flags:?} {result}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(result["schema_version"], 2);
+        assert_eq!(result["command"], format!("bot {}", args[0]));
+        assert_eq!(result["error"]["code"], "INVALID_ARGUMENT");
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn v1_bot_help_matches_the_reviewed_cli() {
+    let sandbox = Sandbox::new();
+    // Captured from e4749287044a71ec752f8539c51e77dfbbfe5ba0.
+    let expected = concat!(
+        "List or inspect registered Manager Bots\n",
+        "\n",
+        "Usage: hive bot <COMMAND>\n",
+        "\n",
+        "Commands:\n",
+        "  list  List registered Manager Bots\n",
+        "  show  Show a registered Bot's identity and routing metadata\n",
+        "  help  Print this message or the help of the given subcommand(s)\n",
+        "\n",
+        "Options:\n",
+        "  -h, --help  Print help\n",
+        "List registered Manager Bots\n",
+        "\n",
+        "Usage: hive bot list [OPTIONS]\n",
+        "\n",
+        "Options:\n",
+        "      --limit <LIMIT>        [default: 50]\n",
+        "      --after <KEY>          \n",
+        "      --contract <VERSION>   Select the CLI contract version [possible values: 1, 2]\n",
+        "      --workspace <PATH>     Select the Hive workspace\n",
+        "      --project <ID>         Select the project or reserved scope\n",
+        "      --project-root <PATH>  Select the Git project root\n",
+        "      --format <FORMAT>      Set the output format [possible values: text, json]\n",
+        "      --json                 Use JSON output\n",
+        "      --at <COMMIT>          Read a snapshot at a full local commit object ID\n",
+        "      --authority            Check the selected workspace's authority for this read\n",
+        "  -h, --help                 Print help\n",
+        "Show a registered Bot's identity and routing metadata\n",
+        "\n",
+        "Usage: hive bot show [OPTIONS] <BOT-ID>\n",
+        "\n",
+        "Arguments:\n",
+        "  <BOT-ID>  \n",
+        "\n",
+        "Options:\n",
+        "      --contract <VERSION>   Select the CLI contract version [possible values: 1, 2]\n",
+        "      --workspace <PATH>     Select the Hive workspace\n",
+        "      --project <ID>         Select the project or reserved scope\n",
+        "      --project-root <PATH>  Select the Git project root\n",
+        "      --format <FORMAT>      Set the output format [possible values: text, json]\n",
+        "      --json                 Use JSON output\n",
+        "      --at <COMMIT>          Read a snapshot at a full local commit object ID\n",
+        "      --authority            Check the selected workspace's authority for this read\n",
+        "  -h, --help                 Print help\n",
+    );
+    let mut actual = Vec::new();
+    for args in [
+        &["bot", "--help"][..],
+        &["bot", "list", "--help"],
+        &["bot", "show", "--help"],
+    ] {
+        let output = sandbox.run(args);
+        assert!(output.status.success(), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        actual.extend(output.stdout);
+    }
+    assert_eq!(String::from_utf8(actual).unwrap(), expected);
+    sandbox.assert_empty();
+}
+
+#[test]
+fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
+    let sandbox = Sandbox::new();
+    let target = [
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+    ];
+    for (options, code, exit) in [
+        (
+            &["show", "01900000-0000-7000-8000-00000000000A"][..],
+            "INVALID_ARGUMENT",
+            2,
+        ),
+        (&["list", "--limit", "malformed"], "INVALID_ARGUMENT", 2),
+        (&["list", "--limit", "-1"], "INVALID_ARGUMENT", 2),
+        (&["list", "--limit", "101"], "INVALID_ARGUMENT", 2),
+        (&["list", "--limit"], "INVALID_ARGUMENT", 2),
+        (
+            &["list", "--project", "INVALID_PROJECT"],
+            "INVALID_ARGUMENT",
+            2,
+        ),
+        (&["list", "--cursor", "malformed"], "STALE_CURSOR", 5),
+        (&["list", "--cursor"], "INVALID_ARGUMENT", 2),
+    ] {
+        let (leaf, options) = options.split_first().unwrap();
+        let args = [
+            &["bot", leaf][..],
+            &target,
+            options,
+            &["--contract", "2", "--json"],
+        ]
+        .concat();
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{args:?}: {error}\n{output:?}"));
+        assert_eq!(output.status.code(), Some(exit), "{args:?}: {report}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], format!("bot {leaf}"));
+        assert_eq!(report["error"]["code"], code);
+        assert!(report.get("context").is_none(), "{args:?}");
+    }
+
+    for (literal, exit) in [("--project=--json", 2), ("--cursor=--json", 5)] {
+        let args = [&["bot", "list"][..], &target, &[literal, "--contract", "2"]].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(exit), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+    sandbox.assert_empty();
+}
