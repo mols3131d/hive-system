@@ -868,6 +868,11 @@ pub(crate) enum WorkspaceCommand {
     },
     /// Gracefully stop the owned Dolt process for an explicitly selected workspace.
     Stop,
+    /// Resolve one pending request after a verified workspace stop.
+    Recover {
+        #[arg(long, value_name = "PATH")]
+        dolt_bin: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1708,7 +1713,10 @@ fn recover_unknown_long(
     let (action, _) = matched.subcommand()?;
     if !matches!(
         (domain, action),
-        ("workspace", "init" | "status" | "start" | "stop") | (_, "list" | "show")
+        (
+            "workspace",
+            "init" | "status" | "start" | "stop" | "recover"
+        ) | (_, "list" | "show")
     ) {
         return None;
     }
@@ -2577,7 +2585,9 @@ impl Command {
                     Ok(())
                 }
                 Self::Workspace(WorkspaceAction::Runtime(
-                    WorkspaceCommand::Start { .. } | WorkspaceCommand::Stop,
+                    WorkspaceCommand::Start { .. }
+                    | WorkspaceCommand::Stop
+                    | WorkspaceCommand::Recover { .. },
                 )) => {
                     if common.workspace.is_none()
                         || common.project.is_some()
