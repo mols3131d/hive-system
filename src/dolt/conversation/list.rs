@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use super::{Selection, invalid, select, split_frontmatter, validate_metadata};
 use crate::cli::{CommonOptions, ConversationListArgs};
-use crate::config_file::{MAX_FILE_BYTES, open_regular_child};
+use crate::config_file::{MAX_FILE_BYTES, ScopedDirectory, open_regular_child};
 use crate::dolt::{DoltFailure, DoltSuccess, is_uuid_v7};
 use crate::error::{ErrorCode, HiveError};
 
@@ -38,6 +38,7 @@ pub(super) fn page(
     limit: usize,
 ) -> Result<Value, HiveError> {
     let root = &selection.candidate.root;
+    let root_identity = root.file_identity()?;
     let workspace = selection.candidate.workspace_id();
     let scope = format!(
         "{:x}",
@@ -45,7 +46,7 @@ pub(super) fn page(
             json!([
                 "conversation-list-v1",
                 workspace,
-                root.file_identity()?,
+                root_identity,
                 selection.db_commit,
                 &args.target.database,
                 args.target
@@ -69,14 +70,15 @@ pub(super) fn page(
     let mut items = Vec::new();
     let mut set = Sha256::new();
 
-    if let Some(directory) = root.open_directory(&["conversations", "bots", bot].map(OsStr::new))? {
-        let original = directory_version(&directory)?;
-        let ids = published_ids(&directory)?;
+    let components = ["conversations", "bots", bot].map(OsStr::new);
+    let directory = root.open_directory(&components)?;
+    let original = directory.as_ref().map(directory_version).transpose()?;
+    if let Some(directory) = &directory {
+        let ids = published_ids(directory)?;
         let mut remaining = MAX_SCAN_BYTES;
         for id in ids {
             let filename = format!("{id}.md");
-            let file =
-                open_regular_child(&directory, OsStr::new(&filename))?.ok_or_else(changed)?;
+            let file = open_regular_child(directory, OsStr::new(&filename))?.ok_or_else(changed)?;
             let bytes = read_frontmatter(file, &mut remaining)?;
             let text = str::from_utf8(&bytes)
                 .ok()
@@ -92,10 +94,8 @@ pub(super) fn page(
             set.update(Sha256::digest(&bytes));
             items.push(metadata);
         }
-        if directory_version(&directory)? != original {
-            return Err(changed());
-        }
     }
+    verify_scan(root, root_identity, &components, original)?;
 
     let revision = format!("{:x}", set.finalize());
     let start = match continuation {
@@ -209,14 +209,54 @@ fn published_ids(directory: &File) -> Result<Vec<String>, HiveError> {
     Ok(ids)
 }
 
-fn directory_version(directory: &File) -> Result<(i64, i64, i64, i64), HiveError> {
+#[derive(Debug, PartialEq, Eq)]
+struct DirectoryVersion {
+    device: u64,
+    inode: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+fn directory_version(directory: &File) -> Result<DirectoryVersion, HiveError> {
     let info = directory.metadata().map_err(|_| read_error())?;
-    Ok((
-        info.mtime(),
-        info.mtime_nsec(),
-        info.ctime(),
-        info.ctime_nsec(),
-    ))
+    Ok(DirectoryVersion {
+        device: info.dev(),
+        inode: info.ino(),
+        modified: (info.mtime(), info.mtime_nsec()),
+        changed: (info.ctime(), info.ctime_nsec()),
+    })
+}
+
+fn verify_scan(
+    root: &ScopedDirectory,
+    root_identity: (u64, u64),
+    components: &[&OsStr],
+    original: Option<DirectoryVersion>,
+) -> Result<(), HiveError> {
+    // A parent can move while the original Queen descriptor and timestamps
+    // remain valid. Resolve the same selection again from the anchored root.
+    let current = root
+        .open_directory(components)
+        .map_err(reopen_error)?
+        .as_ref()
+        .map(directory_version)
+        .transpose()?;
+    if current != original
+        || ScopedDirectory::open_absolute(&root.path)
+            .map_err(reopen_error)?
+            .file_identity()?
+            != root_identity
+    {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+fn reopen_error(error: HiveError) -> HiveError {
+    match error.code {
+        ErrorCode::NotFound | ErrorCode::InvalidConfig => changed(),
+        _ => error,
+    }
 }
 
 struct DirectoryStream(*mut libc::DIR);
@@ -300,6 +340,90 @@ fn changed() -> HiveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_completion_rejects_replaced_parents_without_leaking_paths() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct TempTree(PathBuf);
+
+        impl Drop for TempTree {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("hive-scan-{}-{nonce}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        let fixture = TempTree(path);
+        let bot = "01900000-0000-7000-8000-000000000002";
+        let conversation = "01900000-0000-7000-8000-000000000003";
+        let components = ["conversations", "bots", bot].map(OsStr::new);
+        let assert_redacted_change = |error: HiveError| {
+            assert_eq!(error.code.exit_status(), 5);
+            assert_eq!(
+                serde_json::to_value(error).unwrap(),
+                json!({
+                    "code": "CONCURRENT_CHANGE",
+                    "message": "The Queen's conversation directory changed during the scan.",
+                })
+            );
+        };
+        for parent in 0..=2 {
+            let case = fixture.0.join(parent.to_string());
+            let workspace = case.join("private-workspace-fixture");
+            let queen = workspace.join("conversations/bots").join(bot);
+            let root = {
+                fs::create_dir_all(&workspace).unwrap();
+                ScopedDirectory::open_absolute(&workspace).unwrap()
+            };
+            let root_identity = root.file_identity().unwrap();
+            verify_scan(&root, root_identity, &components, None).unwrap();
+            fs::create_dir_all(&queen).unwrap();
+            assert_redacted_change(
+                verify_scan(&root, root_identity, &components, None).unwrap_err(),
+            );
+            fs::write(
+                queen.join(format!("{conversation}.md")),
+                b"private-fixture-content",
+            )
+            .unwrap();
+            let directory = root.open_directory(&components).unwrap().unwrap();
+            let original = directory_version(&directory).unwrap();
+            assert_eq!(published_ids(&directory).unwrap(), [conversation]);
+
+            let replaced = queen.ancestors().nth(parent + 1).unwrap();
+            let displaced = case.join("private-displaced-fixture");
+            fs::rename(replaced, &displaced).unwrap();
+            fs::create_dir_all(&queen).unwrap();
+            assert_eq!(directory_version(&directory).unwrap(), original);
+            assert_redacted_change(
+                verify_scan(&root, root_identity, &components, Some(original)).unwrap_err(),
+            );
+
+            fs::remove_dir_all(replaced).unwrap();
+            symlink(&displaced, replaced).unwrap();
+            assert_redacted_change(
+                verify_scan(
+                    &root,
+                    root_identity,
+                    &components,
+                    Some(directory_version(&directory).unwrap()),
+                )
+                .unwrap_err(),
+            );
+        }
+    }
 
     #[test]
     fn frontmatter_scan_stops_at_the_closing_delimiter() {
