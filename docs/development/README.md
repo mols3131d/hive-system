@@ -207,7 +207,7 @@ hive --contract 2 --json bot show 01900000-0000-7000-8000-00000000000a \
 
 Select the copy's Dolt endpoint explicitly. Hive checks the workspace UUID against the descriptor and the endpoint's committed `main` snapshot. The committed Queen's slug selects exactly `assets/bots/<slug>/SOUL.md` at the supplied Git commit. The output includes the Soul path and UTF-8 body, Queen metadata, workspace UUID, Dolt commit, asset commit, and descriptor policy pin. Optional YAML frontmatter is omitted from the body. When present, `workspace_id`, `id` or `bot_id`, `slug` or `bot_slug`, `display_name`, and `role` must match the selected identity.
 
-Use a self-contained Git object store. Soul inspection rejects alternates and symlinks in the object store, caps the blob output at 128 KiB, and checks the bytes against the blob ID from the selected tree. The filesystem checks and Git reads run in separate steps, so the object-store layout must stay stable during inspection.
+Soul inspection requires Linux with access to `/proc/self/fd` and a self-contained Git object store. Hive pins the Git and object directories for the read, rejects alternates and symlinks in the object store, and rechecks the directory identities and layout before returning a result. It verifies the requested commit and every tree along the path against their object IDs before following child entries. The read limits are 1 MiB per commit or tree and 128 KiB for the Soul blob, which is also checked against its object ID. These checks assume the repository is under the operator’s control.
 
 Inspection establishes portable identity agreement for the selected revisions. Physical endpoint pairing, an active-root decision, and host loading require separate evidence.
 

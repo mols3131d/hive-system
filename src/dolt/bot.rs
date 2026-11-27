@@ -135,16 +135,16 @@ pub(crate) fn show(
             Ok(json!({"bot": select_bot(snapshot, id)?, "observed_revision": snapshot.commit}))
         });
     };
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         show_soul(target, id, root, commit)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = (root, commit);
         Err(DoltFailure::without_context(HiveError::new(
             ErrorCode::NotImplemented,
-            "Soul inspection requires no-follow workspace directory support.",
+            "Soul inspection requires Linux with file-descriptor access through /proc.",
         )))
     }
 }
@@ -167,7 +167,7 @@ fn select_bot(snapshot: &mut Snapshot, id: &str) -> Result<BotMetadata, HiveErro
     BotMetadata::try_from(row)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn show_soul(
     target: &DoltTargetArgs,
     id: &str,
@@ -216,7 +216,7 @@ fn show_soul(
     Ok(result)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn soul_body<'a>(
     bytes: &'a [u8],
     workspace_id: &str,
@@ -306,7 +306,7 @@ fn stale_cursor() -> HiveError {
     )
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

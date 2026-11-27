@@ -239,7 +239,7 @@ fn inspects_committed_bot_metadata_and_pins_page_continuations() {
     assert_eq!(run(&["show", &staged], 0)["data"]["bot"]["id"], staged);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
 fn inspects_only_the_explicit_committed_soul() {
