@@ -17,6 +17,8 @@ mod issue_readiness;
 mod issue_show;
 #[path = "dolt_validation/issue_updates.rs"]
 mod issue_updates;
+#[path = "dolt_validation/label.rs"]
+mod label;
 #[path = "dolt_validation/migration.rs"]
 mod migration;
 #[path = "dolt_validation/project.rs"]
