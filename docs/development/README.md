@@ -112,7 +112,20 @@ A selected Issue with malformed summary fields returns `INVALID_RECORD` at the v
 
 `issue ready` and `issue blocked` accept the same target, scopes, filters, and pagination options. Both select executable todo Issues. Ready Issues have no hold, current Claim, unmet prerequisite, or archived Area in their ancestry. Missing prerequisites, invalid readiness metadata, and uncertain Area chains also block readiness. Blocked summaries include a `reasons` array of stable codes. The query reports prerequisite and Area blockers without exposing related records. Each cursor is specific to its view. Readiness describes the observed commit and grants no execution permission.
 
-Recursive Area listing, global discovery, and context resolution are follow-up work.
+Global discovery and context resolution are follow-up work.
+
+## Committed Area trees
+
+Use the same synthetic Dolt target and SELECT-only account for `area tree`. Omit `--root` to read the forest of committed root Areas, or select one subtree by its canonical lowercase UUIDv7.
+
+```sh
+hive --contract 2 --json area tree \
+  --root 01900000-0000-7000-8000-000000000002 \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+The result contains an array of root summaries, including archived Areas, and a `children` array at each node. Roots and siblings sort by bytewise slug, then ID. A known leaf has empty children, while an unknown root returns `NOT_FOUND`. The limit is 100 nodes across the entire result and 32 levels, with each returned root at level 1. Larger selections return `CONTEXT_LIMIT`. Cycles encountered during traversal return `INVALID_RECORD`.
 
 ## Committed Bot metadata
 
