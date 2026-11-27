@@ -160,6 +160,18 @@ hive --contract 2 --json bot show 01900000-0000-7000-8000-00000000000a \
 
 `bot show` takes an exact lowercase UUIDv7 and can inspect retired Queens. Both commands return registry metadata and the verified Dolt commit. Registry status describes retirement. Committed Soul inspection requires the workspace and asset repository pairing from [#18](https://github.com/mols3131d/hive-system/issues/18).
 
+## Historical Queen conversations
+
+Use contract 2 with an explicit workspace root, the same authenticated Dolt reader and target options, and exact lowercase UUIDv7 selectors for the Queen and conversation.
+
+```sh
+hive --contract 2 --json conversation show --workspace /example/hive-v2-userdata \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001 \
+  --bot 01900000-0000-7000-8000-00000000000a --id 01900000-0000-7000-8000-00000000000b
+```
+
+The read returns validated metadata and the verbatim Markdown body for an active or retired Queen. Hive matches the portable workspace UUID across the descriptor, committed Dolt target, and conversation header. The header must also match the committed Queen UUID and slug. Copies can share a workspace UUID, so select the filesystem copy and its Dolt target explicitly. Physical database-to-root binding and active-root authority are outside this inspection. See the [conversation file contract](../architecture/dolt-workspace-contract.md#private-queen-conversation-file-contract).
+
 ## Agent-assisted development
 
 Use [instruction ownership](agents/rule-ownership.md) to place scoped guidance, [asset lifecycle](agents/assets.md) when selecting or updating reusable Agent Assets, and [harness verification](agents/harness.md) to distinguish configuration from observed runtime behavior.
