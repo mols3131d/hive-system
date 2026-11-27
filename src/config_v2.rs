@@ -8,7 +8,7 @@ mod unix {
 
     use crate::cli::{CommonOptions, Format, View};
     use crate::config::{absolute_env, current_dir, json_path, resolve_path};
-    use crate::config_file::{self, OutputFields, ScopedDirectory, parse, present, untagged};
+    use crate::config_file::{self, OutputFields, ScopedDirectory, parse_v2, present, untagged};
     use crate::dolt::{STORAGE_SCHEMA_VERSION, is_uuid};
     use crate::error::{ErrorCode, HiveError};
 
@@ -155,7 +155,7 @@ mod unix {
         else {
             return Ok(None);
         };
-        let fields: UserFields = parse(&bytes, "V2 user configuration")?;
+        let fields: UserFields = parse_v2(&bytes, "V2 user configuration")?;
         require_version(&fields.version, 2, "User configuration version")?;
         let workspace = fields.workspace.map(PathBuf::from);
         if let Some(path) = &workspace {
@@ -190,7 +190,7 @@ mod unix {
                     "The v2 workspace descriptor is missing.",
                 )
             })?;
-        let descriptor: Descriptor = parse(&bytes, "Workspace descriptor")?;
+        let descriptor: Descriptor = parse_v2(&bytes, "Workspace descriptor")?;
         require_version(&descriptor.version, 2, "Workspace descriptor version")?;
         require_version(
             &descriptor.schema_version,

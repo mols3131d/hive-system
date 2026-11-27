@@ -1162,10 +1162,22 @@ fn v2_rejects_unsafe_config_descriptor_and_workspace_paths() {
     );
     fs::remove_file(&marker).unwrap();
     write(&marker, V2_DESCRIPTOR);
+    fs::create_dir_all(target.join("nested/child")).unwrap();
+    let report = v2_json(
+        show_v2(
+            &fixture,
+            &["--json", "--workspace", "../candidate/./nested/child/../.."],
+        )
+        .output()
+        .unwrap(),
+        0,
+    );
+    assert_eq!(report["data"]["workspace_root"], target.to_str().unwrap());
     symlink(&target, fixture.0.join("synthetic-private-link")).unwrap();
     for path in [
         "../synthetic-private-link",
         "../synthetic-private-link/../candidate",
+        "../outside/../candidate",
     ] {
         v2_error(
             show_v2(&fixture, &["--json", "--workspace", path])
@@ -1187,7 +1199,11 @@ fn v2_rejects_unsafe_config_descriptor_and_workspace_paths() {
     v2_error(
         show_v2(
             &fixture,
-            &["--json", "--workspace", "../synthetic-private-absent"],
+            &[
+                "--json",
+                "--workspace",
+                "../synthetic-private-absent/../candidate",
+            ],
         )
         .output()
         .unwrap(),
@@ -1292,4 +1308,60 @@ fn v2_reports_strict_schema_errors_without_disclosing_inputs() {
         2,
         "INVALID_CONFIG",
     );
+}
+
+#[test]
+fn v2_rejects_tagged_field_names_and_accepts_quoted_tag_like_values() {
+    let fixture = Sandbox::new();
+    fixture.user_config("!!str output: {!!str format: json}\n");
+    let legacy = json_result(
+        &fixture.run(&["--json", "config", "show", "--scope", "user"]),
+        "config show",
+        0,
+    );
+    assert_eq!(legacy["data"]["output_format"], "json");
+
+    let candidate = fixture.0.join("xdg/hive/v2/!!str candidate");
+    let marker = candidate.join("hive-workspace.yml");
+    let user = fixture.0.join("xdg/hive/v2/config.yml");
+    write(&marker, V2_DESCRIPTOR);
+    let config = "version: 2\nworkspace: '!!str candidate'\noutput: {format: json}\n";
+    write(&user, config);
+    let report = v2_json(show_v2(&fixture, &[]).output().unwrap(), 0);
+    assert_eq!(
+        report["data"]["workspace_root"],
+        candidate.to_str().unwrap()
+    );
+
+    for (file, contents) in [
+        (
+            &marker,
+            V2_DESCRIPTOR.replacen("version:", "!!str version:", 1),
+        ),
+        (&user, config.replacen("version:", "!!str version:", 1)),
+        (&user, config.replacen("format:", "!!str format:", 1)),
+        (
+            &user,
+            config.replacen("format:", "!<tag:yaml.org,2002:str> format:", 1),
+        ),
+        (&user, config.replacen("format:", "! format:", 1)),
+    ] {
+        write(file, contents);
+        let output = show_v2(&fixture, &["--json"]).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "tagged key was accepted in {file:?}"
+        );
+        assert_redacted(&output, &["!!str", "tag:yaml.org"]);
+        v2_error(output, 2, "INVALID_CONFIG");
+        write(
+            file,
+            if file == &marker {
+                V2_DESCRIPTOR
+            } else {
+                config
+            },
+        );
+    }
 }

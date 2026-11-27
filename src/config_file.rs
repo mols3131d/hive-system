@@ -13,6 +13,8 @@ pub(crate) use filesystem::read_scoped;
 pub(crate) use filesystem::{ScopedDirectory, read_regular};
 
 const MAX_FILE_BYTES: usize = 64 * 1024;
+const MAX_YAML_DEPTH: usize = 8;
+const MAX_YAML_NODES: usize = 128;
 
 #[derive(Debug)]
 pub(crate) struct UserConfig {
@@ -168,16 +170,72 @@ fn is_remote_alias(alias: &str) -> bool {
         })
 }
 
-pub(crate) fn parse<T: de::DeserializeOwned>(bytes: &[u8], source: &str) -> Result<T, HiveError> {
+fn parse<T: de::DeserializeOwned>(bytes: &[u8], source: &str) -> Result<T, HiveError> {
+    deserialize_yaml(yaml_input(bytes, source)?, source)
+}
+
+#[cfg(unix)]
+pub(crate) fn parse_v2<T: de::DeserializeOwned>(
+    bytes: &[u8],
+    source: &str,
+) -> Result<T, HiveError> {
+    use serde_saphyr::granit_parser::{self, Event, Parser};
+
+    enum Collection {
+        Mapping { next_is_key: bool },
+        Sequence,
+    }
+
+    let input = yaml_input(bytes, source)?;
+    // serde-saphyr 2.2.0 allows explicit string tags on struct fields even
+    // with reject_tagged_field_names. Check the original node events for v2.
+    let options = granit_parser::options! {
+        strict_indentation: true,
+        flow_nesting_limit: MAX_YAML_DEPTH,
+        block_nesting_limit: MAX_YAML_DEPTH,
+    };
+    let malformed = || invalid(format!("{source} contains invalid YAML or fields"));
+    let mut collections = Vec::new();
+    let mut nodes = 0;
+    for result in Parser::new_from_str_with_options(input, options) {
+        let (event, _) = result.map_err(|_| malformed())?;
+        if event.is_node() {
+            nodes += 1;
+            if nodes > MAX_YAML_NODES || collections.len() > MAX_YAML_DEPTH {
+                return Err(malformed());
+            }
+            if let Some(Collection::Mapping { next_is_key }) = collections.last_mut() {
+                if *next_is_key && event.tag().is_some() {
+                    return Err(invalid(format!("{source} contains a tagged field name")));
+                }
+                *next_is_key = !*next_is_key;
+            }
+        }
+        match event {
+            Event::MappingStart(..) => collections.push(Collection::Mapping { next_is_key: true }),
+            Event::SequenceStart(..) => collections.push(Collection::Sequence),
+            Event::MappingEnd | Event::SequenceEnd => {
+                collections.pop();
+            }
+            _ => {}
+        }
+    }
+    deserialize_yaml(input, source)
+}
+
+fn yaml_input<'a>(bytes: &'a [u8], source: &str) -> Result<&'a str, HiveError> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err(invalid(format!("{source} exceeds the 64 KiB size limit")));
     }
-    let input = str::from_utf8(bytes).map_err(|_| invalid(format!("{source} must be UTF-8")))?;
+    str::from_utf8(bytes).map_err(|_| invalid(format!("{source} must be UTF-8")))
+}
+
+fn deserialize_yaml<T: de::DeserializeOwned>(input: &str, source: &str) -> Result<T, HiveError> {
     let options = serde_saphyr::options! {
         budget: serde_saphyr::budget! {
             max_documents: 1,
-            max_depth: 8,
-            max_nodes: 128,
+            max_depth: MAX_YAML_DEPTH,
+            max_nodes: MAX_YAML_NODES,
             max_anchors: 0,
             max_aliases: 0,
         },
@@ -297,24 +355,33 @@ mod filesystem {
                 .custom_flags(libc::O_DIRECTORY)
                 .open(&resolved)
                 .map_err(read_error)?;
-            // Walk before normalizing parent components so missing directories and
-            // symlinks cannot be hidden by a subsequent "..".
+            let mut ancestors = Vec::new();
+            // Open each component before processing any following ".." so
+            // missing directories and symlinks cannot be hidden by normalization.
             for component in components {
-                let name = match component {
-                    Component::CurDir => continue,
+                match component {
+                    Component::CurDir => {}
                     Component::Normal(name) => {
+                        let child =
+                            open_child(&file, name, libc::O_DIRECTORY)?.ok_or_else(|| {
+                                HiveError::new(
+                                    ErrorCode::NotFound,
+                                    "Workspace directory does not exist",
+                                )
+                            })?;
+                        ancestors.push(std::mem::replace(&mut file, child));
                         resolved.push(name);
-                        name
                     }
                     Component::ParentDir => {
-                        resolved.pop();
-                        OsStr::new("..")
+                        // A directory moved after open may have a different OS
+                        // parent. Return to the ancestor we already traversed.
+                        if let Some(parent) = ancestors.pop() {
+                            file = parent;
+                            resolved.pop();
+                        }
                     }
                     _ => return Err(invalid("Workspace root has an invalid path component")),
-                };
-                file = open_child(&file, name, libc::O_DIRECTORY)?.ok_or_else(|| {
-                    HiveError::new(ErrorCode::NotFound, "Workspace directory does not exist")
-                })?;
+                }
             }
             Ok(Self {
                 file,
