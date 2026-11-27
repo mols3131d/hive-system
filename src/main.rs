@@ -149,6 +149,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let result = match invocation.command {
         Command::DoltArtifact(DoltArtifactCommand::List(args)) => dolt::artifact::list(&args),
         Command::DoltArtifact(DoltArtifactCommand::Show(args)) => dolt::artifact::show(&args),
+        Command::DoltArtifact(DoltArtifactCommand::Create(args)) => {
+            dolt::artifact::create(&invocation.common, &args)
+        }
         Command::Validate(args) => dolt::validate(&args),
         Command::Operation(cli::OperationCommand::Show(args)) => {
             dolt::operation::show(&invocation.common, &args)

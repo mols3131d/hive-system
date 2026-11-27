@@ -2052,6 +2052,13 @@ fn artifact_contract_selection_preserves_legacy_help_and_v2_error_boundaries() {
     let v2 = sandbox.run(&["artifact", "list", "--contract", "2", "--help"]);
     assert!(v2.status.success());
     assert!(String::from_utf8(v2.stdout).unwrap().contains("--scope"));
+    let create = sandbox.run(&["artifact", "create", "--contract", "2", "--help"]);
+    assert!(create.status.success());
+    let help = String::from_utf8(create.stdout).unwrap();
+    assert!(help.contains("--if-match") && help.contains("--evidence-file"));
+    let legacy_create = sandbox.run(&["artifact", "create", "--help"]);
+    assert_eq!(legacy_create.status.code(), Some(2));
+    assert!(legacy_create.stdout.is_empty());
 
     for (leaf, options) in [
         ("list", &["--limit", "-7"][..]),
@@ -2063,6 +2070,8 @@ fn artifact_contract_selection_preserves_legacy_help_and_v2_error_boundaries() {
         ("show", &["bad", "--approval", "fixture"][..]),
         ("show", &["--workspace", "fixture"][..]),
         ("show", &["not-a-uuid", "--file", "fixture"][..]),
+        ("create", &["--kind", "report"][..]),
+        ("create", &["--scope", "area:fixture"][..]),
     ] {
         let selectors = ["--contract", "2", "--json"];
         let command = [&["artifact", leaf][..], options].concat();

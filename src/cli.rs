@@ -667,6 +667,33 @@ pub(crate) enum ArtifactCommand {
 pub(crate) enum DoltArtifactCommand {
     List(ArtifactListArgs),
     Show(ArtifactShowArgs),
+    Create(ArtifactCreateArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ArtifactCreateArgs {
+    /// An exact Area UUIDv7 for a direct link. Omit for a standalone Artifact.
+    #[arg(long)]
+    pub(crate) area: Option<String>,
+    /// Expected revision of the selected Area as AREA=REV.
+    #[arg(long)]
+    pub(crate) if_match: Option<String>,
+    #[arg(long)]
+    pub(crate) kind: String,
+    #[arg(long)]
+    pub(crate) title: String,
+    /// UTF-8 Markdown file, up to 64 KiB.
+    #[arg(long)]
+    pub(crate) file: PathBuf,
+    #[arg(long)]
+    pub(crate) actor: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Args)]
@@ -1553,6 +1580,10 @@ fn parse_dolt_artifact(
                         .about("Read one committed Artifact with explicit scope coverage."),
                 ))
             })
+            .subcommand(add_leaf_options(ArtifactCreateArgs::augment_args(
+                clap::Command::new("create")
+                    .about("Create a standalone or directly Area-linked Artifact."),
+            )))
     });
 
     // Recover known malformed options to locate the contract and output format.
@@ -1571,6 +1602,15 @@ fn parse_dolt_artifact(
     };
     let probe = recover_common(v2.clone()).mut_subcommand("artifact", |artifact| {
         artifact.mut_subcommands(|leaf| {
+            if leaf.get_name() == "create" {
+                return extended_error_options(leaf).mut_args(|arg| match arg.get_id().as_str() {
+                    "area" | "if_match" | "kind" | "title" | "file" | "actor" | "request_id"
+                    | "evidence_file" | "database" | "workspace_id" | "port" => {
+                        recover_value(arg).required(false)
+                    }
+                    _ => arg,
+                });
+            }
             if !matches!(leaf.get_name(), "list" | "show") {
                 return leaf;
             }
@@ -1638,8 +1678,10 @@ fn parse_dolt_artifact(
         Err(_) => return None,
     };
     let (command_name, leaf) = matched_leaf(&v2, &matched)?;
-    if !matches!(command_name.as_str(), "artifact list" | "artifact show")
-        || requested_contract(Some(&matched), Some(leaf)) != Contract::V2
+    if !matches!(
+        command_name.as_str(),
+        "artifact list" | "artifact show" | "artifact create"
+    ) || requested_contract(Some(&matched), Some(leaf)) != Contract::V2
     {
         return None;
     }
@@ -1663,20 +1705,44 @@ fn parse_dolt_artifact(
                 invalid(safe_parse_message(error.kind()))
             }
         })?;
-        let (_, leaf) = matched_leaf(cli, &matches).expect("matched Artifact read");
+        let (_, leaf) = matched_leaf(cli, &matches).expect("matched Dolt Artifact command");
         let common = CommonArgs::from_arg_matches(&matches)
             .and_then(|root| CommonArgs::from_arg_matches(leaf).map(|options| (root, options)))
             .map_err(|error| invalid(safe_parse_message(error.kind())))?;
         let common = common.0.resolve(common.1).map_err(invalid)?;
-        let command = if command_name == "artifact list" {
-            ArtifactListArgs::from_arg_matches(leaf).map(DoltArtifactCommand::List)
-        } else {
-            ArtifactShowArgs::from_arg_matches(leaf).map(DoltArtifactCommand::Show)
+        let command = match command_name.as_str() {
+            "artifact list" => {
+                ArtifactListArgs::from_arg_matches(leaf).map(DoltArtifactCommand::List)
+            }
+            "artifact show" => {
+                ArtifactShowArgs::from_arg_matches(leaf).map(DoltArtifactCommand::Show)
+            }
+            _ => ArtifactCreateArgs::from_arg_matches(leaf).map(DoltArtifactCommand::Create),
         }
         .map_err(|error| invalid(safe_parse_message(error.kind())))?;
         let target = match &command {
             DoltArtifactCommand::List(args) => &args.target,
             DoltArtifactCommand::Show(args) => &args.target,
+            DoltArtifactCommand::Create(args) => {
+                if common.workspace.is_none() || !args.target.has_all() {
+                    return Err(invalid(
+                        "Artifact create requires --workspace, --workspace-id, --database, and --port.",
+                    ));
+                }
+                if common.project.is_some()
+                    || common.project_root.is_some()
+                    || !matches!(common.view, View::WorkingTree)
+                {
+                    return Err(invalid(
+                        "Artifact create requires a current workspace and an explicit link selection.",
+                    ));
+                }
+                return Ok(Invocation {
+                    common,
+                    command: Command::DoltArtifact(command),
+                    command_name: command_name.clone(),
+                });
+            }
         };
         target
             .validate_common(
@@ -1807,7 +1873,8 @@ fn recover_unknown_long(
         (
             "workspace",
             "init" | "status" | "start" | "stop" | "recover"
-        ) | (_, "list" | "show")
+        ) | ("artifact", "create")
+            | (_, "list" | "show")
     ) {
         return None;
     }
@@ -1817,11 +1884,12 @@ fn recover_unknown_long(
     let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
     let long = unknown_long_name(leaf, invalid)?;
 
-    // Let Clap replay the original tokens. Init and Label list take no
+    // Let Clap replay the original tokens. These selected leaves take no
     // positionals, so the temporary option can take one plain separated
     // value. The original parse error still determines the result.
     let workspace_init = (domain, action) == ("workspace", "init");
-    let allow_separated_value = workspace_init || (domain, action) == ("label", "list");
+    let allow_separated_value =
+        workspace_init || matches!((domain, action), ("label", "list") | ("artifact", "create"));
     const UNKNOWN_LONG: &str = "recovered_unknown_long";
     let retry = cli.clone().mut_subcommand(domain, |command| {
         command.mut_subcommand(action, |leaf| {

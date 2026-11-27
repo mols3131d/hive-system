@@ -11,7 +11,8 @@ use crate::dolt::{
     context_evidence::read_evidence_bytes,
     context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7,
     issue_writer::{
-        self, Decision, Kind, Mutation, StagedIssue, WriteIdentity, digest, invalid, new_uuid_v7,
+        self, Decision, Kind, Mutation, StagedMutation, WriteIdentity, digest, invalid,
+        new_uuid_v7, valid_revision, valid_title,
     },
     read_error,
     receipt_history::{HistoricalReceipt, valid_sha256},
@@ -259,14 +260,6 @@ fn read_file(path: Option<&Path>, limit: usize) -> Result<Option<String>, HiveEr
     .transpose()
 }
 
-fn valid_revision(revision: &str) -> bool {
-    revision.chars().count() <= 36 && workflow::valid_ref(revision)
-}
-
-fn valid_title(title: &str) -> bool {
-    !title.trim().is_empty() && title.chars().count() <= 255 && !title.chars().any(char::is_control)
-}
-
 fn valid_text(text: &str) -> bool {
     !text.trim().is_empty() && text.len() <= MAX_TEXT_BYTES
 }
@@ -286,8 +279,8 @@ impl Mutation for Update<'_> {
         WriteIdentity {
             kind: Kind::Update,
             request_id: &self.args.request_id,
-            area_id: self.scope.area,
-            issue_id: Some(self.scope.issue),
+            area_id: Some(self.scope.area),
+            record_id: Some(self.scope.issue),
             actor: self.scope.actor,
             fingerprint: &self.fingerprint,
             authorization_ref: &self.decision.evidence.authorization_ref,
@@ -358,7 +351,7 @@ impl Mutation for Update<'_> {
         (): (),
         now: OffsetDateTime,
         sql_time: &str,
-    ) -> Result<StagedIssue, HiveError> {
+    ) -> Result<StagedMutation, HiveError> {
         let result = UpdateResult {
             version: 1,
             area_id: self.scope.area.to_owned(),
@@ -383,8 +376,8 @@ impl Mutation for Update<'_> {
             return Err(stale());
         }
         let encoded = issue_writer::encode(&result, Kind::Update)?;
-        Ok(StagedIssue {
-            issue_id: result.issue_id,
+        Ok(StagedMutation {
+            record_id: result.issue_id,
             result: encoded,
         })
     }
