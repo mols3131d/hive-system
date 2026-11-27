@@ -1,3 +1,4 @@
+pub(crate) mod area;
 pub(crate) mod bot;
 mod graph;
 mod issue;

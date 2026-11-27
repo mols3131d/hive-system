@@ -9,7 +9,10 @@ mod output;
 
 use std::process::ExitCode;
 
-use cli::{BotCommand, Command, ConfigCommand, Contract, Invocation, IssueCommand, ParseFailure};
+use cli::{
+    AreaCommand, BotCommand, Command, ConfigCommand, Contract, Invocation, IssueCommand,
+    ParseFailure,
+};
 use error::{ErrorCode, HiveError};
 
 fn main() -> ExitCode {
@@ -102,6 +105,8 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     }
     let result = match invocation.command {
         Command::Validate(args) => dolt::validate(&args),
+        Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
+        Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
         Command::Bot(BotCommand::List {
             target,
             status,
