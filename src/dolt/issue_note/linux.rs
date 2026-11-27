@@ -57,16 +57,16 @@ impl<'a> Request<'a> {
         }
         let body_bytes = read_evidence_bytes(&args.file, MAX_BODY_BYTES).map_err(|error| {
             let message = if matches!(error.code, ErrorCode::ContextLimit) {
-                "The progress note exceeds the supported byte limit."
+                "The Issue note exceeds the supported byte limit."
             } else {
-                "Could not read the explicit regular progress note file."
+                "Could not read the explicit regular Issue note file."
             };
             HiveError::new(error.code, message)
         })?;
-        let body = String::from_utf8(body_bytes)
-            .map_err(|_| invalid("The progress note must be UTF-8."))?;
+        let body =
+            String::from_utf8(body_bytes).map_err(|_| invalid("The Issue note must be UTF-8."))?;
         if body.trim().is_empty() {
-            return Err(invalid("The progress note must have a body."));
+            return Err(invalid("The Issue note must have a body."));
         }
         let fingerprint = NoteFingerprint {
             workspace_id: workspace,
@@ -162,7 +162,7 @@ fn guard_issue(db: &mut impl Queryable, request: &Request<'_>) -> Result<(), Hiv
     require_active_area(
         db,
         &args.area,
-        "A progress note requires active Area ancestry.",
+        "An Issue note requires active Area ancestry.",
     )
 }
 
@@ -183,7 +183,7 @@ fn verify_issue(
     if status != "in-progress" || !matches!(kind.as_str(), "feature" | "task" | "bug") {
         return Err(HiveError::new(
             ErrorCode::InvalidTransition,
-            "A progress note requires an in-progress executable Issue.",
+            "An Issue note requires an in-progress executable Issue.",
         ));
     }
     if !matches!(claim, Some((id, holder)) if id == request.args.claim && holder == request.args.actor)
