@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod config_file;
 mod config_git;
+mod config_v2;
 mod dolt;
 mod error;
 mod output;
@@ -88,6 +89,18 @@ fn dispatch(invocation: Invocation) -> ExitCode {
 fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let name = &invocation.command_name;
     let format = invocation.common.format.unwrap_or_default();
+    if matches!(
+        invocation.command,
+        Command::Config(ConfigCommand::Show(cli::ConfigScopeArgs {
+            scope: cli::ConfigScope::Workspace,
+        }))
+    ) {
+        let (format, result) = config_v2::show(&invocation.common);
+        return match result {
+            Ok(data) => output::success(Contract::V2, format, name, None, &data),
+            Err(error) => output::failure(Contract::V2, format, Some(name), None, error),
+        };
+    }
     let result = match invocation.command {
         Command::Validate(args) => dolt::validate(&args),
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),

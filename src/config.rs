@@ -434,7 +434,7 @@ fn without_unavailable(mut data: Value) -> Value {
     data
 }
 
-fn json_path(path: &Path) -> Result<&str, HiveError> {
+pub(crate) fn json_path(path: &Path) -> Result<&str, HiveError> {
     path.to_str()
         .ok_or_else(|| invalid("A configuration path cannot be represented as UTF-8."))
 }
@@ -710,13 +710,13 @@ fn reviewed_file(
     Ok(committed)
 }
 
-fn absolute_env(name: &str) -> Option<PathBuf> {
+pub(crate) fn absolute_env(name: &str) -> Option<PathBuf> {
     env::var_os(name)
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
 }
 
-fn current_dir() -> Result<PathBuf, HiveError> {
+pub(crate) fn current_dir() -> Result<PathBuf, HiveError> {
     env::current_dir().map_err(|_| {
         failure(
             ErrorCode::IoError,
@@ -725,7 +725,11 @@ fn current_dir() -> Result<PathBuf, HiveError> {
     })
 }
 
-fn resolve_path(path: &Path, base: &Path, home: Option<&Path>) -> Result<PathBuf, HiveError> {
+pub(crate) fn resolve_path(
+    path: &Path,
+    base: &Path,
+    home: Option<&Path>,
+) -> Result<PathBuf, HiveError> {
     let display = path.to_string_lossy();
     if path.as_os_str().is_empty()
         || display.contains("://")
