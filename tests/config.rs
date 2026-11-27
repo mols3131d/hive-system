@@ -90,7 +90,18 @@ impl Sandbox {
 
     fn commit(&self, root: &Path) {
         self.git(root, &["add", "."]);
-        self.git(root, &["commit", "-qm", "Fixture", "--allow-empty"]);
+        // Keep fixture commits from detaching background maintenance that races with snapshots.
+        self.git(
+            root,
+            &[
+                "-c",
+                "maintenance.auto=false",
+                "commit",
+                "-qm",
+                "Fixture",
+                "--allow-empty",
+            ],
+        );
     }
 
     fn workspace(&self, name: &str, project_url: &str) -> PathBuf {
