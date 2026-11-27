@@ -9,8 +9,7 @@ mod assembly;
 mod directives;
 #[path = "context/resume.rs"]
 mod resume;
-#[path = "context/workflow.rs"]
-mod workflow;
+use crate::dolt::context_workflow as workflow;
 
 use std::collections::HashSet;
 

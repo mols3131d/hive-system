@@ -2196,7 +2196,7 @@ fn workspace_status_checks_process_start_and_endpoint_independently() {
 }
 
 #[test]
-fn context_inspect_binds_the_committed_role_policy_to_the_descriptor() {
+fn context_resolve_binds_the_committed_role_policy_to_the_descriptor() {
     let fixture = Sandbox::new();
     let policy = fixture.init_repo("policy");
     let role_path = policy.join("docs/architecture/dolt-mvp-contract.md");
@@ -2218,7 +2218,7 @@ fn context_inspect_binds_the_committed_role_policy_to_the_descriptor() {
         "--contract",
         "2",
         "context",
-        "inspect",
+        "resolve",
         "--workspace",
         workspace.to_str().unwrap(),
         "--database",
@@ -2248,7 +2248,7 @@ fn context_inspect_binds_the_committed_role_policy_to_the_descriptor() {
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["schema_version"], 2);
         assert_eq!(report["ok"], false);
-        assert_eq!(report["command"], "context inspect");
+        assert_eq!(report["command"], "context resolve");
         assert_eq!(report["error"]["code"], code);
         assert!(report.get("data").is_none());
         report
@@ -2257,7 +2257,7 @@ fn context_inspect_binds_the_committed_role_policy_to_the_descriptor() {
     expect(
         &[
             "context",
-            "inspect",
+            "resolve",
             "--role",
             "invalid-role",
             "--contract",
@@ -2291,7 +2291,7 @@ fn context_inspect_binds_the_committed_role_policy_to_the_descriptor() {
     expect(
         &[
             "context",
-            "inspect",
+            "resolve",
             "--asset-commit",
             "--contract",
             "2",
@@ -2332,4 +2332,219 @@ fn context_inspect_binds_the_committed_role_policy_to_the_descriptor() {
     let missing_role = fixture.git(&policy, &["rev-parse", "HEAD"]);
     write(&descriptor, descriptor_at(&missing_role));
     expect(&common, 7, "POLICY_UNAVAILABLE");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn context_resolve_accepts_only_bounded_exact_evidence_inputs() {
+    let fixture = Sandbox::new();
+    let policy = fixture.init_repo("policy");
+    write(
+        &policy.join("docs/architecture/dolt-mvp-contract.md"),
+        "# Fixture\n\n### Bot and curated memory\n\n| Drone | Fixture role |\n\n#### Continuity boundaries and proposed MVP scope\n",
+    );
+    fixture.commit(&policy);
+    let pin = fixture.git(&policy, &["rev-parse", "HEAD"]);
+    let root = fixture.0.join("workspace");
+    let workspace = "01900000-0000-7000-8000-000000000001";
+    let area = "01900000-0000-7000-8000-000000000002";
+    let issue = "01900000-0000-7000-8000-000000000003";
+    let artifact = "01900000-0000-7000-8000-000000000004";
+    let invocation = "01900000-0000-7000-8000-000000000005";
+    write(
+        &root.join("hive-workspace.yml"),
+        format!(
+            "version: 2\nworkspace_id: {workspace}\nschema_version: 1\npolicy_revision: {pin}\n"
+        ),
+    );
+    let path = fixture.0.join("evidence.json");
+    let file = path.to_str().unwrap();
+    let common = [
+        "context",
+        "resolve",
+        "--workspace",
+        root.to_str().unwrap(),
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+        "--workspace-id",
+        workspace,
+        "--policy-root",
+        policy.to_str().unwrap(),
+        "--actor",
+        "fixture-actor",
+        "--role",
+        "drone",
+        "--issue",
+        issue,
+        "--area",
+        area,
+    ];
+    let expect = |extra: &[&str], exit, code| {
+        let args = [common.as_slice(), extra, &["--contract", "2", "--json"]].concat();
+        let output = fixture.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&output.stderr)));
+        assert_eq!(output.status.code(), Some(exit), "{report}");
+        assert_eq!(report["command"], "context resolve");
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["error"]["code"], code);
+        assert!(report.get("data").is_none());
+        report
+    };
+    let declaration = serde_json::json!({
+        "version": 1, "evidence_id": "fixture-id", "revision": "r1", "source_ref": "fixture",
+        "issuer_ref": "fixture-issuer", "workspace_id": workspace, "actor_ref": "fixture-actor",
+        "area_id": area, "issue_id": issue, "operations": ["disclose_artifact_body"],
+        "record": {"kind": "artifact", "id": artifact, "revision": "artifact-r1"},
+        "invocation_id": invocation, "db_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "valid_from": "2000-01-01T00:00:00Z", "expires_at": "2099-01-01T00:00:00Z",
+        "withdrawn": false
+    });
+    let receipt = serde_json::json!({"directive_id": area, "request_id": invocation});
+    let selected = [
+        "--include-artifact",
+        artifact,
+        "--evidence-file",
+        file,
+        "--invocation-id",
+        invocation,
+    ];
+    expect(&["--include-artifact", artifact], 7, "AUTHORITY_UNVERIFIED");
+    expect(
+        &[
+            "--include-artifact",
+            artifact,
+            "--include-artifact",
+            artifact,
+        ],
+        2,
+        "INVALID_ARGUMENT",
+    );
+    expect(
+        &["--evidence-file", file, "--evidence-file", file],
+        2,
+        "INVALID_ARGUMENT",
+    );
+    let ids: Vec<_> = (1..=26)
+        .map(|id| format!("01900000-0000-7000-8000-00000000{id:04x}"))
+        .collect();
+    let excessive: Vec<_> = ids
+        .iter()
+        .flat_map(|id| ["--include-artifact", id.as_str()])
+        .collect();
+    expect(&excessive, 2, "CONTEXT_LIMIT");
+
+    write(
+        &path,
+        serde_json::json!({"version": 1, "directive_receipts": [receipt]}).to_string(),
+    );
+    expect(&selected, 7, "AUTHORITY_UNVERIFIED");
+    write(
+        &path,
+        serde_json::json!({"version": 1, "directive_receipts": [receipt, receipt]}).to_string(),
+    );
+    expect(&["--evidence-file", file], 2, "INVALID_ARGUMENT");
+    write(
+        &path,
+        serde_json::json!({"version": 1, "handoff": receipt}).to_string(),
+    );
+    expect(
+        &["--invocation-id", invocation, "--evidence-file", file],
+        2,
+        "INVALID_ARGUMENT",
+    );
+
+    let valid = serde_json::json!({"version": 1, "directive_receipts": [receipt], "artifacts": [declaration]});
+    write(&path, valid.to_string());
+    let report = expect(&selected, 7, "AUTHORITY_UNVERIFIED");
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("verified pairing")
+    );
+    expect(
+        &["--include-artifact", artifact, "--evidence-file", file],
+        7,
+        "AUTHORITY_UNVERIFIED",
+    );
+    expect(
+        &["--evidence-file", file, "--invocation-id", invocation],
+        6,
+        "UNAUTHORIZED",
+    );
+    for (field, value, exit, code) in [
+        ("actor_ref", "other-actor", 6, "UNAUTHORIZED"),
+        ("area_id", workspace, 6, "UNAUTHORIZED"),
+        ("issue_id", workspace, 6, "UNAUTHORIZED"),
+        ("invocation_id", workspace, 6, "UNAUTHORIZED"),
+        (
+            "expires_at",
+            "2001-01-01T00:00:00Z",
+            7,
+            "AUTHORITY_UNVERIFIED",
+        ),
+        ("unexpected", "synthetic-private", 2, "INVALID_ARGUMENT"),
+    ] {
+        let mut changed = valid.clone();
+        changed["artifacts"][0][field] = value.into();
+        write(&path, changed.to_string());
+        let report = expect(&selected, exit, code);
+        assert!(!report.to_string().contains("synthetic-private"));
+    }
+    write(
+        &path,
+        valid.to_string().replace(
+            "\"kind\":\"artifact\"",
+            "\"kind\":\"artifact\",\"kind\":\"artifact\"",
+        ),
+    );
+    expect(&selected, 2, "INVALID_ARGUMENT");
+
+    for content in [
+        "{\"version\":1,\"version\":1}",
+        "{\"version\":1,\"unexpected\":true}",
+    ] {
+        write(&path, content);
+        expect(&["--evidence-file", file], 2, "INVALID_ARGUMENT");
+    }
+    let content = "{\"version\":1}";
+    write(
+        &path,
+        format!("{content}{}", " ".repeat(256 * 1024 - content.len())),
+    );
+    expect(&["--evidence-file", file], 7, "AUTHORITY_UNVERIFIED");
+    write(
+        &path,
+        format!("{content}{}", " ".repeat(256 * 1024 + 1 - content.len())),
+    );
+    expect(&["--evidence-file", file], 2, "CONTEXT_LIMIT");
+
+    let link = fixture.0.join("linked-evidence.json");
+    symlink(&path, &link).unwrap();
+    expect(
+        &["--evidence-file", link.to_str().unwrap()],
+        2,
+        "INVALID_ARGUMENT",
+    );
+    let parent_link = fixture.0.join("linked-directory");
+    symlink(&fixture.0, &parent_link).unwrap();
+    expect(
+        &[
+            "--evidence-file",
+            parent_link.join("evidence.json").to_str().unwrap(),
+        ],
+        2,
+        "INVALID_ARGUMENT",
+    );
+    let traversal = fixture.0.join("invocation/../evidence.json");
+    expect(
+        &["--evidence-file", traversal.to_str().unwrap()],
+        2,
+        "INVALID_ARGUMENT",
+    );
+    fs::remove_file(&path).unwrap();
+    expect(&["--evidence-file", file], 7, "AUTHORITY_UNVERIFIED");
 }

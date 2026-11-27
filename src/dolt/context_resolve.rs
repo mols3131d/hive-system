@@ -1,10 +1,10 @@
-//! Entry point for explicit current context inspection. Policy preflight can
+//! Entry point for explicit current context resolveion. Policy preflight can
 //! complete independently of the workspace runtime's snapshot pairing check.
 
-use crate::cli::{CommonOptions, ContextInspectArgs, ContextRole};
+use crate::cli::{CommonOptions, ContextResolveArgs, ContextRole};
 use crate::error::{ErrorCode, HiveError};
 
-use super::{DoltFailure, DoltSuccess, DoltTarget, is_uuid_v7};
+use super::{DoltFailure, DoltSuccess, DoltTarget, is_uuid, is_uuid_v7};
 
 const DEFAULT_BUDGET: usize = 32 * 1024;
 const MAX_BUDGET: usize = 64 * 1024;
@@ -19,9 +19,9 @@ impl ContextRole {
     }
 }
 
-pub(crate) fn inspect(
+pub(crate) fn resolve(
     common: &CommonOptions,
-    args: &ContextInspectArgs,
+    args: &ContextResolveArgs,
 ) -> Result<DoltSuccess, Box<DoltFailure>> {
     let (role, budget) = selection(common, args).map_err(DoltFailure::without_context)?;
     let target = DoltTarget::parse(&args.target).map_err(DoltFailure::without_context)?;
@@ -30,7 +30,7 @@ pub(crate) fn inspect(
 
 fn selection(
     common: &CommonOptions,
-    args: &ContextInspectArgs,
+    args: &ContextResolveArgs,
 ) -> Result<(ContextRole, usize), HiveError> {
     let actor = args
         .actor
@@ -55,6 +55,37 @@ fn selection(
     }
     if let Some(issue) = &args.issue {
         super::issue::parse_selector(issue)?;
+    }
+    if args.include_artifact.len() > crate::cli::MAX_CONTEXT_ARTIFACTS {
+        return Err(HiveError::new(
+            ErrorCode::ContextLimit,
+            "Select at most 25 explicit Artifact bodies.",
+        ));
+    }
+    let mut artifacts = std::collections::BTreeSet::new();
+    if args
+        .include_artifact
+        .iter()
+        .any(|id| !is_uuid_v7(id) || !artifacts.insert(id))
+    {
+        return Err(invalid(
+            "Each included Artifact must have a distinct exact lowercase UUIDv7.",
+        ));
+    }
+    if !artifacts.is_empty() && args.issue.is_none() {
+        return Err(HiveError::new(
+            ErrorCode::Unauthorized,
+            "Explicit Artifact body disclosure requires an exact Issue selection.",
+        ));
+    }
+    if !artifacts.is_empty() && args.evidence_file.is_none() {
+        return Err(HiveError::new(
+            ErrorCode::AuthorityUnverified,
+            "Explicit Artifact bodies require current workflow evidence.",
+        ));
+    }
+    if args.invocation_id.as_deref().is_some_and(|id| !is_uuid(id)) {
+        return Err(invalid("Supply a canonical lowercase invocation UUID."));
     }
     if args
         .asset_commit
@@ -93,7 +124,7 @@ fn selection(
 #[cfg(unix)]
 fn preflight(
     common: &CommonOptions,
-    args: &ContextInspectArgs,
+    args: &ContextResolveArgs,
     target: DoltTarget<'_>,
     role: ContextRole,
     budget: usize,
@@ -130,6 +161,36 @@ fn preflight(
             ),
         ));
     }
+    if let Some(path) = args.evidence_file.as_deref() {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use super::context_evidence::{EvidenceFile, Selection};
+            EvidenceFile::read(path)
+                .and_then(|file| {
+                    file.validate(&Selection {
+                        workspace_id: workspace.workspace_id(),
+                        actor_ref: args.actor.as_deref().expect("validated actor"),
+                        bot_id: args.bot.as_deref(),
+                        invocation_id: args.invocation_id.as_deref(),
+                        issue: args.issue.as_deref(),
+                        area: args.area.as_deref(),
+                        artifacts: &args.include_artifact,
+                    })
+                })
+                .map_err(|error| DoltFailure::with_context(context.clone(), error))?;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = path;
+            return Err(DoltFailure::with_context(
+                context,
+                HiveError::new(
+                    ErrorCode::NotImplemented,
+                    "Safe context evidence files require Linux or macOS.",
+                ),
+            ));
+        }
+    }
     Err(DoltFailure::with_context(
         context,
         HiveError::new(
@@ -142,7 +203,7 @@ fn preflight(
 #[cfg(not(unix))]
 fn preflight(
     _common: &CommonOptions,
-    _args: &ContextInspectArgs,
+    _args: &ContextResolveArgs,
     _target: DoltTarget<'_>,
     _role: ContextRole,
     _budget: usize,

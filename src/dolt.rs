@@ -1,7 +1,12 @@
 pub(crate) mod area;
 pub(crate) mod artifact;
 pub(crate) mod bot;
-pub(crate) mod context_inspect;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod context_evidence;
+pub(crate) mod context_resolve;
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[path = "dolt/context/workflow.rs"]
+mod context_workflow;
 #[cfg(unix)]
 mod conversation;
 pub(crate) mod directive;

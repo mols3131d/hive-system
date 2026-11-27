@@ -286,9 +286,8 @@ pub(crate) struct ContextArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum ContextCommand {
-    /// Check the selected v2 scope and current context prerequisites.
-    #[command(hide = true)]
-    Inspect(ContextInspectArgs),
+    /// Resolve bounded current v2 context.
+    Resolve(ContextResolveArgs),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -299,7 +298,7 @@ pub(crate) enum ContextRole {
 }
 
 #[derive(Args)]
-pub(crate) struct ContextInspectArgs {
+pub(crate) struct ContextResolveArgs {
     /// Reviewed local Hive system checkout at the workspace's policy pin.
     #[arg(long, value_name = "PATH")]
     pub(crate) policy_root: Option<PathBuf>,
@@ -318,12 +317,23 @@ pub(crate) struct ContextInspectArgs {
     pub(crate) area: Option<String>,
     #[arg(long, value_name = "UUID-OR-#NUMBER")]
     pub(crate) issue: Option<String>,
+    /// Exact UUIDv7 of an Artifact body to include. Repeat up to 25 times.
+    #[arg(long, value_name = "UUID")]
+    pub(crate) include_artifact: Vec<String>,
+    /// Bounded versioned nonsecret JSON provenance for this request.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) evidence_file: Option<PathBuf>,
+    /// Independent invocation UUID required for current body declarations.
+    #[arg(long, value_name = "UUID")]
+    pub(crate) invocation_id: Option<String>,
     /// Total inline body budget in UTF-8 bytes.
     #[arg(long, value_name = "BYTES", allow_negative_numbers = true)]
     pub(crate) budget: Option<String>,
     #[command(flatten)]
     pub(crate) target: DoltTargetArgs,
 }
+
+pub(crate) const MAX_CONTEXT_ARTIFACTS: usize = 25;
 
 #[derive(Subcommand)]
 #[allow(
@@ -1012,6 +1022,13 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     if let Some(workspace) = workspace_parser(&cli, &args) {
         cli = workspace;
     }
+    if !has_context_v2_selection(&cli, &args) {
+        cli = cli.mut_subcommand("context", |_| {
+            CommonArgs::augment_args(
+                clap::Command::new("context").about("Show the selected workspace context"),
+            )
+        });
+    }
     let mut config_error_matches = None;
     let extension = resource_parser(&cli, &args).or_else(|| label_parser(&cli, &args));
     let (parsed, extension_matches) = if let Some(extension) = extension {
@@ -1069,6 +1086,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                         .try_get_matches_from(&args)
                         .ok()?;
                     recover_unknown_long(&cli, &args, &partial, &error, "workspace")
+                        .or_else(|| recover_unknown_long(&cli, &args, &partial, &error, "context"))
                         .or(Some(partial))
                 });
             let root = partial.as_ref();
@@ -1118,7 +1136,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             .into_iter()
             .any(|id| context.value_source(id) == Some(ValueSource::CommandLine))
         {
-            return Err("Supply common options before context or after inspect.");
+            return Err("Supply common options before context or after resolve.");
         }
         let root = CommonArgs::from_arg_matches(&matches)
             .map_err(|error| safe_parse_message(error.kind()))?;
@@ -1712,6 +1730,32 @@ fn retry_config_show(
     }
 }
 
+fn has_context_v2_selection(cli: &clap::Command, args: &[OsString]) -> bool {
+    if !args.iter().skip(1).any(|arg| arg == "context") {
+        return false;
+    }
+    let probe = cli.clone().mut_subcommand("context", |context| {
+        extended_help_probe(context).mut_subcommand("resolve", extended_help_probe)
+    });
+    let matches = match probe.clone().try_get_matches_from(args) {
+        Ok(matches) => Some(matches),
+        Err(error) => retry_scoped_read_failure(&probe, args, &error, "context").or_else(|| {
+            let partial = probe
+                .clone()
+                .ignore_errors(true)
+                .try_get_matches_from(args)
+                .ok()?;
+            recover_unknown_long(&probe, args, &partial, &error, "context").or(Some(partial))
+        }),
+    };
+    matches.as_ref().is_some_and(|matches| {
+        matched_leaf(&probe, matches).is_some_and(|(name, leaf)| {
+            matches!(name.as_str(), "context" | "context resolve")
+                && requested_contract(Some(matches), Some(leaf)) == Contract::V2
+        })
+    })
+}
+
 fn retry_scoped_read_failure(
     cli: &clap::Command,
     args: &[OsString],
@@ -1750,9 +1794,8 @@ fn retry_scoped_read_failure(
     let retry = recover_scope(cli.clone().mut_subcommand(domain, |command| {
         command.mut_subcommands(|leaf| {
             recover_scope(leaf).mut_args(|arg| match arg.get_id().as_str() {
-                "database" | "workspace_id" | "port" | "cursor" | "area" | "asset_commit" => {
-                    recover_value(arg)
-                }
+                "database" | "workspace_id" | "port" | "cursor" | "area" | "asset_commit"
+                | "include_artifact" | "evidence_file" | "invocation_id" => recover_value(arg),
                 "status" | "limit" | "after" | "role" | "actor" | "issue" | "bot" | "budget"
                 | "policy_root" => recover_value(arg.value_parser(StringValueParser::new())),
                 "bot_id" | "id" => arg
@@ -2079,22 +2122,22 @@ impl Command {
             return match self {
                 Self::Validate(args) => args.validate_dolt_selection(common),
                 Self::Context(ContextArgs {
-                    command: Some(ContextCommand::Inspect(args)),
+                    command: Some(ContextCommand::Resolve(args)),
                 }) => {
                     if common.workspace.is_none()
                         || !args.target.has_all()
                         || args.policy_root.is_none()
                     {
                         return Err(
-                            "Context inspect requires --workspace, --workspace-id, --database, --port, and --policy-root.",
+                            "Context resolve requires --workspace, --workspace-id, --database, --port, and --policy-root.",
                         );
                     }
                     if common.project_root.is_some() || !matches!(common.view, View::WorkingTree) {
-                        return Err("Context inspect accepts only the current v2 snapshot.");
+                        return Err("Context resolve accepts only the current v2 snapshot.");
                     }
                     Ok(())
                 }
-                Self::Context(_) => Err("Use context inspect with an explicit contract 2 target."),
+                Self::Context(_) => Err("Use context resolve with an explicit contract 2 target."),
                 Self::Area(command) => command.validate_dolt_selection(common),
                 Self::Resource(command) => command.validate_dolt_selection(common),
                 Self::Workspace(WorkspaceCommand::Status(target)) => {
@@ -2185,7 +2228,7 @@ impl Command {
         }
         match self {
             Self::Context(ContextArgs { command: Some(_) }) => {
-                Err("Context inspect requires --contract 2.")
+                Err("Context resolve requires --contract 2.")
             }
             Self::Config(ConfigCommand::Bind) => {
                 common.require_working_tree()?;

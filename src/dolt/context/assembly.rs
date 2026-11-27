@@ -16,7 +16,6 @@ use crate::dolt::DoltSuccess;
 use crate::error::{ErrorCode, HiveError};
 
 const MAX_JSON_BYTES: usize = 512 * 1024;
-const MAX_SELECTED_ARTIFACTS: usize = 25;
 
 pub(super) struct RoleBody<'a> {
     pub(super) role: ContextRole,
@@ -66,7 +65,7 @@ pub(super) fn assemble(
     }
     let max = inputs.budget.unwrap_or(DEFAULT_INLINE_BYTES);
     if !(1..=MAX_INLINE_BYTES).contains(&max)
-        || inputs.artifacts.len() > MAX_SELECTED_ARTIFACTS
+        || inputs.artifacts.len() > crate::cli::MAX_CONTEXT_ARTIFACTS
         || inputs.activation_receipts.len() > directives::MAX_DIRECTIVES
     {
         return Err(limit("Context selection exceeds its request limits."));
@@ -85,6 +84,20 @@ pub(super) fn assemble(
     let mut remaining = max;
     let identity = identity(snapshot, inputs, &mut remaining)?;
     let candidates = directives::collect(snapshot, scope, inputs.request.observed_at)?;
+    let applicable: BTreeSet<_> = candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect();
+    if inputs
+        .activation_receipts
+        .keys()
+        .any(|id| !applicable.contains(id))
+    {
+        return Err(HiveError::new(
+            ErrorCode::Unauthorized,
+            "An activation receipt selects a Directive outside the applicable context.",
+        ));
+    }
     let mut directions = Vec::new();
     for candidate in candidates {
         let request_id = inputs
