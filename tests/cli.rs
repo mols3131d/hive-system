@@ -4150,6 +4150,15 @@ fn stopped_issue_transitions_keep_output_options_and_literal_boundaries() {
     let output = ["--contract", "2", "--json"];
     for action in ["release", "recover", "submit"] {
         let command = ["issue", action];
+        for help in [
+            ["help", "issue", action, "--contract", "2"],
+            ["issue", "help", action, "--contract", "2"],
+        ] {
+            let report = sandbox.run(&help);
+            assert!(report.status.success(), "{help:?} {report:?}");
+            assert!(report.stderr.is_empty());
+            assert!(String::from_utf8_lossy(&report.stdout).contains("--stop-evidence"));
+        }
         for invalid in [
             &["--unknown=--contract=1", issue][..],
             &["-Z", issue],
@@ -4214,6 +4223,16 @@ fn issue_set_parent_keeps_late_v2_errors_and_literal_argument_boundaries() {
         "--port",
         "3306",
     ];
+    for args in [
+        &["--contract", "2", "help", "issue", "set-parent"][..],
+        &["help", "issue", "set-parent", "--contract", "2"],
+        &["issue", "help", "set-parent", "--contract", "2"],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(0), "{args:?} {output:?}");
+        assert!(output.stderr.is_empty(), "{args:?} {output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("--parent-area"));
+    }
     for suffix in [
         &["--clear", "--evidence-file", "fixture.json"][..],
         &["--parent", parent, "--evidence-file", "fixture.json"],
@@ -4223,6 +4242,16 @@ fn issue_set_parent_keeps_late_v2_errors_and_literal_argument_boundaries() {
             "--parent-area",
             issue,
             "--clear",
+            "--evidence-file",
+            "fixture.json",
+        ],
+        &[
+            "--parent",
+            parent,
+            "--parent-area",
+            issue,
+            "-X",
+            "--unknown=--contract=1",
             "--evidence-file",
             "fixture.json",
         ],
@@ -4319,6 +4348,14 @@ fn issue_reconciliation_preserves_contract_selection_and_structured_errors() {
     let id = "01900000-0000-7000-8000-000000000001";
     let revision = format!("{id}=fixture-r1");
     for action in ["cancel", "reopen"] {
+        for args in [
+            ["help", "issue", action, "--contract", "2"],
+            ["issue", "help", action, "--contract", "2"],
+        ] {
+            let output = sandbox.run(&args);
+            assert!(output.status.success(), "{args:?} {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("--reason"));
+        }
         let command = [
             "issue",
             action,
@@ -4346,6 +4383,7 @@ fn issue_reconciliation_preserves_contract_selection_and_structured_errors() {
             &[][..],
             &["--reason", "fixture-reason", "--reason", "fixture-reason"][..],
             &["--reason=--json", "--unknown", "fixture-value"][..],
+            &["--reason=--json", "-Z", "--unknown=--contract=1"][..],
         ] {
             let output =
                 sandbox.run(&[&command[..], suffix, &["--contract", "2", "--json"]].concat());
