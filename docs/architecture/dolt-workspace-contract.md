@@ -190,6 +190,7 @@ $XDG_STATE_HOME/hive/v2/
 │       ├── lock                  # OS-held exclusive advisory lock (stable inode; never unlink/steal)
 │       ├── active-root.json      # Canonical registered active workspace_root and DB identity
 │       ├── pending-request.json  # Durable pending-commit marker (no payload body or credentials)
+│       ├── stopped-request.json  # Verified exit evidence bound to a pending marker
 │       └── server.json           # Owned Dolt SQL Server PID, start identity, nonce, endpoint ref
 └── diagnostics/                  # Optional redacted local diagnostics only
 
@@ -220,14 +221,15 @@ Supply all of `--workspace-id UUID --database NAME --port PORT` to inspect commi
 
 A safely readable `pending-request.json` is enough to report `recovery_required`, even if its contents are incomplete. Status does not interpret its payload. Status observes files without taking the writer lock, so lifecycle commands must reverify under that lock. These observations grant no mutation authority and provide no evidence about worker execution, claims or stop.
 
-#### Workspace start and stop
+#### Workspace start, stop and recovery
 
 ```sh
 hive --contract 2 --json --workspace PATH workspace start --dolt-bin PATH --port PORT
 hive --contract 2 --json --workspace PATH workspace stop
+hive --contract 2 --json --workspace PATH workspace recover --dolt-bin PATH
 ```
 
-Use an existing bootstrapped workspace and an already registered canonical root. The Linux lifecycle requires a workspace state directory owned by the caller with mode `0700`, Dolt 2.7.6, procfs, pidfds, a local filesystem exposing the Dolt storage lock, and a free loopback port from 1024 through 65535. Both commands acquire the stable workspace-ID lock. A pending request blocks start and is preserved by stop.
+Use an existing bootstrapped workspace and an already registered canonical root. The Linux lifecycle requires a workspace state directory owned by the caller with mode `0700`, Dolt 2.7.6, procfs, pidfds, and a local filesystem exposing the Dolt storage lock. All three commands acquire the stable workspace-ID lock. Start requires a free loopback port from 1024 through 65535. A pending request blocks start and is preserved by stop.
 
 Start provisions launch-specific credentials in a private directory beneath the workspace state directory. The reader receives database SELECT. The initial writer receives database SELECT and UPDATE on `workspace_counters` for the scoped transaction verification. The running response identifies the reader account and private password file for use with the existing reader environment variables.
 
@@ -236,6 +238,10 @@ Start writes and syncs `run-<nonce>/server-config.yaml` (mode `0600`) beneath th
 Start and stop verify the boot and process start identity, the launched executable and arguments, the process's exclusive kernel lock on the selected `db/.dolt/noms/LOCK` inode, and its exact loopback listener. The launch-specific reader then verifies the committed workspace UUID and schema, bracketed by process, store, and listener checks. Stop sends SIGTERM through the verified pidfd and waits for process exit before removing the local server record. An interrupted launch or stale server record requires inspection.
 
 For launches using `--config`, ownership verification checks the process's inherited descriptor against the synced private `config-id` record and verifies its seals and exact bytes for the selected database, launch directory and endpoint. A running legacy launch remains eligible for verified stop when its arguments exactly match the launcher that supplied all settings as command-line flags and all existing ownership checks pass.
+
+If an owned launch has a safely readable pending marker, `workspace stop` durably records the pidfd-verified exit before removing the launch directory and server record. The proof binds the registered workspace lock and state directory, exact launch, canonical store, executable identity and digest, and exact marker identity and digest. Recovery can finish interrupted launch cleanup when the surviving records match that proof.
+
+`workspace recover` supports v1 Issue note markers and requires the absolute path to the same Dolt executable used by that launch. It holds the registered workspace and canonical Dolt storage locks while a temporary loopback server reads a private copy of the store and working set with a fresh SELECT-only account. It stops the temporary server before clearing the exact marker. Recovery reports `confirmed` for a verified matching receipt introduced at HEAD, or `rolled_back` for a verified clean HEAD at the recorded base with no receipt in retained history. The selected workspace stays stopped. Unavailable proof, an unsupported marker, or inconclusive history keeps the marker and returns `COMMIT_UNCERTAIN`. An interruption can leave a private `.recovery-*` directory under the workspace state directory for local inspection and cleanup.
 
 ## Private Queen conversation file contract
 

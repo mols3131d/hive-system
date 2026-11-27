@@ -9,7 +9,7 @@ use crate::error::HiveError;
 mod linux;
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{inspect_empty_target, probe_versions};
+pub(crate) use linux::{Installed, fd_path, inspect_empty_target, probe_versions, sync_tree};
 
 pub(crate) fn run(target: &Path, register_runtime: bool) -> Result<Value, HiveError> {
     #[cfg(target_os = "linux")]

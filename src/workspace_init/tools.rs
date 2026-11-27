@@ -17,7 +17,7 @@ use crate::dolt::{
 };
 use crate::error::{ErrorCode, HiveError};
 
-pub(super) struct Installed<'a> {
+pub(crate) struct Installed<'a> {
     dolt: PathBuf,
     git: PathBuf,
     scratch: &'a File,
@@ -25,7 +25,7 @@ pub(super) struct Installed<'a> {
 }
 
 impl<'a> Installed<'a> {
-    pub(super) fn check(scratch: &'a File) -> Result<Self, HiveError> {
+    pub(crate) fn check(scratch: &'a File) -> Result<Self, HiveError> {
         let installed = Self::locate(scratch)?;
         check_dolt_version(&installed.dolt(&installed.home, &["version"], None)?)?;
         if !installed
@@ -166,6 +166,12 @@ impl<'a> Installed<'a> {
                 return Err(unverified_db());
             }
         }
+        self.verify_schema(db, commit)?;
+        restrict_db_modes(db)?;
+        Ok(commit.to_owned())
+    }
+
+    pub(crate) fn verify_schema(&self, db: &Path, commit: &str) -> Result<(), HiveError> {
         let tables = self.query(db, &format!("SHOW FULL TABLES AS OF '{commit}'"))?;
         if tables.len() != initial_schema_tables().count() {
             return Err(unverified_db());
@@ -184,8 +190,7 @@ impl<'a> Installed<'a> {
                 ));
             }
         }
-        restrict_db_modes(db)?;
-        Ok(commit.to_owned())
+        Ok(())
     }
 
     pub(super) fn initialize_assets(&self, assets: &Path) -> Result<(String, File), HiveError> {
@@ -228,7 +233,7 @@ impl<'a> Installed<'a> {
         Ok((commit.to_owned(), native))
     }
 
-    fn query(&self, db: &Path, query: &str) -> Result<Vec<Value>, HiveError> {
+    pub(crate) fn query(&self, db: &Path, query: &str) -> Result<Vec<Value>, HiveError> {
         #[derive(serde::Deserialize)]
         struct Rows {
             rows: Vec<Value>,
@@ -239,7 +244,12 @@ impl<'a> Installed<'a> {
             .map_err(|_| unverified_db())
     }
 
-    fn dolt(&self, cwd: &Path, args: &[&str], input: Option<File>) -> Result<String, HiveError> {
+    pub(crate) fn dolt(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        input: Option<File>,
+    ) -> Result<String, HiveError> {
         let mut command = self.dolt_command(cwd);
         command.args(args);
         if let Some(input) = input {

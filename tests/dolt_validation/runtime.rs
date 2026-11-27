@@ -1500,8 +1500,24 @@ fn issue_note_writer_fixture(
     assert_eq!(recovered["data"], replayed["data"]);
     assert!(!marker.exists());
 
+    let receipt: (String, String, String, String, String, String, String, String) = reader
+        .exec_first(
+            "SELECT kind, actor_ref, fingerprint, authorization_ref, base_commit,
+                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'), workflow_evidence_json, result_json
+             FROM operation_receipts WHERE CAST(request_id AS BINARY) = ?",
+            (id(60),),
+        )
+        .unwrap()
+        .unwrap();
+    let mut committed: Value = serde_json::from_str(&pending).unwrap();
+    committed["request_id"] = serde_json::json!(id(60));
+    committed["base_commit"] = serde_json::json!(receipt.4);
+    committed["fingerprint"] = serde_json::json!(receipt.2);
+    committed["receipt_digest"] =
+        serde_json::json!(digest(serde_json::to_string(&receipt).unwrap().as_bytes()));
     drop(reader);
     drop(observer);
+    stopped_note_recovery_fixture(state, dolt, port, run, &connect, committed);
     let owner_parent = id(2);
     let archived_root = id(70);
     restart(Some(&format!(
@@ -1595,4 +1611,221 @@ fn issue_note_writer_fixture(
         fs::remove_file(&marker).unwrap();
         run(&start, 0);
     }
+
+    let receipt_ddl = include_str!("../../assets/schema/dolt/0001_initial.sql")
+        .split("CREATE TABLE operation_receipts")
+        .nth(1)
+        .unwrap()
+        .split_once(';')
+        .unwrap()
+        .0;
+    restart(
+        Some(&format!(
+            "DROP TABLE operation_receipts;
+             CALL DOLT_ADD('.');
+             CALL DOLT_COMMIT('-m', 'Synthetic receipt table removal');
+             CREATE TABLE operation_receipts{receipt_ddl};"
+        )),
+        None,
+    );
+    let mut reader = connect("reader");
+    let new_base = storage_state(&mut reader);
+    let introduced = written["data"]["confirmed_commit"].as_str().unwrap();
+    let old_count: u64 = reader
+        .exec_first(
+            format!(
+                "SELECT COUNT(*) FROM operation_receipts AS OF '{introduced}' WHERE request_id = ?"
+            ),
+            (id(60),),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(old_count, 1);
+    let before = effect(&mut reader);
+    assert_eq!(before.0, 0);
+    let incomplete = note(&id(60), "fixture-holder", current_revision, body, 8);
+    assert_eq!(incomplete["error"]["code"], "COMMIT_UNCERTAIN");
+    assert_eq!(storage_state(&mut reader), new_base);
+    assert_eq!(effect(&mut reader), before);
+    assert!(!marker.exists());
+}
+
+#[cfg(target_os = "linux")]
+fn stopped_note_recovery_fixture(
+    state: &Path,
+    dolt: &Path,
+    port: &str,
+    run: &impl Fn(&[&str], i32) -> Value,
+    connect: &impl Fn(&str) -> Conn,
+    committed: Value,
+) {
+    let server = state.join("server.json");
+    let marker = state.join("pending-request.json");
+    let proof = state.join("stopped-request.json");
+    let dolt_bin = dolt.to_str().unwrap();
+    let recover = ["workspace", "recover", "--dolt-bin", dolt_bin];
+    let start = ["workspace", "start", "--dolt-bin", dolt_bin, "--port", port];
+    let stop = ["workspace", "stop"];
+    let record = |marker_value: &Value| {
+        fs::write(&marker, marker_value.to_string()).unwrap();
+        fs::set_permissions(&marker, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    };
+    let refused = |args: &[&str], expected: &Value| {
+        let result = run(args, 8);
+        assert_eq!(result["error"]["code"], "COMMIT_UNCERTAIN");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), expected.to_string());
+        assert!(!result.to_string().contains("fixture-holder"));
+        assert!(!result.to_string().contains("receipt_digest"));
+    };
+    let resolved = |outcome| {
+        let report = run(&recover, 0);
+        assert_eq!(report["data"]["state"], "stopped");
+        assert_eq!(report["data"]["process_exit"], "pidfd_verified");
+        assert_eq!(report["data"]["outcome"], outcome);
+        assert!(!report.to_string().contains("fixture-holder"));
+        assert!(!marker.exists() && !proof.exists() && !server.exists());
+        assert!(fs::read_dir(state).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            !name.to_string_lossy().starts_with("run-")
+                && !name.to_string_lossy().starts_with(".recovery-")
+        }));
+    };
+
+    let server_record = fs::read(&server).unwrap();
+    record(&committed);
+    refused(&recover, &committed); // A current launch gives no stopped proof.
+    run(&stop, 0);
+    let saved = state.join("saved-proof");
+    fs::rename(&proof, &saved).unwrap();
+    refused(&recover, &committed);
+    assert_eq!(run(&start, 7)["error"]["code"], "AUTHORITY_UNVERIFIED");
+    fs::rename(&saved, &proof).unwrap();
+    let held = fs::File::open(state.join("lock")).unwrap();
+    // SAFETY: held owns the valid descriptor throughout the contention check.
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert_eq!(run(&recover, 5)["error"]["code"], "LOCK_BUSY");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), committed.to_string());
+    drop(held);
+    refused(
+        &[
+            "workspace",
+            "recover",
+            "--dolt-bin",
+            "/fixture-missing-dolt",
+        ],
+        &committed,
+    );
+
+    // Interruption after removing the launch directory and before unlinking
+    // server.json leaves the synced exit proof and exact marker usable.
+    fs::write(&server, &server_record).unwrap();
+    resolved("confirmed");
+    run(&start, 0);
+    let mut writer = connect("writer");
+    let (head, session, original_title): (String, u64, String) = writer
+        .exec_first(
+            "SELECT DOLT_HASHOF('HEAD'), CONNECTION_ID(), title FROM issues WHERE id = ?",
+            (id(11),),
+        )
+        .unwrap()
+        .unwrap();
+    let mut rollback = committed;
+    let launch = || serde_json::from_slice::<Value>(&fs::read(&server).unwrap()).unwrap();
+    rollback["launch_nonce"] = launch()["nonce"].clone();
+    rollback["session_id"] = serde_json::json!(session);
+    rollback["request_id"] = serde_json::json!(id(68));
+    rollback["base_commit"] = serde_json::json!(head);
+    writer.query_drop("START TRANSACTION").unwrap();
+    writer
+        .exec_drop(
+            "UPDATE issues SET title = 'Fixture rolled-back title' WHERE id = ?",
+            (id(11),),
+        )
+        .unwrap();
+    record(&rollback);
+    drop(writer);
+    let active = launch();
+    run(&stop, 0);
+
+    let root = Path::new(active["workspace_root"].as_str().unwrap());
+    let db = root.join("db");
+    let original = root.join("saved-db");
+    fs::rename(&db, &original).unwrap();
+    fs::create_dir(&db).unwrap();
+    fs::rename(original.join(".dolt"), db.join(".dolt")).unwrap();
+    refused(&recover, &rollback);
+    fs::rename(db.join(".dolt"), original.join(".dolt")).unwrap();
+    fs::remove_dir(&db).unwrap();
+    fs::rename(&original, &db).unwrap();
+    resolved("rolled_back");
+
+    run(&start, 0);
+    let mut reader = connect("reader");
+    let observed: (String, String) = reader
+        .exec_first(
+            "SELECT DOLT_HASHOF('HEAD'), title FROM issues WHERE id = ?",
+            (id(11),),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed, (head, original_title.clone()));
+    drop(reader);
+    let mut unsupported = rollback.clone();
+    unsupported["launch_nonce"] = launch()["nonce"].clone();
+    unsupported["version"] = serde_json::json!(2);
+    unsupported["kind"] = serde_json::json!("issue.create");
+    record(&unsupported);
+    run(&stop, 0);
+    assert!(proof.exists());
+    refused(&recover, &unsupported);
+    assert!(proof.exists());
+    assert_eq!(run(&start, 7)["error"]["code"], "AUTHORITY_UNVERIFIED");
+    // Only the fixture removes its deliberately unsupported marker.
+    fs::remove_file(&marker).unwrap();
+
+    run(&start, 0);
+    let mut writer = connect("writer");
+    writer
+        .exec_drop(
+            "UPDATE issues SET title = 'Fixture dirty title' WHERE id = ?",
+            (id(11),),
+        )
+        .unwrap();
+    let dirty: bool = writer
+        .query_first("SELECT EXISTS(SELECT 1 FROM dolt_status)")
+        .unwrap()
+        .unwrap();
+    assert!(dirty);
+    rollback["launch_nonce"] = launch()["nonce"].clone();
+    rollback["session_id"] = serde_json::json!(
+        writer
+            .query_first::<u64, _>("SELECT CONNECTION_ID()")
+            .unwrap()
+            .unwrap()
+    );
+    record(&rollback);
+    drop(writer);
+    run(&stop, 0);
+    assert!(proof.exists());
+    refused(&recover, &rollback);
+    assert!(proof.exists());
+    assert_eq!(run(&start, 7)["error"]["code"], "AUTHORITY_UNVERIFIED");
+    // Restore only the deliberately fabricated fixture state for later tests.
+    fs::remove_file(&marker).unwrap();
+    run(&start, 0);
+    let mut writer = connect("writer");
+    writer
+        .exec_drop(
+            "UPDATE issues SET title = ? WHERE id = ?",
+            (original_title, id(11)),
+        )
+        .unwrap();
+    let dirty: bool = writer
+        .query_first("SELECT EXISTS(SELECT 1 FROM dolt_status)")
+        .unwrap()
+        .unwrap();
+    assert!(!dirty);
 }

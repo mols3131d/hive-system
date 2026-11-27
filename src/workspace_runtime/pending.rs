@@ -6,7 +6,7 @@ pub(crate) const MAX_BYTES: usize = 4096;
 /// The pinned file descriptor and bytes let confirmation verify the exact entry
 /// it is about to clear under the workspace-ID lock.
 pub(crate) struct PendingEntry {
-    file: File,
+    pub(super) file: File,
     pub(crate) bytes: Vec<u8>,
 }
 
@@ -26,7 +26,7 @@ impl WriterRuntime<'_> {
     }
 }
 
-fn read_pending(dir: &ScopedDirectory) -> Result<Option<PendingEntry>, HiveError> {
+pub(super) fn read_pending(dir: &ScopedDirectory) -> Result<Option<PendingEntry>, HiveError> {
     let Some(file) = dir.open_regular(OsStr::new(NAME))? else {
         return Ok(None);
     };
@@ -73,7 +73,7 @@ fn publish(dir: &ScopedDirectory, bytes: &[u8]) -> Result<PendingEntry, HiveErro
     Ok(entry)
 }
 
-fn clear(dir: &ScopedDirectory, entry: PendingEntry) -> Result<(), HiveError> {
+pub(super) fn clear(dir: &ScopedDirectory, entry: PendingEntry) -> Result<(), HiveError> {
     let current =
         read_pending(dir)?.ok_or_else(|| unverified("The pending marker disappeared."))?;
     if !same_file(&entry.file, &current.file)? || entry.bytes != current.bytes {
@@ -83,12 +83,6 @@ fn clear(dir: &ScopedDirectory, entry: PendingEntry) -> Result<(), HiveError> {
     }
     fs::remove_file(at(dir, NAME)).map_err(io_error)?;
     sync(dir)
-}
-
-fn same_file(first: &File, second: &File) -> Result<bool, HiveError> {
-    let first = first.metadata().map_err(io_error)?;
-    let second = second.metadata().map_err(io_error)?;
-    Ok((first.dev(), first.ino()) == (second.dev(), second.ino()))
 }
 
 #[cfg(test)]
