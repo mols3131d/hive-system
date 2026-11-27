@@ -2527,14 +2527,37 @@ fn retry_area_create_failure(
         ErrorKind::ValueValidation
             | ErrorKind::InvalidValue
             | ErrorKind::ArgumentConflict
+            | ErrorKind::UnknownArgument
             | ErrorKind::TooManyValues
             | ErrorKind::InvalidUtf8
     ) {
         return None;
     }
-    let retry = extended_error_options(cli.clone().disable_help_subcommand(true))
-        .mut_subcommand("area", |area| {
-            extended_help_probe(area).mut_subcommand("create", extended_error_options)
+    let recover_values = |command| {
+        extended_error_options(command).mut_args(|arg| {
+            if arg.get_long().is_some()
+                && !matches!(
+                    arg.get_id().as_str(),
+                    "contract" | "format" | "json" | "extended_help_probe"
+                )
+            {
+                arg.value_parser(OsStringValueParser::new())
+            } else {
+                arg
+            }
+        })
+    };
+    let retry =
+        recover_values(cli.clone().disable_help_subcommand(true)).mut_subcommand("area", |area| {
+            extended_help_probe(area).mut_subcommand("create", |create| {
+                recover_values(create).arg(
+                    Arg::new("area_create_extra_values")
+                        .num_args(0..)
+                        .action(ArgAction::Append)
+                        .value_parser(OsStringValueParser::new())
+                        .hide(true),
+                )
+            })
         });
     let matches = retry.try_get_matches_from(args).ok()?;
     let (command, leaf) = matched_leaf(cli, &matches)?;
