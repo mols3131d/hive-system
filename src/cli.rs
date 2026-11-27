@@ -310,6 +310,8 @@ pub(crate) struct ConfigShowArgs {
     pub(crate) area: Option<String>,
     #[arg(skip)]
     pub(crate) resource: Option<PathBuf>,
+    #[arg(skip)]
+    pub(crate) dolt_target: DoltTargetArgs,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -714,7 +716,7 @@ pub(crate) enum MemoryCommand {
     },
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 pub(crate) struct DoltTargetArgs {
     /// Expected identity of the local Dolt workspace.
     #[arg(long, value_name = "UUID")]
@@ -1111,6 +1113,10 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 .ok()
                 .flatten()
                 .cloned();
+            if leaf.try_contains_id("workspace_id").is_ok() {
+                args.dolt_target = DoltTargetArgs::from_arg_matches(leaf)
+                    .map_err(|error| safe_parse_message(error.kind()))?;
+            }
         }
         command.validate(&common)?;
         Ok((common, command))
@@ -1627,7 +1633,7 @@ fn retry_config_show(
     };
     let retry = accept_numeric_project(cli.clone().mut_subcommand("config", |config| {
         config.mut_subcommand("show", |show| {
-            accept_numeric_project(show)
+            DoltTargetArgs::augment_args(accept_numeric_project(show))
                 .arg(Arg::new("area").long("area").allow_negative_numbers(true))
                 .arg(
                     Arg::new("resource")
@@ -1655,7 +1661,12 @@ fn retry_config_show(
             *error_matches = retry
                 .mut_subcommand("config", |config| {
                     config.mut_subcommand("show", |show| {
-                        show.mut_arg("area", relaxed).mut_arg("resource", relaxed)
+                        show.mut_args(|arg| match arg.get_id().as_str() {
+                            "area" | "resource" | "workspace_id" | "database" | "port" => {
+                                relaxed(arg)
+                            }
+                            _ => arg,
+                        })
                     })
                 })
                 .try_get_matches_from(args)
@@ -2029,6 +2040,17 @@ impl Command {
     fn validate(&self, common: &CommonOptions) -> Result<(), &'static str> {
         if common.contract == Contract::V2 {
             return match self {
+                Self::Config(ConfigCommand::Show(args)) if args.dolt_target.has_any() => {
+                    if !matches!(args.target.scope, ConfigScope::Resolved) {
+                        return Err("Dolt verification requires config show --scope resolved.");
+                    }
+                    if !args.dolt_target.has_all() {
+                        return Err(
+                            "Dolt verification requires --workspace-id, --database, and --port.",
+                        );
+                    }
+                    Ok(())
+                }
                 Self::Validate(args) => args.validate_dolt_selection(common),
                 Self::Area(command) => command.validate_dolt_selection(common),
                 Self::Resource(command) => command.validate_dolt_selection(common),

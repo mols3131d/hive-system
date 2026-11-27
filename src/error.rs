@@ -92,6 +92,18 @@ enum ErrorDetails {
         diagnostics: Vec<RecordDiagnostic>,
         truncated: bool,
     },
+    #[cfg(unix)]
+    Areas {
+        candidates: Vec<AreaCandidate>,
+        truncated: bool,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AreaCandidate {
+    pub(crate) id: String,
+    pub(crate) slug: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -114,6 +126,31 @@ pub(crate) struct RecordDiagnostic {
 }
 
 impl HiveError {
+    #[cfg(unix)]
+    pub(crate) fn ambiguous_areas(candidates: Vec<AreaCandidate>, truncated: bool) -> Self {
+        Self {
+            code: ErrorCode::AmbiguousScope,
+            message:
+                "The selected Resource is linked to multiple Areas. Select an Area with --area."
+                    .into(),
+            details: Some(ErrorDetails::Areas {
+                candidates,
+                truncated,
+            }),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn area_candidates(&self) -> Option<(&[AreaCandidate], bool)> {
+        match &self.details {
+            Some(ErrorDetails::Areas {
+                candidates,
+                truncated,
+            }) => Some((candidates, *truncated)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
