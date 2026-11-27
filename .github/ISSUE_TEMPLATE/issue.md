@@ -21,5 +21,3 @@ about: "Questions, requests, or development tasks not covered by a dedicated for
 - (*References — related Issues, canonical documents, or links*)
 
 (*Omit empty sections, duplicated information, and unsupported claims.*)
-
-(*For substantially agent-authored text, append a final fenced YAML author block using verified identity values; see `.github/templates/README.md`. Omit for human-only text.*)
