@@ -17,6 +17,8 @@ mod issue_dependency;
 mod issue_parent;
 #[path = "runtime/issue_reconcile.rs"]
 mod issue_reconcile;
+#[path = "runtime/issue_review.rs"]
+mod issue_review;
 #[path = "runtime/issue_transition.rs"]
 mod issue_transition;
 #[path = "runtime/issue_update.rs"]

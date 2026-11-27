@@ -282,6 +282,12 @@ pub(crate) enum Command {
     #[command(skip)]
     IssueSubmit(IssueSubmitArgs),
     #[command(skip)]
+    IssueSubmitEpic(IssueSubmitEpicArgs),
+    #[command(skip)]
+    IssueRequestChanges(IssueReviewArgs),
+    #[command(skip)]
+    IssueAccept(IssueAcceptArgs),
+    #[command(skip)]
     IssueDependency(IssueDependencyArgs, bool),
     #[command(skip)]
     IssueParent(IssueParentArgs),
@@ -1391,6 +1397,42 @@ pub(crate) struct IssueSubmitArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueSubmitEpicArgs {
+    #[command(flatten)]
+    pub(crate) transition: IssueTransitionArgs,
+    /// Reference to the submitted result evidence.
+    #[arg(long)]
+    pub(crate) evidence: String,
+    /// UTF-8 Markdown submission.
+    #[arg(long)]
+    pub(crate) file: PathBuf,
+}
+
+#[derive(Args)]
+pub(crate) struct IssueReviewArgs {
+    #[command(flatten)]
+    pub(crate) transition: IssueTransitionArgs,
+    /// Exact current submission transition UUIDv7.
+    #[arg(long)]
+    pub(crate) submission: String,
+    /// Authorization reference in the reviewed decision file.
+    #[arg(long)]
+    pub(crate) approval: String,
+    /// UTF-8 Markdown review outcome.
+    #[arg(long)]
+    pub(crate) file: PathBuf,
+}
+
+#[derive(Args)]
+pub(crate) struct IssueAcceptArgs {
+    #[command(flatten)]
+    pub(crate) review: IssueReviewArgs,
+    /// Exact cancelled immediate child acknowledged in this scope change. Repeat for each.
+    #[arg(long)]
+    pub(crate) ack_cancelled_child: Vec<String>,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueListArgs {
     /// Select Issues across the workspace.
     #[arg(long)]
@@ -1667,6 +1709,24 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             Some(("issue", issue)) if issue.subcommand_name() == Some("submit") => {
                 Command::IssueSubmit(
                     IssueSubmitArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("submit-epic") => {
+                Command::IssueSubmitEpic(
+                    IssueSubmitEpicArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("request-changes") => {
+                Command::IssueRequestChanges(
+                    IssueReviewArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("accept") => {
+                Command::IssueAccept(
+                    IssueAcceptArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
             }
@@ -2194,7 +2254,15 @@ fn recover_unknown_long(
         (domain, action),
         (
             "issue",
-            "set-parent" | "release" | "recover" | "submit" | "cancel" | "reopen"
+            "set-parent"
+                | "release"
+                | "recover"
+                | "submit"
+                | "cancel"
+                | "reopen"
+                | "submit-epic"
+                | "request-changes"
+                | "accept"
         )
     ) {
         return [true, false].into_iter().find_map(|equals| {
@@ -2217,6 +2285,9 @@ fn recover_unknown_long(
                     | "release"
                     | "recover"
                     | "submit"
+                    | "submit-epic"
+                    | "request-changes"
+                    | "accept"
                     | "set-parent"
             )
     );
@@ -2355,6 +2426,17 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             .subcommand(add_leaf_options(IssueSubmitArgs::augment_args(
                 clap::Command::new("submit").about("Submit a stopped execution for review."),
             )))
+            .subcommand(add_leaf_options(IssueSubmitEpicArgs::augment_args(
+                clap::Command::new("submit-epic").about("Submit a resolved epic for review."),
+            )))
+            .subcommand(add_leaf_options(IssueReviewArgs::augment_args(
+                clap::Command::new("request-changes")
+                    .about("Return the exact reviewed submission to todo."),
+            )))
+            .subcommand(add_leaf_options(IssueAcceptArgs::augment_args(
+                clap::Command::new("accept")
+                    .about("Accept the exact reviewed submission and close the Issue."),
+            )))
             .subcommand(add_leaf_options(IssueParentArgs::augment_args(
                 clap::Command::new("set-parent")
                     .about("Attach, move or clear an exact Issue parent."),
@@ -2380,6 +2462,9 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             "release",
             "recover",
             "submit",
+            "submit-epic",
+            "request-changes",
+            "accept",
             "cancel",
             "reopen",
             "add-dependency",
@@ -2404,6 +2489,9 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .mut_subcommand("release", extended_error_options)
                 .mut_subcommand("recover", extended_error_options)
                 .mut_subcommand("submit", extended_error_options)
+                .mut_subcommand("submit-epic", extended_error_options)
+                .mut_subcommand("request-changes", extended_error_options)
+                .mut_subcommand("accept", extended_error_options)
                 .mut_subcommand("add-dependency", extended_error_options)
                 .mut_subcommand("remove-dependency", extended_error_options)
                 .subcommand(issue_help("help"))
@@ -2433,6 +2521,9 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                     "release",
                     "recover",
                     "submit",
+                    "submit-epic",
+                    "request-changes",
+                    "accept",
                 ],
             )
             .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "issue"))
@@ -2452,8 +2543,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
         Some(("issue", issue)) => match issue.subcommand() {
             Some((
                 "note" | "create" | "update" | "select" | "claim" | "release" | "recover"
-                | "submit" | "cancel" | "reopen" | "add-dependency" | "remove-dependency"
-                | "set-parent",
+                | "submit" | "cancel" | "reopen" | "submit-epic" | "request-changes" | "accept"
+                | "add-dependency" | "remove-dependency" | "set-parent",
                 leaf,
             )) => Some(leaf),
             Some(("help", _)) => help_leaf.map(|(_, leaf)| leaf),
@@ -3482,6 +3573,19 @@ impl Command {
                     },
                     _,
                 )
+                | Self::IssueSubmitEpic(IssueSubmitEpicArgs {
+                    transition: args, ..
+                })
+                | Self::IssueRequestChanges(IssueReviewArgs {
+                    transition: args, ..
+                })
+                | Self::IssueAccept(IssueAcceptArgs {
+                    review:
+                        IssueReviewArgs {
+                            transition: args, ..
+                        },
+                    ..
+                })
                 | Self::IssueSubmit(IssueSubmitArgs {
                     stopped:
                         IssueStopArgs {
@@ -3642,6 +3746,9 @@ impl Command {
             | Self::IssueParent(_)
             | Self::IssueRelease(_, _)
             | Self::IssueSubmit(_)
+            | Self::IssueSubmitEpic(_)
+            | Self::IssueRequestChanges(_)
+            | Self::IssueAccept(_)
             | Self::IssueDependency(_, _) => Err("Issue commands require --contract 2."),
             Self::Backup(_) => Err("Backup commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),

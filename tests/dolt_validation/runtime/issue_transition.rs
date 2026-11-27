@@ -317,6 +317,7 @@ pub(super) fn exercise(
         claim_again,
     );
 
+    issue_review::exercise_epic(state, root, port, dolt, &epic, epic_rev, &run, restart);
     let mut reader = connect_owned(state, port, "reader");
     let settled = storage_state(&mut reader);
     let replay = run_command(args, 0);
@@ -726,10 +727,15 @@ fn exercise_stop(
         0,
     );
 
-    // Model a subsequent nonsemantic revision without changing the original submission.
+    // A later note with the exact submission timestamp still leaves the submission current.
+    let transition = result["transition_id"].as_str().unwrap();
     restart(
         Some(OfflineFixtureEdit::CommitSql(&format!(
-            "UPDATE issues SET priority = 1, revision = '{}' WHERE id = '{issue}';",
+            "INSERT INTO issue_updates (id, issue_id, kind, body, author_ref, created_at)
+             SELECT '{}', issue_id, 'comment', 'Synthetic note', 'fixture-commenter', created_at
+             FROM issue_updates WHERE id = '{transition}';
+             UPDATE issues SET priority = 1, revision = '{}' WHERE id = '{issue}';",
+            id(229),
             id(225),
         ))),
         None,
@@ -782,6 +788,90 @@ fn exercise_stop(
     );
     assert_eq!(inspected["data"]["result"], *result);
     assert!(inspected["data"]["current_claim"].is_null());
+
+    let target = issue_review::Target { root, port, issue };
+    let reviewer = "fixture-independent-reviewer";
+    let wrong_base = target.review(
+        "request-changes",
+        result["issue_revision"].as_str().unwrap(),
+        transition,
+        reviewer,
+        230,
+        &[],
+    );
+    assert_eq!(wrong_base.run(run, 5)["error"]["code"], "STALE_REVISION");
+    let self_review = target.review("request-changes", &id(225), transition, holder, 231, &[]);
+    assert_eq!(
+        self_review.run(run, 7)["error"]["code"],
+        "AUTHORITY_UNVERIFIED"
+    );
+    let changes = target.review("request-changes", &id(225), transition, reviewer, 232, &[]);
+    let changed = changes.run(run, 0);
+    let changed = &changed["data"]["result"];
+    assert_eq!(changed["status"], "todo");
+    assert_eq!(changed["submission_id"], transition);
+    let mut reader = connect_owned(state, port, "reader");
+    let feedback: (String, String, Option<String>) = reader
+        .exec_first(
+            "SELECT kind, body, (SELECT claim_id FROM issue_claims WHERE issue_id = u.issue_id)
+         FROM issue_updates u WHERE id = ?",
+            (changed["transition_id"].as_str().unwrap(),),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        feedback,
+        (
+            "transition".to_owned(),
+            "Synthetic review café\r\n".to_owned(),
+            None
+        )
+    );
+    drop(reader);
+
+    let next_claim = claim_again(changed["issue_revision"].as_str().unwrap(), id(233));
+    assert_ne!(next_claim["claim_id"], result["former_claim_id"]);
+    let later = run_stop(
+        "submit",
+        &revision(&next_claim),
+        &id(234),
+        current_stop(&next_claim),
+        false,
+        0,
+    );
+    let later = &later["data"]["result"];
+    let later_rev = later["issue_revision"].as_str().unwrap();
+    let mut reader = connect_owned(state, port, "reader");
+    let before_old_review = storage_state(&mut reader);
+    let superseded = target.review("accept", later_rev, transition, reviewer, 235, &[]);
+    assert_eq!(
+        superseded.run(run, 7)["error"]["code"],
+        "AUTHORITY_UNVERIFIED"
+    );
+    assert_eq!(storage_state(&mut reader), before_old_review);
+    let exact = target.review(
+        "accept",
+        later_rev,
+        later["transition_id"].as_str().unwrap(),
+        reviewer,
+        236,
+        &[],
+    );
+    drop(reader);
+    restart(
+        Some(OfflineFixtureEdit::CommitSql(&format!(
+            "DELETE FROM operation_receipts WHERE request_id = '{}';",
+            id(234),
+        ))),
+        None,
+    );
+    assert_eq!(exact.run(run, 7)["error"]["code"], "AUTHORITY_UNVERIFIED");
+    restart(
+        Some(OfflineFixtureEdit::RestoreHead(&before_old_review.0)),
+        None,
+    );
+    assert_eq!(exact.run(run, 0)["data"]["result"]["status"], "done");
+    assert_eq!(changes.run(run, 0)["data"]["result"], *changed);
 }
 
 fn decode(output: std::process::Output) -> (i32, Value) {

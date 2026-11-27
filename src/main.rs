@@ -237,6 +237,17 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
             dolt::issue_transition::release(&invocation.common, &args, recovery)
         }
         Command::IssueSubmit(args) => dolt::issue_transition::submit(&invocation.common, &args),
+        Command::IssueSubmitEpic(args) => {
+            dolt::issue_transition::submit_epic(&invocation.common, &args)
+        }
+        Command::IssueRequestChanges(args) => {
+            dolt::issue_transition::review(&invocation.common, &args, None)
+        }
+        Command::IssueAccept(args) => dolt::issue_transition::review(
+            &invocation.common,
+            &args.review,
+            Some(&args.ack_cancelled_child),
+        ),
         Command::IssueDependency(args, add) => {
             dolt::issue_dependency::write(&invocation.common, &args, add)
         }

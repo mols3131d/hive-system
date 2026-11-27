@@ -112,6 +112,9 @@ impl Kind {
             Self::Note
             | Self::Transition(
                 issue_transition::Operation::Select
+                | issue_transition::Operation::SubmitEpic
+                | issue_transition::Operation::RequestChanges
+                | issue_transition::Operation::Accept
                 | issue_transition::Operation::Cancel
                 | issue_transition::Operation::Reopen,
             ) => &[
@@ -199,6 +202,13 @@ pub(super) trait Mutation {
     fn verify_decision(&self, now: OffsetDateTime) -> Result<(), HiveError>;
     fn evidence(&self) -> Result<String, HiveError>;
     fn check_scope(&self, snapshot: &mut Snapshot) -> Result<(), HiveError>;
+    fn verify_replay_decision(
+        &self,
+        _snapshot: &mut Snapshot,
+        _base: &str,
+    ) -> Result<(), HiveError> {
+        Ok(())
+    }
     fn guard(
         &self,
         db: &mut Transaction<'_>,
@@ -489,6 +499,7 @@ pub(super) fn execute(
             let result = scoped
                 .verify(snapshot, &introduced, &receipt)
                 .map_err(|_| uncertain())?;
+            mutation.verify_replay_decision(snapshot, &receipt.base_commit)?;
             require_clean(&mut snapshot.connection, &commit)?;
             runtime.check()?;
             mutation.verify_decision(observe_time()?)?;
@@ -1157,6 +1168,12 @@ mod tests {
             ("issue.release", issue_transition::Operation::Release),
             ("issue.recover", issue_transition::Operation::Recover),
             ("issue.submit", issue_transition::Operation::Submit),
+            ("issue.submit-epic", issue_transition::Operation::SubmitEpic),
+            (
+                "issue.request-changes",
+                issue_transition::Operation::RequestChanges,
+            ),
+            ("issue.accept", issue_transition::Operation::Accept),
             ("issue.cancel", issue_transition::Operation::Cancel),
             ("issue.reopen", issue_transition::Operation::Reopen),
         ] {
@@ -1165,7 +1182,7 @@ mod tests {
             assert!(matches!(marker.operation(), Ok(Kind::Transition(kind)) if kind == operation));
             assert_eq!(json!(marker), transition);
         }
-        transition["kind"] = json!("issue.submit-epic");
+        transition["kind"] = json!("issue.unknown-transition");
         assert!(read(&transition).is_err());
 
         let legacy_bytes = serde_json::to_string(&legacy).unwrap();
