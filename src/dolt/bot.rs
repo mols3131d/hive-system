@@ -168,17 +168,19 @@ fn select_bot(snapshot: &mut Snapshot, id: &str) -> Result<BotMetadata, HiveErro
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn validate_restored_souls(
+pub(super) fn validate_archived_souls(
     reader: &mut super::records::RecordReader<'_>,
     workspace_id: &str,
     mut read_soul_blob: impl FnMut(&str) -> Result<String, HiveError>,
-) -> Result<(), HiveError> {
+) -> Result<std::collections::BTreeMap<String, String>, HiveError> {
+    let mut queens = std::collections::BTreeMap::new();
     for row in reader.records::<BotRow>("bots", COLUMNS, "id")? {
         let bot = BotMetadata::try_from(row)?;
         let blob = read_soul_blob(&format!("bots/{}/SOUL.md", bot.slug))?;
         soul_body(blob.as_bytes(), workspace_id, &bot)?;
+        queens.insert(bot.id, bot.slug);
     }
-    Ok(())
+    Ok(queens)
 }
 
 #[cfg(target_os = "linux")]

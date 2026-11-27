@@ -178,7 +178,7 @@ fn read_frontmatter(mut input: impl Read, remaining: &mut usize) -> Result<Vec<u
     }
 }
 
-fn published_ids(directory: &File) -> Result<Vec<String>, HiveError> {
+pub(super) fn published_ids(directory: &File) -> Result<Vec<String>, HiveError> {
     let mut stream = DirectoryStream::open(directory)?;
     let mut ids = Vec::new();
     let mut scanned = 0;

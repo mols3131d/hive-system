@@ -11,6 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+#[path = "workspace_init/conversation_backup.rs"]
+mod conversation_backup;
+
 struct Fixture(PathBuf);
 
 impl Fixture {
@@ -1300,43 +1303,10 @@ fn backup_help_and_conversation_flag_are_contract_two_only() {
     let help = run(&["backup", "create", "--help", "--contract", "2"]);
     assert!(help.status.success(), "{help:?}");
     assert!(String::from_utf8_lossy(&help.stdout).contains("--include-conversations"));
-    let refused = response(
-        run(&[
-            "--contract",
-            "2",
-            "--json",
-            "--workspace",
-            "missing",
-            "backup",
-            "create",
-            "--destination",
-            "backup",
-            "--include-conversations",
-        ]),
-        7,
-    );
-    assert_eq!(refused["error"]["code"], "NOT_IMPLEMENTED");
-    assert!(!fixture.0.join("backup").exists());
     let help = run(&["backup", "restore", "--help", "--contract", "2"]);
     assert!(help.status.success(), "{help:?}");
     assert!(String::from_utf8_lossy(&help.stdout).contains("--source <SNAPSHOT>"));
-    let refused = response(
-        run(&[
-            "--contract",
-            "2",
-            "--json",
-            "backup",
-            "restore",
-            "--source",
-            "missing",
-            "--target",
-            "restored",
-            "--include-conversations",
-        ]),
-        7,
-    );
-    assert_eq!(refused["error"]["code"], "NOT_IMPLEMENTED");
-    assert!(!fixture.0.join("restored").exists());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--include-conversations"));
 }
 
 #[test]

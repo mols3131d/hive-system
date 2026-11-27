@@ -144,6 +144,7 @@ fn with_registered<T>(
 pub(super) fn backup(
     options: &CommonOptions,
     destination: &Path,
+    include_conversations: bool,
     format: &mut Format,
 ) -> Result<Value, HiveError> {
     with_registered(
@@ -201,7 +202,7 @@ pub(super) fn backup(
                 db,
                 native,
                 noms,
-                destination,
+                (destination, include_conversations),
                 check_stopped,
             )
         },

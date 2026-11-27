@@ -47,8 +47,6 @@ pub(crate) fn backup(
     options: &CommonOptions,
     command: &crate::cli::BackupCommand,
 ) -> (Format, Result<Value, HiveError>) {
-    use crate::error::ErrorCode;
-
     use crate::cli::BackupCommand;
 
     let format = options.format.unwrap_or_default();
@@ -58,15 +56,10 @@ pub(crate) fn backup(
         include_conversations,
     } = command
     {
-        let result = if *include_conversations {
-            Err(HiveError::new(
-                ErrorCode::NotImplemented,
-                "Conversation restoration requires a later contract-2 implementation.",
-            ))
-        } else {
-            crate::workspace_restore::run(source, target)
-        };
-        return (format, result);
+        return (
+            format,
+            crate::workspace_restore::run(source, target, *include_conversations),
+        );
     }
     let BackupCommand::Create {
         destination,
@@ -75,28 +68,19 @@ pub(crate) fn backup(
     else {
         unreachable!("restore returned above");
     };
-    if *include_conversations {
-        return (
-            format,
-            Err(HiveError::new(
-                ErrorCode::NotImplemented,
-                "Backup conversation inclusion requires a later contract-2 implementation.",
-            )),
-        );
-    }
     #[cfg(target_os = "linux")]
     {
         let mut format = format;
-        let result = runtime::backup(options, destination, &mut format);
+        let result = runtime::backup(options, destination, *include_conversations, &mut format);
         (format, result)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = destination;
+        let _ = (destination, include_conversations);
         (
             format,
             Err(HiveError::new(
-                ErrorCode::NotImplemented,
+                crate::error::ErrorCode::NotImplemented,
                 "Backup creation is supported only on Linux.",
             )),
         )

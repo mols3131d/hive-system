@@ -9,6 +9,8 @@ pub(crate) mod context_resolve;
 mod context_workflow;
 #[cfg(unix)]
 mod conversation;
+#[cfg(target_os = "linux")]
+pub(crate) use conversation::archive as conversation_archive;
 pub(crate) mod directive;
 #[cfg(any(test, target_os = "linux"))]
 mod directive_receipt;
@@ -205,8 +207,6 @@ pub(crate) fn validate_restored_records(
     installed: &crate::workspace_init::Installed<'_>,
     db: &std::path::Path,
     commit: &str,
-    workspace_id: &str,
-    read_soul_blob: impl FnMut(&str) -> Result<String, HiveError>,
 ) -> Result<(), HiveError> {
     let mut reader = records::RecordReader::Offline {
         installed,
@@ -220,7 +220,37 @@ pub(crate) fn validate_restored_records(
             diagnostics.truncated,
         ));
     }
-    bot::validate_restored_souls(&mut reader, workspace_id, read_soul_blob)
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_archived_queens(
+    installed: &crate::workspace_init::Installed<'_>,
+    db: &std::path::Path,
+    commit: &str,
+    workspace_id: &str,
+    assets: &std::path::Path,
+    asset_commit: &str,
+) -> Result<std::collections::BTreeMap<String, String>, HiveError> {
+    let mut reader = records::RecordReader::Offline {
+        installed,
+        db,
+        commit,
+    };
+    bot::validate_archived_souls(&mut reader, workspace_id, |path| {
+        let object = format!("{asset_commit}:{path}");
+        let size = installed.git(assets, &["cat-file", "-s", &object])?;
+        if !size
+            .trim()
+            .parse::<usize>()
+            .is_ok_and(|size| size <= crate::config_git::MAX_BLOB_BYTES)
+        {
+            return Err(unverified_authority(
+                "An archived Soul exceeds the asset blob limit.",
+            ));
+        }
+        installed.git(assets, &["cat-file", "blob", &object])
+    })
 }
 
 fn encode_id_cursor(id: &str, binding: &Value) -> String {

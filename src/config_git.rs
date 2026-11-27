@@ -436,7 +436,7 @@ pub(crate) fn with_asset_bundle<T>(
     root: &crate::config_file::ScopedDirectory,
     scratch: &Path,
     bundle: &Path,
-    complete: impl FnOnce(&str, &dyn Fn() -> Result<(), HiveError>) -> Result<T, HiveError>,
+    complete: impl FnOnce(&str, &Path, &dyn Fn() -> Result<(), HiveError>) -> Result<T, HiveError>,
 ) -> Result<T, HiveError> {
     let repository = AssetRepository::open(root)?;
     let head = execute_asset(
@@ -510,7 +510,7 @@ pub(crate) fn with_asset_bundle<T>(
     verify_checkout_tree(command, revision)?;
     // The artifact contains only the verified bundle; Git's local metadata
     // lives in scratch and will be removed with it.
-    complete(revision, &recheck)
+    complete(revision, &verify, &recheck)
 }
 
 #[cfg(target_os = "linux")]
