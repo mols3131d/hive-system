@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 
-use crate::dolt::{Snapshot, is_uuid_v7};
+use crate::dolt::is_uuid_v7;
 use crate::error::HiveError;
 
-use super::{Diagnostics, artifacts, directives};
+use super::{Diagnostics, RecordReader, artifacts, directives};
 
 pub(super) fn validate(
-    snapshot: &mut Snapshot,
+    snapshot: &mut RecordReader<'_>,
     area_ids: &HashSet<&str>,
     issue_ids: &HashSet<&str>,
     diagnostics: &mut Diagnostics,
@@ -25,8 +25,8 @@ pub(super) fn validate(
         }
     }
 
-    let resources = snapshot.records::<String>("resources", "id", "id")?;
-    for id in &resources {
+    let resources = snapshot.records::<(String,)>("resources", "id", "id")?;
+    for (id,) in &resources {
         diagnostics.check_id("resources", id, &[]);
     }
 
@@ -38,7 +38,7 @@ pub(super) fn validate(
     let artifacts = artifacts::validate(snapshot, diagnostics)?;
     let artifact_ids = artifacts.iter().map(String::as_str).collect();
     let project_ids = projects.iter().map(|(id, _)| id.as_str()).collect();
-    let resource_ids = resources.iter().map(String::as_str).collect();
+    let resource_ids = resources.iter().map(|(id,)| id.as_str()).collect();
     let label_ids = labels.iter().map(|(id, _)| id.as_str()).collect();
     for (table, columns, left_ids, right_ids) in [
         (

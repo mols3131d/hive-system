@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 
-use super::{Diagnostics, HiveError, Snapshot, is_uuid_v7};
+use super::{Diagnostics, HiveError, RecordReader, is_uuid_v7};
 
 const TABLE: &str = "issue_updates";
 const COLUMNS: &str = "id, issue_id, kind, transition_json IS NOT NULL, \
-    CASE WHEN JSON_VALID(transition_json) THEN JSON_TYPE(transition_json) = 'OBJECT' ELSE FALSE END";
+    (CASE WHEN JSON_VALID(transition_json) THEN JSON_TYPE(transition_json) = 'OBJECT' ELSE FALSE END) = TRUE";
 
 pub(super) fn validate(
-    snapshot: &mut Snapshot,
+    snapshot: &mut RecordReader<'_>,
     issue_ids: &HashSet<&str>,
     diagnostics: &mut Diagnostics,
 ) -> Result<(), HiveError> {

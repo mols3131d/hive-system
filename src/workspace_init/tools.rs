@@ -239,6 +239,10 @@ impl<'a> Installed<'a> {
             rows: Vec<Value>,
         }
         let stdout = self.dolt(db, &["sql", "-r", "json", "-q", query], None)?;
+        // Dolt 2.7.6 prints an empty object when a SELECT returns zero rows.
+        if stdout.trim() == "{}" {
+            return Ok(Vec::new());
+        }
         serde_json::from_str::<Rows>(&stdout)
             .map(|result| result.rows)
             .map_err(|_| unverified_db())
@@ -258,6 +262,17 @@ impl<'a> Installed<'a> {
         run(command, "Dolt", args[0])
     }
 
+    pub(crate) fn prepare_dolt_restore(&self) -> Result<(), HiveError> {
+        for (key, value) in [("user.name", "Hive"), ("user.email", "backup@hive.invalid")] {
+            self.dolt(
+                &self.home,
+                &["config", "--global", "--add", key, value],
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
     fn dolt_command(&self, cwd: &Path) -> Command {
         let mut command = self.command(&self.dolt, cwd);
         command
@@ -267,13 +282,32 @@ impl<'a> Installed<'a> {
         command
     }
 
-    fn git(&self, cwd: &Path, args: &[&str]) -> Result<String, HiveError> {
+    pub(crate) fn git(&self, cwd: &Path, args: &[&str]) -> Result<String, HiveError> {
         let mut command = self.git_command(cwd);
         command.args(args);
         run(command, "Git", args[0])
     }
 
-    fn git_command(&self, cwd: &Path) -> Command {
+    pub(crate) fn read_committed_soul(
+        &self,
+        assets: &Path,
+        revision: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, HiveError> {
+        crate::config_git::read_committed_asset_blob(
+            &|| Ok(self.git_command(assets)),
+            revision,
+            Path::new(path),
+        )?
+        .ok_or_else(|| {
+            HiveError::new(
+                ErrorCode::NotFound,
+                "The selected Queen's Soul is missing from the asset commit.",
+            )
+        })
+    }
+
+    pub(crate) fn git_command(&self, cwd: &Path) -> Command {
         let mut command = self.command(&self.git, cwd);
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -484,11 +518,11 @@ fn unrecognized_git_version() -> HiveError {
 
 // Dolt 2.7.6 explicitly sets broad permissions on some internal files.
 // Only touch regular single-link files within the verified private staging tree.
-fn restrict_db_modes(db: &Path) -> Result<(), HiveError> {
+pub(crate) fn restrict_db_modes(db: &Path) -> Result<(), HiveError> {
     fn restrict(directory: &Path) -> io::Result<()> {
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
-            let meta = entry.metadata()?;
+            let meta = fs::symlink_metadata(entry.path())?;
             if meta.is_dir() {
                 fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o700))?;
                 restrict(&entry.path())?;

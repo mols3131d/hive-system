@@ -1,12 +1,12 @@
-use super::{Diagnostics, HiveError, Snapshot, is_uuid};
+use super::{Diagnostics, HiveError, RecordReader, is_uuid};
 
 const TABLE: &str = "operation_receipts";
 const COLUMNS: &str = "request_id, fingerprint, \
-    CASE WHEN JSON_VALID(workflow_evidence_json) THEN JSON_TYPE(workflow_evidence_json) = 'OBJECT' ELSE FALSE END, \
-    CASE WHEN JSON_VALID(result_json) THEN JSON_TYPE(result_json) = 'OBJECT' ELSE FALSE END";
+    (CASE WHEN JSON_VALID(workflow_evidence_json) THEN JSON_TYPE(workflow_evidence_json) = 'OBJECT' ELSE FALSE END) = TRUE, \
+    (CASE WHEN JSON_VALID(result_json) THEN JSON_TYPE(result_json) = 'OBJECT' ELSE FALSE END) = TRUE";
 
 pub(super) fn validate(
-    snapshot: &mut Snapshot,
+    snapshot: &mut RecordReader<'_>,
     diagnostics: &mut Diagnostics,
 ) -> Result<(), HiveError> {
     let rows = snapshot.records::<(String, String, bool, bool)>(TABLE, COLUMNS, "request_id")?;

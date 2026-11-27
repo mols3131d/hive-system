@@ -168,6 +168,20 @@ fn select_bot(snapshot: &mut Snapshot, id: &str) -> Result<BotMetadata, HiveErro
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn validate_snapshot_souls<T: AsRef<[u8]>>(
+    reader: &mut super::records::RecordReader<'_>,
+    workspace_id: &str,
+    mut read_soul_blob: impl FnMut(&str) -> Result<T, HiveError>,
+) -> Result<(), HiveError> {
+    for row in reader.records::<BotRow>("bots", COLUMNS, "id")? {
+        let bot = BotMetadata::try_from(row)?;
+        let blob = read_soul_blob(&format!("bots/{}/SOUL.md", bot.slug))?;
+        soul_body(blob.as_ref(), workspace_id, &bot)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 pub(super) struct SoulRead {
     pub(super) bot: BotMetadata,
     pub(super) path: String,

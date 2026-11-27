@@ -141,6 +141,28 @@ pub(super) fn require_active_area(
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn require_active_area_at(
+    db: &mut impl mysql::prelude::Queryable,
+    area: &str,
+    commit: &str,
+    archived_message: &'static str,
+) -> Result<(), HiveError> {
+    if !super::is_commit_hash(commit) {
+        return Err(HiveError::new(
+            ErrorCode::InvalidRecord,
+            "The Area ancestry commit is malformed.",
+        ));
+    }
+    let sql = format!(
+        "SELECT parent_id, slug, archived_at IS NOT NULL FROM areas AS OF '{commit}'
+         WHERE CAST(id AS BINARY) = ?"
+    );
+    verify_area_ancestry(area, archived_message, |id| {
+        db.exec_first(&sql, (id,)).map_err(super::read_error)
+    })
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn verify_area_ancestry(
     area: &str,
     archived_message: &'static str,
