@@ -10,8 +10,9 @@ mod output;
 use std::process::ExitCode;
 
 use cli::{
-    AreaCommand, BotCommand, Command, ConfigCommand, Contract, ConversationCommand,
-    DirectiveCommand, DoltArtifactCommand, Invocation, IssueCommand, ParseFailure, ResourceCommand,
+    AreaCommand, BotCommand, Command, ConfigCommand, ContextArgs, ContextCommand, Contract,
+    ConversationCommand, DirectiveCommand, DoltArtifactCommand, Invocation, IssueCommand,
+    ParseFailure, ResourceCommand,
 };
 use error::{ErrorCode, HiveError};
 
@@ -49,7 +50,7 @@ fn dispatch(invocation: Invocation) -> ExitCode {
     let operation = match invocation.command {
         Command::Config(ConfigCommand::Show(args)) => config::Operation::Config(args.target.scope),
         Command::Config(ConfigCommand::Validate(args)) => config::Operation::Config(args.scope),
-        Command::Context => config::Operation::Context,
+        Command::Context(_) => config::Operation::Context,
         Command::Doctor => config::Operation::Doctor,
         _ => {
             return output::failure(
@@ -106,6 +107,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::DoltArtifact(DoltArtifactCommand::List(args)) => dolt::artifact::list(&args),
         Command::DoltArtifact(DoltArtifactCommand::Show(args)) => dolt::artifact::show(&args),
         Command::Validate(args) => dolt::validate(&args),
+        Command::Context(ContextArgs {
+            command: Some(ContextCommand::Inspect(args)),
+        }) => dolt::context_inspect::inspect(&invocation.common, &args),
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),

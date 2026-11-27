@@ -202,21 +202,7 @@ pub(crate) fn show(args: &ArtifactShowArgs) -> Result<DoltSuccess, Box<DoltFailu
         for scope in &scopes {
             scope.verify(snapshot)?;
         }
-        for kind in ScopeKind::ALL {
-            let (_, links, column) = kind.tables();
-            // Include aliases accepted by the table collation, plus case aliases
-            // in binary collations. A malformed link must block body disclosure.
-            let rows: Vec<(String, String)> = snapshot.exec_rows(
-                |commit| {
-                    format!(
-                        "SELECT artifact_id, {column} FROM {links} AS OF '{commit}'
-                     WHERE artifact_id = CAST(? AS CHAR) OR CAST(LOWER(artifact_id) AS BINARY) = ? LIMIT ?"
-                    )
-                },
-                (&args.id, &args.id, MAX_SCOPES + 1),
-            )?;
-            verify_coverage(kind, &args.id, &rows, &scopes)?;
-        }
+        verify_links(snapshot, &args.id, &scopes)?;
 
         // Apply the byte limit inside SQL so an oversized body never reaches the CLI.
         let rows: Vec<(String, String, String, String, Option<String>)> = snapshot.exec_rows(
@@ -245,6 +231,52 @@ pub(crate) fn show(args: &ArtifactShowArgs) -> Result<DoltSuccess, Box<DoltFailu
         artifact["body"] = json!(body);
         Ok(json!({"artifact": artifact, "observed_revision": snapshot.commit}))
     })
+}
+
+fn verify_links(snapshot: &mut Snapshot, id: &str, scopes: &[Scope<'_>]) -> Result<(), HiveError> {
+    for kind in ScopeKind::ALL {
+        let (_, links, column) = kind.tables();
+        // Include aliases accepted by the table collation, plus case aliases
+        // in binary collations. A malformed link must block body disclosure.
+        let rows: Vec<(String, String)> = snapshot.exec_rows(
+                |commit| {
+                    format!(
+                        "SELECT artifact_id, {column} FROM {links} AS OF '{commit}'
+                     WHERE artifact_id = CAST(? AS CHAR) OR CAST(LOWER(artifact_id) AS BINARY) = ? LIMIT ?"
+                    )
+                },
+                (id, id, MAX_SCOPES + 1),
+            )?;
+        verify_coverage(kind, id, &rows, scopes)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn verify_context_handoff_links(
+    snapshot: &mut Snapshot,
+    artifact: &str,
+    issue: &str,
+    area: &str,
+    project: Option<&str>,
+) -> Result<(), HiveError> {
+    let mut scopes = vec![
+        Scope {
+            kind: ScopeKind::Issue,
+            id: issue,
+        },
+        Scope {
+            kind: ScopeKind::Area,
+            id: area,
+        },
+    ];
+    if let Some(id) = project {
+        scopes.push(Scope {
+            kind: ScopeKind::Project,
+            id,
+        });
+    }
+    verify_links(snapshot, artifact, &scopes)
 }
 
 fn verify_coverage(

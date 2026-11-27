@@ -1,6 +1,7 @@
 pub(crate) mod area;
 pub(crate) mod artifact;
 pub(crate) mod bot;
+pub(crate) mod context_inspect;
 #[cfg(unix)]
 mod conversation;
 pub(crate) mod directive;
@@ -155,6 +156,8 @@ fn reader_credential(name: &'static str) -> Result<String, HiveError> {
 struct Snapshot {
     connection: Conn,
     commit: String,
+    #[cfg(test)]
+    workspace_id: String,
 }
 
 impl Snapshot {
@@ -248,7 +251,12 @@ impl Snapshot {
             ));
         }
 
-        let mut snapshot = Snapshot { connection, commit };
+        let mut snapshot = Snapshot {
+            connection,
+            commit,
+            #[cfg(test)]
+            workspace_id: workspace_id.to_owned(),
+        };
         snapshot.verify_schema()?;
         let identity: Vec<(i8, String)> = snapshot.rows(
             "workspace_meta",

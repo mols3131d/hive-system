@@ -1868,3 +1868,100 @@ fn v2_workspace_scope_preserves_descriptor_failure_diagnostics() {
         assert_eq!(report["error"]["message"], message);
     }
 }
+
+#[test]
+fn context_inspect_binds_the_committed_role_policy_to_the_descriptor() {
+    let fixture = Sandbox::new();
+    let policy = fixture.init_repo("policy");
+    let role_path = policy.join("docs/architecture/dolt-mvp-contract.md");
+    write(
+        &role_path,
+        "# Synthetic contract\n\n### Bot and curated memory\n\n| Drone | Synthetic role |\n\n#### Continuity boundaries and proposed MVP scope\n",
+    );
+    fixture.commit(&policy);
+    let pin = fixture.git(&policy, &["rev-parse", "HEAD"]);
+    let workspace = fixture.0.join("v2-workspace");
+    let descriptor = workspace.join("hive-workspace.yml");
+    let actor = "fixture-actor";
+    let id = "0195f1b2-3c4d-7e8f-9a0b-1c2d3e4f5a6b";
+    let descriptor_at = |pin: &str| {
+        format!("version: 2\nworkspace_id: {id}\nschema_version: 1\npolicy_revision: {pin}\n")
+    };
+    write(&descriptor, descriptor_at(&pin));
+    let common = [
+        "--contract",
+        "2",
+        "context",
+        "inspect",
+        "--workspace",
+        workspace.to_str().unwrap(),
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+        "--workspace-id",
+        id,
+        "--policy-root",
+        policy.to_str().unwrap(),
+        "--actor",
+        actor,
+        "--role",
+        "drone",
+        "--issue",
+        "#1",
+        "--json",
+    ];
+    let expect = |args: &[&str], exit, code| {
+        let output = fixture.run(args);
+        assert_eq!(
+            output.status.code(),
+            Some(exit),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["command"], "context inspect");
+        assert_eq!(report["error"]["code"], code);
+        assert!(report.get("data").is_none());
+        report
+    };
+
+    expect(
+        &[
+            "context",
+            "inspect",
+            "--role",
+            "invalid-role",
+            "--contract",
+            "2",
+            "--json",
+        ],
+        2,
+        "INVALID_ARGUMENT",
+    );
+    // The committed document remains the selected policy even with a dirty replacement.
+    write(&role_path, "synthetic-private working replacement");
+    let report = expect(&common, 7, "AUTHORITY_UNVERIFIED");
+    assert_eq!(report["context"]["policy_revision"], pin);
+    assert!(!report.to_string().contains("synthetic-private"));
+    expect(
+        &[common.as_slice(), &["--budget", "1"]].concat(),
+        2,
+        "CONTEXT_LIMIT",
+    );
+    expect(
+        &[common.as_slice(), &["--bot", id]].concat(),
+        2,
+        "INVALID_ARGUMENT",
+    );
+
+    // A checkout at another commit cannot satisfy the pin even if the old object exists.
+    fixture.commit(&policy);
+    let report = expect(&common, 4, "INCOMPATIBLE_POLICY");
+    assert!(report.get("context").is_none());
+    let missing_role = fixture.git(&policy, &["rev-parse", "HEAD"]);
+    write(&descriptor, descriptor_at(&missing_role));
+    expect(&common, 7, "POLICY_UNAVAILABLE");
+}

@@ -252,7 +252,7 @@ pub(crate) enum Command {
     #[command(subcommand)]
     Memory(MemoryCommand),
     /// Show the selected workspace context.
-    Context,
+    Context(ContextArgs),
     /// Inspect Areas under contract 2.
     #[command(subcommand, hide = true)]
     Area(AreaCommand),
@@ -268,6 +268,50 @@ pub(crate) enum Command {
     Validate(ValidateArgs),
     /// Check the local environment and workspace.
     Doctor,
+}
+
+#[derive(Args)]
+pub(crate) struct ContextArgs {
+    #[command(subcommand)]
+    pub(crate) command: Option<ContextCommand>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ContextCommand {
+    /// Check the selected v2 scope and current context prerequisites.
+    #[command(hide = true)]
+    Inspect(ContextInspectArgs),
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum ContextRole {
+    Queen,
+    Overlord,
+    Drone,
+}
+
+#[derive(Args)]
+pub(crate) struct ContextInspectArgs {
+    /// Reviewed local Hive system checkout at the workspace's policy pin.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) policy_root: Option<PathBuf>,
+    /// Exact workflow participant reference.
+    #[arg(long, value_name = "REF")]
+    pub(crate) actor: Option<String>,
+    /// Role policy to load. A registered Bot implies Queen.
+    #[arg(long, value_enum)]
+    pub(crate) role: Option<ContextRole>,
+    #[arg(long, value_name = "UUID")]
+    pub(crate) bot: Option<String>,
+    #[arg(long, value_name = "UUID")]
+    pub(crate) area: Option<String>,
+    #[arg(long, value_name = "UUID-OR-#NUMBER")]
+    pub(crate) issue: Option<String>,
+    /// Total inline body budget in UTF-8 bytes.
+    #[arg(long, value_name = "BYTES", allow_negative_numbers = true)]
+    pub(crate) budget: Option<String>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Subcommand)]
@@ -948,6 +992,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 .or(area_matches)
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
+                .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "context"))
                 .or_else(|| retry_conversation_failure(&cli, &args, error.kind()))
                 .or_else(|| {
                     cli.clone()
@@ -987,6 +1032,23 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
         message: "A command is required.".to_owned(),
     })?;
     let parsed = || -> Result<_, &'static str> {
+        if let Some(("context", context)) = matches.subcommand()
+            && context.subcommand().is_some()
+            && [
+                "contract",
+                "workspace",
+                "project",
+                "project_root",
+                "format",
+                "json",
+                "at",
+                "authority",
+            ]
+            .into_iter()
+            .any(|id| context.value_source(id) == Some(ValueSource::CommandLine))
+        {
+            return Err("Supply common options before context or after inspect.");
+        }
         let root = CommonArgs::from_arg_matches(&matches)
             .map_err(|error| safe_parse_message(error.kind()))?;
         let leaf_options =
@@ -1465,9 +1527,8 @@ fn retry_scoped_read_failure(
         command.mut_subcommands(|leaf| {
             recover_scope(leaf).mut_args(|arg| match arg.get_id().as_str() {
                 "database" | "workspace_id" | "port" | "cursor" | "area" => recover_value(arg),
-                "status" | "limit" | "after" => {
-                    recover_value(arg.value_parser(StringValueParser::new()))
-                }
+                "status" | "limit" | "after" | "role" | "actor" | "issue" | "bot" | "budget"
+                | "policy_root" => recover_value(arg.value_parser(StringValueParser::new())),
                 "bot_id" | "id" => arg
                     .value_parser(StringValueParser::new())
                     .allow_negative_numbers(true),
@@ -1594,7 +1655,9 @@ fn defer_project_check(command: clap::Command) -> clap::Command {
 }
 
 fn add_leaf_options(command: clap::Command) -> clap::Command {
-    if command.has_subcommands() {
+    if command.get_name() == "context" && command.has_subcommands() {
+        CommonArgs::augment_args(command.mut_subcommands(add_leaf_options))
+    } else if command.has_subcommands() {
         command.mut_subcommands(add_leaf_options)
     } else {
         CommonArgs::augment_args(command)
@@ -1608,9 +1671,10 @@ fn matched_leaf<'a>(
     let (first, subcommand) = matches.subcommand()?;
     if let Some((second, leaf)) = subcommand.subcommand() {
         Some((format!("{first} {second}"), leaf))
-    } else if cli
-        .find_subcommand(first)
-        .is_some_and(|command| !command.has_subcommands())
+    } else if first == "context"
+        || cli
+            .find_subcommand(first)
+            .is_some_and(|command| !command.has_subcommands())
     {
         // A partial parse can stop in a domain before selecting a leaf.
         Some((first.to_owned(), subcommand))
@@ -1776,6 +1840,23 @@ impl Command {
         if common.contract == Contract::V2 {
             return match self {
                 Self::Validate(args) => args.validate_dolt_selection(common),
+                Self::Context(ContextArgs {
+                    command: Some(ContextCommand::Inspect(args)),
+                }) => {
+                    if common.workspace.is_none()
+                        || !args.target.has_all()
+                        || args.policy_root.is_none()
+                    {
+                        return Err(
+                            "Context inspect requires --workspace, --workspace-id, --database, --port, and --policy-root.",
+                        );
+                    }
+                    if common.project_root.is_some() || !matches!(common.view, View::WorkingTree) {
+                        return Err("Context inspect accepts only the current v2 snapshot.");
+                    }
+                    Ok(())
+                }
+                Self::Context(_) => Err("Use context inspect with an explicit contract 2 target."),
                 Self::Area(command) => command.validate_dolt_selection(common),
                 Self::Resource(command) => command.validate_dolt_selection(common),
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
@@ -1810,6 +1891,9 @@ impl Command {
             };
         }
         match self {
+            Self::Context(ContextArgs { command: Some(_) }) => {
+                Err("Context inspect requires --contract 2.")
+            }
             Self::Config(ConfigCommand::Bind) => {
                 common.require_working_tree()?;
                 if common.workspace.is_none() || common.project.is_none() {

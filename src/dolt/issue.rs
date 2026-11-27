@@ -16,7 +16,7 @@ const MAX_INLINE_BYTES: usize = 65_536;
 const MAX_RESPONSE_BYTES: usize = 524_288;
 
 #[derive(Debug, Eq, PartialEq)]
-enum IssueSelector {
+pub(super) enum IssueSelector {
     Uuid(String),
     Number(u64),
 }
@@ -304,7 +304,7 @@ fn load_issue_detail(
     Ok(issue)
 }
 
-fn parse_selector(value: &str) -> Result<IssueSelector, HiveError> {
+pub(super) fn parse_selector(value: &str) -> Result<IssueSelector, HiveError> {
     if is_uuid_v7(value) {
         return Ok(IssueSelector::Uuid(value.to_owned()));
     }

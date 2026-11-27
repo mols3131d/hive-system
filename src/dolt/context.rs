@@ -2,6 +2,13 @@
 //! must be verified before disclosing these inputs. Snapshot authentication
 //! establishes the database selection, not the actor's workflow authority.
 
+#[path = "context/directives.rs"]
+mod directives;
+#[path = "context/resume.rs"]
+mod resume;
+#[path = "context/workflow.rs"]
+mod workflow;
+
 use std::collections::HashSet;
 
 use super::{
@@ -196,6 +203,7 @@ struct UpdateRef {
 }
 
 struct Work {
+    db_commit: String,
     issue: IssueDetail,
     inline_bytes: usize,
     prerequisites: Vec<String>,
@@ -206,18 +214,6 @@ struct Work {
     handoff: Option<UpdateRef>,
     updates: Vec<UpdateRef>,
     omitted_updates: u64,
-}
-
-impl Work {
-    fn require_handoff_provenance(&self) -> Result<(), HiveError> {
-        if self.handoff.is_some() {
-            return Err(HiveError::new(
-                ErrorCode::AuthorityUnverified,
-                "Current handoff body provenance is unavailable. Use an authorized exact handoff retrieval path.",
-            ));
-        }
-        Ok(())
-    }
 }
 
 // Budget is the remaining allowance after role, Soul and Directives.
@@ -278,6 +274,7 @@ fn collect_work(
     // Closure author is unnecessary for resume.
     issue.closed_by_ref = None;
     Ok(Some(Work {
+        db_commit: snapshot.commit.clone(),
         issue,
         inline_bytes,
         prerequisites,
