@@ -12,7 +12,7 @@ use super::{
     DoltSuccess, DoltTarget, Snapshot,
     area::create as area_create,
     artifact::{create as artifact_create, update as artifact_update},
-    bot::register as bot_register,
+    bot::{register as bot_register, retire as bot_retire},
     context_evidence::read_evidence_bytes,
     context_resolve::observe_time,
     context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7, issue_create,
@@ -53,6 +53,8 @@ pub(super) enum Kind {
     SetParent,
     #[serde(rename = "bot.register")]
     BotRegister,
+    #[serde(rename = "bot.retire")]
+    BotRetire,
     #[serde(untagged)]
     Transition(issue_transition::Operation),
 }
@@ -71,6 +73,7 @@ impl Kind {
             Self::DependencyAdd => "issue.add-dependency",
             Self::DependencyRemove => "issue.remove-dependency",
             Self::BotRegister => bot_register::KIND,
+            Self::BotRetire => bot_retire::KIND,
             Self::Transition(operation) => operation.name(),
             Self::SetParent => "issue.set-parent",
         }
@@ -88,6 +91,7 @@ impl Kind {
             Self::ProjectAddIssue => "Project add-issue",
             Self::DependencyAdd | Self::DependencyRemove => "Issue dependency",
             Self::BotRegister => "Bot register",
+            Self::BotRetire => "Bot retire",
             Self::Transition(issue_transition::Operation::Select) => "Issue select",
             Self::Transition(issue_transition::Operation::Claim) => "Issue claim",
             Self::Transition(issue_transition::Operation::Cancel) => "Issue cancel",
@@ -172,6 +176,7 @@ impl Kind {
                 ("operation_receipts", "INSERT"),
             ],
             Self::BotRegister => &[("bots", "INSERT"), ("operation_receipts", "INSERT")],
+            Self::BotRetire => &[("bots", "UPDATE"), ("operation_receipts", "INSERT")],
         }
     }
 
@@ -252,7 +257,7 @@ pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
 
 // Version 1 has no kind field and always denotes a holder-scoped Issue note. Version 2
 // carries an Issue kind. Version 3 carries an Artifact ID and optional Area.
-// Version 4 carries a typed transition or the Area, Project or Bot registration identifiers.
+// Version 4 carries a typed transition or the Area, Project or Bot identifiers.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Pending {
@@ -392,9 +397,16 @@ impl Pending {
             (4, Some(Kind::ProjectAddIssue), Some(_), None, None, None, Some(_), None) => {
                 Ok(Kind::ProjectAddIssue)
             }
-            (4, Some(Kind::BotRegister), None, None, None, None, None, Some(_)) => {
-                Ok(Kind::BotRegister)
-            }
+            (
+                4,
+                Some(kind @ (Kind::BotRegister | Kind::BotRetire)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(_),
+            ) => Ok(kind),
             (4, Some(kind @ Kind::Transition(_)), Some(_), Some(_), None, None, None, None) => {
                 Ok(kind)
             }
@@ -414,7 +426,7 @@ impl Pending {
             Kind::AreaCreate => self.area_id.as_deref(),
             Kind::ArtifactCreate | Kind::ArtifactUpdate => self.artifact_id.as_deref(),
             Kind::ProjectCreate | Kind::ProjectAddIssue => self.project_id.as_deref(),
-            Kind::BotRegister => self.bot_id.as_deref(),
+            Kind::BotRegister | Kind::BotRetire => self.bot_id.as_deref(),
             _ => self.issue_id.as_deref(),
         }
     }
@@ -466,7 +478,7 @@ pub(super) fn execute(
             receipt_at(snapshot, request.request_id, &commit, None).map_err(|_| uncertain())?;
         mutation.verify_decision(observe_time()?)?;
         let (outcome, base, introduced, result) = if let Some(receipt) = existing {
-            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate | Kind::AreaCreate | Kind::BotRegister | Kind::Transition(_) | Kind::SetParent) || request.kind.is_project() || request.kind.is_dependency() {
+            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate | Kind::AreaCreate | Kind::BotRegister | Kind::BotRetire | Kind::Transition(_) | Kind::SetParent) || request.kind.is_project() || request.kind.is_dependency() {
                 check_fingerprint(&receipt.fingerprint, request.fingerprint, request.kind)?;
             }
             let scoped = ScopedReceipt::read(
@@ -526,7 +538,7 @@ pub(super) fn execute(
                         "prerequisite_area_id": result["prerequisite_area_id"],
                         "prerequisite_id": result["prerequisite_id"],
                     }),
-                    Kind::BotRegister => json!({"bot_id": result["bot_id"]}),
+                    Kind::BotRegister | Kind::BotRetire => json!({"bot_id": result["bot_id"]}),
                     Kind::SetParent => json!({
                         "area_id": request.area_id, "issue_id": result["issue"]["issue_id"],
                         "old_parent_id": result["old_parent"]["issue_id"],
@@ -623,7 +635,8 @@ fn apply(
         kind @ (Kind::AreaCreate
         | Kind::ProjectCreate
         | Kind::ProjectAddIssue
-        | Kind::BotRegister) => (4, Some(kind)),
+        | Kind::BotRegister
+        | Kind::BotRetire) => (4, Some(kind)),
         kind @ Kind::Transition(_) => (4, Some(kind)),
     };
     let area_scope = request.area_id.map(str::to_owned);
@@ -635,7 +648,9 @@ fn apply(
         Kind::ProjectCreate | Kind::ProjectAddIssue => {
             (area_scope, None, None, None, Some(staged.record_id), None)
         }
-        Kind::BotRegister => (None, None, None, None, None, Some(staged.record_id)),
+        Kind::BotRegister | Kind::BotRetire => {
+            (None, None, None, None, None, Some(staged.record_id))
+        }
         _ => (area_scope, None, Some(staged.record_id), None, None, None),
     };
     let marker = Pending {
@@ -778,6 +793,7 @@ enum ScopedReceipt {
     Project(Box<planning::ScopedProject>),
     Dependency(Box<issue_dependency::ScopedDependency>),
     BotRegister(bot_register::RegisterResult),
+    BotRetire(bot_retire::RetireResult),
     Transition(Box<issue_transition::Record>),
     Parent(Box<issue_parent::ScopedParent>),
 }
@@ -918,6 +934,19 @@ impl ScopedReceipt {
                 bot_register::check_scope(snapshot, request, record, actor, receipt)
                     .map(Self::BotRegister)
             }
+            Kind::BotRetire => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                bot_retire::check_scope(
+                    snapshot,
+                    request,
+                    record.ok_or_else(uncertain)?,
+                    actor,
+                    receipt,
+                )
+                .map(Self::BotRetire)
+            }
         }
     }
 
@@ -963,6 +992,9 @@ impl ScopedReceipt {
             Self::Create(result) => {
                 issue_create::verify_effect(snapshot, commit, receipt, &result)?;
                 Ok(json!(result))
+            }
+            Self::BotRetire(result) => {
+                bot_retire::verify_effect(snapshot, commit, receipt, &result)
             }
         }
     }

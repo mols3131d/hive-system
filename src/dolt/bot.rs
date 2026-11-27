@@ -3,7 +3,7 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::cli::{BotRegisterArgs, CommonOptions, DoltTargetArgs, is_slug};
+use crate::cli::{BotRegisterArgs, BotRetireArgs, CommonOptions, DoltTargetArgs, is_slug};
 use crate::error::{ErrorCode, HiveError};
 
 use super::{DoltFailure, DoltSuccess, Snapshot, encode_id_cursor, id_cursor_key, is_uuid_v7};
@@ -68,6 +68,27 @@ pub(crate) fn register(
         Err(DoltFailure::without_context(HiveError::new(
             ErrorCode::NotImplemented,
             "Bot register requires a verified Linux workspace runtime.",
+        )))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) mod retire;
+
+pub(crate) fn retire(
+    common: &CommonOptions,
+    args: &BotRetireArgs,
+) -> Result<DoltSuccess, Box<DoltFailure>> {
+    #[cfg(target_os = "linux")]
+    {
+        retire::write(common, args).map_err(DoltFailure::without_context)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (common, args);
+        Err(DoltFailure::without_context(HiveError::new(
+            ErrorCode::NotImplemented,
+            "Bot retire requires a verified Linux workspace runtime.",
         )))
     }
 }
