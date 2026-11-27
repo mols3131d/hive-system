@@ -233,7 +233,11 @@ Use an existing bootstrapped workspace and an already registered canonical root.
 
 Start provisions launch-specific credentials in a private directory beneath the workspace state directory. The reader receives database SELECT. The initial writer receives database SELECT and UPDATE on `workspace_counters` for the scoped transaction verification. The running response identifies the reader account and private password file for use with the existing reader environment variables.
 
+Start writes and syncs `run-<nonce>/server-config.yaml` (mode `0600`) beneath the private workspace state directory. Dolt receives the same bytes through an inherited sealed Linux file descriptor with `--config /proc/self/fd/<fd>` and `--skip-root-user-initialization`. The config contains the loopback listener and local paths for the selected database and private Dolt state. Credentials stay in the existing private files. Hive leaves any prior `db/config.yaml` in place.
+
 Start and stop verify the boot and process start identity, the launched executable and arguments, the process's exclusive kernel lock on the selected `db/.dolt/noms/LOCK` inode, and its exact loopback listener. The launch-specific reader then verifies the committed workspace UUID and schema, bracketed by process, store, and listener checks. Stop sends SIGTERM through the verified pidfd and waits for process exit before removing the local server record. An interrupted launch or stale server record requires inspection.
+
+For launches using `--config`, ownership verification checks the process's inherited descriptor against the synced private `config-id` record and verifies its seals and exact bytes for the selected database, launch directory and endpoint. A running legacy launch remains eligible for verified stop when its arguments exactly match the launcher that supplied all settings as command-line flags and all existing ownership checks pass.
 
 If an owned launch has a safely readable pending marker, `workspace stop` durably records the pidfd-verified exit before removing the launch directory and server record. The proof binds the registered workspace lock and state directory, exact launch, canonical store, executable identity and digest, and exact marker identity and digest. Recovery can finish interrupted launch cleanup when the surviving records match that proof.
 
