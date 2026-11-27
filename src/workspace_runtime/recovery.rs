@@ -1,7 +1,7 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
-use crate::dolt::issue_note::{Pending, uncertain};
+use crate::dolt::issue_writer::{Pending, uncertain};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

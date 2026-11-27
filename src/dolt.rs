@@ -14,6 +14,7 @@ pub(crate) mod directive;
 mod directive_receipt;
 mod graph;
 mod issue;
+pub(crate) mod issue_create;
 mod issue_list;
 pub(crate) mod issue_note;
 #[cfg(any(test, target_os = "linux"))]
@@ -21,6 +22,8 @@ mod issue_note_fingerprint;
 #[cfg(target_os = "linux")]
 mod issue_note_receipt;
 mod issue_readiness;
+#[cfg(target_os = "linux")]
+pub(crate) mod issue_writer;
 pub(crate) mod label;
 pub(crate) mod operation;
 mod project;
