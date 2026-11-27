@@ -40,7 +40,7 @@ impl Sandbox {
         Self(path)
     }
 
-    fn run(&self, args: &[&str]) -> Output {
+    fn run(&self, args: &[impl AsRef<std::ffi::OsStr> + std::fmt::Debug]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_hive"))
             .args(args)
             .env_clear()
@@ -1638,7 +1638,11 @@ fn malformed_area_create_values_and_conflicts_keep_the_v2_envelope() {
         "3307",
     ];
     let flags = ["--contract", "2", "--json"];
-    for invalid in [&["--project", "BAD!"][..], &["--slug", "duplicate-slug"]] {
+    for invalid in [
+        &["--project", "BAD!"][..],
+        &["--slug", "duplicate-slug"],
+        &["unexpected-position"],
+    ] {
         for args in [
             [&flags[..], &command, invalid].concat(),
             [&command[..], invalid, &flags].concat(),
@@ -1663,6 +1667,31 @@ fn malformed_area_create_values_and_conflicts_keep_the_v2_envelope() {
     assert_eq!(result.status.code(), Some(2));
     assert!(result.stdout.is_empty());
     assert!(!result.stderr.is_empty());
+    let before_end = [
+        &command[..],
+        &["unexpected-position", "--", "--contract", "2", "--json"],
+    ]
+    .concat();
+    let result = sandbox.run(&before_end);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(result.stdout.is_empty());
+
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let mut invalid: Vec<_> = command.iter().map(OsString::from).collect();
+        let name = command.iter().position(|arg| *arg == "--name").unwrap();
+        invalid[name + 1] = OsString::from_vec(vec![255]);
+        invalid.extend(flags.into_iter().map(OsString::from));
+        let output = sandbox.run(&invalid);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "area create");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    }
     sandbox.assert_empty();
 }
 
