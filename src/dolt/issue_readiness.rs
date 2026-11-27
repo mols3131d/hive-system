@@ -10,6 +10,9 @@ use super::issue_list::SummaryRow;
 use super::records::{IssueStatus, is_issue_type};
 use super::{MAX_ROWS_PER_TABLE, Snapshot, is_uuid_v7};
 
+// Match a non-whitespace character using Unicode White_Space, as Rust str::trim does.
+const NON_WHITESPACE: &str = r"[^\x{0009}-\x{000D}\x{0020}\x{0085}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]";
+
 #[derive(Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(super) enum Blocker {
@@ -28,6 +31,7 @@ type PrerequisiteRow = (String, String, String, Option<String>, Option<String>, 
 pub(super) struct Readiness {
     areas: Option<HashMap<String, Area>>,
     ancestry: HashMap<String, Ancestry>,
+    prerequisites_read: usize,
 }
 
 struct Area {
@@ -75,18 +79,20 @@ impl Readiness {
             .map(|row| SqlValue::from(&row.0))
             .collect();
         let placeholders = vec!["?"; ids.len()].join(", ");
+        let mut metadata_params = vec![SqlValue::from(NON_WHITESPACE)];
+        metadata_params.extend(ids.iter().cloned());
         let metadata: Vec<(String, bool, bool, bool)> = snapshot.exec_rows(
             |commit| {
                 format!(
                     "SELECT i.id, i.hold_reason IS NOT NULL, c.issue_id IS NOT NULL,
                     i.closed_at IS NULL AND i.closed_by_ref IS NULL AND i.resolution_note IS NULL
-                        AND LENGTH(TRIM(i.revision)) > 0
+                        AND i.revision REGEXP ?
                  FROM issues AS OF '{commit}' AS i
                  LEFT JOIN issue_claims AS OF '{commit}' AS c ON c.issue_id = i.id
                  WHERE i.id IN ({placeholders})"
                 )
             },
-            ids.clone(),
+            metadata_params,
         )?;
         let mut reasons: HashMap<_, _> = metadata
             .into_iter()
@@ -104,14 +110,19 @@ impl Readiness {
                 (id, reasons)
             })
             .collect();
+        // This Readiness instance serves the whole page, including lookahead batches.
+        let remaining = MAX_ROWS_PER_TABLE - self.prerequisites_read;
+        let mut prerequisite_params = vec![SqlValue::from(NON_WHITESPACE); 3];
+        prerequisite_params.extend(ids);
+        prerequisite_params.push(SqlValue::from(remaining as u64 + 1));
         let prerequisites: Vec<PrerequisiteRow> = snapshot.exec_rows(
             |commit| {
                 format!(
                     "SELECT i.id, d.issue_id, d.prerequisite_id, p.type, p.status,
                          COALESCE(p.closed_at IS NOT NULL AND YEAR(p.closed_at) > 0
-                             AND LENGTH(TRIM(p.closed_by_ref)) > 0
-                             AND LENGTH(TRIM(p.resolution_note)) > 0
-                             AND LENGTH(TRIM(p.revision)) > 0
+                             AND p.closed_by_ref REGEXP ?
+                             AND p.resolution_note REGEXP ?
+                             AND p.revision REGEXP ?
                              AND c.issue_id IS NULL, FALSE)
                      FROM issue_dependencies AS OF '{commit}' AS d
                      JOIN issues AS OF '{commit}' AS i ON i.id = d.issue_id
@@ -119,18 +130,19 @@ impl Readiness {
                         ON p.id = d.prerequisite_id
                         AND CAST(p.id AS BINARY) = CAST(d.prerequisite_id AS BINARY)
                      LEFT JOIN issue_claims AS OF '{commit}' AS c ON c.issue_id = p.id
-                     WHERE i.id IN ({placeholders}) LIMIT {}",
-                    MAX_ROWS_PER_TABLE + 1
+                     WHERE i.id IN ({placeholders}) LIMIT ?"
                 )
             },
-            ids,
+            prerequisite_params,
         )?;
-        if prerequisites.len() > MAX_ROWS_PER_TABLE {
+        if prerequisites.len() > remaining {
             return Err(HiveError::new(
                 ErrorCode::ContextLimit,
                 "The readiness query exceeds the prerequisite read limit.",
             ));
         }
+
+        self.prerequisites_read += prerequisites.len();
 
         let mut unmet = HashSet::new();
         let mut invalid = HashSet::new();
