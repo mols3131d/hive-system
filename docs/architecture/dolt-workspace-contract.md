@@ -70,25 +70,18 @@ version: 2
 workspace_id: 0195f1b2-3c4d-7e8f-9a0b-1c2d3e4f5a6b
 schema_version: 1
 policy_revision: c66b3c50150e18426485d134de92c6b311dac125
-storage:
-  db: db
-  assets: assets
-  conversations: conversations
 ```
 
 | Field | Type | Requirement |
 | --- | --- | --- |
 | `version` | integer | Required; must equal `2`. Any other integer fails with `SCHEMA_INCOMPATIBLE`; non-integer fails with `INVALID_CONFIG`. |
-| `workspace_id` | string | Required; immutable lowercase UUIDv7 (`CHAR(36)`). Must match `workspace_meta.workspace_id` in `db/`. |
+| `workspace_id` | string | Required immutable canonical lowercase UUID. Match the exact committed `workspace_meta.workspace_id` in `db/`. |
 | `schema_version` | integer | Required; must equal `1` for the pinned initial migration and match committed `schema_migrations.version` in `db/`. |
 | `policy_revision` | string | Required; 40-character lowercase hexadecimal `hive-system` commit SHA pinning the reviewed v2 policy revision. |
-| `storage.db` | string | Required; normal relative single-component directory name (`db` in MVP). |
-| `storage.assets` | string | Required; normal relative single-component directory name (`assets` in MVP). |
-| `storage.conversations` | string | Required; normal relative single-component directory name (`conversations` in MVP). |
 
 - Reject `hive-workspace.yml` if it contains credentials, machine-local paths, endpoints, bindings, or unknown fields.
 - A directory containing v1 `hive.yml` without `hive-workspace.yml` is rejected under `--contract 2` with `SCHEMA_INCOMPATIBLE`. Conversely, v1 ignores `hive-workspace.yml` and rejects v2 workspaces.
-- A mismatch between `hive-workspace.yml` `workspace_id` and `workspace_meta.workspace_id` in `db/` fails closed (`SCHEMA_INCOMPATIBLE` or `AUTHORITY_UNVERIFIED`) with no repair or fallback.
+- A mismatch between `hive-workspace.yml` `workspace_id` and `workspace_meta.workspace_id` in `db/` returns `AUTHORITY_UNVERIFIED` and leaves all targets untouched.
 
 ## User configuration and local Area/resource bindings
 
@@ -111,10 +104,7 @@ output:
 
 ### Local Area and resource bindings
 
-V2 replaces v1's Git-only project binding with **local Area/resource bindings** that support both Git repositories and non-Git directories without modifying external projects. Two machine-local binding surfaces are supported:
-
-1. **User-local binding map (`$XDG_CONFIG_HOME/hive/v2/bindings.yml`, optional):** Stores local directory-to-resource bindings outside external projects so non-adopting repositories and non-Git directories stay completely untouched.
-2. **Opted-in directory-local binding (`<resource-root>/.local/hive/v2/binding.yml`, optional):** Explicit opt-in parallel to v1's `.local/hive/config.yml`. When `<resource-root>` is inside a Git worktree, `.local/hive/v2/binding.yml` **must be untracked and ignored** by Git (never modify `.gitignore` or Git config as a side effect). Non-Git directories may use this file without requiring a Git root.
+V2 reads local Area and Resource bindings from the optional machine-local `$XDG_CONFIG_HOME/hive/v2/bindings.yml`. A binding maps a canonical resource directory to a registered Resource and optional scope. This also supports non-Git directories and keeps the binding file outside external projects. V1 continues to use its pinned project binding rules.
 
 Example `$XDG_CONFIG_HOME/hive/v2/bindings.yml`:
 
@@ -129,28 +119,17 @@ bindings:
     project_id: 0195f1b2-4000-7000-8000-000000000020
 ```
 
-Example `<resource-root>/.local/hive/v2/binding.yml`:
-
-```yaml
-version: 2
-workspace: /example/hive-v2-userdata
-workspace_id: 0195f1b2-3c4d-7e8f-9a0b-1c2d3e4f5a6b
-resource_id: 0195f1b2-4000-7000-8000-000000000010
-area_id: 0195f1b2-4000-7000-8000-000000000001
-```
-
 | Field | Type | Requirement |
 | --- | --- | --- |
 | `version` | integer | Required; must equal `2`. |
-| `path` | string | Required in `bindings.yml` entries only; canonical local directory path (unique per entry after normalization; duplicate target paths fail with `INVALID_CONFIG`). |
+| `path` | string | Required canonical local directory path. Reject duplicate paths after normalization with `INVALID_CONFIG`. |
 | `workspace` | string | Optional local path to the v2 workspace root; if omitted, resolves through `config.yml` `workspace` or fails if none applies. |
-| `workspace_id` | string | Optional lowercase UUIDv7 pin; when present, must match the resolved workspace's `workspace_id`. |
+| `workspace_id` | string | Optional canonical lowercase workspace UUID. When supplied, match the resolved workspace ID exactly. |
 | `resource_id` | string | Required lowercase UUIDv7 matching a registered row in `resources`. |
 | `area_id` | string | Optional lowercase UUIDv7 matching an Area linked to `resource_id` in `area_resources`. |
 | `project_id` | string | Optional lowercase UUIDv7 matching an existing row in `projects`. |
 
-- Binding discovery checks an explicit resource root if supplied, otherwise the invocation directory and (when inside a Git worktree) its Git worktree root. Do not traverse unrelated parent repositories or cross filesystem boundaries.
-- If both `bindings.yml` and `.local/hive/v2/binding.yml` match the same active directory with conflicting values, refuse with `AMBIGUOUS_SCOPE`.
+- Resolve a supplied resource root by exact canonical path. Otherwise choose the longest registered directory path containing the canonical invocation directory. Compare path components and refuse an ambiguous match. Obtain bindings only from the machine-local file.
 - A Resource may be linked to multiple Areas in `area_resources`. If neither CLI `--area` nor the binding specifies `area_id` and `resource_id` maps to more than one Area, return `AMBIGUOUS_SCOPE` with the bounded candidate Area IDs and slugs — **never silently choose**.
 - Local bindings are convenience data, never an authority grant or harness installation.
 
@@ -159,14 +138,14 @@ area_id: 0195f1b2-4000-7000-8000-000000000001
 Resolve workspace and scope in strict order:
 
 1. Explicit CLI flags (`--workspace`, `--area`, `--project`, `--resource`).
-2. Applicable verified local binding (`bindings.yml` or `.local/hive/v2/binding.yml`).
+2. Applicable verified local binding in `bindings.yml`.
 3. User configuration default (`$XDG_CONFIG_HOME/hive/v2/config.yml`).
 4. Validated XDG default candidate (`$XDG_DATA_HOME/hive/v2/userdata/`).
 
 Refusal rules (fail closed):
 
 - **No fallback on explicit error:** An invalid or incompatible explicit CLI target fails immediately without consulting bindings, user defaults, or the XDG candidate.
-- **No silent binding bypass:** If an applicable local binding is invalid, corrupt, tracked/unignored in Git, or points to an incompatible workspace, fail closed even when CLI overrides are supplied.
+- **No silent binding bypass:** Reject an invalid applicable binding or an incompatible bound workspace. Report the selected input source and a typed failure.
 - **No partial binding override:** Changing a bound workspace without also supplying explicit scope (or supplying an `--area`/`--project` that conflicts with the active binding without an explicit workspace + scope pair) fails with `AMBIGUOUS_SCOPE`.
 - **XDG candidate is read-only discovery:** Presence of `$XDG_DATA_HOME/hive/v2/userdata/` requires a valid `hive-workspace.yml` and compatible `db/`; it never authorizes initialization, migration, or policy adoption.
 - **Hook invocation boundary:** Optional `hook dispatch` requires an explicit or prebound target and must not fall back to the user default or XDG candidate.
@@ -205,8 +184,7 @@ $XDG_STATE_HOME/hive/v2/
 │       ├── lock                  # OS-held exclusive advisory lock (stable inode; never unlink/steal)
 │       ├── active-root.json      # Canonical registered active workspace_root and DB identity
 │       ├── pending-request.json  # Durable pending-commit marker (no payload body or credentials)
-│       ├── server.json           # Owned Dolt SQL Server PID, start identity, nonce, endpoint ref
-│       └── credentials.json      # Mode 0600 local writer/reader DB credentials (never logged/backed up)
+│       └── server.json           # Owned Dolt SQL Server PID, start identity, nonce, endpoint ref
 └── diagnostics/                  # Optional redacted local diagnostics only
 
 $XDG_RUNTIME_DIR/hive/v2/         # Used only when XDG_RUNTIME_DIR is absolute and private
@@ -217,7 +195,7 @@ $XDG_RUNTIME_DIR/hive/v2/         # Used only when XDG_RUNTIME_DIR is absolute a
 
 - **Active-root verification:** Under the `workspace_id`-keyed lock, writers verify that the target canonical `workspace_root` matches `active-root.json` and `db/` `workspace_meta.workspace_id`. A restored copy at a different path remains inactive until explicitly promoted after verifying the old authority stopped and preserving final history.
 - **Pending-request marker:** Contains only `workspace_id`, `request_id`, `base_commit`, payload `fingerprint`, and bounded server/connection identity. Reconcile before any replay or new write.
-- **No secrets in shared state:** `credentials.json`, `server.json`, `active-root.json`, `lock`, `pending-request.json`, `config.yml`, `bindings.yml`, and `.local/hive/v2/binding.yml` are strictly machine-local and excluded from `db/`, `assets/`, and backup manifests.
+- Keep runtime state and local config outside `db/`, `assets/` and backup manifests. Obtain credentials through the explicitly selected machine-local runtime mechanism. Preserve the existing environment-based reader credentials for validation.
 
 ## Private Queen conversation file contract
 
@@ -252,7 +230,7 @@ title: "Release readiness discussion"
 provenance:
   source: file
   session_ref: "synthetic-host-session-01"
-  body_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  body_sha256: "c13dcf456b4c68087bad7c2a2cfac88ec18cbc08a551cd0d6c3523e307bfa9f2"
 ---
 
 # Release readiness discussion
@@ -263,7 +241,7 @@ Synthetic Queen conversation body preserved verbatim for human recall.
 | Field | Type | Requirement |
 | --- | --- | --- |
 | `version` | integer | Required; must equal `1`. |
-| `workspace_id` | string | Required; lowercase UUIDv7 matching `hive-workspace.yml` and `workspace_meta.workspace_id`. |
+| `workspace_id` | string | Required canonical lowercase UUID matching `hive-workspace.yml` and the committed `workspace_meta.workspace_id`. |
 | `bot_id` | string | Required; lowercase UUIDv7 matching directory `<bot_id>` and `bots.id`. |
 | `bot_slug` | string | Required; lowercase kebab-case slug matching `bots.slug` for `bot_id`. |
 | `conversation_id` | string | Required; lowercase UUIDv7 matching `<conversation_id>.md` filename stem. |
@@ -286,7 +264,7 @@ Frontmatter uses the same strict YAML parser rules (`deny_unknown_fields`, `<= 6
   6. Do **not** create a Dolt transaction, Dolt mutation receipt, Issue revision update, or global index file.
 - **Historical list, show, and export (`conversation list`, `show`, `export`):**
   - Permitted for **both active and retired** registered Queens in the selected workspace (`bots` row must exist; `retired_at` may be set).
-  - `conversation list` scans regular `.md` files in `conversations/bots/<bot_id>/` (ignoring no symlinks — symlinks or unexpected entries fail validation), parses and validates frontmatter consistency (`workspace_id`, `bot_id`, `bot_slug`, filename stem == `conversation_id`), sorts deterministically by `conversation_id` descending (UUIDv7 creation order with ID tie-break), and paginates with bounded page sizes (default `25`, max `100`) and a cursor bound to the last returned `conversation_id`.
+  - `conversation list` reads bounded metadata from regular published files in the selected Queen directory. Exclude unpublished staging files and refuse unsafe paths. Validate the workspace, Queen and filename identity. Sort by conversation ID descending and page at 25 by default or up to 100. Bind cursors to the selected workspace, Queen, query, sort and a digest of the observed published metadata. A changed scope or published set returns `STALE_CURSOR`. Return `CONTEXT_LIMIT` if the scan cannot complete within the implementation's bounded metadata budget. Read conversation bodies through explicit show, export or backup.
   - `conversation show` opens `<conversation_id>.md` via descriptor-relative `O_NOFOLLOW`, validates all frontmatter fields and `body_sha256`, and returns metadata plus body without modifying state or runtime context.
   - `conversation export` validates the stored file identically and writes a standalone UTF-8 Markdown copy to a new safe destination (no-clobber, no symlink escape).
 - **Context and backup/restore boundaries:**
@@ -303,7 +281,7 @@ All verification must run on isolated disposable directories using synthetic UUI
 | Boundary | Owning issue | Synthetic inputs | Required verification |
 | --- | --- | --- | --- |
 | XDG & contract isolation | `#18` (`A15`) | One XDG tree containing both v1 (`hive/config.yml`, `hive.yml`) and v2 (`hive/v2/config.yml`, `hive-workspace.yml`) | `--contract 2` resolves only v2 and rejects v1 with `SCHEMA_INCOMPATIBLE`; v1 remains unaffected; unset/empty/relative XDG vars fall back properly; relative/unset `XDG_RUNTIME_DIR` uses loopback, never `/tmp`; missing `HOME` fails closed |
-| Precedence, bindings & provenance | `#18` (`A01`, `A11`, `A15`) | Synthetic CLI flags, `bindings.yml`, `.local/hive/v2/binding.yml` (Git ignored, Git tracked/unignored, and non-Git dir), `config.yml`, and XDG candidate | Order `cli > binding > user > xdg-default` with exact `sources.*` provenance; invalid CLI target refuses without fallback; partial binding override and conflicting bindings return `AMBIGUOUS_SCOPE`; multi-Area Resource returns candidates without silent pick; tracked/unignored Git binding fails; non-adopting external project files and Git config remain untouched |
+| Precedence, bindings & provenance | `#18` (`A01`, `A11`, `A15`) | Synthetic CLI flags, machine-local `bindings.yml` with Git and non-Git directories, `config.yml`, and XDG candidate | Order `cli > binding > user > xdg-default` with exact `sources.*` provenance; invalid CLI target refuses without fallback; partial binding override or ambiguous scope returns `AMBIGUOUS_SCOPE`. Duplicate canonical binding paths return `INVALID_CONFIG`. A multi-Area Resource returns candidates. External project files and Git config remain untouched |
 | Strict YAML, paths & runtime state | `#18` (`A11`, `A14`) | Malformed YAML (unknown/duplicate keys, anchors, tags, `> 64 KiB`, non-UTF-8), symlinks escaping root, descriptor/DB `workspace_id` mismatch, and an inactive restored copy | Typed errors with redacted diagnostics; symlink traversal refused; `workspace_id` mismatch fails closed; `workspace_id`-keyed lock and `active-root.json` block writes to an inactive copy; no secrets or machine-local bindings in `hive-workspace.yml`, `db/`, `assets/`, or backup manifests |
 | Committed Soul & management exclusion | `#20` (`A06`, `A20`, `D03`) | Synthetic `assets/bots/<slug>/` with committed `SOUL.md`, dirty/untracked `SOUL.md`, optional `README.md`/`AGENTS.md`, and symlink escape | Dirty/untracked Soul and symlink escapes fail; management frontmatter stripped from Soul payload; optional `README.md`/`AGENTS.md` never required and strictly excluded from `context resolve` |
 | Private Queen conversations | `#20` (`A06`, `A11`, `D01`) | Synthetic active and retired Queens, two UTF-8 Markdown imports sharing one `--session-ref`, corrupt `body_sha256`, mismatched IDs, oversize/non-UTF-8/symlink input | Atomic lock-held import creates distinct `conversation_id` files preserving earlier bytes; retired Queen rejects new imports while permitting `list`/`show`/`export`; invalid inputs and corrupt files fail closed; `context resolve` excludes conversation bodies |
