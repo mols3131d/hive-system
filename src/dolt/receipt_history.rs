@@ -1,6 +1,8 @@
 //! Receipt rows and their immutable introduction edge in retained Dolt history.
 
-use super::{Snapshot, context_workflow as workflow, is_commit_hash, is_uuid};
+use mysql::prelude::Queryable;
+
+use super::{Snapshot, context_workflow as workflow, is_commit_hash, is_uuid, read_error};
 use crate::error::{ErrorCode, HiveError};
 
 const MAX_RECEIPT_BYTES: usize = 256 * 1024;
@@ -161,7 +163,7 @@ fn receipt_changes(snapshot: &mut Snapshot, request_id: &str) -> Result<Vec<Delt
     if snapshot
         .connection
         .query_first::<mysql::Row, _>("SHOW WARNINGS LIMIT 1")
-        .map_err(super::read_error)?
+        .map_err(read_error)?
         .is_some()
     {
         return Err(invalid_record(
