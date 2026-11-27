@@ -112,9 +112,12 @@ fn check_id(id: &str) -> Result<(), HiveError> {
 
 fn show_resource(snapshot: &mut Snapshot, id: &str) -> Result<Value, HiveError> {
     let rows: Vec<ResourceRow> = snapshot.exec_rows(
-        |commit| format!(
-            "SELECT {SUMMARY_COLUMNS}, r.uri FROM resources AS OF '{commit}' AS r +             WHERE CAST(r.id AS BINARY) = ? LIMIT 1"
-        ),
+        |commit| {
+            format!(
+                "SELECT {SUMMARY_COLUMNS}, r.uri FROM resources AS OF '{commit}' AS r
+             WHERE CAST(r.id AS BINARY) = ? LIMIT 1"
+            )
+        },
         (id,),
     )?;
     let row = rows.into_iter().next().ok_or_else(|| {
@@ -166,11 +169,18 @@ fn list_page(
     params.extend([SqlValue::from(limit + 1), SqlValue::from(offset)]);
     let rows: Vec<ResourceRow> = snapshot.exec_rows(
         |commit| {
-            let join = link.map(|(_, table, column, _)| format!(
-                " JOIN {table} AS OF '{commit}' AS j +                 ON CAST(j.resource_id AS BINARY) = CAST(r.id AS BINARY) +                 WHERE CAST(j.{column} AS BINARY) = ?"
-            )).unwrap_or_default();
+            let join = link
+                .map(|(_, table, column, _)| {
+                    format!(
+                        " JOIN {table} AS OF '{commit}' AS j
+                 ON CAST(j.resource_id AS BINARY) = CAST(r.id AS BINARY)
+                 WHERE CAST(j.{column} AS BINARY) = ?"
+                    )
+                })
+                .unwrap_or_default();
             format!(
-                "SELECT {SUMMARY_COLUMNS}, NULL FROM resources AS OF '{commit}' AS r{join} +                 ORDER BY {SORT} LIMIT ? OFFSET ?"
+                "SELECT {SUMMARY_COLUMNS}, NULL FROM resources AS OF '{commit}' AS r{join}
+                 ORDER BY {SORT} LIMIT ? OFFSET ?"
             )
         },
         params,
