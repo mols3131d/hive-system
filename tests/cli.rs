@@ -3208,7 +3208,6 @@ fn operation_show_requires_v2_and_exact_current_selection() {
     let sandbox = Sandbox::new();
     let id = "01900000-0000-7000-8000-000000000001";
     for (contract, request, extra, exit, code) in [
-        ("1", id, &[][..], 2, "INVALID_ARGUMENT"),
         ("2", "INVALID", &[][..], 2, "INVALID_ARGUMENT"),
         (
             "2",
@@ -3285,5 +3284,72 @@ fn conversation_import_help_and_invocation_require_explicit_v2() {
     let help = sandbox.run(&["conversation", "--help"]);
     assert!(help.status.success());
     assert!(!String::from_utf8(help.stdout).unwrap().contains("import"));
+    sandbox.assert_empty();
+}
+
+#[test]
+fn operation_is_registered_for_v2_help_and_preserves_v1_unknown_command_bytes() {
+    let sandbox = Sandbox::new();
+    for selection in [&[][..], &["--contract", "1"][..]] {
+        for suffix in [
+            &["--help"][..],
+            &["show", "--help"][..],
+            &["show", "fixture"][..],
+            &["show", "fixture", "--json"][..],
+        ] {
+            let operation = [selection, &["operation"], suffix].concat();
+            // Compare against a domain absent from the legacy grammar.
+            let unknown = [selection, &["unknown-domain"], suffix].concat();
+            let operation = sandbox.run(&operation);
+            let unknown = sandbox.run(&unknown);
+            assert_eq!(operation.status.code(), Some(2));
+            assert_eq!(operation.status, unknown.status);
+            assert_eq!(operation.stdout, unknown.stdout);
+            assert_eq!(operation.stderr, unknown.stderr);
+        }
+        let help = sandbox.run(&[selection, &["--help"]].concat());
+        assert!(help.status.success());
+        assert!(
+            !String::from_utf8(help.stdout)
+                .unwrap()
+                .contains("operation")
+        );
+    }
+    let late_v1 = sandbox.run(&["operation", "show", "--contract", "1", "--help"]);
+    let unknown = sandbox.run(&["unknown-domain", "show", "--contract", "1", "--help"]);
+    assert_eq!(late_v1.status, unknown.status);
+    assert_eq!(late_v1.stdout, unknown.stdout);
+    assert_eq!(late_v1.stderr, unknown.stderr);
+
+    for (args, expected) in [
+        (
+            &["--contract", "2", "--help"][..],
+            "Inspect committed operation receipts.",
+        ),
+        (
+            &["--contract", "2", "operation", "--help"][..],
+            "Inspect the durable outcome",
+        ),
+        (
+            &["operation", "show", "--contract", "2", "--help"][..],
+            "hive operation show",
+        ),
+        (
+            &["operation", "show", "--help", "--contract", "2"][..],
+            "hive operation show",
+        ),
+        (
+            &["--contract", "2", "help", "operation", "show"][..],
+            "REQUEST_ID",
+        ),
+    ] {
+        let help = sandbox.run(args);
+        assert!(help.status.success(), "{args:?}: {:?}", help);
+        assert!(help.stderr.is_empty());
+        assert!(
+            String::from_utf8(help.stdout).unwrap().contains(expected),
+            "{args:?}"
+        );
+    }
     sandbox.assert_empty();
 }
