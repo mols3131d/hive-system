@@ -259,6 +259,11 @@ pub(crate) enum Command {
     /// Inspect Issues under contract 2.
     #[command(subcommand, hide = true)]
     Issue(IssueCommand),
+    #[command(skip)]
+    Resource(ResourceCommand),
+    /// Inspect preserved Queen conversations under contract 2.
+    #[command(subcommand, hide = true)]
+    Conversation(ConversationCommand),
     /// Validate workspace records.
     Validate(ValidateArgs),
     /// Check the local environment and workspace.
@@ -697,6 +702,24 @@ pub(crate) struct DoltTargetArgs {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum ConversationCommand {
+    /// Show one preserved Queen conversation.
+    Show(ConversationShowArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ConversationShowArgs {
+    /// Canonical lowercase UUIDv7 of the registered Queen.
+    #[arg(long, value_name = "UUID", allow_negative_numbers = true)]
+    pub(crate) bot: Option<OsString>,
+    /// Canonical lowercase UUIDv7 of the preserved conversation.
+    #[arg(long, value_name = "UUID", allow_negative_numbers = true)]
+    pub(crate) id: Option<OsString>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Subcommand)]
 pub(crate) enum AreaCommand {
     /// List committed root Areas or the direct children of one Area.
     List(AreaListArgs),
@@ -735,6 +758,44 @@ pub(crate) struct AreaShowArgs {
     /// Canonical lowercase UUIDv7 Area selector.
     #[arg(value_name = "ID", allow_negative_numbers = true)]
     pub(crate) area: String,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ResourceCommand {
+    /// List committed Resource metadata in one explicit scope.
+    List(ResourceListArgs),
+    /// Show one committed Resource and its stored URI.
+    Show(ResourceShowArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ResourceListArgs {
+    /// Select Resources across the workspace.
+    #[arg(long)]
+    pub(crate) all: bool,
+    /// Select Resources directly linked to this Area UUIDv7.
+    #[arg(long, value_name = "ID", allow_negative_numbers = true)]
+    pub(crate) area: Option<String>,
+    /// Select Resources directly linked to this Issue UUIDv7.
+    #[arg(long, value_name = "ID", allow_negative_numbers = true)]
+    pub(crate) issue: Option<String>,
+    /// Page size (default 25, maximum 100).
+    #[arg(long, default_value = "25", allow_negative_numbers = true)]
+    pub(crate) limit: String,
+    /// Continue from the previous page's next_cursor.
+    #[arg(long)]
+    pub(crate) cursor: Option<String>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct ResourceShowArgs {
+    /// Canonical lowercase UUIDv7 Resource selector.
+    #[arg(value_name = "ID", allow_negative_numbers = true)]
+    pub(crate) resource: String,
     #[command(flatten)]
     pub(crate) target: DoltTargetArgs,
 }
@@ -828,16 +889,28 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
         return project;
     }
     let mut config_error_matches = None;
-    let matches = match cli.clone().try_get_matches_from(&args).or_else(|error| {
-        match error.kind() {
-            ErrorKind::ValueValidation => retry_issue_query(&cli, &args)
-                .map(Ok)
-                .or_else(|| retry_config_show(&cli, &args, &mut config_error_matches)),
-            ErrorKind::UnknownArgument => retry_config_show(&cli, &args, &mut config_error_matches),
-            _ => None,
-        }
-        .unwrap_or(Err(error))
-    }) {
+    let resource = resource_parser(&cli, &args);
+    let (parsed, resource_matches) = if let Some(resource) = resource {
+        cli = resource.cli;
+        (resource.parsed, resource.partial)
+    } else {
+        (
+            cli.clone().try_get_matches_from(&args).or_else(|error| {
+                match error.kind() {
+                    ErrorKind::ValueValidation => retry_issue_query(&cli, &args)
+                        .map(Ok)
+                        .or_else(|| retry_config_show(&cli, &args, &mut config_error_matches)),
+                    ErrorKind::UnknownArgument => {
+                        retry_config_show(&cli, &args, &mut config_error_matches)
+                    }
+                    _ => None,
+                }
+                .unwrap_or(Err(error))
+            }),
+            None,
+        )
+    };
+    let matches = match parsed {
         Ok(matches) => matches,
         Err(error)
             if matches!(
@@ -856,9 +929,11 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 }
                 _ => None,
             };
-            let partial = config_error_matches
+            let partial = resource_matches
+                .or(config_error_matches)
                 .or(area_matches)
                 .or_else(|| retry_bot_failure(&cli, &args, error.kind()))
+                .or_else(|| retry_conversation_failure(&cli, &args, error.kind()))
                 .or_else(|| {
                     cli.clone()
                         .ignore_errors(true)
@@ -902,8 +977,16 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
         let leaf_options =
             CommonArgs::from_arg_matches(leaf).map_err(|error| safe_parse_message(error.kind()))?;
         let common = root.resolve(leaf_options)?;
-        let Cli { mut command } =
-            Cli::from_arg_matches(&matches).map_err(|error| safe_parse_message(error.kind()))?;
+        let mut command = if let Some(("resource", resource)) = matches.subcommand() {
+            Command::Resource(
+                ResourceCommand::from_arg_matches(resource)
+                    .map_err(|error| safe_parse_message(error.kind()))?,
+            )
+        } else {
+            Cli::from_arg_matches(&matches)
+                .map_err(|error| safe_parse_message(error.kind()))?
+                .command
+        };
         if common.contract == Contract::V2
             && let Command::Bot(BotCommand::List { page, .. }) = &mut command
             && leaf.value_source("limit") == Some(clap::parser::ValueSource::DefaultValue)
@@ -1152,6 +1235,113 @@ fn recover_unknown_long(
     (recovered.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine)).then_some(matches)
 }
 
+struct ResourceParse {
+    cli: clap::Command,
+    parsed: Result<ArgMatches, clap::Error>,
+    partial: Option<ArgMatches>,
+}
+
+fn resource_parser(cli: &clap::Command, args: &[OsString]) -> Option<ResourceParse> {
+    if !args.iter().any(|arg| arg == "resource") {
+        return None;
+    }
+    // Only select this extension after Clap has recognized the Resource domain
+    // and contract 2. Contract 1 uses the original command tree and errors.
+    let extended = cli
+        .clone()
+        .subcommand(add_leaf_options(ResourceCommand::augment_subcommands(
+            clap::Command::new("resource")
+                .subcommand_required(true)
+                .hide(true),
+        )));
+    let parsed = extended.clone().try_get_matches_from(args);
+    let partial = if parsed.is_err() {
+        let recovery =
+            resource_error_options(extended.clone()).mut_subcommand("resource", |domain| {
+                // List options on show still have known token boundaries.
+                let list_options = domain
+                    .find_subcommand("list")
+                    .expect("Resource list command")
+                    .get_arguments()
+                    .filter(|arg| {
+                        matches!(
+                            arg.get_id().as_str(),
+                            "all" | "area" | "issue" | "limit" | "cursor"
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                resource_help_probe(domain)
+                    .mut_subcommand("list", resource_error_options)
+                    .mut_subcommand("show", |show| {
+                        resource_error_options(show.args(list_options))
+                    })
+            });
+        recovery.ignore_errors(true).try_get_matches_from(args).ok()
+    } else {
+        None
+    };
+    let matches = parsed.as_ref().ok().or(partial.as_ref())?;
+    let domain = matches.subcommand_matches("resource")?;
+    let leaf = domain.subcommand().map(|(_, leaf)| leaf);
+    (requested_contract(Some(matches), leaf) == Contract::V2).then_some(ResourceParse {
+        cli: extended,
+        parsed,
+        partial,
+    })
+}
+
+fn resource_error_options(command: clap::Command) -> clap::Command {
+    // Recover only output selection. Keep Clap's token boundaries, including
+    // attached literal values and everything after the end-of-options marker.
+    resource_help_probe(command)
+        .args_override_self(true)
+        .mut_args(|arg| {
+            let arg = match arg.get_id().as_str() {
+                "json" => {
+                    // A bare switch has an empty occurrence. Keep attached
+                    // values inert and retain all independent occurrences.
+                    return arg
+                        .action(ArgAction::Append)
+                        .overrides_with(clap::builder::Resettable::Reset)
+                        .value_parser(OsStringValueParser::new())
+                        .num_args(0..=1)
+                        .require_equals(true);
+                }
+                "at" | "project" => arg.value_parser(StringValueParser::new()),
+                "format" => arg.value_parser(StringValueParser::new().map(|value| {
+                    if value == "json" {
+                        Format::Json
+                    } else {
+                        Format::Text
+                    }
+                })),
+                _ => arg,
+            };
+            if arg.is_positional() || arg.get_id() == "resource_help_probe" {
+                arg
+            } else if arg.get_action().takes_values() {
+                arg.allow_negative_numbers(true).num_args(0..=1)
+            } else {
+                // Recover from a malformed attached flag value without
+                // consuming a subsequent token.
+                arg.action(ArgAction::Set)
+                    .value_parser(StringValueParser::new())
+                    .num_args(0..=1)
+                    .require_equals(true)
+            }
+        })
+}
+
+fn resource_help_probe(command: clap::Command) -> clap::Command {
+    command.disable_help_flag(true).arg(
+        Arg::new("resource_help_probe")
+            .short('h')
+            .long("help")
+            .action(ArgAction::SetTrue),
+    )
+}
+
 fn retry_issue_query(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {
     // A malformed Project must reach the v2 UUID check after Clap has read
     // the contract and format. Keep the original parser for all other commands.
@@ -1269,6 +1459,78 @@ fn retry_bot_failure(
         .then_some(matches)
 }
 
+fn retry_conversation_failure(
+    cli: &clap::Command,
+    args: &[OsString],
+    kind: ErrorKind,
+) -> Option<ArgMatches> {
+    if !matches!(
+        kind,
+        ErrorKind::UnknownArgument
+            | ErrorKind::ArgumentConflict
+            | ErrorKind::ValueValidation
+            | ErrorKind::InvalidValue
+            | ErrorKind::InvalidUtf8
+            | ErrorKind::TooManyValues
+    ) {
+        return None;
+    }
+    const SCOPED_VALUES: &[&str] = &["workspace", "project", "project-root", "at"];
+    const LEAF_VALUES: &[&str] = &["bot", "id", "workspace-id", "database", "port"];
+    let recover_metadata = |command: clap::Command, leaf: bool| {
+        command.mut_args(|arg| {
+            let Some(long) = arg.get_long() else {
+                return arg;
+            };
+            if !SCOPED_VALUES.contains(&long)
+                && !(leaf && LEAF_VALUES.contains(&long))
+                && long != "authority"
+            {
+                return arg;
+            }
+            let attached_only = long == "authority";
+            arg.action(ArgAction::Append)
+                .value_parser(OsStringValueParser::new())
+                .num_args(0..=1)
+                .require_equals(attached_only)
+        })
+    };
+    let retry = recover_metadata(cli.clone(), false)
+        .mut_subcommand("conversation", |conversation| {
+            conversation.mut_subcommand("show", |show| recover_metadata(show, true))
+        });
+    // Join a split single-dash value only after a known value-taking option.
+    // Clap still recognizes all long options, equals values and the -- boundary.
+    // These matches supply output metadata only. The original error is retained.
+    let mut args = args.iter().cloned().peekable();
+    let mut normalized = Vec::new();
+    normalized.extend(args.next());
+    while let Some(mut arg) = args.next() {
+        if arg == "--" {
+            normalized.push(arg);
+            normalized.extend(args);
+            break;
+        }
+        if arg
+            .to_str()
+            .and_then(|arg| arg.strip_prefix("--"))
+            .is_some_and(|name| SCOPED_VALUES.contains(&name) || LEAF_VALUES.contains(&name))
+            && args.peek().is_some_and(
+                |value| matches!(value.as_encoded_bytes(), [b'-', next, ..] if *next != b'-'),
+            )
+        {
+            arg.push("=");
+            arg.push(args.next().expect("peeked selector value"));
+        }
+        normalized.push(arg);
+    }
+    let matches = retry.try_get_matches_from(normalized).ok()?;
+    let (command, leaf) = matched_leaf(cli, &matches)?;
+    (command == "conversation show"
+        && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+        .then_some(matches)
+}
+
 fn retry_area_read(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {
     // Recover the output options for the original error. A forbidden Project
     // or negative cursor can stop the initial parse before it sees them.
@@ -1331,6 +1593,13 @@ fn usage_for(cli: &mut clap::Command, matches: Option<&ArgMatches>) -> clap::bui
 fn requested_format(root: Option<&ArgMatches>, leaf: Option<&ArgMatches>) -> Format {
     let requested_json = |args: &ArgMatches| {
         args.try_get_one::<bool>("json").ok().flatten() == Some(&true)
+            || args
+                .try_get_occurrences::<OsString>("json")
+                .ok()
+                .flatten()
+                .is_some_and(|mut occurrences| {
+                    occurrences.any(|mut values| values.next().is_none())
+                })
             || args
                 .try_get_many::<Format>("format")
                 .ok()
@@ -1469,7 +1738,24 @@ impl Command {
             return match self {
                 Self::Validate(args) => args.validate_dolt_selection(common),
                 Self::Area(command) => command.validate_dolt_selection(common),
+                Self::Resource(command) => command.validate_dolt_selection(common),
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
+                Self::Conversation(ConversationCommand::Show(args)) => {
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Conversation show requires --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Conversation show accepts only explicit workspace and conversation selection.",
+                        );
+                    }
+                    Ok(())
+                }
                 Self::Issue(
                     IssueCommand::List(args)
                     | IssueCommand::Ready(args)
@@ -1499,6 +1785,7 @@ impl Command {
             }
             Self::Area(_) => Err("Area commands require --contract 2."),
             Self::Issue(_) => Err("Issue commands require --contract 2."),
+            Self::Conversation(_) => Err("Conversation commands require --contract 2."),
             Self::Bot(command) => command.validate(common),
             Self::Validate(args) => {
                 if args.all || args.target.has_any() {
@@ -1611,6 +1898,23 @@ impl AreaCommand {
         )?;
         if !target.has_all() {
             return Err("Dolt Area reads require --workspace-id, --database, and --port.");
+        }
+        Ok(())
+    }
+}
+
+impl ResourceCommand {
+    fn validate_dolt_selection(&self, common: &CommonOptions) -> Result<(), &'static str> {
+        let target = match self {
+            Self::List(args) => &args.target,
+            Self::Show(args) => &args.target,
+        };
+        target.validate_common(
+            common,
+            "Dolt Resource reads accept only an explicit local database and workspace ID.",
+        )?;
+        if !target.has_all() {
+            return Err("Dolt Resource reads require --workspace-id, --database, and --port.");
         }
         Ok(())
     }

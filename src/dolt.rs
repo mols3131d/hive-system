@@ -1,13 +1,17 @@
 pub(crate) mod area;
 pub(crate) mod artifact;
 pub(crate) mod bot;
+#[cfg(unix)]
+mod conversation;
 mod graph;
 mod issue;
 mod issue_list;
 mod issue_readiness;
 mod project;
 mod records;
+pub(crate) mod resource;
 
+use std::ffi::OsStr;
 use std::num::NonZeroU16;
 use std::time::Duration;
 
@@ -16,7 +20,9 @@ use mysql::{Conn, OptsBuilder, Params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::cli::{DoltTargetArgs, IssueShowArgs, ValidateArgs};
+use crate::cli::{
+    CommonOptions, ConversationShowArgs, DoltTargetArgs, IssueShowArgs, ValidateArgs,
+};
 use crate::error::{ErrorCode, HiveError};
 
 pub(crate) use issue::show as issue_show;
@@ -53,6 +59,42 @@ impl DoltFailure {
             error,
         })
     }
+}
+
+pub(crate) fn conversation_show(
+    common: &CommonOptions,
+    args: &ConversationShowArgs,
+) -> Result<DoltSuccess, Box<DoltFailure>> {
+    let bot_id = conversation_selector(args.bot.as_deref(), "--bot")?;
+    let conversation_id = conversation_selector(args.id.as_deref(), "--id")?;
+    #[cfg(unix)]
+    {
+        conversation::read(common, args, bot_id, conversation_id)
+            .map_err(DoltFailure::without_context)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (common, bot_id, conversation_id);
+        Err(DoltFailure::without_context(HiveError::new(
+            ErrorCode::NotImplemented,
+            "Conversation inspection is unavailable on this platform.",
+        )))
+    }
+}
+
+fn conversation_selector<'a>(
+    value: Option<&'a OsStr>,
+    flag: &str,
+) -> Result<&'a str, Box<DoltFailure>> {
+    value
+        .and_then(OsStr::to_str)
+        .filter(|id| is_uuid_v7(id))
+        .ok_or_else(|| {
+            DoltFailure::without_context(HiveError::new(
+                ErrorCode::InvalidArgument,
+                format!("Supply {flag} as a canonical lowercase UUIDv7."),
+            ))
+        })
 }
 
 pub(crate) fn validate(args: &ValidateArgs) -> Result<DoltSuccess, Box<DoltFailure>> {

@@ -10,8 +10,8 @@ mod output;
 use std::process::ExitCode;
 
 use cli::{
-    AreaCommand, BotCommand, Command, ConfigCommand, Contract, DoltArtifactCommand, Invocation,
-    IssueCommand, ParseFailure,
+    AreaCommand, BotCommand, Command, ConfigCommand, Contract, ConversationCommand,
+    DoltArtifactCommand, Invocation, IssueCommand, ParseFailure, ResourceCommand,
 };
 use error::{ErrorCode, HiveError};
 
@@ -109,6 +109,8 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
+        Command::Resource(ResourceCommand::List(args)) => dolt::resource::list(&args),
+        Command::Resource(ResourceCommand::Show(args)) => dolt::resource::show(&args),
         Command::ProjectRead(args) => dolt::project_read(&args),
         Command::Bot(BotCommand::List {
             target,
@@ -119,6 +121,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         }) => dolt::bot::list(&target, status.as_deref(), page.limit, cursor.as_deref()),
         Command::Bot(BotCommand::Show { target, bot_id }) => dolt::bot::show(&target, &bot_id),
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
+        Command::Conversation(ConversationCommand::Show(args)) => {
+            dolt::conversation_show(&invocation.common, &args)
+        }
         Command::Issue(IssueCommand::List(args)) => dolt::issue_list(
             &args,
             invocation.common.project.as_ref(),
