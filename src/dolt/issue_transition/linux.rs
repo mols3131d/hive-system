@@ -3,19 +3,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
-use crate::cli::{CommonOptions, IssueTransitionArgs};
+use crate::cli::{
+    CommonOptions, IssueReleaseArgs, IssueStopArgs, IssueSubmitArgs, IssueTransitionArgs,
+};
 use crate::error::{ErrorCode, HiveError};
 
 use super::super::{
-    DoltSuccess, DoltTarget, MAX_ROWS_PER_TABLE, Snapshot, context_workflow as workflow,
-    is_commit_hash, is_uuid, is_uuid_v7,
+    DoltSuccess, DoltTarget, MAX_ROWS_PER_TABLE, Snapshot,
+    context_evidence::read_evidence_bytes,
+    context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7,
     issue_readiness::{Blocker, NON_WHITESPACE},
     issue_writer::{
         self, Decision, Kind, Mutation, StagedMutation, WriteIdentity, digest, invalid,
         new_uuid_v7, valid_revision,
     },
     read_error,
-    receipt_history::{HistoricalReceipt, verify_delta},
+    receipt_history::{HistoricalReceipt, valid_sha256, verify_delta},
     records::{IssueStatus, is_issue_type},
     scope::{require_active_area, require_active_area_at},
 };
@@ -26,6 +29,12 @@ pub(in crate::dolt) enum Operation {
     Select,
     #[serde(rename = "issue.claim")]
     Claim,
+    #[serde(rename = "issue.release")]
+    Release,
+    #[serde(rename = "issue.recover")]
+    Recover,
+    #[serde(rename = "issue.submit")]
+    Submit,
 }
 
 impl Operation {
@@ -33,6 +42,9 @@ impl Operation {
         match kind {
             "issue.select" => Some(Self::Select),
             "issue.claim" => Some(Self::Claim),
+            "issue.release" => Some(Self::Release),
+            "issue.recover" => Some(Self::Recover),
+            "issue.submit" => Some(Self::Submit),
             _ => None,
         }
     }
@@ -41,6 +53,9 @@ impl Operation {
         match self {
             Self::Select => "issue.select",
             Self::Claim => "issue.claim",
+            Self::Submit => "issue.submit",
+            Self::Recover => "issue.recover",
+            Self::Release => "issue.release",
         }
     }
 
@@ -48,6 +63,8 @@ impl Operation {
         match self {
             Self::Select => ("backlog", "todo"),
             Self::Claim => ("todo", "in-progress"),
+            Self::Release | Self::Recover => ("in-progress", "todo"),
+            Self::Submit => ("in-progress", "review"),
         }
     }
 }
@@ -60,6 +77,51 @@ struct EvidenceRefs {
     revision: String,
     source_ref: String,
     issuer_ref: String,
+}
+
+const MAX_REASON_BYTES: usize = 1024;
+const MAX_RESULT_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StopKind {
+    ExecutionStopped,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StopEvidence {
+    version: u8,
+    kind: StopKind,
+    evidence_ref: String,
+    workspace_id: String,
+    issue_id: String,
+    claim_id: String,
+    holder_ref: String,
+    source_ref: String,
+    observed_at: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryRole {
+    Owner,
+    Reviewer,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryReview {
+    role: RecoveryRole,
+    reviewer_ref: String,
+    reviewed_at: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Stopped {
+    stop: StopEvidence,
+    body_sha256: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -84,6 +146,26 @@ struct Evidence {
     valid_from: String,
     expires_at: String,
     withdrawn: bool,
+    #[serde(
+        default,
+        deserialize_with = "optional_object",
+        skip_serializing_if = "Option::is_none"
+    )]
+    stop: Option<StopEvidence>,
+    #[serde(
+        default,
+        deserialize_with = "optional_object",
+        skip_serializing_if = "Option::is_none"
+    )]
+    recovery_review: Option<RecoveryReview>,
+}
+
+fn optional_object<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    Option::<&serde_json::value::RawValue>::deserialize(deserializer)?
+        .map(workflow::parse_json_object)
+        .transpose()
 }
 
 impl Evidence {
@@ -108,6 +190,15 @@ enum Effect {
         claim_id: String,
         holder_ref: String,
     },
+    #[serde(rename = "issue.release")]
+    Release { stopped: Stopped },
+    #[serde(rename = "issue.recover")]
+    Recover { stopped: Stopped },
+    #[serde(rename = "issue.submit")]
+    Submit {
+        stopped: Stopped,
+        result_evidence_ref: String,
+    },
 }
 
 impl Effect {
@@ -115,16 +206,38 @@ impl Effect {
         match self {
             Self::Select {} => Operation::Select,
             Self::Claim { .. } => Operation::Claim,
+            Self::Release { .. } => Operation::Release,
+            Self::Recover { .. } => Operation::Recover,
+            Self::Submit { .. } => Operation::Submit,
         }
     }
 
     fn claim(&self) -> Option<(&str, &str)> {
         match self {
-            Self::Select {} => None,
             Self::Claim {
                 claim_id,
                 holder_ref,
             } => Some((claim_id, holder_ref)),
+            _ => None,
+        }
+    }
+
+    fn stopped(&self) -> Option<&Stopped> {
+        match self {
+            Self::Release { stopped }
+            | Self::Recover { stopped }
+            | Self::Submit { stopped, .. } => Some(stopped),
+            Self::Select { .. } | Self::Claim { .. } => None,
+        }
+    }
+
+    fn result_evidence_ref(&self) -> Option<&str> {
+        match self {
+            Self::Submit {
+                result_evidence_ref,
+                ..
+            } => Some(result_evidence_ref),
+            _ => None,
         }
     }
 }
@@ -155,10 +268,30 @@ struct Request<'a> {
     id: &'a str,
     expected: &'a str,
     holder: Option<&'a str>,
+    stopped: Option<&'a Stopped>,
+    result_evidence_ref: Option<&'a str>,
 }
 
 impl Request<'_> {
     fn fingerprint(&self) -> String {
+        if let Some(stopped) = self.stopped {
+            return digest(
+                json!([
+                    1,
+                    self.operation,
+                    self.workspace,
+                    self.area,
+                    self.issue,
+                    self.actor,
+                    self.expected,
+                    stopped.stop,
+                    stopped.body_sha256,
+                    self.result_evidence_ref,
+                ])
+                .to_string()
+                .as_bytes(),
+            );
+        }
         digest(
             json!([
                 1,
@@ -207,6 +340,43 @@ impl Request<'_> {
         {
             return Err(workflow::unverified());
         }
+        if self.stopped.map(|stopped| &stopped.stop) != evidence.stop.as_ref() {
+            return Err(workflow::unverified());
+        }
+        if let Some(stopped) = self.stopped {
+            let stop = &stopped.stop;
+            if stop.version != 1
+                || stop.workspace_id != self.workspace
+                || stop.issue_id != self.issue
+                || Some(stop.holder_ref.as_str()) != self.holder
+                || !is_uuid_v7(&stop.claim_id)
+                || ![&stop.holder_ref, &stop.source_ref, &stop.evidence_ref]
+                    .into_iter()
+                    .all(|value| workflow::valid_ref(value))
+                || self
+                    .result_evidence_ref
+                    .is_some_and(|value| !workflow::valid_ref(value) || value == stop.evidence_ref)
+                || !valid_sha256(&stopped.body_sha256)
+            {
+                return Err(workflow::unverified());
+            }
+            let observed =
+                workflow::parse_time(&stop.observed_at).ok_or_else(workflow::unverified)?;
+            if observed > now {
+                return Err(workflow::unverified());
+            }
+            match (self.operation, &evidence.recovery_review) {
+                (Operation::Recover, Some(review))
+                    if review.reviewer_ref == evidence.issuer_ref
+                        && workflow::parse_time(&review.reviewed_at)
+                            .is_some_and(|time| observed <= time && time <= now) => {}
+                (Operation::Release | Operation::Submit, None) if self.actor == stop.holder_ref => {
+                }
+                _ => return Err(workflow::unverified()),
+            }
+        } else if evidence.recovery_review.is_some() {
+            return Err(workflow::unverified());
+        }
         Ok(())
     }
 }
@@ -215,12 +385,108 @@ struct Transition<'a> {
     request: Request<'a>,
     fingerprint: String,
     decision: Decision<Evidence>,
+    body: String,
 }
 
 pub(super) fn write(
     common: &CommonOptions,
     args: &IssueTransitionArgs,
     holder: Option<&str>,
+) -> Result<DoltSuccess, HiveError> {
+    let operation = if holder.is_some() {
+        Operation::Claim
+    } else {
+        Operation::Select
+    };
+    execute(common, args, holder, operation, None)
+}
+
+struct StoppedInput<'a> {
+    args: &'a IssueStopArgs,
+    body: String,
+    result_evidence_ref: Option<&'a str>,
+}
+
+pub(super) fn release(
+    common: &CommonOptions,
+    args: &IssueReleaseArgs,
+    recovery: bool,
+) -> Result<DoltSuccess, HiveError> {
+    if !valid_reason(&args.reason) {
+        return Err(invalid(
+            "Supply a nonblank reason of at most 1024 bytes without control characters.",
+        ));
+    }
+    execute_stopped(
+        common,
+        if recovery {
+            Operation::Recover
+        } else {
+            Operation::Release
+        },
+        StoppedInput {
+            args: &args.stopped,
+            body: args.reason.clone(),
+            result_evidence_ref: None,
+        },
+    )
+}
+
+pub(super) fn submit(
+    common: &CommonOptions,
+    args: &IssueSubmitArgs,
+) -> Result<DoltSuccess, HiveError> {
+    if !workflow::valid_ref(&args.evidence) {
+        return Err(invalid("Supply a valid result evidence reference."));
+    }
+    let bytes = read_evidence_bytes(&args.file, MAX_RESULT_BYTES)?;
+    let body =
+        String::from_utf8(bytes).map_err(|_| invalid("The submission file must be UTF-8."))?;
+    if !valid_result(&body) {
+        return Err(invalid(
+            "Supply a nonblank UTF-8 submission file without NUL bytes.",
+        ));
+    }
+    execute_stopped(
+        common,
+        Operation::Submit,
+        StoppedInput {
+            args: &args.stopped,
+            body,
+            result_evidence_ref: Some(&args.evidence),
+        },
+    )
+}
+
+fn valid_reason(body: &str) -> bool {
+    body.len() <= MAX_REASON_BYTES && !body.trim().is_empty() && !body.chars().any(char::is_control)
+}
+
+fn valid_result(body: &str) -> bool {
+    body.len() <= MAX_RESULT_BYTES && !body.trim().is_empty() && !body.contains('\0')
+}
+
+fn execute_stopped(
+    common: &CommonOptions,
+    operation: Operation,
+    input: StoppedInput<'_>,
+) -> Result<DoltSuccess, HiveError> {
+    let args = &input.args.claim_args;
+    execute(
+        common,
+        &args.transition,
+        Some(&args.holder),
+        operation,
+        Some(input),
+    )
+}
+
+fn execute(
+    common: &CommonOptions,
+    args: &IssueTransitionArgs,
+    holder: Option<&str>,
+    operation: Operation,
+    input: Option<StoppedInput<'_>>,
 ) -> Result<DoltSuccess, HiveError> {
     let target = DoltTarget::parse(&args.target)?;
     let workspace =
@@ -241,12 +507,32 @@ pub(super) fn write(
         .filter(|(issue, rev)| *issue == args.issue && valid_revision(rev))
         .map(|(_, rev)| rev)
         .ok_or_else(|| invalid("Supply one Issue revision as --if-match ISSUE=REV."))?;
+    let decision: Decision<Evidence> = issue_writer::read_decision(&args.evidence_file)?;
+    let stopped = input
+        .as_ref()
+        .map(|input| {
+            let args = input.args;
+            if !is_uuid_v7(&args.claim) || !workflow::valid_ref(&args.stop_evidence) {
+                return Err(invalid(
+                    "Supply an exact Claim UUIDv7 and a valid stop evidence reference.",
+                ));
+            }
+            let stop = decision
+                .evidence
+                .stop
+                .as_ref()
+                .filter(|stop| {
+                    stop.evidence_ref == args.stop_evidence && stop.claim_id == args.claim
+                })
+                .ok_or_else(workflow::unverified)?;
+            Ok(Stopped {
+                stop: stop.clone(),
+                body_sha256: digest(input.body.as_bytes()),
+            })
+        })
+        .transpose()?;
     let request = Request {
-        operation: if holder.is_some() {
-            Operation::Claim
-        } else {
-            Operation::Select
-        },
+        operation,
         workspace: workspace.workspace_id(),
         area: &args.area,
         issue: &args.issue,
@@ -254,17 +540,20 @@ pub(super) fn write(
         id: &args.request_id,
         expected,
         holder,
+        stopped: stopped.as_ref(),
+        result_evidence_ref: input.as_ref().and_then(|input| input.result_evidence_ref),
     };
     let transition = Transition {
         fingerprint: request.fingerprint(),
         request,
-        decision: issue_writer::read_decision(&args.evidence_file)?,
+        decision,
+        body: input.map(|input| input.body).unwrap_or_default(),
     };
     issue_writer::execute(&workspace, target, &transition)
 }
 
 impl Mutation for Transition<'_> {
-    type Guard = ();
+    type Guard = Option<Claim>;
 
     fn identity(&self) -> WriteIdentity<'_> {
         WriteIdentity {
@@ -308,22 +597,51 @@ impl Mutation for Transition<'_> {
         }
     }
 
-    fn guard(&self, db: &mut Transaction<'_>, _: &mut Snapshot) -> Result<(), HiveError> {
+    fn guard(&self, db: &mut Transaction<'_>, _: &mut Snapshot) -> Result<Self::Guard, HiveError> {
         let request = &self.request;
         let issue = Issue::read(db, request.issue, None)?;
         request.check_issue(&issue)?;
-        request.check_readiness(db, &issue, None)
+        let claim = if request.stopped.is_some() {
+            Claim::read(db, request.issue, None)?
+        } else {
+            None
+        };
+        request.check_readiness(db, &issue, None)?;
+        Ok(claim)
     }
 
     fn stage(
         &self,
         db: &mut Transaction<'_>,
-        (): (),
+        claim: Self::Guard,
         now: OffsetDateTime,
         sql_time: &str,
     ) -> Result<StagedMutation, HiveError> {
         let request = &self.request;
         let (previous_status, status) = request.operation.states();
+        let effect = if let Some(stopped) = request.stopped {
+            request.check_stop(claim.as_ref(), now)?;
+            let stopped = stopped.clone();
+            match request.operation {
+                Operation::Release => Effect::Release { stopped },
+                Operation::Recover => Effect::Recover { stopped },
+                Operation::Submit => Effect::Submit {
+                    stopped,
+                    result_evidence_ref: request
+                        .result_evidence_ref
+                        .ok_or_else(workflow::unverified)?
+                        .to_owned(),
+                },
+                _ => return Err(workflow::unverified()),
+            }
+        } else if let Some(holder) = request.holder {
+            Effect::Claim {
+                claim_id: new_uuid_v7(now)?,
+                holder_ref: holder.to_owned(),
+            }
+        } else {
+            Effect::Select {}
+        };
         let record = Record {
             version: 1,
             transition_id: new_uuid_v7(now)?,
@@ -336,13 +654,7 @@ impl Mutation for Transition<'_> {
             status: status.to_owned(),
             actor_ref: request.actor.to_owned(),
             evidence: self.decision.evidence.references(),
-            effect: match request.holder {
-                None => Effect::Select {},
-                Some(holder) => Effect::Claim {
-                    claim_id: new_uuid_v7(now)?,
-                    holder_ref: holder.to_owned(),
-                },
-            },
+            effect,
         };
         record.require_new_ids(db, None)?;
         db.exec_drop(
@@ -371,12 +683,27 @@ impl Mutation for Transition<'_> {
             )
             .map_err(read_error)?;
         }
+        if let Some(stopped) = record.effect.stopped() {
+            db.exec_drop(
+                "DELETE FROM issue_claims WHERE CAST(issue_id AS BINARY) = ?
+                 AND CAST(claim_id AS BINARY) = ? AND CAST(holder_ref AS BINARY) = ?",
+                (
+                    request.issue,
+                    &stopped.stop.claim_id,
+                    &stopped.stop.holder_ref,
+                ),
+            )
+            .map_err(read_error)?;
+            if db.affected_rows() != 1 {
+                return Err(claim_mismatch());
+            }
+        }
         let kind = self.identity().kind;
         let encoded = issue_writer::encode(&record, kind)?;
         db.exec_drop(
             "INSERT INTO issue_updates (id, issue_id, kind, body, author_ref, created_at, transition_json)
-             VALUES (?, ?, 'transition', '', ?, ?, ?)",
-            (&record.transition_id, request.issue, request.actor, sql_time, &encoded),
+             VALUES (?, ?, 'transition', ?, ?, ?, ?)",
+            (&record.transition_id, request.issue, &self.body, request.actor, sql_time, &encoded),
         ).map_err(read_error)?;
         Ok(StagedMutation {
             record_id: record.issue_id,
@@ -441,6 +768,58 @@ impl Issue {
     }
 }
 
+pub(in crate::dolt) struct Claim {
+    pub(in crate::dolt) id: String,
+    pub(in crate::dolt) holder: String,
+    acquired_at: String,
+}
+
+impl Claim {
+    pub(in crate::dolt) fn read(
+        db: &mut impl Queryable,
+        issue: &str,
+        commit: Option<&str>,
+    ) -> Result<Option<Self>, HiveError> {
+        let at = as_of(commit)?;
+        let rows: Vec<(String, String, String, String)> = db
+            .exec(
+                format!(
+                    "SELECT issue_id, claim_id, holder_ref,
+                     DATE_FORMAT(acquired_at, '%Y-%m-%dT%H:%i:%s.%fZ')
+                     FROM issue_claims{at} WHERE issue_id = ? LIMIT 2"
+                ),
+                (issue,),
+            )
+            .map_err(read_error)?;
+        let mut rows = rows.into_iter();
+        let Some((owner, id, holder, acquired_at)) = rows.next() else {
+            return Ok(None);
+        };
+        if rows.next().is_some()
+            || owner != issue
+            || !is_uuid_v7(&id)
+            || !workflow::valid_ref(&holder)
+            || workflow::parse_time(&acquired_at).is_none()
+        {
+            return Err(invalid_record(
+                "The Issue has invalid or ambiguous Claim metadata.",
+            ));
+        }
+        Ok(Some(Self {
+            id,
+            holder,
+            acquired_at,
+        }))
+    }
+}
+
+fn claim_mismatch() -> HiveError {
+    HiveError::new(
+        ErrorCode::ClaimConflict,
+        "The exact current Claim and holder do not match.",
+    )
+}
+
 impl Request<'_> {
     fn check_issue(&self, issue: &Issue) -> Result<(), HiveError> {
         if issue.area != self.area {
@@ -450,20 +829,20 @@ impl Request<'_> {
         if status.is_none() || !valid_revision(&issue.revision) || !is_issue_type(&issue.kind) {
             return Err(invalid_record("The Issue lifecycle metadata is invalid."));
         }
-        if issue.claimed {
+        if issue.claimed && self.stopped.is_none() {
             return Err(HiveError::new(
                 ErrorCode::ClaimConflict,
                 "The Issue already has a Claim row.",
             ));
         }
-        if status == Some(IssueStatus::InProgress) {
+        if status == Some(IssueStatus::InProgress) && !issue.claimed {
             return Err(invalid_record("An in-progress Issue is missing its Claim."));
         }
         if issue.revision != self.expected {
             return Err(stale());
         }
         if issue.status != self.operation.states().0
-            || (self.operation == Operation::Claim && issue.kind == "epic")
+            || (self.operation != Operation::Select && issue.kind == "epic")
         {
             return Err(HiveError::new(
                 ErrorCode::InvalidTransition,
@@ -487,12 +866,29 @@ impl Request<'_> {
         Ok(())
     }
 
+    fn check_stop(&self, claim: Option<&Claim>, now: OffsetDateTime) -> Result<(), HiveError> {
+        let stop = &self.stopped.ok_or_else(workflow::unverified)?.stop;
+        let claim = claim
+            .filter(|claim| claim.id == stop.claim_id && claim.holder == stop.holder_ref)
+            .ok_or_else(claim_mismatch)?;
+        let acquired = workflow::parse_time(&claim.acquired_at).ok_or_else(workflow::unverified)?;
+        if !workflow::parse_time(&stop.observed_at)
+            .is_some_and(|time| acquired <= time && time <= now)
+        {
+            return Err(workflow::unverified());
+        }
+        Ok(())
+    }
+
     fn check_readiness(
         &self,
         db: &mut impl Queryable,
         issue: &Issue,
         commit: Option<&str>,
     ) -> Result<(), HiveError> {
+        if matches!(self.operation, Operation::Release | Operation::Recover) {
+            return Ok(());
+        }
         let archived = "The Issue's Area ancestry is archived.";
         let active = match commit {
             Some(commit) => require_active_area_at(db, self.area, commit, archived),
@@ -508,7 +904,7 @@ impl Request<'_> {
             }
             other => other?,
         }
-        if issue.hold.is_some() {
+        if self.operation == Operation::Claim && issue.hold.is_some() {
             blockers.push(Blocker::Hold);
         }
         let at = as_of(commit)?;
@@ -648,7 +1044,13 @@ impl Record {
             actor: &self.actor_ref,
             id: &self.request_id,
             expected: &self.previous_issue_revision,
-            holder: self.effect.claim().map(|(_, holder)| holder),
+            holder: self.effect.claim().map(|(_, holder)| holder).or_else(|| {
+                self.effect
+                    .stopped()
+                    .map(|stopped| stopped.stop.holder_ref.as_str())
+            }),
+            stopped: self.effect.stopped(),
+            result_evidence_ref: self.effect.result_evidence_ref(),
         }
     }
 }
@@ -722,6 +1124,12 @@ pub(in crate::dolt) fn verify_effect(
     binding.check_readiness(db, &before, Some(base))?;
     record.require_new_ids(db, Some(base))?;
 
+    if binding.stopped.is_some() {
+        let claim = Claim::read(db, binding.issue, Some(base))?;
+        let created = workflow::parse_time(&receipt.created_at).ok_or_else(workflow::unverified)?;
+        binding.check_stop(claim.as_ref(), created)?;
+    }
+
     if after.area != before.area
         || after.kind != before.kind
         || after.status != record.status
@@ -735,31 +1143,37 @@ pub(in crate::dolt) fn verify_effect(
 
     // Read only the exact update and expected Claim, and compare the complete row.
     let at = as_of(Some(introduced))?;
-    let update: Option<(String, String, bool, String, String, Option<String>)> = db.exec_first(
-        format!("SELECT issue_id, kind, OCTET_LENGTH(body) = 0, author_ref, DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'),
+    type UpdateRow = (
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+    );
+    let update: Option<UpdateRow> = db.exec_first(
+        format!("SELECT issue_id, kind, CASE WHEN OCTET_LENGTH(body) <= ? THEN body END, author_ref, DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'),
                  CASE WHEN OCTET_LENGTH(transition_json) <= ? THEN transition_json END
                  FROM issue_updates{at} WHERE CAST(id AS BINARY) = ?"),
-        (workflow::MAX_DECLARATION_BYTES, &record.transition_id),
+        (if binding.operation == Operation::Submit { MAX_RESULT_BYTES } else { MAX_REASON_BYTES },
+         workflow::MAX_DECLARATION_BYTES, &record.transition_id),
     ).map_err(read_error)?;
-    if !matches!(update, Some((issue, kind, true, actor, created, Some(typed)))
-        if issue == record.issue_id && kind == "transition"
-           && actor == record.actor_ref && created == receipt.created_at && typed == receipt.result)
+    if !matches!(update, Some((issue, kind, Some(body), actor, created, Some(typed)))
+    if issue == record.issue_id && kind == "transition"
+       && actor == record.actor_ref && created == receipt.created_at && typed == receipt.result
+       && match binding.stopped {
+            Some(stopped) => digest(body.as_bytes()) == stopped.body_sha256
+                && if binding.operation == Operation::Submit { valid_result(&body) } else { valid_reason(&body) },
+            None => body.is_empty(),
+       })
     {
         return Err(workflow::unverified());
     }
 
     if let Some((id, holder)) = record.effect.claim() {
-        let claim: Option<(String, String, String)> = db
-            .exec_first(
-                format!(
-                    "SELECT claim_id, holder_ref, DATE_FORMAT(acquired_at, '%Y-%m-%dT%H:%i:%s.%fZ')
-                     FROM issue_claims{at} WHERE CAST(issue_id AS BINARY) = ?"
-                ),
-                (&record.issue_id,),
-            )
-            .map_err(read_error)?;
-        if !matches!(claim, Some((actual_id, actual_holder, acquired))
-            if actual_id == id && actual_holder == holder && acquired == receipt.created_at)
+        let claim = Claim::read(db, &record.issue_id, Some(introduced))?;
+        if !matches!(claim, Some(claim)
+            if claim.id == id && claim.holder == holder && claim.acquired_at == receipt.created_at)
         {
             return Err(workflow::unverified());
         }
@@ -772,6 +1186,8 @@ pub(in crate::dolt) fn verify_effect(
     ];
     if record.effect.operation() == Operation::Claim {
         expected.insert(0, ("issue_claims", 1, 0, 0));
+    } else if binding.stopped.is_some() {
+        expected.insert(0, ("issue_claims", 0, 1, 0));
     }
     verify_delta(db, base, introduced, &expected)?;
     let mut result = json!({
@@ -781,6 +1197,18 @@ pub(in crate::dolt) fn verify_effect(
     if let Some((claim, holder)) = record.effect.claim() {
         result["claim_id"] = json!(claim);
         result["holder_ref"] = json!(holder);
+    }
+    if let Some(stopped) = binding.stopped {
+        result["former_claim_id"] = json!(stopped.stop.claim_id);
+        result["former_holder_ref"] = json!(stopped.stop.holder_ref);
+        result["stop_evidence_ref"] = json!(stopped.stop.evidence_ref);
+        result["request_id"] = json!(record.request_id);
+        result["previous_status"] = json!(record.previous_status);
+        result["previous_issue_revision"] = json!(record.previous_issue_revision);
+        if let Some(reference) = binding.result_evidence_ref {
+            result["result_evidence_ref"] = json!(reference);
+            result["result_sha256"] = json!(stopped.body_sha256);
+        }
     }
     Ok(result)
 }

@@ -274,6 +274,10 @@ pub(crate) enum Command {
     #[command(skip)]
     IssueClaim(IssueClaimArgs),
     #[command(skip)]
+    IssueRelease(IssueReleaseArgs, bool),
+    #[command(skip)]
+    IssueSubmit(IssueSubmitArgs),
+    #[command(skip)]
     IssueDependency(IssueDependencyArgs, bool),
     #[command(skip)]
     Resource(ResourceCommand),
@@ -1300,6 +1304,39 @@ pub(crate) struct IssueClaimArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueStopArgs {
+    #[command(flatten)]
+    pub(crate) claim_args: IssueClaimArgs,
+    /// Exact current Claim UUIDv7.
+    #[arg(long)]
+    pub(crate) claim: String,
+    /// Reference selecting the stop attestation in the decision file.
+    #[arg(long)]
+    pub(crate) stop_evidence: String,
+}
+
+#[derive(Args)]
+pub(crate) struct IssueReleaseArgs {
+    #[command(flatten)]
+    pub(crate) stopped: IssueStopArgs,
+    /// Reason for ending execution responsibility.
+    #[arg(long)]
+    pub(crate) reason: String,
+}
+
+#[derive(Args)]
+pub(crate) struct IssueSubmitArgs {
+    #[command(flatten)]
+    pub(crate) stopped: IssueStopArgs,
+    /// Reference to the submitted result evidence.
+    #[arg(long)]
+    pub(crate) evidence: String,
+    /// UTF-8 Markdown submission.
+    #[arg(long)]
+    pub(crate) file: PathBuf,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueListArgs {
     /// Select Issues across the workspace.
     #[arg(long)]
@@ -1540,6 +1577,21 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             Some(("issue", issue)) if issue.subcommand_name() == Some("claim") => {
                 Command::IssueClaim(
                     IssueClaimArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue))
+                if matches!(issue.subcommand_name(), Some("release" | "recover")) =>
+            {
+                Command::IssueRelease(
+                    IssueReleaseArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                    issue.subcommand_name() == Some("recover"),
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("submit") => {
+                Command::IssueSubmit(
+                    IssueSubmitArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
             }
@@ -1954,6 +2006,22 @@ fn unknown_long_name<'a>(leaf: &clap::Command, invalid: &'a str) -> Option<&'a s
     .then_some(long)
 }
 
+fn unknown_short_name(leaf: &clap::Command, invalid: &str) -> Option<char> {
+    let mut chars = invalid.strip_prefix('-')?.chars();
+    let flag = chars.next()?;
+    (chars.next().is_none()
+        && !matches!(flag, '-' | '=')
+        && !flag.is_whitespace()
+        && !flag.is_control()
+        && !leaf.get_arguments().any(|arg| {
+            arg.get_short() == Some(flag)
+                || arg
+                    .get_all_short_aliases()
+                    .is_some_and(|aliases| aliases.contains(&flag))
+        }))
+    .then_some(flag)
+}
+
 fn recover_context_resolve(
     cli: &clap::Command,
     args: &[OsString],
@@ -1986,21 +2054,7 @@ fn recover_context_resolve(
         let option = if let Some(long) = unknown_long_name(leaf, invalid) {
             Arg::new(format!("recovered_unknown_--{long}")).long(long.to_owned())
         } else {
-            let mut chars = invalid.strip_prefix('-')?.chars();
-            let flag = chars.next()?;
-            if chars.next().is_some()
-                || matches!(flag, '-' | '=')
-                || flag.is_whitespace()
-                || flag.is_control()
-                || leaf.get_arguments().any(|arg| {
-                    arg.get_short() == Some(flag)
-                        || arg
-                            .get_all_short_aliases()
-                            .is_some_and(|aliases| aliases.contains(&flag))
-                })
-            {
-                return None;
-            }
+            let flag = unknown_short_name(leaf, invalid)?;
             Arg::new(format!("recovered_unknown_-{flag}")).short(flag)
         };
         recovered_ids.push(option.get_id().clone());
@@ -2055,7 +2109,13 @@ fn recover_unknown_long(
         ("project", "add-issue")
             | (
                 "issue",
-                "add-dependency" | "remove-dependency" | "select" | "claim"
+                "add-dependency"
+                    | "remove-dependency"
+                    | "select"
+                    | "claim"
+                    | "release"
+                    | "recover"
+                    | "submit"
             )
     );
     if !(named_write
@@ -2075,7 +2135,17 @@ fn recover_unknown_long(
         return None;
     };
     let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
-    let long = unknown_long_name(leaf, invalid)?;
+    const UNKNOWN_OPTION: &str = "recovered_unknown_long";
+    let recovered = if let Some(long) = unknown_long_name(leaf, invalid) {
+        Arg::new(UNKNOWN_OPTION).long(long.to_owned())
+    } else if matches!(
+        (domain, action),
+        ("issue", "release" | "recover" | "submit")
+    ) {
+        Arg::new(UNKNOWN_OPTION).short(unknown_short_name(leaf, invalid)?)
+    } else {
+        return None;
+    };
 
     let workspace_init = (domain, action) == ("workspace", "init");
     let allow_incomplete = named_write || positional_write;
@@ -2089,7 +2159,6 @@ fn recover_unknown_long(
     } else {
         &[accept_value]
     };
-    const UNKNOWN_LONG: &str = "recovered_unknown_long";
     let build_retry = |accept_value: bool| {
         cli.clone().mut_subcommand(domain, |command| {
             command.mut_subcommand(action, |leaf| {
@@ -2099,8 +2168,8 @@ fn recover_unknown_long(
                     leaf
                 };
                 leaf.arg(
-                    Arg::new(UNKNOWN_LONG)
-                        .long(long.to_owned())
+                    recovered
+                        .clone()
                         .num_args(0..=1)
                         .require_equals(!accept_value)
                         .value_parser(OsStringValueParser::new())
@@ -2122,7 +2191,7 @@ fn recover_unknown_long(
         matches
             .subcommand_matches(domain)
             .and_then(|command| command.subcommand_matches(action))
-            .is_some_and(|leaf| leaf.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine))
+            .is_some_and(|leaf| leaf.value_source(UNKNOWN_OPTION) == Some(ValueSource::CommandLine))
     };
     let mut missing = None;
     for &accept_value in modes {
@@ -2177,6 +2246,16 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             .subcommand(add_leaf_options(IssueClaimArgs::augment_args(
                 clap::Command::new("claim").about("Record an exclusive Claim for a ready Issue."),
             )))
+            .subcommand(add_leaf_options(IssueReleaseArgs::augment_args(
+                clap::Command::new("release").about("Release the exact stopped execution Claim."),
+            )))
+            .subcommand(add_leaf_options(IssueReleaseArgs::augment_args(
+                clap::Command::new("recover")
+                    .about("Recover the exact stopped Claim with a reviewed decision."),
+            )))
+            .subcommand(add_leaf_options(IssueSubmitArgs::augment_args(
+                clap::Command::new("submit").about("Submit a stopped execution for review."),
+            )))
             .subcommand(add_leaf_options(IssueDependencyArgs::augment_args(
                 clap::Command::new("add-dependency").about("Add an exact Issue prerequisite."),
             )))
@@ -2195,6 +2274,9 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .mut_subcommand("update", extended_error_options)
                 .mut_subcommand("select", extended_error_options)
                 .mut_subcommand("claim", extended_error_options)
+                .mut_subcommand("release", extended_error_options)
+                .mut_subcommand("recover", extended_error_options)
+                .mut_subcommand("submit", extended_error_options)
                 .mut_subcommand("add-dependency", extended_error_options)
                 .mut_subcommand("remove-dependency", extended_error_options)
         });
@@ -2212,8 +2294,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
     let leaf = match partial.subcommand() {
         Some(("issue", issue)) => match issue.subcommand() {
             Some((
-                "note" | "create" | "update" | "select" | "claim" | "add-dependency"
-                | "remove-dependency",
+                "note" | "create" | "update" | "select" | "claim" | "release" | "recover"
+                | "submit" | "add-dependency" | "remove-dependency",
                 leaf,
             )) => Some(leaf),
             None => None,
@@ -3117,6 +3199,31 @@ impl Command {
                 Self::IssueSelect(args)
                 | Self::IssueClaim(IssueClaimArgs {
                     transition: args, ..
+                })
+                | Self::IssueRelease(
+                    IssueReleaseArgs {
+                        stopped:
+                            IssueStopArgs {
+                                claim_args:
+                                    IssueClaimArgs {
+                                        transition: args, ..
+                                    },
+                                ..
+                            },
+                        ..
+                    },
+                    _,
+                )
+                | Self::IssueSubmit(IssueSubmitArgs {
+                    stopped:
+                        IssueStopArgs {
+                            claim_args:
+                                IssueClaimArgs {
+                                    transition: args, ..
+                                },
+                            ..
+                        },
+                    ..
                 }) => {
                     if common.workspace.is_none() || !args.target.has_all() {
                         return Err(
@@ -3248,6 +3355,8 @@ impl Command {
             | Self::IssueUpdate(_)
             | Self::IssueSelect(_)
             | Self::IssueClaim(_)
+            | Self::IssueRelease(_, _)
+            | Self::IssueSubmit(_)
             | Self::IssueDependency(_, _) => Err("Issue commands require --contract 2."),
             Self::Backup(_) => Err("Backup commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),

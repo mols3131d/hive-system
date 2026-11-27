@@ -87,6 +87,7 @@ impl Kind {
             Self::BotRegister => "Bot register",
             Self::Transition(issue_transition::Operation::Select) => "Issue select",
             Self::Transition(issue_transition::Operation::Claim) => "Issue claim",
+            Self::Transition(operation) => operation.name(),
         }
     }
 
@@ -105,6 +106,12 @@ impl Kind {
             Self::Note | Self::Transition(issue_transition::Operation::Select) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
+                ("operation_receipts", "INSERT"),
+            ],
+            Self::Transition(_) => &[
+                ("issues", "UPDATE"),
+                ("issue_updates", "INSERT"),
+                ("issue_claims", "DELETE"),
                 ("operation_receipts", "INSERT"),
             ],
             Self::Update => &[("issues", "UPDATE"), ("operation_receipts", "INSERT")],
@@ -1102,13 +1109,16 @@ mod tests {
         for (name, operation) in [
             ("issue.select", issue_transition::Operation::Select),
             ("issue.claim", issue_transition::Operation::Claim),
+            ("issue.release", issue_transition::Operation::Release),
+            ("issue.recover", issue_transition::Operation::Recover),
+            ("issue.submit", issue_transition::Operation::Submit),
         ] {
             value["kind"] = json!(name);
             let marker = read(&value).unwrap();
             assert!(matches!(marker.operation(), Ok(Kind::Transition(kind)) if kind == operation));
             assert_eq!(json!(marker), value);
         }
-        value["kind"] = json!("issue.release");
+        value["kind"] = json!("issue.submit-epic");
         assert!(read(&value).is_err());
 
         let legacy_bytes = serde_json::to_string(&legacy).unwrap();
@@ -1117,12 +1127,7 @@ mod tests {
 
         let mut project = value;
         project["version"] = json!(4);
-        project["project_id"] = project
-            .as_object_mut()
-            .unwrap()
-            .remove("artifact_id")
-            .unwrap();
-        project.as_object_mut().unwrap().remove("issue_id");
+        project["project_id"] = project.as_object_mut().unwrap().remove("issue_id").unwrap();
         project["kind"] = json!("project.add-issue");
         let linked = read(&project).unwrap();
         assert!(matches!(linked.operation(), Ok(Kind::ProjectAddIssue)));

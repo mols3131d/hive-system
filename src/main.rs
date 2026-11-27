@@ -219,6 +219,10 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::IssueClaim(args) => {
             dolt::issue_transition::write(&invocation.common, &args.transition, Some(&args.holder))
         }
+        Command::IssueRelease(args, recovery) => {
+            dolt::issue_transition::release(&invocation.common, &args, recovery)
+        }
+        Command::IssueSubmit(args) => dolt::issue_transition::submit(&invocation.common, &args),
         Command::IssueDependency(args, add) => {
             dolt::issue_dependency::write(&invocation.common, &args, add)
         }
