@@ -103,7 +103,7 @@ fn revision(reader: &mut Conn, issue: &str) -> String {
         .unwrap()
 }
 
-fn marker_for(state: &Path, session: u64, edit: &Edit, receipt: &issue_update::Receipt) -> Value {
+fn marker_for(state: &Path, session: u64, edit: &Edit, receipt: &Receipt) -> Value {
     json!({
         "version": 2, "kind": receipt.0, "workspace_id": id(1),
         "launch_nonce": launch_nonce(state), "session_id": session, "request_id": edit.request,
@@ -212,7 +212,7 @@ pub(super) fn exercise(
     }
     assert_eq!(removed["data"]["base_commit"], initial.0);
     let removed_state = storage_state(&mut reader);
-    let removed_receipt = issue_update::stored_receipt(&mut reader, &remove.request);
+    let removed_receipt = stored_receipt(&mut reader, &remove.request);
     let present = |reader: &mut Conn| -> u64 {
         reader.exec_first(
             "SELECT COUNT(*) FROM issue_dependencies WHERE issue_id = ? AND prerequisite_id = ?",
@@ -231,7 +231,7 @@ pub(super) fn exercise(
         .unwrap();
     writer.query_drop("START TRANSACTION").unwrap();
     let pending = marker_for(state, session, &remove, &removed_receipt);
-    issue_update::record_intent(state, &pending);
+    record_intent(state, &pending);
     let marker = state.join("pending-request.json");
     let add = Edit::new("add-dependency", 152, after.clone());
     assert_eq!(edit(&add, 8)["error"]["code"], "COMMIT_UNCERTAIN");
@@ -258,12 +258,12 @@ pub(super) fn exercise(
     );
     assert_eq!(storage_state(&mut reader), added_state);
 
-    let receipt = issue_update::stored_receipt(&mut reader, &add.request);
+    let receipt = stored_receipt(&mut reader, &add.request);
     let session = reader
         .query_first("SELECT CONNECTION_ID()")
         .unwrap()
         .unwrap();
-    issue_update::record_intent(state, &marker_for(state, session, &add, &receipt));
+    record_intent(state, &marker_for(state, session, &add, &receipt));
     drop(reader);
     let stop = run(&["workspace", "stop"], 0);
     assert_eq!(stop["data"]["process_exit"], "pidfd_verified");
@@ -327,7 +327,7 @@ pub(super) fn exercise(
     rollback["kind"] = json!("issue.remove-dependency");
     rollback["base_commit"] = json!(added_state.0);
     rollback["fingerprint"] = pending_remove.evidence["evidence"]["fingerprint"].clone();
-    issue_update::record_intent(state, &rollback);
+    record_intent(state, &rollback);
     run(&["workspace", "stop"], 0);
     drop(writer);
     let recover = run(
@@ -409,13 +409,13 @@ pub(super) fn exercise(
         ))),
         None,
     );
-    let forged_receipt = issue_update::stored_receipt(&mut connect("reader"), &add.request);
+    let forged_receipt = stored_receipt(&mut connect("reader"), &add.request);
     let session = connect("reader")
         .query_first("SELECT CONNECTION_ID()")
         .unwrap()
         .unwrap();
     let forged_marker = marker_for(state, session, &add, &forged_receipt);
-    issue_update::record_intent(state, &forged_marker);
+    record_intent(state, &forged_marker);
     run(&["workspace", "stop"], 0);
     let recover = run(
         &["workspace", "recover", "--dolt-bin", dolt.to_str().unwrap()],

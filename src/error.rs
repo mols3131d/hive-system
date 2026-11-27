@@ -16,12 +16,14 @@ pub(crate) enum ErrorCode {
     NotFound,
     InvalidRecord,
     InvalidTransition,
+    Blocked,
     IncompatiblePolicy,
     SchemaIncompatible,
     ConstraintViolation,
     AlreadyExists,
     RequestConflict,
     AlreadyClaimed,
+    ClaimConflict,
     ClaimMismatch,
     StaleRevision,
     StaleCursor,
@@ -50,12 +52,14 @@ impl ErrorCode {
             | Self::ContextLimit => 2,
             Self::NotFound => 3,
             Self::InvalidRecord
+            | Self::Blocked
             | Self::InvalidTransition
             | Self::IncompatiblePolicy
             | Self::SchemaIncompatible
             | Self::ConstraintViolation => 4,
             Self::AlreadyExists
             | Self::RequestConflict
+            | Self::ClaimConflict
             | Self::AlreadyClaimed
             | Self::ClaimMismatch
             | Self::StaleRevision
@@ -98,6 +102,10 @@ pub(crate) struct ErrorInput {
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 enum ErrorDetails {
+    #[cfg(target_os = "linux")]
+    Blockers {
+        blockers: Vec<crate::dolt::issue_transition::Blocker>,
+    },
     #[cfg(any(test, unix))]
     ContextReference {
         kind: &'static str,
@@ -144,6 +152,13 @@ pub(crate) struct RecordDiagnostic {
 }
 
 impl HiveError {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn blocked(blockers: Vec<crate::dolt::issue_transition::Blocker>) -> Self {
+        let mut error = Self::new(ErrorCode::Blocked, "The Issue is blocked.");
+        error.details = Some(ErrorDetails::Blockers { blockers });
+        error
+    }
+
     #[cfg(unix)]
     pub(crate) fn with_input(mut self, kind: &'static str, source: &'static str) -> Self {
         self.input = Some(Box::new(ErrorInput { kind, source }));
