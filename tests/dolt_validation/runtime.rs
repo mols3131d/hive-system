@@ -5,6 +5,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 #[path = "runtime/artifact_create.rs"]
 mod artifact_create;
+#[path = "runtime/issue_dependency.rs"]
+mod issue_dependency;
 #[path = "runtime/issue_update.rs"]
 mod issue_update;
 
@@ -1273,6 +1275,7 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
         &restart,
         &dolt,
     );
+    issue_dependency::exercise(&state, &fixture_root, &port, &dolt, &invoke, &restart);
     issue_update::exercise(&state, &fixture_root, &port, &dolt, &run, &restart);
     issue_create_writer_fixture(&state, &fixture_root, &port, &dolt, &run, &restart);
     assert!(cleanup.finish(), "Verified runtime fixture stop failed");
@@ -2068,6 +2071,7 @@ fn issue_create_writer_fixture(
         [
             "artifact_areas",
             "artifacts",
+            "issue_dependencies",
             "issue_updates",
             "issues",
             "operation_receipts",

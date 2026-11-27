@@ -17,6 +17,7 @@ mod directive_receipt;
 mod graph;
 mod issue;
 pub(crate) mod issue_create;
+pub(crate) mod issue_dependency;
 mod issue_list;
 pub(crate) mod issue_note;
 #[cfg(any(test, target_os = "linux"))]
