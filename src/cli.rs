@@ -1376,7 +1376,7 @@ fn label_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedParse>
             .ignore_errors(true)
             .try_get_matches_from(args)
             .ok()?;
-        Some(recover_unknown_long(&recovery, args, "label", &partial, error).unwrap_or(partial))
+        Some(recover_unknown_long(&recovery, args, &partial, error, "label").unwrap_or(partial))
     });
     let matches = parsed.as_ref().ok().or(partial.as_ref())?;
     let domain = matches.subcommand_matches("label")?;
