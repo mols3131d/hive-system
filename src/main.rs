@@ -6,6 +6,7 @@ mod config_v2;
 mod dolt;
 mod error;
 mod output;
+mod workspace_status;
 
 use std::process::ExitCode;
 
@@ -90,6 +91,13 @@ fn dispatch(invocation: Invocation) -> ExitCode {
 fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let name = &invocation.command_name;
     let format = invocation.common.format.unwrap_or_default();
+    if let Command::Workspace(cli::WorkspaceCommand::Status(target)) = &invocation.command {
+        let (format, result) = workspace_status::observe(&invocation.common, target);
+        return match result {
+            Ok(data) => output::success(Contract::V2, format, name, None, &data),
+            Err(error) => output::failure(Contract::V2, format, Some(name), None, error),
+        };
+    }
     if let Command::Config(ConfigCommand::Show(args)) = &invocation.command
         && matches!(
             args.target.scope,

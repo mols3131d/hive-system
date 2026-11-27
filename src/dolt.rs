@@ -157,6 +157,36 @@ struct Snapshot {
     commit: String,
 }
 
+pub(crate) fn is_database_name(database: &str) -> bool {
+    !database.is_empty()
+        && database.len() <= 64
+        && database
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+pub(crate) fn parse_port(port: &std::ffi::OsStr) -> Result<NonZeroU16, HiveError> {
+    port.to_str()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| {
+            HiveError::new(
+                ErrorCode::InvalidArgument,
+                "Supply a Dolt port between 1 and 65535.",
+            )
+        })
+}
+
+#[cfg(unix)]
+pub(crate) fn committed_identity(target: &DoltTargetArgs) -> Result<Value, HiveError> {
+    let (snapshot, workspace_id) = Snapshot::open(target)?;
+    Ok(json!({
+        "workspace_id": workspace_id,
+        "dolt_commit": snapshot.commit,
+        "dolt_version": DOLT_VERSION,
+        "storage_schema_version": STORAGE_SCHEMA_VERSION,
+    }))
+}
+
 impl Snapshot {
     fn open(target: &DoltTargetArgs) -> Result<(Self, String), HiveError> {
         let (Some(database), Some(port), Some(workspace_id)) = (
@@ -170,15 +200,7 @@ impl Snapshot {
             ));
         };
         // Parse the value after clap has recognized the contract and output options.
-        let Some(port) = port
-            .to_str()
-            .and_then(|value| value.parse::<NonZeroU16>().ok())
-        else {
-            return Err(HiveError::new(
-                ErrorCode::InvalidArgument,
-                "Supply a Dolt port between 1 and 65535.",
-            ));
-        };
+        let port = parse_port(port)?;
 
         if !is_uuid(workspace_id) {
             return Err(HiveError::new(
@@ -186,12 +208,7 @@ impl Snapshot {
                 "The expected workspace ID must be a lowercase UUID.",
             ));
         }
-        if database.is_empty()
-            || database.len() > 64
-            || !database
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        {
+        if !is_database_name(database) {
             return Err(HiveError::new(
                 ErrorCode::InvalidArgument,
                 "Supply a Dolt database name using letters, digits, underscores, or hyphens.",

@@ -1868,3 +1868,237 @@ fn v2_workspace_scope_preserves_descriptor_failure_diagnostics() {
         assert_eq!(report["error"]["message"], message);
     }
 }
+
+const STATUS_WORKSPACE_ID: &str = "0195f1b2-3c4d-7e8f-9a0b-1c2d3e4f5a6b";
+
+fn status_report(mut command: Command, args: &[&str], exit: i32) -> Value {
+    let output = command.args(args).output().unwrap();
+    assert_redacted(&output, &["synthetic-private"]);
+    assert_eq!(
+        output.status.code(),
+        Some(exit),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["command"], "workspace status");
+    assert_eq!(report["ok"], exit == 0);
+    report
+}
+
+#[test]
+fn workspace_status_resolves_offline_without_creating_state() {
+    let fixture = Sandbox::new();
+    let root = fixture.0.join("workspace");
+    write(&root.join("hive-workspace.yml"), V2_DESCRIPTOR);
+    write(
+        &fixture.0.join("xdg/hive/v2/bindings.yml"),
+        format!(
+            "version: 2\nbindings:\n{}",
+            v2_binding("../../../invocation", "../../../workspace")
+        ),
+    );
+    let before = snapshot(&fixture.0);
+    let command = || {
+        fixture.hive(
+            &fixture.0.join("invocation"),
+            &["workspace", "status", "--contract", "2", "--json"],
+        )
+    };
+    let report = status_report(command(), &[], 0);
+    assert_eq!(report["data"]["workspace_source"], "binding");
+    assert_eq!(report["data"]["workspace_root"], root.to_str().unwrap());
+    assert_eq!(report["data"]["active_root"], "unregistered");
+    assert_eq!(report["data"]["state"], "unknown");
+    assert_eq!(report["data"]["runtime"]["process"], "unrecorded");
+    assert!(report["data"]["committed_identity"].is_null());
+
+    let target = [
+        "--workspace-id",
+        STATUS_WORKSPACE_ID,
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+    ];
+    let report = status_report(command(), &target, 2);
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("HIVE_DOLT_USER")
+    );
+    let report = status_report(command(), &["--port", "3307"], 2);
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    let late_options = fixture.hive(
+        &fixture.0.join("invocation"),
+        &[
+            "workspace",
+            "status",
+            "--unknown",
+            "--contract",
+            "2",
+            "--json",
+        ],
+    );
+    let report = status_report(late_options, &[], 2);
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    let report = status_report(command(), &["--workspace", "../missing"], 3);
+    assert_eq!(report["error"]["code"], "NOT_FOUND");
+    assert_eq!(snapshot(&fixture.0), before);
+}
+
+#[test]
+fn workspace_status_checks_registration_and_scopes_state_to_its_uuid() {
+    let fixture = Sandbox::new();
+    let root = fixture.0.join("workspace");
+    write(&root.join("hive-workspace.yml"), V2_DESCRIPTOR);
+    write(&fixture.0.join("copy/hive-workspace.yml"), V2_DESCRIPTOR);
+    let workspaces = fixture.0.join("home/.local/state/hive/v2/workspaces");
+    let active = workspaces.join(STATUS_WORKSPACE_ID);
+    let registration = active.join("active-root.json");
+    let fields = serde_json::json!({
+        "version": 2, "workspace_id": STATUS_WORKSPACE_ID, "workspace_root": root,
+    });
+    write(&registration, fields.to_string());
+    write(
+        &workspaces.join(AREA).join("server.json"),
+        "synthetic-private",
+    );
+    let command = || {
+        let mut command = fixture.hive(
+            &fixture.0.join("invocation"),
+            &["--contract", "2", "--json", "workspace", "status"],
+        );
+        command.env("XDG_STATE_HOME", "relative-state");
+        command
+    };
+    let before = snapshot(&fixture.0);
+    let report = status_report(command(), &["--workspace", "../workspace"], 0);
+    assert_eq!(report["data"]["active_root"], "matched");
+    let report = status_report(command(), &["--workspace", "../copy"], 7);
+    assert_eq!(report["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert_eq!(snapshot(&fixture.0), before);
+
+    write(&active.join("pending-request.json"), "synthetic-private");
+    let report = status_report(command(), &["--workspace", "../workspace"], 0);
+    assert_eq!(report["data"]["state"], "recovery_required");
+
+    let mut mixed = fields.clone();
+    mixed["workspace_id"] = AREA.into();
+    write(&registration, mixed.to_string());
+    let report = status_report(command(), &["--workspace", "../workspace"], 7);
+    assert_eq!(report["error"]["code"], "AUTHORITY_UNVERIFIED");
+
+    write(
+        &registration,
+        r#"{"version":2,"version":2,"synthetic-private":"secret"}"#,
+    );
+    let report = status_report(command(), &["--workspace", "../workspace"], 2);
+    assert_eq!(report["error"]["code"], "INVALID_CONFIG");
+
+    fs::remove_file(&registration).unwrap();
+    symlink(workspaces.join(AREA).join("server.json"), &registration).unwrap();
+    let report = status_report(command(), &["--workspace", "../workspace"], 2);
+    assert_eq!(report["error"]["code"], "INVALID_CONFIG");
+
+    let other_state = fixture.0.join("other-state");
+    fs::create_dir_all(other_state.join("hive")).unwrap();
+    symlink(workspaces.parent().unwrap(), other_state.join("hive/v2")).unwrap();
+    let mut linked = command();
+    linked.env("XDG_STATE_HOME", other_state);
+    let report = status_report(linked, &["--workspace", "../workspace"], 2);
+    assert_eq!(report["error"]["code"], "INVALID_CONFIG");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn workspace_status_checks_process_start_and_endpoint_independently() {
+    let fixture = Sandbox::new();
+    let root = fixture.0.join("workspace");
+    write(&root.join("hive-workspace.yml"), V2_DESCRIPTOR);
+    let state = fixture.0.join("local-state");
+    let active = state.join("hive/v2/workspaces").join(STATUS_WORKSPACE_ID);
+    let registration = active.join("active-root.json");
+    write(
+        &registration,
+        serde_json::json!({
+            "version": 2, "workspace_id": STATUS_WORKSPACE_ID, "workspace_root": root,
+        })
+        .to_string(),
+    );
+    let stat = fs::read_to_string("/proc/self/stat").unwrap();
+    let start_ticks: u64 = stat
+        .rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_ascii_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    let mut server = serde_json::json!({
+        "version": 2, "workspace_id": STATUS_WORKSPACE_ID, "workspace_root": root,
+        "pid": std::process::id(), "boot_id": boot_id.trim_end(), "start_ticks": start_ticks,
+        "nonce": AREA, "endpoint": { "database": "fixture_db", "port": 3307 },
+    });
+    let server_path = active.join("server.json");
+    write(&server_path, server.to_string());
+    let command = || {
+        let mut command = fixture.hive(
+            &fixture.0.join("invocation"),
+            &[
+                "--contract",
+                "2",
+                "workspace",
+                "status",
+                "--json",
+                "--workspace",
+                "../workspace",
+            ],
+        );
+        command.env("XDG_STATE_HOME", &state);
+        command
+    };
+    let before = snapshot(&fixture.0);
+    let report = status_report(command(), &[], 0);
+    assert_eq!(report["data"]["runtime"]["process"], "pid_start_verified");
+    assert_eq!(report["data"]["runtime"]["endpoint"], "recorded");
+    assert_eq!(
+        report["data"]["runtime"]["endpoint_ownership"],
+        "unverified"
+    );
+    assert_eq!(report["data"]["state"], "unknown");
+
+    let target = [
+        "--workspace-id",
+        STATUS_WORKSPACE_ID,
+        "--database",
+        "fixture_db",
+        "--port",
+        "3308",
+    ];
+    let report = status_report(command(), &target, 7);
+    assert_eq!(report["error"]["code"], "AUTHORITY_UNVERIFIED");
+    let target = [
+        "--workspace-id",
+        AREA,
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+    ];
+    let report = status_report(command(), &target, 7);
+    assert_eq!(report["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert_eq!(snapshot(&fixture.0), before);
+
+    server["start_ticks"] = (start_ticks + 1).into();
+    write(&server_path, server.to_string());
+    let report = status_report(command(), &[], 7);
+    assert_eq!(report["error"]["code"], "AUTHORITY_UNVERIFIED");
+}
