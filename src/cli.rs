@@ -637,7 +637,7 @@ pub(crate) enum IssueCommand {
 #[derive(Args)]
 pub(crate) struct IssueShowArgs {
     /// Canonical lowercase UUIDv7 or quoted #number Issue selector.
-    #[arg(value_name = "ISSUE")]
+    #[arg(value_name = "ISSUE", allow_negative_numbers = true)]
     pub(crate) issue: String,
     #[command(flatten)]
     pub(crate) target: DoltTargetArgs,

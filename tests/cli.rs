@@ -745,6 +745,30 @@ fn dolt_issue_show_requires_contract_2_and_validates_explicit_target_and_selecto
         assert!(output.stderr.is_empty(), "{args:?}");
     }
 
+    for bad_selector in ["-1", "-1.5"] {
+        let args = [
+            "issue",
+            "show",
+            bad_selector,
+            "--workspace-id",
+            uuid,
+            "--database",
+            "fixture_db",
+            "--port",
+            "3307",
+            "--contract",
+            "2",
+            "--json",
+        ];
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], "issue show", "{args:?}");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT", "{args:?}");
+    }
+
     for bad_selector in [
         "1",
         "#0",
