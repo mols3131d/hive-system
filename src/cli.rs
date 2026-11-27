@@ -4,7 +4,9 @@ use std::str::FromStr;
 
 use clap::{
     ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
-    builder::{NonEmptyStringValueParser, StringValueParser, TypedValueParser},
+    builder::{
+        NonEmptyStringValueParser, OsStringValueParser, StringValueParser, TypedValueParser,
+    },
     error::ErrorKind,
     value_parser,
 };
@@ -959,18 +961,42 @@ fn retry_conversation_failure(
 ) -> Option<ArgMatches> {
     if !matches!(
         kind,
-        ErrorKind::UnknownArgument | ErrorKind::ArgumentConflict
+        ErrorKind::UnknownArgument
+            | ErrorKind::ArgumentConflict
+            | ErrorKind::ValueValidation
+            | ErrorKind::InvalidValue
+            | ErrorKind::InvalidUtf8
+            | ErrorKind::TooManyValues
     ) {
         return None;
     }
-    let retry = cli.clone().mut_subcommand("conversation", |conversation| {
-        conversation.mut_subcommand("show", |show| {
-            show.mut_arg("bot", |arg| arg.action(ArgAction::Append))
-                .mut_arg("id", |arg| arg.action(ArgAction::Append))
+    const SCOPED_VALUES: &[&str] = &["workspace", "project", "project-root", "at"];
+    const LEAF_VALUES: &[&str] = &["bot", "id", "workspace-id", "database", "port"];
+    let recover_metadata = |command: clap::Command, leaf: bool| {
+        command.mut_args(|arg| {
+            let Some(long) = arg.get_long() else {
+                return arg;
+            };
+            if !SCOPED_VALUES.contains(&long)
+                && !(leaf && LEAF_VALUES.contains(&long))
+                && long != "authority"
+            {
+                return arg;
+            }
+            let attached_only = long == "authority";
+            arg.action(ArgAction::Append)
+                .value_parser(OsStringValueParser::new())
+                .num_args(0..=1)
+                .require_equals(attached_only)
         })
-    });
-    // Join split single-dash selector values for this metadata-only retry.
-    // Preserve long options, help switches, equals values, and the -- boundary.
+    };
+    let retry = recover_metadata(cli.clone(), false)
+        .mut_subcommand("conversation", |conversation| {
+            conversation.mut_subcommand("show", |show| recover_metadata(show, true))
+        });
+    // Join a split single-dash value only after a known value-taking option.
+    // Clap still recognizes all long options, equals values and the -- boundary.
+    // These matches supply output metadata only. The original error is retained.
     let mut args = args.iter().cloned().peekable();
     let mut normalized = Vec::new();
     normalized.extend(args.next());
@@ -980,10 +1006,13 @@ fn retry_conversation_failure(
             normalized.extend(args);
             break;
         }
-        if (arg == "--bot" || arg == "--id")
-            && args.peek().is_some_and(|value| {
-                matches!(value.as_encoded_bytes(), [b'-', next, ..] if !matches!(next, b'-' | b'h' | b'V'))
-            })
+        if arg
+            .to_str()
+            .and_then(|arg| arg.strip_prefix("--"))
+            .is_some_and(|name| SCOPED_VALUES.contains(&name) || LEAF_VALUES.contains(&name))
+            && args.peek().is_some_and(
+                |value| matches!(value.as_encoded_bytes(), [b'-', next, ..] if *next != b'-'),
+            )
         {
             arg.push("=");
             arg.push(args.next().expect("peeked selector value"));
