@@ -940,6 +940,31 @@ pub(crate) enum AreaCommand {
     Tree(AreaTreeArgs),
     /// Show one committed Area.
     Show(AreaShowArgs),
+    /// Create a root Area or a direct child of an explicit parent.
+    Create(AreaCreateArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct AreaCreateArgs {
+    #[arg(long)]
+    pub(crate) slug: String,
+    #[arg(long)]
+    pub(crate) name: String,
+    /// Exact parent UUIDv7. Omit for a root Area.
+    #[arg(long)]
+    pub(crate) parent: Option<String>,
+    /// Expected revision of the selected parent as PARENT=REV.
+    #[arg(long)]
+    pub(crate) if_match: Option<String>,
+    #[arg(long)]
+    pub(crate) actor: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Args)]
@@ -3075,6 +3100,20 @@ impl AreaCommand {
             Self::List(args) => &args.target,
             Self::Tree(args) => &args.target,
             Self::Show(args) => &args.target,
+            Self::Create(args) => {
+                if common.workspace.is_none() || !args.target.has_all() {
+                    return Err(
+                        "Area create requires --workspace, --workspace-id, --database, and --port.",
+                    );
+                }
+                if common.project.is_some()
+                    || common.project_root.is_some()
+                    || !matches!(common.view, View::WorkingTree)
+                {
+                    return Err("Area create requires explicit workspace or exact parent scope.");
+                }
+                return Ok(());
+            }
         };
         target.validate_common(
             common,

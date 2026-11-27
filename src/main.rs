@@ -157,6 +157,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
+        Command::Area(AreaCommand::Create(args)) => dolt::area::create(&invocation.common, &args),
         Command::Label(cli::LabelCommand::List(args)) => {
             dolt::label::list(&args, invocation.common.project.as_ref())
         }
