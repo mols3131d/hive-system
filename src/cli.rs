@@ -853,7 +853,7 @@ pub(crate) enum BackupCommand {
     Create {
         #[arg(long, value_name = "NEW_DIR")]
         destination: PathBuf,
-        /// Request private conversation inclusion (currently unavailable).
+        /// Include verified private Queen conversation snapshots.
         #[arg(long)]
         include_conversations: bool,
     },
@@ -863,7 +863,7 @@ pub(crate) enum BackupCommand {
         source: PathBuf,
         #[arg(long, value_name = "EMPTY_DIR")]
         target: PathBuf,
-        /// Request private conversation restoration (currently unavailable).
+        /// Restore the private Queen conversations listed in the backup.
         #[arg(long)]
         include_conversations: bool,
     },

@@ -14,8 +14,8 @@ use crate::config_file::ScopedDirectory;
 use crate::config_git::with_asset_bundle;
 use crate::config_v2::Candidate;
 use crate::dolt::{
-    DOLT_VERSION, INITIAL_SCHEMA, STORAGE_SCHEMA_VERSION, is_commit_hash, is_uuid,
-    validate_backup_souls,
+    DOLT_VERSION, INITIAL_SCHEMA, STORAGE_SCHEMA_VERSION, conversation_archive, is_commit_hash,
+    is_uuid, validate_backup_souls,
 };
 use crate::error::{ErrorCode, HiveError};
 use crate::workspace_init::{Installed, fd_path, sync_tree};
@@ -40,7 +40,7 @@ pub(crate) fn create(
     db: &ScopedDirectory,
     native: &ScopedDirectory,
     noms: &ScopedDirectory,
-    destination: &Path,
+    (destination, include_conversations): (&Path, bool),
     check_stopped: impl Fn() -> Result<(), HiveError>,
 ) -> Result<Value, HiveError> {
     let invalid_destination = || {
@@ -81,6 +81,11 @@ pub(crate) fn create(
         .map_err(io_error)?;
     let stage_name = stage.path().file_name().expect("staging child name");
     let stage_dir = parent.require_child_directory(stage_name)?;
+    // A setgid parent can propagate the bit even with an explicit creation mode.
+    stage_dir
+        .directory_file()
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(io_error)?;
     let stage_fd = fd_path(stage_dir.directory_file());
     let scratch = stage_fd.join("scratch");
     let payload = stage_fd.join("snapshot");
@@ -125,7 +130,7 @@ pub(crate) fn create(
                     "The staged Dolt backup differs from the selected committed revision.",
                 ));
             }
-            validate_backup_souls(
+            let queens = validate_backup_souls(
                 &installed,
                 &restored_db,
                 &revision,
@@ -148,9 +153,19 @@ pub(crate) fn create(
                 }
             }
             fs::set_permissions(&bundle, fs::Permissions::from_mode(0o600)).map_err(io_error)?;
-            let files = digest_payload(&payload_dir)?;
-            let manifest = json!({
-                "format_version": 1,
+            let files = digest_payload(&payload_dir, false)?;
+            let conversations = if include_conversations {
+                Some(conversation_archive::capture(
+                    &workspace.root,
+                    &payload_dir,
+                    workspace.workspace_id(),
+                    &queens,
+                )?)
+            } else {
+                None
+            };
+            let mut manifest = json!({
+                "format_version": if include_conversations { conversation_archive::FORMAT_VERSION } else { 1 },
                 "workspace_id": workspace.workspace_id(),
                 "storage_schema_version": STORAGE_SCHEMA_VERSION,
                 "dolt_version": DOLT_VERSION,
@@ -161,9 +176,14 @@ pub(crate) fn create(
                     unverified("The system time cannot be represented in the backup manifest.")
                 })?.as_secs(),
                 "consistency_state": "verified_stopped_committed",
-                "conversations_included": false,
+                "conversations_included": include_conversations,
                 "files": files,
             });
+            if let Some(conversations) = conversations {
+                manifest["conversations"] = serde_json::to_value(conversations).map_err(|_| {
+                    unverified("Could not encode the conversation archive section.")
+                })?;
+            }
             let bytes = serde_json::to_vec_pretty(&manifest)
                 .map_err(|_| unverified("Could not encode the backup manifest."))?;
             if bytes.len() > MAX_MANIFEST_BYTES {
@@ -179,7 +199,7 @@ pub(crate) fn create(
             sync_tree(payload_dir.directory_file())?;
             if payload_dir.read_bounded(&[OsStr::new("manifest.json")], MAX_MANIFEST_BYTES)?
                 != Some(bytes)
-                || digest_payload(&payload_dir)? != files
+                || digest_payload(&payload_dir, include_conversations)? != files
                 || verify_source()? != revision
             {
                 return Err(HiveError::new(
@@ -446,15 +466,17 @@ pub(crate) fn verify_db(
 
 pub(crate) fn visit_payload(
     payload: &ScopedDirectory,
+    has_conversations: bool,
     mut visit: impl FnMut(&ScopedDirectory, &str, String) -> Result<(), HiveError>,
 ) -> Result<(), HiveError> {
     let unsupported = || unverified("The native backup produced an unsupported file.");
     for entry in fs::read_dir(fd_path(payload.directory_file())).map_err(io_error)? {
-        if !matches!(
-            entry.map_err(io_error)?.file_name().to_str(),
-            Some("dolt" | "assets.bundle" | "manifest.json")
-        ) {
-            return Err(unsupported());
+        let entry = entry.map_err(io_error)?;
+        match entry.file_name().to_str() {
+            Some("dolt" | "assets.bundle" | "manifest.json") => {}
+            // Conversation payload is verified only with explicit inclusion.
+            Some("conversations") if has_conversations => {}
+            _ => return Err(unsupported()),
         }
     }
     let store = payload.require_child_directory(OsStr::new("dolt"))?;
@@ -484,10 +506,13 @@ pub(crate) fn visit_payload(
     visit(payload, "assets.bundle", "assets.bundle".to_owned())
 }
 
-fn digest_payload(payload: &ScopedDirectory) -> Result<Vec<DigestEntry>, HiveError> {
+fn digest_payload(
+    payload: &ScopedDirectory,
+    has_conversations: bool,
+) -> Result<Vec<DigestEntry>, HiveError> {
     let mut files = Vec::new();
     let mut remaining = MAX_PAYLOAD_BYTES;
-    visit_payload(payload, |directory, name, path| {
+    visit_payload(payload, has_conversations, |directory, name, path| {
         let file = digest_file(directory, name, path, remaining, io::sink())?;
         remaining -= file.bytes;
         files.push(file);
