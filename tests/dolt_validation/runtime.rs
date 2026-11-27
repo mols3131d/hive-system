@@ -15,7 +15,7 @@ fn random_token() -> String {
     random_uuid().replace('-', "")
 }
 
-fn prepare() -> (Fixture, String, String) {
+fn prepare(database: &str) -> (Fixture, String, String) {
     let mut fixture = Fixture::initialize(&empty_seed_sql(CASE_INSENSITIVE));
     let state = fixture.root.join("runtime");
     fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
@@ -34,9 +34,9 @@ fn prepare() -> (Fixture, String, String) {
         Some(&format!(
             "CREATE USER '{reader}'@'{HOST}' IDENTIFIED BY '{}';
              CREATE USER '{writer}'@'{HOST}' IDENTIFIED BY '{writer_password}';
-             GRANT SELECT ON {DATABASE}.* TO '{reader}'@'{HOST}';
-             GRANT SELECT ON {DATABASE}.* TO '{writer}'@'{HOST}';
-             GRANT UPDATE ON {DATABASE}.workspace_counters TO '{writer}'@'{HOST}';
+             GRANT SELECT ON {database}.* TO '{reader}'@'{HOST}';
+             GRANT SELECT ON {database}.* TO '{writer}'@'{HOST}';
+             GRANT UPDATE ON {database}.workspace_counters TO '{writer}'@'{HOST}';
              DROP USER 'root'@'localhost';",
             fixture.password
         )),
@@ -62,14 +62,14 @@ fn prepare() -> (Fixture, String, String) {
         grants.sort_unstable();
         grants
     };
-    let select = format!("GRANT SELECT ON `{DATABASE}`.*");
+    let select = format!("GRANT SELECT ON `{database}`.*");
     let usage = "GRANT USAGE ON *.*".to_owned();
     assert_eq!(grants_for(&reader), [select.clone(), usage.clone()]);
     assert_eq!(
         grants_for(&writer),
         [
             select,
-            format!("GRANT UPDATE ON `{DATABASE}`.`workspace_counters`"),
+            format!("GRANT UPDATE ON `{database}`.`workspace_counters`"),
             usage
         ]
     );
@@ -79,14 +79,14 @@ fn prepare() -> (Fixture, String, String) {
 #[test]
 #[ignore = "requires pinned Dolt at HIVE_DOLT_BIN"]
 fn workspace_runtime_provisions_grants_offline() {
-    prepare();
+    prepare(DATABASE);
 }
 
 #[test]
 #[ignore = "requires pinned Dolt at HIVE_DOLT_BIN, local TCP and Linux pidfds"]
 fn workspace_runtime_probes_ownership_and_graceful_stop() {
     let available = TcpListener::bind((HOST, 0)).unwrap();
-    let (mut fixture, nonce, writer_password) = prepare();
+    let (mut fixture, nonce, writer_password) = prepare(DATABASE);
     let nonce = &nonce.replace('-', "")[..24];
     let state = fixture.root.join("runtime");
     let db = fixture.root.join(DATABASE);
@@ -393,9 +393,9 @@ fn workspace_runtime_cli_starts_and_stops_registered_workspace() {
     let port = available.local_addr().unwrap().port().to_string();
     drop(available);
 
-    let workspace = fixture
-        .root
-        .join("work $HOME $$ \u{7f}\u{85}\u{2028}\u{2029}");
+    // The workspace selector rejects control characters. The state root
+    // comes from XDG and exercises DEL and NEL in the private config.
+    let workspace = fixture.root.join("work $HOME $$ \u{2028}\u{2029}");
     let state_home = fixture
         .root
         .join("state ${HOME} $$ \u{7f}\u{85}\u{2028}\u{2029}");
@@ -551,7 +551,7 @@ fn workspace_runtime_cli_starts_and_stops_registered_workspace() {
 #[test]
 #[ignore = "requires pinned Dolt at HIVE_DOLT_BIN, local TCP and Linux pidfds"]
 fn workspace_runtime_cli_stops_legacy_launch_and_preserves_its_config() {
-    let (mut fixture, nonce, _) = prepare();
+    let (mut fixture, nonce, _) = prepare("db");
     let workspace = fixture.root.join("workspace");
     let state_home = fixture.root.join("state");
     let workspace_id = id(1);
