@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -120,25 +122,164 @@ pub(crate) fn list(
     })
 }
 
-pub(crate) fn show(target: &DoltTargetArgs, id: &str) -> Result<DoltSuccess, Box<DoltFailure>> {
+pub(crate) fn show(
+    target: &DoltTargetArgs,
+    id: &str,
+    soul_selection: Option<(&Path, &str)>,
+) -> Result<DoltSuccess, Box<DoltFailure>> {
     if !is_uuid_v7(id) {
         return Err(invalid("Use an exact lowercase UUIDv7 for the Bot ID."));
     }
-    read(target, |snapshot, _| {
-        let rows: Vec<BotRow> = snapshot.exec_rows(
-            |commit| format!(
+    let Some((root, commit)) = soul_selection else {
+        return read(target, |snapshot, _| {
+            Ok(json!({"bot": select_bot(snapshot, id)?, "observed_revision": snapshot.commit}))
+        });
+    };
+    #[cfg(target_os = "linux")]
+    {
+        show_soul(target, id, root, commit)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, commit);
+        Err(DoltFailure::without_context(HiveError::new(
+            ErrorCode::NotImplemented,
+            "Soul inspection requires Linux with file-descriptor access through /proc.",
+        )))
+    }
+}
+
+fn select_bot(snapshot: &mut Snapshot, id: &str) -> Result<BotMetadata, HiveError> {
+    let rows: Vec<BotRow> = snapshot.exec_rows(
+        |commit| {
+            format!(
                 "SELECT {COLUMNS} FROM bots AS OF '{commit}' WHERE CAST(id AS BINARY) = ? LIMIT 1"
-            ),
-            (id,),
-        )?;
-        let row = rows.into_iter().next().ok_or_else(|| {
+            )
+        },
+        (id,),
+    )?;
+    let row = rows.into_iter().next().ok_or_else(|| {
+        HiveError::new(
+            ErrorCode::NotFound,
+            "The selected Bot was not found at the verified Dolt commit.",
+        )
+    })?;
+    BotMetadata::try_from(row)
+}
+
+#[cfg(target_os = "linux")]
+fn show_soul(
+    target: &DoltTargetArgs,
+    id: &str,
+    root: &Path,
+    commit: &str,
+) -> Result<DoltSuccess, Box<DoltFailure>> {
+    use crate::{config_git, config_v2};
+
+    if !config_git::is_full_oid(commit) {
+        return Err(invalid(
+            "Supply a full Git commit object ID with --asset-commit.",
+        ));
+    }
+    let candidate = config_v2::read_explicit(root).map_err(DoltFailure::without_context)?;
+    let expected_id = target
+        .workspace_id
+        .as_deref()
+        .filter(|id| super::is_uuid(id))
+        .ok_or_else(|| invalid("Supply --workspace-id as a canonical lowercase UUID."))?;
+    if candidate.workspace_id() != expected_id {
+        return Err(DoltFailure::without_context(super::unverified_authority(
+            "The workspace descriptor identity does not match the expected UUID.",
+        )));
+    }
+
+    let mut result = read(target, |snapshot, workspace_id| {
+        let bot = select_bot(snapshot, id)?;
+        let relative = format!("bots/{}/SOUL.md", bot.slug);
+        let bytes = config_git::read_asset_blob(&candidate.root, commit, Path::new(&relative))?
+            .ok_or_else(|| {
+                HiveError::new(
+                    ErrorCode::NotFound,
+                    "The selected Queen's Soul is missing from the asset commit.",
+                )
+            })?;
+        let body = soul_body(&bytes, workspace_id, &bot)?;
+        Ok(json!({
+            "bot": bot,
+            "observed_revision": snapshot.commit,
+            "soul": { "path": format!("assets/{relative}"), "body": body },
+        }))
+    })?;
+    result.context["asset_commit"] = json!(commit.to_ascii_lowercase());
+    result.context["policy_revision"] = json!(candidate.policy_revision());
+    result.context["scope"] = json!("soul");
+    Ok(result)
+}
+
+#[cfg(target_os = "linux")]
+fn soul_body<'a>(
+    bytes: &'a [u8],
+    workspace_id: &str,
+    bot: &BotMetadata,
+) -> Result<&'a str, HiveError> {
+    use crate::config_file::parse_v2;
+    use serde_json::Map;
+
+    let input = str::from_utf8(bytes)
+        .ok()
+        .filter(|input| !input.contains('\0'))
+        .ok_or_else(|| {
             HiveError::new(
-                ErrorCode::NotFound,
-                "The selected Bot was not found at the verified Dolt commit.",
+                ErrorCode::InvalidRecord,
+                "The Soul must be UTF-8 without NUL bytes.",
             )
         })?;
-        Ok(json!({"bot": BotMetadata::try_from(row)?, "observed_revision": snapshot.commit}))
-    })
+    let contents = input.strip_prefix('\u{feff}').unwrap_or(input);
+    let Some(contents) = contents
+        .strip_prefix("---\n")
+        .or_else(|| contents.strip_prefix("---\r\n"))
+        .or_else(|| (contents == "---").then_some(""))
+    else {
+        return Ok(input);
+    };
+    let lines = contents.split_inclusive('\n');
+    let mut offset = 0;
+    for line in lines {
+        if matches!(line, "---\n" | "---\r\n" | "---") {
+            let header = &contents[..offset];
+            if !header.trim().is_empty() {
+                let fields: Map<String, Value> = parse_v2(header.as_bytes(), "Soul frontmatter")
+                    .map_err(|_| {
+                        HiveError::new(ErrorCode::InvalidRecord, "The Soul frontmatter is invalid.")
+                    })?;
+                for (field, expected) in [
+                    ("workspace_id", workspace_id),
+                    ("id", bot.id.as_str()),
+                    ("bot_id", bot.id.as_str()),
+                    ("slug", bot.slug.as_str()),
+                    ("bot_slug", bot.slug.as_str()),
+                    ("display_name", bot.display_name.as_str()),
+                    ("role", bot.role),
+                ] {
+                    if fields
+                        .get(field)
+                        .is_some_and(|value| value.as_str() != Some(expected))
+                    {
+                        return Err(HiveError::new(
+                            ErrorCode::InvalidRecord,
+                            "The Soul frontmatter identity does not match the committed registry.",
+                        ));
+                    }
+                }
+            }
+            return Ok(&contents[offset + line.len()..]);
+        }
+        offset += line.len();
+    }
+    Err(HiveError::new(
+        ErrorCode::InvalidRecord,
+        "The Soul frontmatter has no closing delimiter.",
+    ))
 }
 
 fn read(
@@ -163,4 +304,50 @@ fn stale_cursor() -> HiveError {
         ErrorCode::StaleCursor,
         "The Bot list cursor is invalid for the selected workspace, commit, or query.",
     )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_optional_soul_identity_and_returns_only_the_body() {
+        let id = "01900000-0000-7000-8000-00000000000a";
+        let workspace = "01900000-0000-7000-8000-000000000001";
+        let bot = BotMetadata::try_from((
+            id.into(),
+            "queen-alpha".into(),
+            "Synthetic Queen".into(),
+            "revision".into(),
+            None,
+        ))
+        .unwrap();
+        let body = "# Synthetic Queen 기록\r\nKeep exact bytes.";
+        let valid = format!(
+            "---\r\nworkspace_id: {workspace}\r\nbot_id: {id}\r\nslug: queen-alpha\r\nrole: queen\r\n---\r\n{body}"
+        );
+        assert_eq!(soul_body(valid.as_bytes(), workspace, &bot).unwrap(), body);
+        assert_eq!(soul_body(body.as_bytes(), workspace, &bot).unwrap(), body);
+        for header in [
+            "workspace_id: another-workspace",
+            "bot_id: another-queen",
+            "id: another-queen",
+            "slug: another-queen",
+            "bot_slug: another-queen",
+            "display_name: another-queen",
+            "role: overlord",
+            "slug: null",
+            "slug: queen-alpha\nslug: queen-alpha",
+        ] {
+            let input = format!("---\n{header}\n---\n{body}");
+            assert!(matches!(
+                soul_body(input.as_bytes(), workspace, &bot)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidRecord
+            ));
+        }
+        assert!(soul_body(&[0xff], workspace, &bot).is_err());
+        assert!(soul_body(b"---\nslug: queen-alpha\n", workspace, &bot).is_err());
+    }
 }
