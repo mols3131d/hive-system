@@ -13,7 +13,7 @@ use crate::dolt::{
         new_uuid_v7, valid_revision, valid_title,
     },
     read_error,
-    receipt_history::{HistoricalReceipt, valid_sha256},
+    receipt_history::{HistoricalReceipt, valid_sha256, verify_delta},
     records::is_artifact_kind,
     scope::{require_active_area, require_active_area_at},
 };
@@ -454,12 +454,11 @@ pub(in crate::dolt) fn verify_effect(
         require_active_area_at(&mut snapshot.connection, area, base, ARCHIVED)?;
         verify_area_revision(snapshot, base, introduced, area, expected, revision)?;
     }
-    verify_delta(
-        &mut snapshot.connection,
-        base,
-        introduced,
-        result.area_id.is_some(),
-    )?;
+    let mut expected = vec![("artifacts", 1, 0, 0), ("operation_receipts", 1, 0, 0)];
+    if result.area_id.is_some() {
+        expected.splice(0..0, [("areas", 0, 0, 1), ("artifact_areas", 1, 0, 0)]);
+    }
+    verify_delta(&mut snapshot.connection, base, introduced, &expected)?;
     Ok(json!(result))
 }
 
@@ -488,58 +487,6 @@ fn verify_area_revision(
         (expected, revision, area),
     )?;
     if unchanged != [true] {
-        return Err(workflow::unverified());
-    }
-    Ok(())
-}
-
-fn verify_delta(
-    db: &mut impl Queryable,
-    base: &str,
-    introduced: &str,
-    linked: bool,
-) -> Result<(), HiveError> {
-    let mut expected = vec![("artifacts", 1, 0, 0), ("operation_receipts", 1, 0, 0)];
-    if linked {
-        expected.splice(0..0, [("areas", 0, 0, 1), ("artifact_areas", 1, 0, 0)]);
-    }
-    let tables: Vec<(String, String, String, bool, bool)> = db
-        .exec(
-            "SELECT from_table_name, to_table_name, diff_type, data_change, schema_change
-         FROM DOLT_DIFF_SUMMARY(?, ?) ORDER BY from_table_name LIMIT 5",
-            (base, introduced),
-        )
-        .map_err(read_error)?;
-    if tables.len() != expected.len()
-        || tables
-            .iter()
-            .zip(&expected)
-            .any(|((from, to, kind, data, schema), (name, ..))| {
-                from != name || to != name || kind != "modified" || !data || *schema
-            })
-        || db
-            .query_first::<mysql::Row, _>("SHOW WARNINGS LIMIT 1")
-            .map_err(read_error)?
-            .is_some()
-    {
-        return Err(workflow::unverified());
-    }
-    let rows: Vec<(String, u64, u64, u64)> = db
-        .exec(
-            "SELECT table_name, rows_added, rows_deleted, rows_modified
-         FROM DOLT_DIFF_STAT(?, ?) ORDER BY table_name LIMIT 5",
-            (base, introduced),
-        )
-        .map_err(read_error)?;
-    if !rows
-        .iter()
-        .map(|(table, added, deleted, modified)| (table.as_str(), *added, *deleted, *modified))
-        .eq(expected)
-        || db
-            .query_first::<mysql::Row, _>("SHOW WARNINGS LIMIT 1")
-            .map_err(read_error)?
-            .is_some()
-    {
         return Err(workflow::unverified());
     }
     Ok(())

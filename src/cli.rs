@@ -795,6 +795,9 @@ pub(crate) enum DirectiveStatus {
 
 #[derive(Subcommand)]
 pub(crate) enum BotCommand {
+    /// Register a Queen from a reviewed, committed Soul (contract 2).
+    #[command(hide = true)]
+    Register(BotRegisterArgs),
     /// List registered Manager Bots.
     List {
         #[command(flatten)]
@@ -818,6 +821,27 @@ pub(crate) enum BotCommand {
         #[command(flatten)]
         target: DoltTargetArgs,
     },
+}
+
+#[derive(Args)]
+pub(crate) struct BotRegisterArgs {
+    /// Canonical lowercase kebab-case registry slug.
+    #[arg(long)]
+    pub(crate) slug: String,
+    #[arg(long)]
+    pub(crate) name: String,
+    /// Exact lowercase Git commit object ID of the clean asset HEAD.
+    #[arg(long, value_name = "REV")]
+    pub(crate) asset_revision: String,
+    #[arg(long)]
+    pub(crate) actor: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Subcommand)]
@@ -1220,6 +1244,9 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     for domain in ["bot", "directive"] {
         cli = cli.mut_subcommand(domain, |command| {
             command.mut_subcommands(|leaf| {
+                if leaf.get_name() == "register" {
+                    return leaf;
+                }
                 leaf.mut_args(|arg| match arg.get_id().as_str() {
                     "workspace_id" | "database" | "port" => arg.hide(true),
                     _ => arg,
@@ -2991,6 +3018,20 @@ impl DirectiveCommand {
 impl BotCommand {
     fn validate(&self, common: &CommonOptions) -> Result<(), &'static str> {
         let target = match self {
+            Self::Register(args) => {
+                if common.contract != Contract::V2 {
+                    return Err("Bot register requires --contract 2.");
+                }
+                if common.workspace.is_none() || !args.target.has_all() {
+                    return Err(
+                        "Bot register requires --workspace, --workspace-id, --database, and --port.",
+                    );
+                }
+                if common.project.is_some() || common.project_root.is_some() {
+                    return Err("Bot register applies to the selected workspace.");
+                }
+                return common.require_working_tree();
+            }
             Self::List { target, .. } | Self::Show { target, .. } => target,
         };
         if common.contract == Contract::V1 {

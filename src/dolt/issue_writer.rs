@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 use super::{
     DoltSuccess, DoltTarget, Snapshot,
     artifact::create as artifact_create,
+    bot::register as bot_register,
     context_evidence::read_evidence_bytes,
     context_resolve::observe_time,
     context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7, issue_create,
@@ -33,6 +34,8 @@ pub(super) enum Kind {
     Update,
     #[serde(rename = "artifact.create")]
     ArtifactCreate,
+    #[serde(rename = "bot.register")]
+    BotRegister,
 }
 
 impl Kind {
@@ -42,6 +45,7 @@ impl Kind {
             Self::Create => issue_create::KIND,
             Self::Update => issue_update::KIND,
             Self::ArtifactCreate => artifact_create::KIND,
+            Self::BotRegister => bot_register::KIND,
         }
     }
 
@@ -51,6 +55,7 @@ impl Kind {
             Self::Create => "Issue create",
             Self::Update => "Issue update",
             Self::ArtifactCreate => "Artifact create",
+            Self::BotRegister => "Bot register",
         }
     }
 
@@ -74,6 +79,7 @@ impl Kind {
                 ("operation_receipts", "INSERT"),
             ],
             Self::ArtifactCreate => &[("artifacts", "INSERT"), ("operation_receipts", "INSERT")],
+            Self::BotRegister => &[("bots", "INSERT"), ("operation_receipts", "INSERT")],
         }
     }
 }
@@ -143,6 +149,7 @@ pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
 
 // Version 1 has no kind field and always denotes a progress note. Version 2
 // carries an Issue kind. Version 3 carries an Artifact ID and optional Area.
+// Version 4 carries only a Bot ID as the record scope.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Pending {
@@ -177,6 +184,12 @@ pub(crate) struct Pending {
         deserialize_with = "present_id"
     )]
     artifact_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_id"
+    )]
+    bot_id: Option<String>,
     receipt_digest: String,
 }
 
@@ -222,10 +235,14 @@ impl Pending {
             &self.area_id,
             &self.issue_id,
             &self.artifact_id,
+            &self.bot_id,
         ) {
-            (1, None, Some(_), Some(_), None) => Ok(Kind::Note),
-            (2, Some(kind @ (Kind::Create | Kind::Update)), Some(_), Some(_), None) => Ok(kind),
-            (3, Some(Kind::ArtifactCreate), _, None, Some(_)) => Ok(Kind::ArtifactCreate),
+            (1, None, Some(_), Some(_), None, None) => Ok(Kind::Note),
+            (2, Some(kind @ (Kind::Create | Kind::Update)), Some(_), Some(_), None, None) => {
+                Ok(kind)
+            }
+            (3, Some(Kind::ArtifactCreate), _, None, Some(_), None) => Ok(Kind::ArtifactCreate),
+            (4, Some(Kind::BotRegister), None, None, None, Some(_)) => Ok(Kind::BotRegister),
             _ => Err(uncertain()),
         }
     }
@@ -237,10 +254,15 @@ impl Pending {
             || self.session_id == 0
             || !is_uuid(&self.request_id)
             || !is_commit_hash(&self.base_commit)
-            || [&self.area_id, &self.issue_id, &self.artifact_id]
-                .into_iter()
-                .flatten()
-                .any(|id| !is_uuid_v7(id))
+            || [
+                &self.area_id,
+                &self.issue_id,
+                &self.artifact_id,
+                &self.bot_id,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|id| !is_uuid_v7(id))
             || !valid_sha256(&self.fingerprint)
             || !valid_sha256(&self.receipt_digest)
         {
@@ -270,7 +292,7 @@ pub(super) fn execute(
             receipt_at(snapshot, request.request_id, &commit, None).map_err(|_| uncertain())?;
         mutation.verify_decision(observe_time()?)?;
         let (outcome, base, introduced, result) = if let Some(receipt) = existing {
-            if matches!(request.kind, Kind::ArtifactCreate) {
+            if matches!(request.kind, Kind::ArtifactCreate | Kind::BotRegister) {
                 check_fingerprint(&receipt.fingerprint, request.fingerprint, request.kind)?;
             }
             let scoped = ScopedReceipt::read(
@@ -316,10 +338,10 @@ pub(super) fn execute(
                 "workspace_id": workspace.workspace_id(),
                 "db_commit": if outcome == "confirmed" { &introduced } else { &commit },
                 "policy_revision": workspace.policy_revision(),
-                "scope": if matches!(request.kind, Kind::ArtifactCreate) {
-                    json!({"area_id": request.area_id, "artifact_id": result["artifact_id"]})
-                } else {
-                    json!({"area_id": request.area_id, "issue_id": result["issue_id"]})
+                "scope": match request.kind {
+                    Kind::ArtifactCreate => json!({"area_id": request.area_id, "artifact_id": result["artifact_id"]}),
+                    Kind::BotRegister => json!({"bot_id": result["bot_id"]}),
+                    _ => json!({"area_id": request.area_id, "issue_id": result["issue_id"]}),
                 },
             }),
             data: json!({
@@ -401,10 +423,12 @@ fn apply(
         Kind::Note => (1, None),
         kind @ (Kind::Create | Kind::Update) => (2, Some(kind)),
         Kind::ArtifactCreate => (3, Some(Kind::ArtifactCreate)),
+        Kind::BotRegister => (4, Some(Kind::BotRegister)),
     };
-    let (issue_id, artifact_id) = match request.kind {
-        Kind::ArtifactCreate => (None, Some(staged.record_id)),
-        _ => (Some(staged.record_id), None),
+    let (issue_id, artifact_id, bot_id) = match request.kind {
+        Kind::ArtifactCreate => (None, Some(staged.record_id), None),
+        Kind::BotRegister => (None, None, Some(staged.record_id)),
+        _ => (Some(staged.record_id), None, None),
     };
     let marker = Pending {
         version,
@@ -418,6 +442,7 @@ fn apply(
         area_id: request.area_id.map(str::to_owned),
         issue_id,
         artifact_id,
+        bot_id,
         receipt_digest: receipt_digest(&receipt),
     };
     let entry = runtime
@@ -474,7 +499,7 @@ fn open_verified_writer(
             "SELECT GRANTEE, TABLE_NAME, PRIVILEGE_TYPE FROM information_schema.TABLE_PRIVILEGES
          WHERE TABLE_SCHEMA = 'db' AND GRANTEE = ?
          AND TABLE_NAME IN ('issues', 'issue_updates', 'workspace_counters', 'operation_receipts',
-                            'artifacts', 'artifact_areas', 'areas')",
+                            'artifacts', 'artifact_areas', 'areas', 'bots')",
             (&grantee,),
         )
         .map_err(read_error)?;
@@ -519,7 +544,11 @@ fn confirm(
         marker.operation()?,
         &marker.request_id,
         marker.area_id.as_deref(),
-        marker.issue_id.as_deref().or(marker.artifact_id.as_deref()),
+        marker
+            .issue_id
+            .as_deref()
+            .or(marker.artifact_id.as_deref())
+            .or(marker.bot_id.as_deref()),
         &receipt.actor_ref,
         &receipt,
     )?;
@@ -537,6 +566,7 @@ enum ScopedReceipt {
     Create(issue_create::CreateResult),
     Update(Box<issue_update::ScopedUpdate>),
     ArtifactCreate(artifact_create::ScopedCreate),
+    BotRegister(bot_register::RegisterResult),
 }
 
 impl ScopedReceipt {
@@ -594,6 +624,13 @@ impl ScopedReceipt {
                 artifact_create::check_scope(snapshot, request, area, record, actor, receipt)
                     .map(Self::ArtifactCreate)
             }
+            Kind::BotRegister => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                bot_register::check_scope(snapshot, request, record, actor, receipt)
+                    .map(Self::BotRegister)
+            }
         }
     }
 
@@ -620,6 +657,9 @@ impl ScopedReceipt {
             Self::Update(update) => issue_update::verify_effect(snapshot, commit, receipt, &update),
             Self::ArtifactCreate(scoped) => {
                 artifact_create::verify_effect(snapshot, commit, receipt, &scoped)
+            }
+            Self::BotRegister(result) => {
+                bot_register::verify_effect(snapshot, commit, receipt, &result)
             }
             Self::Create(result) => {
                 issue_create::verify_effect(snapshot, commit, receipt, &result)?;
@@ -782,6 +822,24 @@ mod tests {
         value["area_id"] = area_id;
         value["issue_id"] = value["artifact_id"].clone();
         assert!(read(&value).is_err());
+
+        let mut registration = json!(standalone);
+        registration["version"] = json!(4);
+        registration["kind"] = json!("bot.register");
+        let bot_id = registration
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_id")
+            .unwrap();
+        registration["bot_id"] = bot_id;
+        let registered = read(&registration).unwrap();
+        assert!(matches!(registered.operation(), Ok(Kind::BotRegister)));
+        assert_eq!(json!(registered), registration);
+        registration["area_id"] = value["area_id"].clone();
+        assert!(read(&registration).is_err());
+        registration.as_object_mut().unwrap().remove("area_id");
+        registration["version"] = json!(3);
+        assert!(read(&registration).is_err());
 
         value["version"] = json!(1);
         assert!(read(&value).is_err());

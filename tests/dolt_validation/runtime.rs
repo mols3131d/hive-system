@@ -5,6 +5,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 #[path = "runtime/artifact_create.rs"]
 mod artifact_create;
+#[path = "runtime/bot_register.rs"]
+mod bot_register;
 #[path = "runtime/issue_update.rs"]
 mod issue_update;
 
@@ -2068,6 +2070,7 @@ fn issue_create_writer_fixture(
         [
             "artifact_areas",
             "artifacts",
+            "bots",
             "issue_updates",
             "issues",
             "operation_receipts",
