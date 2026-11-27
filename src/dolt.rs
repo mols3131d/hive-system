@@ -4,6 +4,7 @@ mod issue;
 mod issue_list;
 mod issue_readiness;
 mod records;
+pub(crate) mod resource;
 
 use std::num::NonZeroU16;
 use std::time::Duration;

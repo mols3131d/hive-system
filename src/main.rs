@@ -9,7 +9,7 @@ mod output;
 
 use std::process::ExitCode;
 
-use cli::AreaCommand;
+use cli::{AreaCommand, ResourceCommand};
 use cli::{Command, ConfigCommand, Contract, Invocation, IssueCommand, ParseFailure};
 use error::{ErrorCode, HiveError};
 
@@ -105,6 +105,8 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Validate(args) => dolt::validate(&args),
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
+        Command::Resource(ResourceCommand::List(args)) => dolt::resource::list(&args),
+        Command::Resource(ResourceCommand::Show(args)) => dolt::resource::show(&args),
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
         Command::Issue(IssueCommand::List(args)) => dolt::issue_list(
             &args,
