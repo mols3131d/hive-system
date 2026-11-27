@@ -2216,7 +2216,7 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 args,
                 error.kind(),
                 "issue",
-                &["add-dependency", "remove-dependency"],
+                &["add-dependency", "remove-dependency", "select", "claim"],
             )
             .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "issue"))
             .unwrap_or(partial)
