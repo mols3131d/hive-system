@@ -1,3 +1,5 @@
+mod project_v2;
+
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -11,6 +13,8 @@ use clap::{
     error::ErrorKind,
     value_parser,
 };
+
+pub(crate) use project_v2::ProjectRead;
 
 pub(crate) struct Invocation {
     pub(crate) common: CommonOptions,
@@ -227,6 +231,8 @@ pub(crate) enum Command {
     /// List projects or inspect a project scope.
     #[command(subcommand)]
     Project(ProjectCommand),
+    #[command(skip)]
+    ProjectRead(ProjectRead),
     /// Read or manage task records.
     #[command(subcommand)]
     Task(TaskCommand),
@@ -820,6 +826,9 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             })
         },
     );
+    if let Some(project) = project_v2::parse(&cli, &args) {
+        return project;
+    }
     let mut config_error_matches = None;
     let resource = resource_parser(&cli, &args);
     let (parsed, resource_matches) = if let Some(resource) = resource {
@@ -1013,6 +1022,16 @@ fn resource_error_options(command: clap::Command) -> clap::Command {
         .args_override_self(true)
         .mut_args(|arg| {
             let arg = match arg.get_id().as_str() {
+                "json" => {
+                    // A bare switch has an empty occurrence. Keep attached
+                    // values inert and retain all independent occurrences.
+                    return arg
+                        .action(ArgAction::Append)
+                        .overrides_with(clap::builder::Resettable::Reset)
+                        .value_parser(OsStringValueParser::new())
+                        .num_args(0..=1)
+                        .require_equals(true);
+                }
                 "at" | "project" => arg.value_parser(StringValueParser::new()),
                 "format" => arg.value_parser(StringValueParser::new().map(|value| {
                     if value == "json" {
@@ -1023,9 +1042,7 @@ fn resource_error_options(command: clap::Command) -> clap::Command {
                 })),
                 _ => arg,
             };
-            if arg.is_positional()
-                || matches!(arg.get_id().as_str(), "json" | "resource_help_probe")
-            {
+            if arg.is_positional() || arg.get_id() == "resource_help_probe" {
                 arg
             } else if arg.get_action().takes_values() {
                 arg.allow_negative_numbers(true).num_args(0..=1)
@@ -1229,6 +1246,13 @@ fn requested_format(root: Option<&ArgMatches>, leaf: Option<&ArgMatches>) -> For
     let requested_json = |args: &ArgMatches| {
         args.try_get_one::<bool>("json").ok().flatten() == Some(&true)
             || args
+                .try_get_occurrences::<OsString>("json")
+                .ok()
+                .flatten()
+                .is_some_and(|mut occurrences| {
+                    occurrences.any(|mut values| values.next().is_none())
+                })
+            || args
                 .try_get_many::<Format>("format")
                 .ok()
                 .flatten()
@@ -1373,6 +1397,7 @@ impl Command {
                     | IssueCommand::Ready(args)
                     | IssueCommand::Blocked(args),
                 ) => args.validate_dolt_selection(common),
+                Self::Project(_) => Err("Use contract 2 Project read options."),
                 Self::Bot(command) => command.validate(common),
                 _ => Ok(()),
             };

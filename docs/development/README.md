@@ -127,6 +127,24 @@ hive --contract 2 --json area tree \
 
 The result contains an array of root summaries, including archived Areas, and a `children` array at each node. Roots and siblings sort by bytewise slug, then ID. A known leaf has empty children, while an unknown root returns `NOT_FOUND`. The limit is 100 nodes across the entire result and 32 levels, with each returned root at level 1. Larger selections return `CONTEXT_LIMIT`. Cycles encountered during traversal return `INVALID_RECORD`.
 
+## Committed Project inspection
+
+Use the same explicit Dolt target and SELECT-only account for `project list` and `project show` under contract 2.
+
+```sh
+hive --contract 2 --json project list --status active --limit 10 \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+
+hive --contract 2 --json project show 01900000-0000-7000-8000-000000000003 \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+List orders summaries by Project ID and accepts exact `active`, `completed`, or `archived` status. The default page size is 25 and the maximum is 100. Pass `next_cursor` as `--cursor` with the same arguments. A changed workspace, commit, status filter, or page size returns `STALE_CURSOR` (exit 5).
+
+Show takes a canonical lowercase UUIDv7 and returns Project details and up to 25 direct member Issue IDs across Areas. The `issues.truncated` field indicates additional members. Use `issue list --project UUID` to page through member summaries.
+
 ## Committed Bot metadata
 
 Use the same explicit Dolt target and SELECT-only account for contract 2 Bot reads.

@@ -1556,6 +1556,61 @@ fn dolt_resource_reads_preserve_json_errors_and_option_literals() {
 }
 
 #[test]
+fn malformed_resource_json_switch_preserves_independent_output_selection() {
+    let sandbox = Sandbox::new();
+    let command = ["--contract", "2", "resource", "list"];
+    let early = sandbox.run(&[&command[..], &["--format", "json", "--json=false"]].concat());
+    assert_eq!(early.status.code(), Some(2), "{early:?}");
+    assert!(early.stderr.is_empty(), "{early:?}");
+    let report: Value = serde_json::from_slice(&early.stdout).unwrap();
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["command"], "resource list");
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    assert_eq!(
+        report["error"]["message"],
+        "An argument has a missing or invalid value."
+    );
+
+    for options in [
+        &["--json=false", "--format", "json"][..],
+        &["--json=false", "--json"],
+        &["--json", "--json=false"],
+    ] {
+        let output = sandbox.run(&[&command[..], options].concat());
+        assert_eq!(output.status, early.status, "{options:?}");
+        assert_eq!(output.stdout, early.stdout, "{options:?}");
+        assert!(output.stderr.is_empty(), "{options:?}");
+    }
+
+    for args in [
+        [&command[..], &["--json=false"]].concat(),
+        [&command[..], &["--json=true"]].concat(),
+        [&command[..], &["--json="]].concat(),
+        [&command[..], &["--json=--json"]].concat(),
+        [&command[..], &["--json=--format=json"]].concat(),
+        [&command[..], &["--json=false", "--cursor=--json"]].concat(),
+        vec![
+            "--contract",
+            "2",
+            "resource",
+            "show",
+            "--json=false",
+            "--",
+            "--json",
+        ],
+    ] {
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Usage: hive resource"),
+            "{args:?}"
+        );
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn dolt_area_option_recovery_preserves_literals_and_v1_errors() {
     let sandbox = Sandbox::new();
     for args in [
@@ -1622,6 +1677,233 @@ fn dolt_area_option_recovery_preserves_literals_and_v1_errors() {
         assert_eq!(explicit.status.code(), output.status.code(), "{v1:?}");
         assert_eq!(explicit.stdout, output.stdout, "{v1:?}");
         assert_eq!(explicit.stderr, output.stderr, "{v1:?}");
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn project_reads_parse_late_v2_flags_and_preserve_literal_values() {
+    let sandbox = Sandbox::new();
+    let target = [
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+    ];
+    for (index, (action, options)) in [
+        ("list", &["--status", "ACTIVE"][..]),
+        ("list", &["--status"]),
+        ("list", &["--status=--json"]),
+        ("list", &["--limit", "-1"]),
+        ("list", &["--limit", "101"]),
+        ("show", &["project/fixture"]),
+        ("show", &["-1"]),
+        ("show", &[]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut args = vec!["project", action];
+        args.extend(target);
+        args.extend(options);
+        args.extend([
+            "--contract=2",
+            if index % 2 == 0 {
+                "--json"
+            } else {
+                "--format=json"
+            },
+        ]);
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], format!("project {action}"), "{args:?}");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT", "{args:?}");
+        assert!(report.get("context").is_none(), "{args:?}");
+    }
+    let literal_contract = sandbox.run(&["--json", "project", "list", "--after=--contract=2"]);
+    assert_json_failure(
+        &literal_contract,
+        &["--json", "project", "list", "--after=--contract=2"],
+        "project list",
+        "NOT_IMPLEMENTED",
+        7,
+    );
+
+    for options in [&["list", "--status=--json"][..], &["show", "--", "--json"]] {
+        let mut args = vec!["--contract", "2"];
+        args.push("project");
+        args.push(options[0]);
+        args.extend(target);
+        args.extend_from_slice(&options[1..]);
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+    let output = sandbox.run(&["project", "list", "--help", "--contract", "2"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--status"));
+    assert!(output.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
+fn unknown_project_long_option_keeps_original_error_with_late_v2_json() {
+    let sandbox = Sandbox::new();
+    for (command, args) in [
+        (
+            "project list",
+            &["project", "list", "--unknown", "--contract=2", "--json"][..],
+        ),
+        (
+            "project list",
+            &[
+                "project",
+                "list",
+                "--unknown",
+                "--limit",
+                "0",
+                "--contract=2",
+                "--json",
+            ],
+        ),
+        (
+            "project list",
+            &[
+                "project",
+                "list",
+                "--unknown=--contract=1",
+                "--contract=2",
+                "--json",
+            ],
+        ),
+        (
+            "project list",
+            &[
+                "project",
+                "list",
+                "--unknown=--help",
+                "--contract=2",
+                "--json",
+            ],
+        ),
+        (
+            "project show",
+            &[
+                "project",
+                "show",
+                "--unknown=--json",
+                "01900000-0000-7000-8000-000000000003",
+                "--contract",
+                "2",
+                "--format=json",
+            ],
+        ),
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "schema_version": 2, "ok": false, "command": command,
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "An argument or command is not recognized.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn unknown_project_long_option_recovery_keeps_literals_and_legacy_boundaries() {
+    let sandbox = Sandbox::new();
+    for args in [
+        &["project", "list", "--unknown=--json", "--contract=2"][..],
+        &[
+            "project",
+            "list",
+            "--status=--json",
+            "--unknown",
+            "--contract=2",
+        ],
+        &[
+            "project",
+            "list",
+            "--unknown",
+            "--contract=2",
+            "--",
+            "--json",
+        ],
+        &[
+            "project",
+            "show",
+            "--unknown",
+            "--contract=2",
+            "--",
+            "--json",
+        ],
+        &[
+            "project",
+            "list",
+            "--",
+            "--unknown",
+            "--contract=2",
+            "--json",
+        ],
+        &[
+            "project",
+            "list",
+            "--unknown",
+            "value",
+            "--contract=2",
+            "--json",
+        ],
+        &["--unknown", "project", "list", "--contract=2", "--json"],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            output
+                .stderr
+                .starts_with(b"error: An argument or command is not recognized.\n"),
+            "{args:?}",
+        );
+    }
+    for args in [
+        &["--json", "project", "list", "--unknown=--contract=2"][..],
+        &[
+            "--json",
+            "project",
+            "show",
+            "--unknown",
+            "--",
+            "--contract=2",
+        ],
+    ] {
+        let output = sandbox.run(args);
+        let explicit_v1 = sandbox.run(&[&["--contract", "1"][..], args].concat());
+        assert_json_failure(
+            &output,
+            args,
+            &format!("project {}", args[2]),
+            "INVALID_ARGUMENT",
+            2,
+        );
+        assert_eq!(output.status.code(), explicit_v1.status.code(), "{args:?}");
+        assert_eq!(output.stdout, explicit_v1.stdout, "{args:?}");
+        assert_eq!(output.stderr, explicit_v1.stderr, "{args:?}");
     }
     sandbox.assert_empty();
 }
