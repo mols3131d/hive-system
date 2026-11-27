@@ -242,6 +242,9 @@ impl Mutation for Create<'_> {
                 (number,),
             )
             .map_err(read_error)?;
+        if live.is_some() {
+            return Err(invalid_counter());
+        }
         let retained: Vec<u64> = snapshot.exec_rows(
             |commit| {
                 format!(
@@ -251,8 +254,22 @@ impl Mutation for Create<'_> {
             },
             (number, number),
         )?;
-        if live.is_some() || !retained.is_empty() {
+        if !retained.is_empty() {
             return Err(invalid_counter());
+        }
+        // Dolt 2.7.6 can stop this iterator at a schema boundary and return
+        // an empty result with a warning. Read diagnostics on the same
+        // session before any other query replaces them.
+        if snapshot
+            .connection
+            .query_first::<mysql::Row, _>("SHOW WARNINGS LIMIT 1")
+            .map_err(read_error)?
+            .is_some()
+        {
+            return Err(HiveError::new(
+                ErrorCode::InvalidRecord,
+                "Retained Issue number history could not be verified.",
+            ));
         }
         Ok(number)
     }

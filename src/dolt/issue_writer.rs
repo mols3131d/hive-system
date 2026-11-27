@@ -162,8 +162,8 @@ impl Pending {
         }
     }
 
-    fn validate(&self, workspace: &str, nonce: &str) -> Result<(), HiveError> {
-        self.operation()?;
+    fn validate(&self, workspace: &str, nonce: &str) -> Result<Kind, HiveError> {
+        let kind = self.operation()?;
         if self.workspace_id != workspace
             || self.launch_nonce != nonce
             || self.session_id == 0
@@ -176,7 +176,7 @@ impl Pending {
         {
             return Err(uncertain());
         }
-        Ok(())
+        Ok(kind)
     }
 }
 
@@ -190,7 +190,7 @@ pub(super) fn execute(
     with_writer_runtime(workspace, target, |runtime, snapshot| {
         mutation.verify_decision(observe_time()?)?;
         mutation.check_scope(snapshot)?;
-        if let Some(recovered) = reconcile(runtime, workspace.workspace_id(), request.kind)? {
+        if let Some(recovered) = reconcile(runtime, workspace.workspace_id())? {
             *snapshot = recovered;
             mutation.check_scope(snapshot)?;
         }
@@ -350,15 +350,10 @@ fn apply(
     Ok(result)
 }
 
-fn reconcile(
-    runtime: &WriterRuntime<'_>,
-    workspace: &str,
-    kind: Kind,
-) -> Result<Option<Snapshot>, HiveError> {
+fn reconcile(runtime: &WriterRuntime<'_>, workspace: &str) -> Result<Option<Snapshot>, HiveError> {
     if !runtime.has_pending()? {
         return Ok(None);
     }
-    let mut observer = open_verified_writer(runtime, kind, true)?;
     let entry = runtime
         .pending()
         .map_err(|_| uncertain())?
@@ -367,7 +362,8 @@ fn reconcile(
         serde_json::from_slice(&entry.bytes).map_err(|_| uncertain())?,
     )
     .map_err(|_| uncertain())?;
-    marker.validate(workspace, runtime.launch_nonce())?;
+    let kind = marker.validate(workspace, runtime.launch_nonce())?;
+    let mut observer = open_verified_writer(runtime, kind, true)?;
     visible_session(&mut observer.connection, Some(marker.session_id)).map_err(|_| uncertain())?;
 
     // Take a fresh committed snapshot after positive same-launch session evidence.
@@ -633,16 +629,20 @@ mod tests {
         });
         let read = |value: &Value| serde_json::from_value::<Pending>(value.clone());
         let legacy = read(&value).unwrap();
-        legacy.validate("workspace", "launch").unwrap();
-        assert!(matches!(legacy.operation(), Ok(Kind::Note)));
+        assert!(matches!(
+            legacy.validate("workspace", "launch"),
+            Ok(Kind::Note)
+        ));
         assert_eq!(json!(legacy), value);
 
         value["version"] = json!(2);
         assert!(read(&value).unwrap().operation().is_err());
         value["kind"] = json!("issue.create");
         let create = read(&value).unwrap();
-        create.validate("workspace", "launch").unwrap();
-        assert!(matches!(create.operation(), Ok(Kind::Create)));
+        assert!(matches!(
+            create.validate("workspace", "launch"),
+            Ok(Kind::Create)
+        ));
         assert_eq!(json!(create), value);
 
         value["version"] = json!(1);

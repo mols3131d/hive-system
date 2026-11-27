@@ -1186,7 +1186,6 @@ fn issue_note_writer_fixture(
     let stale = note(&id(62), "fixture-holder", revision, body, 5);
     assert_eq!(stale["error"]["code"], "STALE_REVISION");
 
-    let nonce = launch_nonce(state);
     let connect = |role| connect_owned(state, port, role);
     let mut reader = connect("reader");
     let head: String = reader
@@ -1233,15 +1232,7 @@ fn issue_note_writer_fixture(
         .query_first("SELECT CONNECTION_ID()")
         .unwrap()
         .unwrap();
-    let pending = serde_json::json!({
-        "version": 1, "workspace_id": workspace, "launch_nonce": nonce,
-        "session_id": session, "request_id": id(63), "base_commit": head,
-        "fingerprint": "a".repeat(64), "area_id": area, "issue_id": issue,
-        "receipt_digest": "b".repeat(64),
-    })
-    .to_string();
-    fs::write(&marker, &pending).unwrap();
-    fs::set_permissions(&marker, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let pending = write_note_pending_fixture(state, &id(63), &head, session);
     let waiting = note(&id(60), "fixture-holder", revision, body, 8);
     assert_eq!(waiting["error"]["code"], "COMMIT_UNCERTAIN");
     assert_eq!(fs::read_to_string(&marker).unwrap(), pending);
@@ -1249,21 +1240,7 @@ fn issue_note_writer_fixture(
     prior.query_drop("ROLLBACK").unwrap();
     drop(prior);
     let mut observer = connect("writer");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while observer
-        .exec_first::<u64, _, _>(
-            "SELECT ID FROM information_schema.PROCESSLIST WHERE ID = ?",
-            (session,),
-        )
-        .unwrap()
-        .is_some()
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "Synthetic session did not exit"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_session_exit(&mut observer, session);
     let recovered = note(&id(60), "fixture-holder", revision, body, 0);
     assert_eq!(recovered["data"], replayed["data"]);
     assert!(!marker.exists());
@@ -1333,8 +1310,7 @@ fn issue_note_writer_fixture(
         assert!(!message.contains("writer_") && !message.contains(&launch_nonce(state)));
         assert!(!marker.exists());
 
-        let old_pending = b"synthetic unresolved pending request";
-        fs::write(&marker, old_pending).unwrap();
+        let old_pending = write_note_pending_fixture(state, &id(66), &legacy_base.0, 1);
         let legacy = note(&id(65), "fixture-holder", current_revision, body, 7);
         assert_eq!(legacy["error"]["code"], "RUNTIME_UNAVAILABLE");
         assert!(
@@ -1347,7 +1323,7 @@ fn issue_note_writer_fixture(
         drop(reader);
         let stopped = run(&["workspace", "stop"], 0);
         assert_eq!(stopped["data"]["pending_request"], "recorded");
-        assert_eq!(fs::read(&marker).unwrap(), old_pending);
+        assert_eq!(fs::read_to_string(&marker).unwrap(), old_pending);
         let start = [
             "workspace",
             "start",
@@ -1358,10 +1334,39 @@ fn issue_note_writer_fixture(
         ];
         let blocked = run(&start, 7);
         assert_eq!(blocked["error"]["code"], "AUTHORITY_UNVERIFIED");
-        assert_eq!(fs::read(&marker).unwrap(), old_pending);
+        assert_eq!(fs::read_to_string(&marker).unwrap(), old_pending);
         // Only the fixture removes its deliberately fabricated marker.
         fs::remove_file(&marker).unwrap();
         run(&start, 0);
+    }
+}
+
+fn write_note_pending_fixture(state: &Path, request: &str, base: &str, session: u64) -> String {
+    let pending = serde_json::json!({
+        "version": 1, "workspace_id": id(1), "launch_nonce": launch_nonce(state),
+        "session_id": session, "request_id": request, "base_commit": base,
+        "fingerprint": "a".repeat(64), "area_id": id(3), "issue_id": id(11),
+        "receipt_digest": "b".repeat(64),
+    })
+    .to_string();
+    let marker = state.join("pending-request.json");
+    fs::write(&marker, &pending).unwrap();
+    fs::set_permissions(&marker, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    pending
+}
+
+fn wait_for_session_exit(observer: &mut Conn, session: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while observer
+        .exec_first::<u64, _, _>(
+            "SELECT ID FROM information_schema.PROCESSLIST WHERE ID = ?",
+            (session,),
+        )
+        .unwrap()
+        .is_some()
+    {
+        assert!(Instant::now() < deadline, "Synthetic session did not exit");
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -1489,6 +1494,23 @@ fn issue_create_writer_fixture(
         restart(None, Some(&baseline));
         let mut reader = connect("reader");
         let before = storage_state(&mut reader);
+        let mut observer = connect("writer");
+        let mut prior = connect("writer");
+        prior.query_drop("START TRANSACTION").unwrap();
+        let session: u64 = prior
+            .query_first("SELECT CONNECTION_ID()")
+            .unwrap()
+            .unwrap();
+        let pending = write_note_pending_fixture(state, &id(88), &before.0, session);
+        let blocked = create(&request, &area, title, Some(body), 1, 8);
+        assert_eq!(blocked["error"]["code"], "COMMIT_UNCERTAIN");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), pending);
+        assert_eq!(storage_state(&mut reader), before);
+
+        prior.query_drop("ROLLBACK").unwrap();
+        drop(prior);
+        wait_for_session_exit(&mut observer, session);
+        drop(observer);
         let legacy = create(&request, &area, title, Some(body), 1, 7);
         assert_eq!(legacy["error"]["code"], "RUNTIME_UNAVAILABLE");
         assert!(
@@ -1596,19 +1618,7 @@ fn issue_create_writer_fixture(
     assert_eq!(fs::read_to_string(&marker).unwrap(), intent);
     prior.query_drop("ROLLBACK").unwrap();
     drop(prior);
-    // The observer polls for positive fixture teardown evidence before invoking Hive.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while current
-        .exec_first::<u64, _, _>(
-            "SELECT ID FROM information_schema.PROCESSLIST WHERE ID = ?",
-            (session,),
-        )
-        .unwrap()
-        .is_some()
-    {
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_session_exit(&mut current, session);
     assert_eq!(
         create(&request, &area, title, Some(body), 1, 0)["data"],
         replayed["data"]
@@ -1748,4 +1758,77 @@ fn issue_create_writer_fixture(
         assert_eq!(storage_state(&mut reader), unchanged);
         assert!(!marker.exists());
     }
+    // Preserve old commits while introducing a gap in the Issue table history.
+    let tables = [
+        "project_issues",
+        "issue_dependencies",
+        "issue_resources",
+        "issue_claims",
+        "issue_labels",
+        "issue_updates",
+        "artifact_issues",
+        "issues",
+    ];
+    let drops = tables
+        .map(|table| format!("DROP TABLE {table};"))
+        .join("\n");
+    let definitions = SCHEMA
+        .split_inclusive(';')
+        .filter(|statement| {
+            tables.iter().any(|table| {
+                statement
+                    .trim_start()
+                    .starts_with(&format!("CREATE TABLE {table} ("))
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(definitions.len(), tables.len());
+    restart(
+        Some(&format!(
+            "{drops}
+         CALL DOLT_COMMIT('-Am', 'Synthetic Issue table drop');
+         {}
+         UPDATE workspace_counters SET next_value = 6 WHERE name = 'issue_number';",
+            definitions.join("\n")
+        )),
+        None,
+    );
+    let mut reader = connect("reader");
+    let recreated = storage_state(&mut reader);
+    let old_number: Option<u64> = reader
+        .exec_first(
+            format!(
+                "SELECT number FROM issues AS OF '{}' WHERE id = ?",
+                second["data"]["confirmed_commit"].as_str().unwrap(),
+            ),
+            (second_id,),
+        )
+        .unwrap();
+    assert_eq!(old_number, Some(6));
+    let newer_issues: Option<u64> = reader
+        .query_first("SELECT number FROM issues WHERE number >= 6 LIMIT 1")
+        .unwrap();
+    assert!(newer_issues.is_none());
+    let diff: Option<u64> = reader.exec_first(
+        format!(
+            "SELECT 1 FROM dolt_diff_issues AS OF '{}' WHERE from_number >= ? OR to_number >= ? LIMIT 1",
+            recreated.0,
+        ),
+        (6, 6),
+    ).unwrap();
+    assert!(diff.is_none());
+    let diagnostic: Option<(String, u64, String)> =
+        reader.query_first("SHOW WARNINGS LIMIT 1").unwrap();
+    assert!(
+        matches!(diagnostic, Some((_, _, message)) if message.contains("cannot render full diff"))
+    );
+
+    let rejected = create(&id(87), &area, title, None, 1, 4);
+    assert_eq!(rejected["error"]["code"], "INVALID_RECORD");
+    assert_eq!(
+        rejected["error"]["message"],
+        "Retained Issue number history could not be verified."
+    );
+    assert_eq!(storage_state(&mut reader), recreated);
+    assert!(!marker.exists());
 }
