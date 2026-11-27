@@ -637,6 +637,8 @@ pub(crate) struct DoltTargetArgs {
 pub(crate) enum AreaCommand {
     /// List committed root Areas or the direct children of one Area.
     List(AreaListArgs),
+    /// Show the committed Area hierarchy or one subtree.
+    Tree(AreaTreeArgs),
     /// Show one committed Area.
     Show(AreaShowArgs),
 }
@@ -652,6 +654,15 @@ pub(crate) struct AreaListArgs {
     /// Continue from the previous page's next_cursor.
     #[arg(long)]
     pub(crate) cursor: Option<String>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct AreaTreeArgs {
+    /// Select the subtree rooted at this canonical lowercase UUIDv7.
+    #[arg(long, value_name = "ID", allow_negative_numbers = true)]
+    pub(crate) root: Option<String>,
     #[command(flatten)]
     pub(crate) target: DoltTargetArgs,
 }
@@ -840,11 +851,12 @@ fn retry_area_read(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches>
         area.mut_subcommand("list", |list| {
             defer_project_check(list).mut_arg("cursor", |arg| arg.allow_negative_numbers(true))
         })
+        .mut_subcommand("tree", defer_project_check)
         .mut_subcommand("show", defer_project_check)
     }));
     let matches = retry.try_get_matches_from(args).ok()?;
     let (command, leaf) = matched_leaf(cli, &matches)?;
-    (matches!(command.as_str(), "area list" | "area show")
+    (matches!(command.as_str(), "area list" | "area tree" | "area show")
         && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }
@@ -1113,6 +1125,7 @@ impl AreaCommand {
     fn validate_dolt_selection(&self, common: &CommonOptions) -> Result<(), &'static str> {
         let target = match self {
             Self::List(args) => &args.target,
+            Self::Tree(args) => &args.target,
             Self::Show(args) => &args.target,
         };
         target.validate_common(

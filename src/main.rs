@@ -104,6 +104,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let result = match invocation.command {
         Command::Validate(args) => dolt::validate(&args),
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
+        Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
         Command::Issue(IssueCommand::List(args)) => {

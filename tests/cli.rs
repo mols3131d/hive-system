@@ -939,6 +939,21 @@ fn dolt_area_reads_require_contract_2_and_an_explicit_target() {
     for option in ["--parent", "--limit", "--cursor", "--workspace-id"] {
         assert!(help.contains(option), "{help}");
     }
+    let tree_help = sandbox.run(&["--contract", "2", "area", "tree", "--help"]);
+    assert_eq!(tree_help.status.code(), Some(0));
+    assert!(
+        String::from_utf8(tree_help.stdout)
+            .unwrap()
+            .contains("--root")
+    );
+    let args = ["--json", "area", "tree"];
+    assert_json_failure(
+        &sandbox.run(&args),
+        &args,
+        "area tree",
+        "INVALID_ARGUMENT",
+        2,
+    );
 
     let args = ["--json", "area", "list"];
     assert_json_failure(
@@ -1004,10 +1019,14 @@ fn malformed_dolt_area_options_preserve_v2_json_at_root_and_leaf() {
     let selectors = ["--contract", "2", "--json"];
     let project = ["--project", "BAD!"];
     let cursor = ["--cursor", "-1"];
+    let root = ["--root", "-1"];
     let cases = [
         ("area list", &["area", "list"][..], &cursor[..], false),
         ("area list", &["area", "list"][..], &project[..], false),
         ("area list", &["area", "list"][..], &project[..], true),
+        ("area tree", &["area", "tree"][..], &root[..], false),
+        ("area tree", &["area", "tree"][..], &project[..], false),
+        ("area tree", &["area", "tree"][..], &project[..], true),
         (
             "area show",
             &["area", "show", target[1]][..],

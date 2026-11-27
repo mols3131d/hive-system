@@ -1,5 +1,5 @@
 use mysql::prelude::Queryable;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{
     ADMIN, CASE_INSENSITIVE, DATABASE, Fixture, commit, empty_seed_sql, id, storage_state,
@@ -64,6 +64,7 @@ fn check_area_reads(collation: &str) {
     };
 
     assert!(items(run("list", &[], 0)).is_empty());
+    assert_eq!(run("tree", &[], 0)["data"]["roots"], json!([]));
     let (root, leaf, child, grandchild, removed, revision) =
         (id(10), id(11), id(12), id(13), id(14), id(15));
     writer
@@ -133,11 +134,23 @@ fn check_area_reads(collation: &str) {
         "2025-01-01T00:00:00.000001Z"
     );
     assert_eq!(items(children), [child.as_str()]);
-    assert_eq!(items(run("list", &["--parent", &child], 0)), [grandchild]);
+    assert_eq!(
+        items(run("list", &["--parent", &child], 0)),
+        [grandchild.as_str()]
+    );
     let empty = run("list", &["--parent", &leaf], 0);
     assert_eq!(empty["data"]["truncated"], false);
     assert_eq!(empty["data"]["next_cursor"], Value::Null);
     assert!(items(empty).is_empty());
+
+    let (adjacent_child, sibling) = (id(17), id(18));
+    writer
+        .query_drop(format!(
+            "INSERT INTO areas (id, parent_id, slug, name, revision) VALUES
+             ('{adjacent_child}', '{leaf}', 'adjacent-child', 'Adjacent child', '{revision}'),
+             ('{sibling}', '{root}', 'a-sibling', 'Sibling', '{revision}')"
+        ))
+        .unwrap();
 
     for options in [
         &["--limit", "2", "--cursor", cursor][..],
@@ -159,7 +172,53 @@ fn check_area_reads(collation: &str) {
     let last = run("list", &["--limit", "2"], 0);
     assert_eq!(last["data"]["truncated"], false);
     assert_eq!(last["data"]["next_cursor"], Value::Null);
-    assert_eq!(items(last), [leaf, root]);
+    assert_eq!(items(last), [leaf.as_str(), root.as_str()]);
+
+    // Read from the committed hierarchy with a staged move and a dirty edit.
+    writer
+        .exec_drop(
+            "UPDATE areas SET parent_id = ? WHERE id = ?",
+            (&root, &adjacent_child),
+        )
+        .unwrap();
+    writer.query_drop("CALL DOLT_ADD('areas')").unwrap();
+    writer
+        .exec_drop("UPDATE areas SET name = 'Dirty' WHERE id = ?", (&root,))
+        .unwrap();
+    let forest = run("tree", &[], 0);
+    assert_eq!(run("tree", &[], 0), forest);
+    assert_eq!(forest["context"]["scope"], json!({"kind": "roots"}));
+    let roots = forest["data"]["roots"].as_array().unwrap();
+    assert_eq!(roots.len(), 2);
+    assert_eq!(roots[0]["id"], leaf);
+    assert_eq!(roots[0]["children"][0]["id"], adjacent_child);
+    assert_eq!(roots[1]["id"], root);
+    assert_eq!(roots[1]["name"], "Root");
+    assert!(roots[1].get("description").is_none());
+    let children = roots[1]["children"].as_array().unwrap();
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[0]["id"], sibling);
+    assert_eq!(children[1]["id"], child);
+    assert_eq!(children[1]["archived_at"], "2025-01-01T00:00:00.000001Z");
+    assert_eq!(children[1]["children"][0]["id"], grandchild);
+    let subtree = run("tree", &["--root", &root], 0);
+    assert_eq!(
+        subtree["context"]["scope"],
+        json!({"kind": "area", "id": root})
+    );
+    assert_eq!(subtree["data"]["roots"], json!([roots[1]]));
+    assert!(!subtree.to_string().contains(&adjacent_child));
+    assert_eq!(
+        run("tree", &["--root", &child], 0)["data"]["roots"],
+        json!([children[1]])
+    );
+    let leaf_tree = run("tree", &["--root", &sibling], 0);
+    assert_eq!(leaf_tree["data"]["roots"], json!([children[0]]));
+    assert_eq!(leaf_tree["data"]["roots"][0]["children"], json!([]));
+    assert_eq!(
+        run("tree", &["--root", &removed], 3)["error"]["code"],
+        "NOT_FOUND"
+    );
 
     // Lowercase selectors must not match invalid uppercase records, even with a
     // case-insensitive table collation. Scoped errors must redact malformed IDs.
@@ -184,6 +243,10 @@ fn check_area_reads(collation: &str) {
         "NOT_FOUND"
     );
     assert_eq!(
+        run("tree", &["--root", &noncanonical], 3)["error"]["code"],
+        "NOT_FOUND"
+    );
+    assert_eq!(
         run("list", &["--parent", &noncanonical], 3)["error"]["code"],
         "NOT_FOUND"
     );
@@ -191,8 +254,74 @@ fn check_area_reads(collation: &str) {
         let report = run("show", &[selector], 2);
         assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
         assert!(!report.to_string().contains(selector));
+        let report = run("tree", &["--root", selector], 2);
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(!report.to_string().contains(selector));
     }
     let invalid = run("list", &["--parent", &child], 4);
     assert_eq!(invalid["error"]["code"], "INVALID_RECORD");
     assert!(!invalid.to_string().contains(unsafe_id));
+    let invalid = run("tree", &["--root", &child], 4);
+    assert_eq!(invalid["error"]["code"], "INVALID_RECORD");
+    assert!(!invalid.to_string().contains(unsafe_id));
+
+    if collation != CASE_INSENSITIVE {
+        for index in 100..132 {
+            let parent = (index > 100).then(|| id(index - 1));
+            writer.exec_drop(
+                "INSERT INTO areas (id, parent_id, slug, name, revision) VALUES (?, ?, 'deep', 'Deep', ?)",
+                (id(index), parent, &revision),
+            ).unwrap();
+        }
+        commit(&mut writer);
+        run("tree", &["--root", &id(100)], 0);
+        writer.exec_drop(
+            "INSERT INTO areas (id, parent_id, slug, name, revision) VALUES (?, ?, 'deep', 'Deep', ?)",
+            (id(132), id(131), &revision),
+        ).unwrap();
+        commit(&mut writer);
+        assert_eq!(
+            run("tree", &["--root", &id(100)], 2)["error"]["code"],
+            "CONTEXT_LIMIT"
+        );
+
+        writer
+            .exec_drop(
+                "UPDATE areas SET parent_id = ? WHERE id = ?",
+                (&adjacent_child, &root),
+            )
+            .unwrap();
+        commit(&mut writer);
+        let cycle = run("tree", &["--root", &root], 4);
+        assert_eq!(cycle["error"]["code"], "INVALID_RECORD");
+        assert!(
+            cycle["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("cycle")
+        );
+
+        for index in 200..300 {
+            let parent = match index {
+                200 => None,
+                201 | 202 => Some(id(200)),
+                _ => Some(id(201 + index % 2)),
+            };
+            writer.exec_drop(
+                "INSERT INTO areas (id, parent_id, slug, name, revision) VALUES (?, ?, ?, 'Wide', ?)",
+                (id(index), parent, format!("wide-{index}"), &revision),
+            ).unwrap();
+        }
+        commit(&mut writer);
+        run("tree", &["--root", &id(200)], 0);
+        writer.exec_drop(
+            "INSERT INTO areas (id, parent_id, slug, name, revision) VALUES (?, ?, 'wide-300', 'Wide', ?)",
+            (id(300), id(201), &revision),
+        ).unwrap();
+        commit(&mut writer);
+        assert_eq!(
+            run("tree", &["--root", &id(200)], 2)["error"]["code"],
+            "CONTEXT_LIMIT"
+        );
+    }
 }
