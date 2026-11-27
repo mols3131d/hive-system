@@ -1074,6 +1074,17 @@ fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
         "--workspace-id",
         "01900000-0000-7000-8000-000000000001",
     ];
+    let check = |args: &[&str], leaf: &str, code, exit| {
+        let output = sandbox.run(args);
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{args:?}: {error}\n{output:?}"));
+        assert_eq!(output.status.code(), Some(exit), "{args:?}: {report}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], format!("bot {leaf}"));
+        assert_eq!(report["error"]["code"], code);
+        assert!(report.get("context").is_none(), "{args:?}");
+    };
     for (options, code, exit) in [
         (
             &["show", "01900000-0000-7000-8000-00000000000A"][..],
@@ -1082,6 +1093,7 @@ fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
         ),
         (&["list", "--limit", "malformed"], "INVALID_ARGUMENT", 2),
         (&["list", "--limit", "-1"], "INVALID_ARGUMENT", 2),
+        (&["list", "--limit=-1"], "INVALID_ARGUMENT", 2),
         (&["list", "--limit", "101"], "INVALID_ARGUMENT", 2),
         (&["list", "--limit"], "INVALID_ARGUMENT", 2),
         (
@@ -1091,6 +1103,10 @@ fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
         ),
         (&["list", "--cursor", "malformed"], "STALE_CURSOR", 5),
         (&["list", "--cursor"], "INVALID_ARGUMENT", 2),
+        (&["list", "--cursor", "-1"], "INVALID_ARGUMENT", 2),
+        (&["list", "--cursor=-1"], "STALE_CURSOR", 5),
+        (&["list", "--status", "-1"], "INVALID_ARGUMENT", 2),
+        (&["list", "--status=-1"], "INVALID_ARGUMENT", 2),
     ] {
         let (leaf, options) = options.split_first().unwrap();
         let args = [
@@ -1100,23 +1116,58 @@ fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
             &["--contract", "2", "--json"],
         ]
         .concat();
-        let output = sandbox.run(&args);
-        let report: Value = serde_json::from_slice(&output.stdout)
-            .unwrap_or_else(|error| panic!("{args:?}: {error}\n{output:?}"));
-        assert_eq!(output.status.code(), Some(exit), "{args:?}: {report}");
-        assert!(output.stderr.is_empty(), "{args:?}");
-        assert_eq!(report["schema_version"], 2, "{args:?}");
-        assert_eq!(report["command"], format!("bot {leaf}"));
-        assert_eq!(report["error"]["code"], code);
-        assert!(report.get("context").is_none(), "{args:?}");
+        check(&args, leaf, code, exit);
     }
 
-    for (literal, exit) in [("--project=--json", 2), ("--cursor=--json", 5)] {
-        let args = [&["bot", "list"][..], &target, &[literal, "--contract", "2"]].concat();
+    for at in [
+        &["--at", "BAD"][..],
+        &["--at=BAD"],
+        &["--at", "-1"],
+        &["--at=-1"],
+    ] {
+        for (leaf, command) in [
+            ("list", &["bot", "list"][..]),
+            (
+                "show",
+                &["bot", "show", "01900000-0000-7000-8000-00000000000a"],
+            ),
+        ] {
+            let trailing = ["--contract", "2", "--json"];
+            check(
+                &[at, command, &target, &trailing].concat(),
+                leaf,
+                "INVALID_ARGUMENT",
+                2,
+            );
+            check(
+                &[command, &target, at, &trailing].concat(),
+                leaf,
+                "INVALID_ARGUMENT",
+                2,
+            );
+        }
+    }
+
+    for (literal, exit) in [
+        ("--project=--json", 2),
+        ("--cursor=--json", 5),
+        ("--status=--json", 2),
+        ("--at=--json", 2),
+    ] {
+        let command = ["bot", "list"];
+        let trailing = ["--contract", "2"];
+        let args = [&command[..], &target, &[literal], &trailing].concat();
         let output = sandbox.run(&args);
         assert_eq!(output.status.code(), Some(exit), "{args:?}");
         assert!(output.stdout.is_empty(), "{args:?}");
         assert!(!output.stderr.is_empty(), "{args:?}");
+        if literal.starts_with("--at=") {
+            let args = [&[literal][..], &command, &target, &trailing].concat();
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(exit), "{args:?}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            assert!(!output.stderr.is_empty(), "{args:?}");
+        }
     }
     sandbox.assert_empty();
 }

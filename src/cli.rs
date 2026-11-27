@@ -883,18 +883,27 @@ fn retry_bot_failure(
     }
     // Recover the output envelope from Clap's actual option boundaries. The
     // original parse error still applies and these values never reach dispatch.
-    let retry = defer_project_check(cli.clone().mut_subcommand("bot", |bot| {
+    let defer_target_checks = |command| {
+        defer_project_check(command).mut_arg("at", |arg| {
+            arg.value_parser(StringValueParser::new())
+                .allow_negative_numbers(true)
+        })
+    };
+    let retry = defer_target_checks(cli.clone().mut_subcommand("bot", |bot| {
         bot.mut_subcommand("list", |list| {
-            defer_project_check(list)
+            defer_target_checks(list)
                 .mut_arg("limit", |arg| {
                     arg.value_parser(StringValueParser::new())
                         .allow_negative_numbers(true)
                         .num_args(0..=1)
                 })
-                .mut_arg("cursor", |arg| arg.num_args(0..=1))
+                .mut_arg("cursor", |arg| {
+                    arg.allow_negative_numbers(true).num_args(0..=1)
+                })
+                .mut_arg("status", |arg| arg.allow_negative_numbers(true))
         })
         .mut_subcommand("show", |show| {
-            defer_project_check(show).mut_arg("bot_id", |arg| {
+            defer_target_checks(show).mut_arg("bot_id", |arg| {
                 arg.value_parser(StringValueParser::new())
                     .allow_negative_numbers(true)
             })
