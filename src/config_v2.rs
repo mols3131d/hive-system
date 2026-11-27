@@ -505,7 +505,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub(crate) use unix::read_explicit;
+pub(crate) use unix::{Candidate, read_explicit};
 
 #[cfg(target_os = "linux")]
 pub(crate) use unix::verify_bootstrap_layout;

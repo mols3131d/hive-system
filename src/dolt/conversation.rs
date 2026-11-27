@@ -1,3 +1,9 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod list;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) use list::run as list;
+
 use std::ffi::OsStr;
 
 use serde::{Deserialize, Serialize};
@@ -7,7 +13,7 @@ use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::{DoltSuccess, Snapshot, is_uuid, unverified_authority};
-use crate::cli::{CommonOptions, ConversationShowArgs, is_slug};
+use crate::cli::{CommonOptions, ConversationShowArgs, DoltTargetArgs, is_slug};
 use crate::config_file::{MAX_FILE_BYTES, parse_v2, present, untagged};
 use crate::config_v2;
 use crate::error::{ErrorCode, HiveError};
@@ -63,14 +69,29 @@ enum Source {
     Stdin,
 }
 
-pub(super) fn read(
+struct Selection {
+    candidate: config_v2::Candidate,
+    bot_slug: String,
+    db_commit: String,
+}
+
+impl Selection {
+    fn context(&self) -> Value {
+        json!({
+            "workspace_id": self.candidate.workspace_id(),
+            "db_commit": self.db_commit,
+            "policy_revision": self.candidate.policy_revision(),
+            "scope": "conversation",
+        })
+    }
+}
+
+fn select(
     common: &CommonOptions,
-    args: &ConversationShowArgs,
+    target: &DoltTargetArgs,
     bot_id: &str,
-    conversation_id: &str,
-) -> Result<DoltSuccess, HiveError> {
-    let expected_id = args
-        .target
+) -> Result<Selection, HiveError> {
+    let expected_id = target
         .workspace_id
         .as_deref()
         .filter(|id| is_uuid(id))
@@ -95,7 +116,7 @@ pub(super) fn read(
     }
     // The explicit root and endpoint are paired by portable identity for
     // inspection. This does not establish which physical db/ serves the endpoint.
-    let (mut snapshot, _) = Snapshot::open(&args.target)?;
+    let (mut snapshot, _) = Snapshot::open(target)?;
     let queens: Vec<(String, String)> = snapshot.exec_rows(
         |commit| {
             format!(
@@ -119,6 +140,23 @@ pub(super) fn read(
             ));
         }
     };
+    Ok(Selection {
+        candidate,
+        bot_slug: bot_slug.clone(),
+        db_commit: snapshot.commit,
+    })
+}
+
+pub(super) fn read(
+    common: &CommonOptions,
+    args: &ConversationShowArgs,
+    bot_id: &str,
+    conversation_id: &str,
+) -> Result<DoltSuccess, HiveError> {
+    let selection = select(common, &args.target, bot_id)?;
+    let candidate = &selection.candidate;
+    let workspace_id = candidate.workspace_id();
+    let bot_slug = &selection.bot_slug;
     let filename = format!("{conversation_id}.md");
     let components = ["conversations", "bots", bot_id, &filename].map(OsStr::new);
     let bytes = candidate
@@ -129,12 +167,7 @@ pub(super) fn read(
         })?;
     let (metadata, body) = validate_file(&bytes, workspace_id, bot_id, bot_slug, conversation_id)?;
     Ok(DoltSuccess {
-        context: json!({
-            "workspace_id": workspace_id,
-            "db_commit": snapshot.commit,
-            "policy_revision": candidate.policy_revision(),
-            "scope": "conversation",
-        }),
+        context: selection.context(),
         data: json!({ "metadata": metadata, "body": body }),
     })
 }
@@ -157,6 +190,20 @@ fn validate_file<'a>(
         ));
     }
 
+    let metadata = validate_metadata(header, workspace_id, bot_id, bot_slug, conversation_id)?;
+    if metadata.provenance.body_sha256 != format!("{:x}", Sha256::digest(body.as_bytes())) {
+        return Err(invalid("The conversation body digest does not match."));
+    }
+    Ok((metadata, body))
+}
+
+fn validate_metadata(
+    header: &str,
+    workspace_id: &str,
+    bot_id: &str,
+    bot_slug: &str,
+    conversation_id: &str,
+) -> Result<Metadata, HiveError> {
     let Tagged(metadata, None) =
         parse_v2::<Tagged<Metadata>>(header.as_bytes(), "Conversation frontmatter").map_err(
             |_| invalid("The conversation frontmatter contains invalid YAML or fields."),
@@ -191,11 +238,7 @@ fn validate_file<'a>(
     {
         return Err(invalid("The conversation frontmatter metadata is invalid."));
     }
-    // Its lowercase hexadecimal encoding also verifies the digest field's shape.
-    if metadata.provenance.body_sha256 != format!("{:x}", Sha256::digest(body.as_bytes())) {
-        return Err(invalid("The conversation body digest does not match."));
-    }
-    Ok((metadata, body))
+    Ok(metadata)
 }
 
 fn split_frontmatter(input: &str) -> Result<(&str, &str), HiveError> {
@@ -326,5 +369,101 @@ mod tests {
         assert!(parse(limit.as_bytes()).is_ok());
         let oversize = limit.replacen("#x", "#xx", 1);
         assert!(parse(oversize.as_bytes()).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn conversation_list_scans_anchored_files_and_invalidates_changed_pages() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use crate::cli::ConversationListArgs;
+
+        struct TempWorkspace(PathBuf);
+
+        impl Drop for TempWorkspace {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("hive-conversation-{}-{nonce}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        let root = TempWorkspace(path);
+        let marker = root.0.join("hive-workspace.yml");
+        fs::write(
+            &marker,
+            format!(
+                "version: 2\nworkspace_id: {WORKSPACE}\nschema_version: 1\npolicy_revision: {}\n",
+                "a".repeat(40)
+            ),
+        )
+        .unwrap();
+        let selection = Selection {
+            candidate: config_v2::read_explicit(&root.0.canonicalize().unwrap()).unwrap(),
+            bot_slug: SLUG.to_owned(),
+            db_commit: "synthetic-test-commit".to_owned(),
+        };
+        let mut args = ConversationListArgs {
+            bot: Some(BOT.into()),
+            limit: "1".to_owned(),
+            cursor: None,
+            target: DoltTargetArgs {
+                workspace_id: Some(WORKSPACE.to_owned()),
+                database: Some("fixture".to_owned()),
+                port: Some("3306".into()),
+            },
+        };
+        let empty = list::page(&selection, &args, BOT, 1).unwrap();
+        assert_eq!(empty["items"], json!([]));
+        assert_eq!(empty["next_cursor"], Value::Null);
+
+        let directory = root.0.join("conversations/bots").join(BOT);
+        fs::create_dir_all(&directory).unwrap();
+        let newer = "01900000-0000-7000-8000-000000000004";
+        let older_file = directory.join(format!("{CONVERSATION}.md"));
+        let newer_file = directory.join(format!("{newer}.md"));
+        let mut older_bytes = fixture("", "\r\n").into_bytes();
+        older_bytes.extend([0xff, 0]);
+        let newer_bytes = fixture("synthetic-body-marker", "\n").replace(CONVERSATION, newer);
+        fs::write(&older_file, &older_bytes).unwrap();
+        fs::write(&newer_file, &newer_bytes).unwrap();
+        let staging = directory.join(".tmp-staging.md");
+        symlink("private-fixture-staging-target", &staging).unwrap();
+        let first = list::page(&selection, &args, BOT, 1).unwrap();
+        assert_eq!(first["items"][0]["conversation_id"], newer);
+        assert_eq!(first["truncated"], true);
+        assert!(!first.to_string().contains("synthetic-body-marker"));
+        args.cursor = Some(first["next_cursor"].as_str().unwrap().to_owned());
+        let second = list::page(&selection, &args, BOT, 1).unwrap();
+        assert_eq!(second["items"][0]["conversation_id"], CONVERSATION);
+        assert_eq!(second["observed_revision"], first["observed_revision"]);
+        assert_eq!(second["next_cursor"], Value::Null);
+        assert_eq!(fs::read(&older_file).unwrap(), older_bytes);
+        assert_eq!(fs::read(&newer_file).unwrap(), newer_bytes.as_bytes());
+        assert_eq!(
+            fs::read_link(&staging).unwrap(),
+            PathBuf::from("private-fixture-staging-target")
+        );
+
+        fs::write(
+            &newer_file,
+            newer_bytes.replace("Synthetic title", "Changed title"),
+        )
+        .unwrap();
+        let error = list::page(&selection, &args, BOT, 1).unwrap_err();
+        assert!(matches!(error.code, ErrorCode::StaleCursor));
+        args.cursor = None;
+        fs::remove_file(&newer_file).unwrap();
+        symlink(&older_file, &newer_file).unwrap();
+        let error = list::page(&selection, &args, BOT, 1).unwrap_err();
+        assert!(matches!(error.code, ErrorCode::InvalidConfig));
     }
 }

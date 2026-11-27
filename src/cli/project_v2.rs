@@ -4,8 +4,11 @@ use clap::{Arg, ArgAction, Args, FromArgMatches, Subcommand};
 
 use super::{
     Command, CommonArgs, Contract, DoltTargetArgs, Invocation, ParseFailure, matched_leaf,
-    recover_unknown_long, requested_contract, requested_format, safe_parse_message,
+    requested_contract, requested_format, safe_parse_message,
 };
+
+// The conversation parser uses this path to the shared recovery helper.
+pub(super) use super::recover_unknown_long;
 
 #[derive(Subcommand)]
 pub(crate) enum ProjectRead {
@@ -72,7 +75,7 @@ pub(super) fn parse(
                 .try_get_matches_from(args)
                 .ok()?;
             let matches =
-                recover_unknown_long(&cli, args, "project", &partial, &error).unwrap_or(partial);
+                recover_unknown_long(&cli, args, &partial, &error, "project").unwrap_or(partial);
             (matches, Some(error.kind()))
         }
     };
