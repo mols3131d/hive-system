@@ -2446,7 +2446,9 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
         None
     };
     let leaf = match partial.subcommand() {
-        Some(("help", _)) => help_leaf.map(|(_, leaf)| leaf),
+        Some(("help", _)) if writer_help_domain(&partial, "issue").is_some() => {
+            help_leaf.map(|(_, leaf)| leaf)
+        }
         Some(("issue", issue)) => match issue.subcommand() {
             Some((
                 "note" | "create" | "update" | "select" | "claim" | "release" | "recover"
