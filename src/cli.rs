@@ -1362,6 +1362,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                         .try_get_matches_from(&args)
                         .ok()?;
                     recover_unknown_long(&cli, &args, &partial, &error, "workspace")
+                        .or_else(|| recover_unknown_long(&cli, &args, &partial, &error, "area"))
                         .or_else(|| recover_context_resolve(&cli, &args, &partial, &error))
                         .or(Some(partial))
                 });
@@ -1937,7 +1938,7 @@ fn recover_unknown_long(
         (
             "workspace",
             "init" | "status" | "start" | "stop" | "recover"
-        ) | ("artifact", "create")
+        ) | ("artifact" | "area", "create")
             | ("project", "create" | "add-issue")
             | (_, "list" | "show")
     ) {
@@ -1950,11 +1951,14 @@ fn recover_unknown_long(
     let long = unknown_long_name(leaf, invalid)?;
 
     let workspace_init = (domain, action) == ("workspace", "init");
-    let project_write = matches!((domain, action), ("project", "create" | "add-issue"));
+    let allow_incomplete = matches!(
+        (domain, action),
+        ("area", "create") | ("project", "create" | "add-issue")
+    );
     let accept_value = workspace_init
         || matches!(
             (domain, action),
-            ("label", "list") | ("artifact", "create") | ("project", "create")
+            ("label", "list") | ("artifact" | "area", "create") | ("project", "create")
         );
     // When the command has positional IDs, first let those slots consume
     // ordinary tokens. Try a separated unknown-option value if that fails.
@@ -2003,7 +2007,11 @@ fn recover_unknown_long(
         let retry = build_retry(accept_value);
         match retry.clone().try_get_matches_from(&args[..end]) {
             Ok(matches) if recognized(&matches) => return Some(matches),
-            Err(error) if project_write && error.kind() == ErrorKind::MissingRequiredArgument => {
+            Err(error)
+                if allow_incomplete
+                    && missing.is_none()
+                    && error.kind() == ErrorKind::MissingRequiredArgument =>
+            {
                 missing = retry
                     .ignore_errors(true)
                     .try_get_matches_from(&args[..end])
