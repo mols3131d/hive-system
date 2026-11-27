@@ -8,6 +8,7 @@ mod graph;
 mod issue;
 mod issue_list;
 mod issue_readiness;
+pub(crate) mod label;
 mod project;
 mod records;
 pub(crate) mod resource;
