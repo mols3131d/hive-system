@@ -2676,6 +2676,21 @@ fn malformed_bot_register_keeps_the_late_v2_envelope() {
         assert!(String::from_utf8_lossy(&help.stdout).contains("--asset-revision"));
         assert!(help.stderr.is_empty());
     }
+    for command in [["help", "bot", "register"], ["bot", "help", "register"]] {
+        let implicit = sandbox.run(&command);
+        assert_eq!(implicit.status.code(), Some(2), "{command:?}: {implicit:?}");
+        let legacy = sandbox.run(&[&["--contract", "1"][..], &command].concat());
+        assert_eq!(legacy.status.code(), Some(2), "{command:?}: {legacy:?}");
+        for args in [
+            [&["--contract", "2"][..], &command].concat(),
+            [&command[..], &["--contract", "2"]].concat(),
+        ] {
+            let help = sandbox.run(&args);
+            assert!(help.status.success(), "{args:?}: {help:?}");
+            assert!(String::from_utf8_lossy(&help.stdout).contains("--asset-revision"));
+            assert!(help.stderr.is_empty());
+        }
+    }
     let command = ["bot", "register", "--slug", "fixture"];
     let selectors = ["--contract", "2", "--json"];
     for invalid in [
