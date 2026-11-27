@@ -1,136 +1,73 @@
 mod graph;
+mod issue;
 mod records;
 
 use std::num::NonZeroU16;
 use std::time::Duration;
 
 use mysql::prelude::{FromRow, Queryable};
-use mysql::{Conn, OptsBuilder};
+use mysql::{Conn, OptsBuilder, Params};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::cli::ValidateArgs;
+use crate::cli::{DoltTargetArgs, IssueShowArgs, ValidateArgs};
 use crate::error::{ErrorCode, HiveError};
 
+pub(crate) use issue::show as issue_show;
+
 const DOLT_VERSION: &str = "2.7.6";
-pub(crate) const STORAGE_SCHEMA_VERSION: u32 = 1;
+const STORAGE_SCHEMA_VERSION: u32 = 1;
 const INITIAL_SCHEMA: &[u8] = include_bytes!("../assets/schema/dolt/0001_initial.sql");
 const INITIAL_SCHEMA_MANIFEST: &str = include_str!("../assets/schema/dolt/0001_schema.sha256");
 const MAX_ROWS_PER_TABLE: usize = 100_000;
 
-pub(crate) struct ValidationReport {
-    pub(crate) workspace_id: String,
-    pub(crate) db_commit: String,
-    pub(crate) diagnostics: records::Diagnostics,
+pub(crate) struct DoltSuccess {
+    pub(crate) context: Value,
+    pub(crate) data: Value,
 }
 
-pub(crate) fn validate(args: &ValidateArgs) -> Result<ValidationReport, HiveError> {
-    let (Some(database), Some(port), Some(workspace_id)) = (
-        args.database.as_deref(),
-        args.port.as_deref(),
-        args.workspace_id.as_deref(),
-    ) else {
-        return Err(HiveError::new(
-            ErrorCode::InvalidArgument,
-            "Supply the database, port, and expected workspace ID.",
-        ));
-    };
-    // Parse the value after clap has recognized the contract and output options.
-    let Some(port) = port
-        .to_str()
-        .and_then(|value| value.parse::<NonZeroU16>().ok())
-    else {
-        return Err(HiveError::new(
-            ErrorCode::InvalidArgument,
-            "Supply a Dolt port between 1 and 65535.",
-        ));
-    };
+pub(crate) struct DoltFailure {
+    pub(crate) context: Option<Value>,
+    pub(crate) error: HiveError,
+}
 
-    if !is_uuid(workspace_id) {
-        return Err(HiveError::new(
-            ErrorCode::InvalidArgument,
-            "The expected workspace ID must be a lowercase UUID.",
-        ));
-    }
-    if database.is_empty()
-        || database.len() > 64
-        || !database
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
-        return Err(HiveError::new(
-            ErrorCode::InvalidArgument,
-            "Supply a Dolt database name using letters, digits, underscores, or hyphens.",
-        ));
+impl DoltFailure {
+    pub(crate) fn without_context(error: HiveError) -> Box<Self> {
+        Box::new(Self {
+            context: None,
+            error,
+        })
     }
 
-    let user = reader_credential("HIVE_DOLT_USER")?;
-    let password = reader_credential("HIVE_DOLT_PASSWORD")?;
-    if user.eq_ignore_ascii_case("root") {
-        return Err(HiveError::new(
-            ErrorCode::InvalidArgument,
-            "Supply a dedicated Dolt reader account.",
+    pub(crate) fn with_context(context: Value, error: HiveError) -> Box<Self> {
+        Box::new(Self {
+            context: Some(context),
+            error,
+        })
+    }
+}
+
+pub(crate) fn validate(args: &ValidateArgs) -> Result<DoltSuccess, Box<DoltFailure>> {
+    let (mut snapshot, workspace_id) =
+        Snapshot::open(&args.target).map_err(DoltFailure::without_context)?;
+    let diagnostics = records::validate(&mut snapshot).map_err(DoltFailure::without_context)?;
+    let context = json!({
+        "workspace_id": workspace_id,
+        "db_commit": snapshot.commit,
+        "scope": "workspace",
+    });
+    if !diagnostics.items.is_empty() {
+        return Err(DoltFailure::with_context(
+            context,
+            HiveError::record_violations(diagnostics.items, diagnostics.truncated),
         ));
     }
-    let timeout = Some(Duration::from_secs(5));
-    let mut connection = Conn::new(
-        OptsBuilder::new()
-            .ip_or_hostname(Some("127.0.0.1"))
-            .tcp_port(port.get())
-            .prefer_socket(false)
-            .tcp_connect_timeout(timeout)
-            .read_timeout(timeout)
-            .write_timeout(timeout)
-            .db_name(Some(database))
-            .user(Some(user))
-            .pass(Some(password)),
-    )
-    .map_err(read_error)?;
-
-    let Some(version): Option<String> = first_row(&mut connection, "SELECT DOLT_VERSION()")? else {
-        return Err(incompatible_schema(
-            "The server did not report a Dolt version.",
-        ));
-    };
-    if version != DOLT_VERSION {
-        return Err(incompatible_schema(format!(
-            "Validation requires Dolt {DOLT_VERSION}."
-        )));
-    }
-
-    let selection: Option<(Option<String>, Option<String>, Option<String>)> = first_row(
-        &mut connection,
-        "SELECT DATABASE(), ACTIVE_BRANCH(), DOLT_HASHOF('HEAD')",
-    )?;
-    let Some((Some(selected_db), Some(branch), Some(commit))) = selection else {
-        return Err(unverified_authority(
-            "The Dolt database or committed main branch is unavailable.",
-        ));
-    };
-    if selected_db != database || branch != "main" || !is_commit_hash(&commit) {
-        return Err(unverified_authority(
-            "The connection must resolve to the selected Dolt database and committed main branch.",
-        ));
-    }
-
-    let mut snapshot = Snapshot { connection, commit };
-    snapshot.verify_schema()?;
-    let identity: Vec<(i8, String)> = snapshot.rows(
-        "workspace_meta",
-        "singleton_id, workspace_id",
-        "ORDER BY singleton_id LIMIT 2",
-    )?;
-    if !matches!(identity.as_slice(), [(1, actual)] if actual == workspace_id) {
-        return Err(unverified_authority(
-            "The committed workspace identity does not match the expected UUID.",
-        ));
-    }
-
-    snapshot.verify_table_definitions()?;
-    let diagnostics = records::validate(&mut snapshot)?;
-    Ok(ValidationReport {
-        workspace_id: workspace_id.to_owned(),
-        db_commit: snapshot.commit,
-        diagnostics,
+    Ok(DoltSuccess {
+        context,
+        data: json!({
+            "storage_schema_version": STORAGE_SCHEMA_VERSION,
+            "diagnostics": diagnostics.items,
+        }),
     })
 }
 
@@ -152,6 +89,112 @@ struct Snapshot {
 }
 
 impl Snapshot {
+    fn open(target: &DoltTargetArgs) -> Result<(Self, String), HiveError> {
+        let (Some(database), Some(port), Some(workspace_id)) = (
+            target.database.as_deref(),
+            target.port.as_deref(),
+            target.workspace_id.as_deref(),
+        ) else {
+            return Err(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "Supply the database, port, and expected workspace ID.",
+            ));
+        };
+        // Parse the value after clap has recognized the contract and output options.
+        let Some(port) = port
+            .to_str()
+            .and_then(|value| value.parse::<NonZeroU16>().ok())
+        else {
+            return Err(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "Supply a Dolt port between 1 and 65535.",
+            ));
+        };
+
+        if !is_uuid(workspace_id) {
+            return Err(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "The expected workspace ID must be a lowercase UUID.",
+            ));
+        }
+        if database.is_empty()
+            || database.len() > 64
+            || !database
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "Supply a Dolt database name using letters, digits, underscores, or hyphens.",
+            ));
+        }
+
+        let user = reader_credential("HIVE_DOLT_USER")?;
+        let password = reader_credential("HIVE_DOLT_PASSWORD")?;
+        if user.eq_ignore_ascii_case("root") {
+            return Err(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "Supply a dedicated Dolt reader account.",
+            ));
+        }
+        let timeout = Some(Duration::from_secs(5));
+        let mut connection = Conn::new(
+            OptsBuilder::new()
+                .ip_or_hostname(Some("127.0.0.1"))
+                .tcp_port(port.get())
+                .prefer_socket(false)
+                .tcp_connect_timeout(timeout)
+                .read_timeout(timeout)
+                .write_timeout(timeout)
+                .db_name(Some(database))
+                .user(Some(user))
+                .pass(Some(password)),
+        )
+        .map_err(read_error)?;
+
+        let Some(version): Option<String> = first_row(&mut connection, "SELECT DOLT_VERSION()")?
+        else {
+            return Err(incompatible_schema(
+                "The server did not report a Dolt version.",
+            ));
+        };
+        if version != DOLT_VERSION {
+            return Err(incompatible_schema(format!(
+                "Validation requires Dolt {DOLT_VERSION}."
+            )));
+        }
+
+        let selection: Option<(Option<String>, Option<String>, Option<String>)> = first_row(
+            &mut connection,
+            "SELECT DATABASE(), ACTIVE_BRANCH(), DOLT_HASHOF('HEAD')",
+        )?;
+        let Some((Some(selected_db), Some(branch), Some(commit))) = selection else {
+            return Err(unverified_authority(
+                "The Dolt database or committed main branch is unavailable.",
+            ));
+        };
+        if selected_db != database || branch != "main" || !is_commit_hash(&commit) {
+            return Err(unverified_authority(
+                "The connection must resolve to the selected Dolt database and committed main branch.",
+            ));
+        }
+
+        let mut snapshot = Snapshot { connection, commit };
+        snapshot.verify_schema()?;
+        let identity: Vec<(i8, String)> = snapshot.rows(
+            "workspace_meta",
+            "singleton_id, workspace_id",
+            "ORDER BY singleton_id LIMIT 2",
+        )?;
+        if !matches!(identity.as_slice(), [(1, actual)] if actual == workspace_id) {
+            return Err(unverified_authority(
+                "The committed workspace identity does not match the expected UUID.",
+            ));
+        }
+
+        snapshot.verify_table_definitions()?;
+        Ok((snapshot, workspace_id.to_owned()))
+    }
     fn verify_schema(&mut self) -> Result<(), HiveError> {
         let tables: Vec<(String, String)> = query_rows(
             &mut self.connection,
@@ -214,6 +257,22 @@ impl Snapshot {
                 self.commit
             ),
         )
+    }
+
+    // Caller values and fetched IDs are bound with SQL parameters; only the
+    // verified commit hash and static SQL templates are formatted.
+    fn exec_rows<T: FromRow, P: Into<Params>>(
+        &mut self,
+        sql: impl FnOnce(&str) -> String,
+        params: P,
+    ) -> Result<Vec<T>, HiveError> {
+        let query = sql(&self.commit);
+        self.connection
+            .exec_opt(query, params)
+            .map_err(read_error)?
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .map_err(|_| incompatible_schema("A committed table returned unexpected column types."))
     }
 
     fn records<T: FromRow>(

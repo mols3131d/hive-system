@@ -239,6 +239,9 @@ pub(crate) enum Command {
     Memory(MemoryCommand),
     /// Show the selected workspace context.
     Context,
+    /// Inspect Issues under contract 2.
+    #[command(subcommand, hide = true)]
+    Issue(IssueCommand),
     /// Validate workspace records.
     Validate(ValidateArgs),
     /// Check the local environment and workspace.
@@ -613,6 +616,34 @@ pub(crate) enum MemoryCommand {
 }
 
 #[derive(Args)]
+pub(crate) struct DoltTargetArgs {
+    /// Expected identity of the local Dolt workspace.
+    #[arg(long, value_name = "UUID")]
+    pub(crate) workspace_id: Option<String>,
+    /// Explicit local Dolt database name.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) database: Option<String>,
+    /// Explicit local Dolt SQL Server port.
+    #[arg(long, value_name = "PORT", allow_negative_numbers = true)]
+    pub(crate) port: Option<OsString>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum IssueCommand {
+    /// Show an Issue and its bounded direct relation IDs.
+    Show(IssueShowArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct IssueShowArgs {
+    /// Canonical lowercase UUIDv7 or quoted #number Issue selector.
+    #[arg(value_name = "ISSUE")]
+    pub(crate) issue: String,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
 pub(crate) struct ValidateArgs {
     #[arg(long, value_name = "TASK", conflicts_with = "all_projects")]
     pub(crate) task: Option<TaskId>,
@@ -623,15 +654,8 @@ pub(crate) struct ValidateArgs {
     /// Validate the whole workspace with contract 2.
     #[arg(long)]
     pub(crate) all: bool,
-    /// Expected identity of the local Dolt workspace.
-    #[arg(long, value_name = "UUID")]
-    pub(crate) workspace_id: Option<String>,
-    /// Explicit local Dolt database name.
-    #[arg(long, value_name = "NAME")]
-    pub(crate) database: Option<String>,
-    /// Explicit local Dolt SQL Server port.
-    #[arg(long, value_name = "PORT", allow_negative_numbers = true)]
-    pub(crate) port: Option<OsString>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
@@ -889,10 +913,11 @@ impl CommonOptions {
 impl Command {
     fn validate(&self, common: &CommonOptions) -> Result<(), &'static str> {
         if common.contract == Contract::V2 {
-            if let Self::Validate(args) = self {
-                return args.validate_dolt_selection(common);
-            }
-            return Ok(());
+            return match self {
+                Self::Validate(args) => args.validate_dolt_selection(common),
+                Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
+                _ => Ok(()),
+            };
         }
         match self {
             Self::Config(ConfigCommand::Bind) => {
@@ -908,12 +933,9 @@ impl Command {
             Self::Project(ProjectCommand::Show { project_id }) => {
                 common.check_project(project_id.as_ref())
             }
+            Self::Issue(_) => Err("Issue commands require --contract 2."),
             Self::Validate(args) => {
-                if args.all
-                    || args.workspace_id.is_some()
-                    || args.database.is_some()
-                    || args.port.is_some()
-                {
+                if args.all || args.target.has_any() {
                     return Err("Dolt validation requires --contract 2.");
                 }
                 if args.against.is_some() && matches!(common.view, View::Authority) {
@@ -928,26 +950,54 @@ impl Command {
     }
 }
 
-impl ValidateArgs {
-    fn validate_dolt_selection(&self, common: &CommonOptions) -> Result<(), &'static str> {
-        if self.task.is_some()
-            || self.all_projects
-            || self.against.is_some()
-            || common.workspace.is_some()
+impl DoltTargetArgs {
+    fn has_any(&self) -> bool {
+        self.workspace_id.is_some() || self.database.is_some() || self.port.is_some()
+    }
+
+    fn validate_common(
+        &self,
+        common: &CommonOptions,
+        error: &'static str,
+    ) -> Result<(), &'static str> {
+        if common.workspace.is_some()
             || common.project.is_some()
             || common.project_root.is_some()
             || !matches!(common.view, View::WorkingTree)
         {
-            return Err(
-                "Dolt validation accepts only an explicit local database and whole-workspace scope.",
-            );
+            return Err(error);
         }
-        if !self.all
-            || self.workspace_id.is_none()
-            || self.database.is_none()
-            || self.port.is_none()
-        {
+        Ok(())
+    }
+
+    fn has_all(&self) -> bool {
+        self.workspace_id.is_some() && self.database.is_some() && self.port.is_some()
+    }
+}
+
+impl ValidateArgs {
+    fn validate_dolt_selection(&self, common: &CommonOptions) -> Result<(), &'static str> {
+        const ERROR: &str =
+            "Dolt validation accepts only an explicit local database and whole-workspace scope.";
+        if self.task.is_some() || self.all_projects || self.against.is_some() {
+            return Err(ERROR);
+        }
+        self.target.validate_common(common, ERROR)?;
+        if !self.all || !self.target.has_all() {
             return Err("Dolt validation requires --all, --workspace-id, --database, and --port.");
+        }
+        Ok(())
+    }
+}
+
+impl IssueShowArgs {
+    fn validate_dolt_selection(&self, common: &CommonOptions) -> Result<(), &'static str> {
+        self.target.validate_common(
+            common,
+            "Dolt issue show accepts only an explicit local database and workspace ID.",
+        )?;
+        if !self.target.has_all() {
+            return Err("Dolt issue show requires --workspace-id, --database, and --port.");
         }
         Ok(())
     }

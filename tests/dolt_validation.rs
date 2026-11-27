@@ -4,6 +4,8 @@ mod artifacts;
 mod bots;
 #[path = "dolt_validation/directives.rs"]
 mod directives;
+#[path = "dolt_validation/issue_show.rs"]
+mod issue_show;
 #[path = "dolt_validation/issue_updates.rs"]
 mod issue_updates;
 #[path = "dolt_validation/receipts.rs"]
@@ -210,9 +212,21 @@ impl Fixture {
         .unwrap()
     }
 
-    fn validate(&self, workspace_id: &str, password: &str, port: u16) -> Output {
+    fn run_hive(&self, args: &[&str], password: &str) -> Output {
         Command::new(env!("CARGO_BIN_EXE_hive"))
-            .args([
+            .args(args)
+            .current_dir(&self.root)
+            .env_clear()
+            .env("HOME", self.root.join("home"))
+            .env("HIVE_DOLT_USER", READER)
+            .env("HIVE_DOLT_PASSWORD", password)
+            .output()
+            .unwrap()
+    }
+
+    fn validate(&self, workspace_id: &str, password: &str, port: u16) -> Output {
+        self.run_hive(
+            &[
                 "--contract",
                 "2",
                 "--json",
@@ -224,14 +238,9 @@ impl Fixture {
                 DATABASE,
                 "--port",
                 &port.to_string(),
-            ])
-            .current_dir(&self.root)
-            .env_clear()
-            .env("HOME", self.root.join("home"))
-            .env("HIVE_DOLT_USER", READER)
-            .env("HIVE_DOLT_PASSWORD", password)
-            .output()
-            .unwrap()
+            ],
+            password,
+        )
     }
 
     fn check(&self, exit: i32, writer: &mut Conn) -> Value {

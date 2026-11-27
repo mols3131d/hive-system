@@ -102,6 +102,7 @@ fn top_level_help_and_version_run_without_a_workspace() {
         let help = String::from_utf8(output.stdout).unwrap();
         assert!(help.contains("Usage: hive"), "{help}");
         assert!(help.contains("--workspace"), "{help}");
+        assert!(!help.contains("\n  issue "), "{help}");
         assert!(output.stderr.is_empty(), "hive {args:?}");
     }
     for args in [["--version"].as_slice(), &["--format=json", "--version"]] {
@@ -612,4 +613,168 @@ fn text_operation_failure_uses_stderr() {
             "hive {args:?}"
         );
     }
+}
+
+#[test]
+fn dolt_issue_show_requires_contract_2_and_validates_explicit_target_and_selector() {
+    let sandbox = Sandbox::new();
+    let uuid = "01900000-0000-7000-8000-000000000010";
+
+    let help = sandbox.run(&["--contract", "2", "issue", "show", "--help"]);
+    assert_eq!(help.status.code(), Some(0));
+    let help_text = String::from_utf8(help.stdout).unwrap();
+    assert!(help_text.contains("Usage: hive issue show"), "{help_text}");
+    assert!(help_text.contains("--workspace-id"), "{help_text}");
+    assert!(help_text.contains("--database"), "{help_text}");
+    assert!(help_text.contains("--port"), "{help_text}");
+    assert!(help.stderr.is_empty());
+
+    for args in [
+        ["--json", "issue", "show", "#1"].as_slice(),
+        &["--json", "--contract", "1", "issue", "show", uuid],
+    ] {
+        assert_json_failure(
+            &sandbox.run(args),
+            args,
+            "issue show",
+            "INVALID_ARGUMENT",
+            2,
+        );
+    }
+
+    for args in [
+        ["--json", "--contract", "2", "issue", "show"].as_slice(),
+        &["--json", "--contract", "2", "issue", "show", "#1"],
+        &[
+            "--json",
+            "--contract",
+            "2",
+            "--workspace",
+            WORKSPACE,
+            "issue",
+            "show",
+            "#1",
+            "--workspace-id",
+            uuid,
+            "--database",
+            "fixture_db",
+            "--port",
+            "3307",
+        ],
+        &[
+            "--json",
+            "--contract",
+            "2",
+            "--project",
+            PROJECT,
+            "issue",
+            "show",
+            "#1",
+            "--workspace-id",
+            uuid,
+            "--database",
+            "fixture_db",
+            "--port",
+            "3307",
+        ],
+        &[
+            "--json",
+            "--contract",
+            "2",
+            "--at",
+            REVISION,
+            "issue",
+            "show",
+            "#1",
+            "--workspace-id",
+            uuid,
+            "--database",
+            "fixture_db",
+            "--port",
+            "3307",
+        ],
+        &[
+            "--json",
+            "--contract",
+            "2",
+            "issue",
+            "show",
+            "#1",
+            "--authority",
+            "--workspace-id",
+            uuid,
+            "--database",
+            "fixture_db",
+            "--port",
+            "3307",
+        ],
+        &[
+            "--json",
+            "--contract",
+            "2",
+            "issue",
+            "show",
+            "#1",
+            "--workspace-id",
+            uuid,
+            "--database",
+            "fixture_db",
+            "--port",
+            "0",
+        ],
+        &[
+            "--json",
+            "--contract",
+            "2",
+            "issue",
+            "show",
+            "#1",
+            "--workspace-id",
+            uuid,
+            "--database",
+            "fixture_db",
+            "--port=-1",
+        ],
+    ] {
+        let output = sandbox.run(args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?} {report}");
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], "issue show", "{args:?}");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT", "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+    }
+
+    for bad_selector in [
+        "1",
+        "#0",
+        "#-1",
+        "bad-selector",
+        "01900000-0000-7000-8000-00000000000A",
+        "01900000-0000-4000-8000-00000000000a",
+    ] {
+        let args = [
+            "--json",
+            "--contract",
+            "2",
+            "issue",
+            "show",
+            bad_selector,
+            "--workspace-id",
+            uuid,
+            "--database",
+            "fixture_db",
+            "--port",
+            "3307",
+        ];
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{bad_selector} {report}");
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "issue show");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(!report.to_string().contains(bad_selector), "{bad_selector}");
+        assert!(output.stderr.is_empty());
+    }
+    sandbox.assert_empty();
 }
