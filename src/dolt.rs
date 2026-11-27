@@ -24,7 +24,10 @@ pub(crate) mod issue_note;
 mod issue_note_fingerprint;
 #[cfg(target_os = "linux")]
 mod issue_note_receipt;
+pub(crate) mod issue_parent;
 mod issue_readiness;
+#[cfg(target_os = "linux")]
+mod issue_relation;
 pub(crate) mod issue_update;
 #[cfg(target_os = "linux")]
 pub(crate) mod issue_writer;

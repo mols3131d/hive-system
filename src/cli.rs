@@ -272,6 +272,8 @@ pub(crate) enum Command {
     #[command(skip)]
     IssueDependency(IssueDependencyArgs, bool),
     #[command(skip)]
+    IssueParent(IssueParentArgs),
+    #[command(skip)]
     Resource(ResourceCommand),
     #[command(skip)]
     Workspace(WorkspaceAction),
@@ -1240,6 +1242,45 @@ pub(crate) struct IssueDependencyArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueParentArgs {
+    /// Exact child Issue UUIDv7.
+    pub(crate) issue: String,
+    /// Exact owning Area UUIDv7 of the child.
+    #[arg(long)]
+    pub(crate) area: String,
+    /// Exact current parent UUIDv7. Omit when attaching a parentless Issue.
+    #[arg(long, requires = "old_parent_area")]
+    pub(crate) old_parent: Option<String>,
+    #[arg(long, requires = "old_parent")]
+    pub(crate) old_parent_area: Option<String>,
+    /// Exact new parent UUIDv7.
+    #[arg(
+        long,
+        required_unless_present = "clear",
+        conflicts_with = "clear",
+        requires = "parent_area"
+    )]
+    pub(crate) parent: Option<String>,
+    #[arg(long, requires = "parent")]
+    pub(crate) parent_area: Option<String>,
+    /// Remove the exact current parent.
+    #[arg(long, requires = "old_parent")]
+    pub(crate) clear: bool,
+    #[arg(long)]
+    pub(crate) actor: String,
+    /// Expected revision as ISSUE=REV, once per incident Issue.
+    #[arg(long, num_args = 1, required = true)]
+    pub(crate) if_match: Vec<String>,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Fresh, request-bound decision file covering every endpoint.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueListArgs {
     /// Select Issues across the workspace.
     #[arg(long)]
@@ -1465,6 +1506,12 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             Some(("issue", issue)) if issue.subcommand_name() == Some("update") => {
                 Command::IssueUpdate(
                     IssueUpdateArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("set-parent") => {
+                Command::IssueParent(
+                    IssueParentArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
             }
@@ -1977,7 +2024,11 @@ fn recover_unknown_long(
     let named_write = matches!((domain, action), ("area" | "project", "create"));
     let positional_write = matches!(
         (domain, action),
-        ("project", "add-issue") | ("issue", "add-dependency" | "remove-dependency")
+        ("project", "add-issue")
+            | (
+                "issue",
+                "add-dependency" | "remove-dependency" | "set-parent"
+            )
     );
     if !(named_write
         || positional_write
@@ -2092,6 +2143,10 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 clap::Command::new("update")
                     .about("Edit an Issue with a current operator decision."),
             )))
+            .subcommand(add_leaf_options(IssueParentArgs::augment_args(
+                clap::Command::new("set-parent")
+                    .about("Attach, move or clear an exact Issue parent."),
+            )))
             .subcommand(add_leaf_options(IssueDependencyArgs::augment_args(
                 clap::Command::new("add-dependency").about("Add an exact Issue prerequisite."),
             )))
@@ -2108,6 +2163,7 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .mut_subcommand("note", extended_error_options)
                 .mut_subcommand("create", extended_error_options)
                 .mut_subcommand("update", extended_error_options)
+                .mut_subcommand("set-parent", extended_error_options)
                 .mut_subcommand("add-dependency", extended_error_options)
                 .mut_subcommand("remove-dependency", extended_error_options)
         });
@@ -2124,9 +2180,11 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
     };
     let leaf = match partial.subcommand() {
         Some(("issue", issue)) => match issue.subcommand() {
-            Some(("note" | "create" | "update" | "add-dependency" | "remove-dependency", leaf)) => {
-                Some(leaf)
-            }
+            Some((
+                "note" | "create" | "update" | "add-dependency" | "remove-dependency"
+                | "set-parent",
+                leaf,
+            )) => Some(leaf),
             None => None,
             _ => return None,
         },
@@ -3018,6 +3076,22 @@ impl Command {
                     }
                     Ok(())
                 }
+                Self::IssueParent(args) => {
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Issue parent edits require --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Issue parent edits require exact current Issue and Area scopes.",
+                        );
+                    }
+                    Ok(())
+                }
                 Self::IssueNote(args) => {
                     if args.kind != "progress" {
                         return Err("Issue note requires --kind progress.");
@@ -3115,6 +3189,7 @@ impl Command {
             | Self::IssueNote(_)
             | Self::IssueCreate(_)
             | Self::IssueUpdate(_)
+            | Self::IssueParent(_)
             | Self::IssueDependency(_, _) => Err("Issue commands require --contract 2."),
             Self::Backup(_) => Err("Backup commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),

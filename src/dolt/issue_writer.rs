@@ -15,7 +15,7 @@ use super::{
     context_evidence::read_evidence_bytes,
     context_resolve::observe_time,
     context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7, issue_create,
-    issue_dependency, issue_note_receipt, issue_update,
+    issue_dependency, issue_note_receipt, issue_parent, issue_update,
     project::planning,
     read_error,
     receipt_history::{
@@ -48,6 +48,8 @@ pub(super) enum Kind {
     DependencyAdd,
     #[serde(rename = "issue.remove-dependency")]
     DependencyRemove,
+    #[serde(rename = "issue.set-parent")]
+    SetParent,
 }
 
 impl Kind {
@@ -63,6 +65,7 @@ impl Kind {
             Self::ProjectAddIssue => planning::ADD_ISSUE,
             Self::DependencyAdd => "issue.add-dependency",
             Self::DependencyRemove => "issue.remove-dependency",
+            Self::SetParent => "issue.set-parent",
         }
     }
 
@@ -77,6 +80,7 @@ impl Kind {
             Self::ProjectCreate => "Project create",
             Self::ProjectAddIssue => "Project add-issue",
             Self::DependencyAdd | Self::DependencyRemove => "Issue dependency",
+            Self::SetParent => "Issue set-parent",
         }
     }
 
@@ -91,7 +95,9 @@ impl Kind {
                 ("issue_updates", "INSERT"),
                 ("operation_receipts", "INSERT"),
             ],
-            Self::Update => &[("issues", "UPDATE"), ("operation_receipts", "INSERT")],
+            Self::Update | Self::SetParent => {
+                &[("issues", "UPDATE"), ("operation_receipts", "INSERT")]
+            }
             Self::DependencyAdd => &[
                 ("issues", "UPDATE"),
                 ("operation_receipts", "INSERT"),
@@ -303,7 +309,8 @@ impl Pending {
                     kind @ (Kind::Create
                     | Kind::Update
                     | Kind::DependencyAdd
-                    | Kind::DependencyRemove),
+                    | Kind::DependencyRemove
+                    | Kind::SetParent),
                 ),
                 Some(_),
                 Some(_),
@@ -397,7 +404,7 @@ pub(super) fn execute(
             receipt_at(snapshot, request.request_id, &commit, None).map_err(|_| uncertain())?;
         mutation.verify_decision(observe_time()?)?;
         let (outcome, base, introduced, result) = if let Some(receipt) = existing {
-            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate | Kind::AreaCreate) || request.kind.is_project() || request.kind.is_dependency() {
+            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate | Kind::AreaCreate | Kind::SetParent) || request.kind.is_project() || request.kind.is_dependency() {
                 check_fingerprint(&receipt.fingerprint, request.fingerprint, request.kind)?;
             }
             let scoped = ScopedReceipt::read(
@@ -455,6 +462,13 @@ pub(super) fn execute(
                         "area_id": request.area_id, "issue_id": result["issue_id"],
                         "prerequisite_area_id": result["prerequisite_area_id"],
                         "prerequisite_id": result["prerequisite_id"],
+                    }),
+                    Kind::SetParent => json!({
+                        "area_id": request.area_id, "issue_id": result["issue"]["issue_id"],
+                        "old_parent_id": result["old_parent"]["issue_id"],
+                        "old_parent_area_id": result["old_parent"]["area_id"],
+                        "parent_id": result["parent"]["issue_id"],
+                        "parent_area_id": result["parent"]["area_id"],
                     }),
                     _ => json!({"area_id": request.area_id, "issue_id": result["issue_id"]}),
                 },
@@ -536,9 +550,11 @@ fn apply(
 
     let (version, kind) = match request.kind {
         Kind::Note => (1, None),
-        kind @ (Kind::Create | Kind::Update | Kind::DependencyAdd | Kind::DependencyRemove) => {
-            (2, Some(kind))
-        }
+        kind @ (Kind::Create
+        | Kind::Update
+        | Kind::DependencyAdd
+        | Kind::DependencyRemove
+        | Kind::SetParent) => (2, Some(kind)),
         kind @ (Kind::ArtifactCreate | Kind::ArtifactUpdate) => (3, Some(kind)),
         kind @ (Kind::AreaCreate | Kind::ProjectCreate | Kind::ProjectAddIssue) => (4, Some(kind)),
     };
@@ -691,6 +707,7 @@ enum ScopedReceipt {
     AreaCreate(area_create::ScopedCreate),
     Project(Box<planning::ScopedProject>),
     Dependency(Box<issue_dependency::ScopedDependency>),
+    Parent(Box<issue_parent::ScopedParent>),
 }
 
 impl ScopedReceipt {
@@ -757,6 +774,21 @@ impl ScopedReceipt {
                 .map(|dependency| Self::Dependency(Box::new(dependency)))
                 .map_err(|_| uncertain())
             }
+            Kind::SetParent => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                issue_parent::check_receipt(
+                    snapshot,
+                    request,
+                    area.ok_or_else(uncertain)?,
+                    record.ok_or_else(uncertain)?,
+                    actor,
+                    receipt,
+                )
+                .map(|parent| Self::Parent(Box::new(parent)))
+                .map_err(|_| uncertain())
+            }
             Kind::ArtifactCreate => {
                 if receipt.kind != kind.name() {
                     return Err(conflict(kind));
@@ -817,6 +849,7 @@ impl ScopedReceipt {
             }
             Self::Update(update) => issue_update::verify_effect(snapshot, commit, receipt, &update),
             Self::Dependency(dependency) => dependency.verify_effect(snapshot, commit, receipt),
+            Self::Parent(parent) => parent.verify_effect(snapshot, commit, receipt),
             Self::ArtifactCreate(scoped) => {
                 artifact_create::verify_effect(snapshot, commit, receipt, &scoped)
             }

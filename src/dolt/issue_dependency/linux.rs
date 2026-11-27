@@ -8,11 +8,10 @@ use crate::error::{ErrorCode, HiveError};
 
 use super::{CommonOptions, DoltSuccess, IssueDependencyArgs};
 use crate::dolt::{
-    DoltTarget, Snapshot, context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7,
-    issue_readiness::NON_WHITESPACE,
+    DoltTarget, Snapshot, context_workflow as workflow, is_uuid, is_uuid_v7,
+    issue_relation::{Endpoint, Grant, Issue, as_of, bind_revisions, stale},
     issue_writer::{
-        self, Decision, Kind, Mutation, StagedMutation, WriteIdentity, digest, invalid,
-        new_uuid_v7, valid_revision,
+        self, Decision, Kind, Mutation, StagedMutation, WriteIdentity, digest, invalid, new_uuid_v7,
     },
     read_error,
     receipt_history::HistoricalReceipt,
@@ -21,55 +20,6 @@ use crate::dolt::{
 };
 
 const ARCHIVED: &str = "Dependency edits require active ancestry for both Areas.";
-
-#[derive(Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct Endpoint {
-    area_id: String,
-    issue_id: String,
-    expected_issue_revision: String,
-}
-
-impl Endpoint {
-    fn valid(&self) -> bool {
-        is_uuid_v7(&self.area_id)
-            && is_uuid_v7(&self.issue_id)
-            && valid_revision(&self.expected_issue_revision)
-    }
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Grant {
-    endpoint: Endpoint,
-    decision: String,
-    evidence_id: String,
-    revision: String,
-    source_ref: String,
-    issuer_ref: String,
-    valid_from: String,
-    expires_at: String,
-    withdrawn: bool,
-}
-
-impl Grant {
-    fn allows(&self, endpoint: &Endpoint, now: OffsetDateTime) -> bool {
-        self.endpoint == *endpoint
-            && endpoint.valid()
-            && self.decision == "allow"
-            && !self.withdrawn
-            && [
-                &self.evidence_id,
-                &self.revision,
-                &self.source_ref,
-                &self.issuer_ref,
-            ]
-            .into_iter()
-            .all(|value| workflow::valid_ref(value))
-            && matches!((workflow::parse_time(&self.valid_from), workflow::parse_time(&self.expires_at)),
-                (Some(start), Some(end)) if start <= now && now < end)
-    }
-}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -114,16 +64,8 @@ impl Request<'_> {
                 self.kind.name(),
                 self.workspace,
                 self.actor,
-                [
-                    self.issue.area_id,
-                    self.issue.issue_id,
-                    self.issue.expected_issue_revision
-                ],
-                [
-                    self.prerequisite.area_id,
-                    self.prerequisite.issue_id,
-                    self.prerequisite.expected_issue_revision
-                ],
+                self.issue.canonical(),
+                self.prerequisite.canonical(),
             ])
             .to_string()
             .as_bytes(),
@@ -181,29 +123,8 @@ pub(super) fn write(
         issue_id: args.prerequisite.clone(),
         expected_issue_revision: String::new(),
     };
-    let invalid_matches = || invalid("Supply exactly one --if-match ISSUE=REV for each endpoint.");
-    if args.if_match.len() != 2 {
-        return Err(invalid_matches());
-    }
-    for revision in &args.if_match {
-        let (id, revision) = revision.split_once('=').ok_or_else(invalid_matches)?;
-        let endpoint = if id == issue.issue_id {
-            &mut issue
-        } else if id == prerequisite.issue_id {
-            &mut prerequisite
-        } else {
-            return Err(invalid_matches());
-        };
-        if !endpoint.expected_issue_revision.is_empty() || !valid_revision(revision) {
-            return Err(invalid_matches());
-        }
-        endpoint.expected_issue_revision = revision.to_owned();
-    }
-    if !issue.valid()
-        || !prerequisite.valid()
-        || !is_uuid(&args.request_id)
-        || !workflow::valid_ref(&args.actor)
-    {
+    bind_revisions(&args.if_match, [&mut issue, &mut prerequisite])?;
+    if !is_uuid(&args.request_id) || !workflow::valid_ref(&args.actor) {
         return Err(invalid(
             "Supply exact Issue and Area UUIDv7s, a request UUID and a bounded actor reference.",
         ));
@@ -261,19 +182,7 @@ impl Mutation for Dependency<'_> {
 
     fn check_scope(&self, snapshot: &mut Snapshot) -> Result<(), HiveError> {
         for endpoint in [self.request.issue, self.request.prerequisite] {
-            let owners: Vec<String> = snapshot.exec_rows(
-                |commit| {
-                    format!(
-                        "SELECT i.area_id FROM issues AS OF '{commit}' i
-                 JOIN areas AS OF '{commit}' a ON CAST(a.id AS BINARY) = CAST(i.area_id AS BINARY)
-                 WHERE CAST(i.id AS BINARY) = ? LIMIT 2"
-                    )
-                },
-                (&endpoint.issue_id,),
-            )?;
-            if !matches!(owners.as_slice(), [owner] if *owner == endpoint.area_id) {
-                return Err(workflow::unverified());
-            }
+            endpoint.check_scope(snapshot)?;
         }
         Ok(())
     }
@@ -351,123 +260,6 @@ impl Mutation for Dependency<'_> {
             result: issue_writer::encode(&result, self.request.kind)?,
             record_id: result.issue_id,
         })
-    }
-}
-
-fn stale() -> HiveError {
-    HiveError::new(
-        ErrorCode::StaleRevision,
-        "An expected Issue revision is stale.",
-    )
-}
-
-fn as_of(commit: Option<&str>) -> Result<String, HiveError> {
-    match commit {
-        None => Ok(String::new()),
-        Some(commit) if is_commit_hash(commit) => Ok(format!(" AS OF '{commit}'")),
-        _ => Err(workflow::unverified()),
-    }
-}
-
-struct Issue {
-    area: String,
-    revision: String,
-    updated_at: String,
-    protected: String,
-    status: String,
-    kind: String,
-    closed_well: bool,
-    closure_absent: bool,
-}
-
-impl Issue {
-    fn read(
-        db: &mut impl Queryable,
-        endpoint: &Endpoint,
-        commit: Option<&str>,
-    ) -> Result<Self, HiveError> {
-        let as_of = as_of(commit)?;
-        type Row = (String, String, String, String, String, String, bool, bool);
-        let row: Option<Row> = db.exec_first(
-            format!(
-                "SELECT area_id, revision, DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s.%fZ'),
-                    JSON_ARRAY(CAST(number AS CHAR), parent_id, type, status, priority, created_at, closed_at,
-                      SHA2(CAST(title AS BINARY), 256), SHA2(CAST(body AS BINARY), 256),
-                      SHA2(CAST(acceptance_criteria AS BINARY), 256), SHA2(CAST(hold_reason AS BINARY), 256),
-                      SHA2(CAST(closed_by_ref AS BINARY), 256), SHA2(CAST(resolution_note AS BINARY), 256)),
-                    status, type,
-                    COALESCE(YEAR(closed_at) > 0 AND closed_by_ref REGEXP ? AND resolution_note REGEXP ?, FALSE),
-                    closed_at IS NULL AND closed_by_ref IS NULL AND resolution_note IS NULL
-                 FROM issues{as_of} WHERE CAST(id AS BINARY) = ?"
-            ),
-            (NON_WHITESPACE, NON_WHITESPACE, &endpoint.issue_id),
-        ).map_err(read_error)?;
-        let Some((
-            area,
-            revision,
-            updated_at,
-            protected,
-            status,
-            kind,
-            closed_well,
-            closure_absent,
-        )) = row
-        else {
-            return Err(workflow::unverified());
-        };
-        if area != endpoint.area_id {
-            return Err(workflow::unverified());
-        }
-        Ok(Self {
-            area,
-            revision,
-            updated_at,
-            protected,
-            status,
-            kind,
-            closed_well,
-            closure_absent,
-        })
-    }
-
-    fn validate_state(
-        &self,
-        db: &mut impl Queryable,
-        endpoint: &Endpoint,
-        commit: Option<&str>,
-    ) -> Result<IssueStatus, HiveError> {
-        let invalid_state = || {
-            HiveError::new(
-                ErrorCode::InvalidRecord,
-                "An endpoint has invalid lifecycle or Claim state.",
-            )
-        };
-        let status = IssueStatus::parse(&self.status).ok_or_else(invalid_state)?;
-        let as_of = as_of(commit)?;
-        let claims: Vec<(String, String, String)> = db
-            .exec(
-                format!(
-                    "SELECT issue_id, claim_id, holder_ref FROM issue_claims{as_of}
-                 WHERE issue_id = ? LIMIT 2"
-                ),
-                (&endpoint.issue_id,),
-            )
-            .map_err(read_error)?;
-        let valid_claim = if status == IssueStatus::InProgress {
-            self.kind != "epic"
-                && matches!(claims.as_slice(), [(id, claim, holder)]
-                if *id == endpoint.issue_id && is_uuid_v7(claim) && workflow::valid_ref(holder))
-        } else {
-            claims.is_empty()
-        };
-        if !records::is_issue_type(&self.kind)
-            || !valid_claim
-            || (status.is_terminal() && !self.closed_well)
-            || (!status.is_terminal() && !self.closure_absent)
-        {
-            return Err(invalid_state());
-        }
-        Ok(status)
     }
 }
 
@@ -570,12 +362,8 @@ impl ScopedDependency {
         {
             require_active_area_at(db, &endpoint.area_id, base, ARCHIVED)?;
             let after = Issue::read(db, endpoint, Some(introduced))?;
-            if after.area != before.area
-                || after.revision != *expected
-                || after.revision == before.revision
-                || after.updated_at != receipt.created_at
-                || after.protected != before.protected
-            {
+            after.verify_revision(&before, expected, &receipt.created_at)?;
+            if after.parent != before.parent {
                 return Err(workflow::unverified());
             }
         }

@@ -215,6 +215,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::IssueDependency(args, add) => {
             dolt::issue_dependency::write(&invocation.common, &args, add)
         }
+        Command::IssueParent(args) => dolt::issue_parent::write(&invocation.common, &args),
         Command::ConversationImport(args) => dolt::conversation_import(&invocation.common, &args),
         Command::Conversation(ConversationCommand::Show(args)) => {
             dolt::conversation_read(&invocation.common, &args, None)
