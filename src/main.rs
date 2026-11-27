@@ -48,9 +48,8 @@ fn dispatch(invocation: Invocation) -> ExitCode {
         Command::Config(ConfigCommand::Validate(_)) | Command::Doctor
     );
     let operation = match invocation.command {
-        Command::Config(ConfigCommand::Show(args) | ConfigCommand::Validate(args)) => {
-            config::Operation::Config(args.scope)
-        }
+        Command::Config(ConfigCommand::Show(args)) => config::Operation::Config(args.target.scope),
+        Command::Config(ConfigCommand::Validate(args)) => config::Operation::Config(args.scope),
         Command::Context => config::Operation::Context,
         Command::Doctor => config::Operation::Doctor,
         _ => {
@@ -98,13 +97,13 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
             Err(error) => output::failure(Contract::V2, format, Some(name), None, error),
         };
     }
-    if matches!(
-        invocation.command,
-        Command::Config(ConfigCommand::Show(cli::ConfigScopeArgs {
-            scope: cli::ConfigScope::Workspace,
-        }))
-    ) {
-        let (format, result) = config_v2::show(&invocation.common);
+    if let Command::Config(ConfigCommand::Show(args)) = &invocation.command
+        && matches!(
+            args.target.scope,
+            cli::ConfigScope::Workspace | cli::ConfigScope::Resolved
+        )
+    {
+        let (format, result) = config_v2::show(&invocation.common, args);
         return match result {
             Ok(data) => output::success(Contract::V2, format, name, None, &data),
             Err(error) => output::failure(Contract::V2, format, Some(name), None, error),
@@ -115,6 +114,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
+        Command::ProjectRead(args) => dolt::project_read(&args),
         Command::Bot(BotCommand::List {
             target,
             status,

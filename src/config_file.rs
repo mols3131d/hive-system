@@ -181,11 +181,6 @@ pub(crate) fn parse_v2<T: de::DeserializeOwned>(
 ) -> Result<T, HiveError> {
     use serde_saphyr::granit_parser::{self, Event, Parser};
 
-    enum Collection {
-        Mapping { next_is_key: bool },
-        Sequence,
-    }
-
     let input = yaml_input(bytes, source)?;
     // serde-saphyr 2.2.0 allows explicit string tags on struct fields even
     // with reject_tagged_field_names. Check the original node events for v2.
@@ -195,28 +190,22 @@ pub(crate) fn parse_v2<T: de::DeserializeOwned>(
         block_nesting_limit: MAX_YAML_DEPTH,
     };
     let malformed = || invalid(format!("{source} contains invalid YAML or fields"));
-    let mut collections = Vec::new();
+    let mut depth = 0;
     let mut nodes = 0;
     for result in Parser::new_from_str_with_options(input, options) {
         let (event, _) = result.map_err(|_| malformed())?;
         if event.is_node() {
             nodes += 1;
-            if nodes > MAX_YAML_NODES || collections.len() > MAX_YAML_DEPTH {
+            if nodes > MAX_YAML_NODES || depth > MAX_YAML_DEPTH {
                 return Err(malformed());
             }
-            if let Some(Collection::Mapping { next_is_key }) = collections.last_mut() {
-                if *next_is_key && event.tag().is_some() {
-                    return Err(invalid(format!("{source} contains a tagged field name")));
-                }
-                *next_is_key = !*next_is_key;
+            if event.tag().is_some() {
+                return Err(invalid(format!("{source} contains a YAML tag")));
             }
         }
         match event {
-            Event::MappingStart(..) => collections.push(Collection::Mapping { next_is_key: true }),
-            Event::SequenceStart(..) => collections.push(Collection::Sequence),
-            Event::MappingEnd | Event::SequenceEnd => {
-                collections.pop();
-            }
+            Event::MappingStart(..) | Event::SequenceStart(..) => depth += 1,
+            Event::MappingEnd | Event::SequenceEnd => depth -= 1,
             _ => {}
         }
     }
