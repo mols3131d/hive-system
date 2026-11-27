@@ -2660,6 +2660,22 @@ fn malformed_project_write_values_keep_the_v2_envelope() {
 #[test]
 fn malformed_bot_register_keeps_the_late_v2_envelope() {
     let sandbox = Sandbox::new();
+    for selection in [&[][..], &["--contract", "1"][..]] {
+        let actual = sandbox.run(&[selection, &["bot", "register", "--help"]].concat());
+        let unknown = sandbox.run(&[selection, &["bot", "unknown-leaf", "--help"]].concat());
+        assert_eq!(actual.status.code(), Some(2));
+        assert_eq!(actual.stdout, unknown.stdout);
+        assert_eq!(actual.stderr, unknown.stderr);
+    }
+    for args in [
+        ["--contract", "2", "bot", "register", "--help"],
+        ["bot", "register", "--help", "--contract", "2"],
+    ] {
+        let help = sandbox.run(&args);
+        assert!(help.status.success(), "{args:?}: {help:?}");
+        assert!(String::from_utf8_lossy(&help.stdout).contains("--asset-revision"));
+        assert!(help.stderr.is_empty());
+    }
     let command = ["bot", "register", "--slug", "fixture"];
     let selectors = ["--contract", "2", "--json"];
     for invalid in [

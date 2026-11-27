@@ -1129,20 +1129,21 @@ mod tests {
         assert!(read(&value).is_err());
         value["kind"] = Value::Null;
         assert!(read(&value).is_err());
-        value.as_object_mut().unwrap().remove("artifact_id");
-        value["issue_id"] = json!("01900000-0000-7000-8000-000000000003");
-        value["version"] = json!(4);
+        let mut transition = value.clone();
+        transition.as_object_mut().unwrap().remove("artifact_id");
+        transition["issue_id"] = json!("01900000-0000-7000-8000-000000000003");
+        transition["version"] = json!(4);
         for (name, operation) in [
             ("issue.select", issue_transition::Operation::Select),
             ("issue.claim", issue_transition::Operation::Claim),
         ] {
-            value["kind"] = json!(name);
-            let marker = read(&value).unwrap();
+            transition["kind"] = json!(name);
+            let marker = read(&transition).unwrap();
             assert!(matches!(marker.operation(), Ok(Kind::Transition(kind)) if kind == operation));
-            assert_eq!(json!(marker), value);
+            assert_eq!(json!(marker), transition);
         }
-        value["kind"] = json!("issue.release");
-        assert!(read(&value).is_err());
+        transition["kind"] = json!("issue.release");
+        assert!(read(&transition).is_err());
 
         let legacy_bytes = serde_json::to_string(&legacy).unwrap();
         let duplicate = legacy_bytes.replacen(r#""version":1"#, r#""version":1,"version":1"#, 1);
