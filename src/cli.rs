@@ -241,6 +241,9 @@ pub(crate) enum Command {
     Memory(MemoryCommand),
     /// Show the selected workspace context.
     Context,
+    /// Inspect Areas under contract 2.
+    #[command(subcommand, hide = true)]
+    Area(AreaCommand),
     /// Inspect Issues under contract 2.
     #[command(subcommand, hide = true)]
     Issue(IssueCommand),
@@ -631,6 +634,38 @@ pub(crate) struct DoltTargetArgs {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum AreaCommand {
+    /// List committed root Areas or the direct children of one Area.
+    List(AreaListArgs),
+    /// Show one committed Area.
+    Show(AreaShowArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct AreaListArgs {
+    /// Select the direct children of this canonical lowercase UUIDv7.
+    #[arg(long, value_name = "ID", allow_negative_numbers = true)]
+    pub(crate) parent: Option<String>,
+    /// Page size (default 25, maximum 100).
+    #[arg(long, default_value = "25", allow_negative_numbers = true)]
+    pub(crate) limit: String,
+    /// Continue from the previous page's next_cursor.
+    #[arg(long)]
+    pub(crate) cursor: Option<String>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct AreaShowArgs {
+    /// Canonical lowercase UUIDv7 Area selector.
+    #[arg(value_name = "ID", allow_negative_numbers = true)]
+    pub(crate) area: String,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Subcommand)]
 pub(crate) enum IssueCommand {
     /// Show an Issue and its bounded direct relation IDs.
     Show(IssueShowArgs),
@@ -972,6 +1007,7 @@ impl Command {
         if common.contract == Contract::V2 {
             return match self {
                 Self::Validate(args) => args.validate_dolt_selection(common),
+                Self::Area(command) => command.validate_dolt_selection(common),
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
                 Self::Issue(IssueCommand::List(args)) => args.validate_dolt_selection(common),
                 _ => Ok(()),
@@ -991,6 +1027,7 @@ impl Command {
             Self::Project(ProjectCommand::Show { project_id }) => {
                 common.check_project(project_id.as_ref())
             }
+            Self::Area(_) => Err("Area commands require --contract 2."),
             Self::Issue(_) => Err("Issue commands require --contract 2."),
             Self::Validate(args) => {
                 if args.all || args.target.has_any() {
@@ -1043,6 +1080,23 @@ impl ValidateArgs {
         self.target.validate_common(common, ERROR)?;
         if !self.all || !self.target.has_all() {
             return Err("Dolt validation requires --all, --workspace-id, --database, and --port.");
+        }
+        Ok(())
+    }
+}
+
+impl AreaCommand {
+    fn validate_dolt_selection(&self, common: &CommonOptions) -> Result<(), &'static str> {
+        let target = match self {
+            Self::List(args) => &args.target,
+            Self::Show(args) => &args.target,
+        };
+        target.validate_common(
+            common,
+            "Dolt Area reads accept only an explicit local database and workspace ID.",
+        )?;
+        if !target.has_all() {
+            return Err("Dolt Area reads require --workspace-id, --database, and --port.");
         }
         Ok(())
     }
