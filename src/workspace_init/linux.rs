@@ -1415,6 +1415,10 @@ mod tests {
             lock_target(&second).unwrap_err().code,
             ErrorCode::ConcurrentChange
         ));
+        // Release the lock explicitly before asserting immediate reacquisition
+        // while other tests may be spawning child processes.
+        // SAFETY: The first directory still owns its open descriptor.
+        assert_eq!(unsafe { libc::flock(first.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(first);
         lock_target(&second).unwrap();
     }

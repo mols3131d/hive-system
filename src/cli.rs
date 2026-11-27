@@ -264,7 +264,7 @@ pub(crate) enum Command {
     #[command(skip)]
     Resource(ResourceCommand),
     #[command(skip)]
-    Workspace(WorkspaceCommand),
+    Workspace(WorkspaceAction),
     #[command(skip)]
     Label(LabelCommand),
     /// Inspect preserved Queen conversations under contract 2.
@@ -728,7 +728,7 @@ pub(crate) struct DoltTargetArgs {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum WorkspaceCommand {
+pub(crate) enum WorkspaceAction {
     /// Initialize a new workspace in an existing empty directory.
     Init {
         #[arg(long, value_name = "EMPTY_DIR")]
@@ -737,8 +737,23 @@ pub(crate) enum WorkspaceCommand {
         #[arg(long)]
         register_runtime: bool,
     },
+    #[command(flatten)]
+    Runtime(WorkspaceCommand),
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WorkspaceCommand {
     /// Observe the selected workspace and local runtime evidence.
     Status(DoltTargetArgs),
+    /// Start Dolt for an explicitly selected active v2 workspace.
+    Start {
+        #[arg(long, value_name = "PATH")]
+        dolt_bin: std::path::PathBuf,
+        #[arg(long, value_name = "PORT")]
+        port: OsString,
+    },
+    /// Gracefully stop the owned Dolt process for an explicitly selected workspace.
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -1069,7 +1084,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                     .map_err(|error| safe_parse_message(error.kind()))?,
             ),
             Some(("workspace", workspace)) => Command::Workspace(
-                WorkspaceCommand::from_arg_matches(workspace)
+                WorkspaceAction::from_arg_matches(workspace)
                     .map_err(|error| safe_parse_message(error.kind()))?,
             ),
             Some(("label", label)) => Command::Label(
@@ -1121,8 +1136,9 @@ fn workspace_parser(legacy: &clap::Command, args: &[OsString]) -> Option<clap::C
     }
     // Probe only the v2 grammar so v1 help and unknown-command errors stay identical.
     let cli = legacy.clone().subcommand(
-        WorkspaceCommand::augment_subcommands(
-            clap::Command::new("workspace").about("Initialize or inspect a v2 workspace."),
+        WorkspaceAction::augment_subcommands(
+            clap::Command::new("workspace")
+                .about("Initialize, inspect, or operate a v2 workspace."),
         )
         .subcommand_required(true)
         .mut_subcommands(add_leaf_options),
@@ -1183,7 +1199,7 @@ fn retry_workspace_conflict(
         .mut_subcommand("workspace", |workspace| {
             workspace.mut_subcommands(|leaf| {
                 leaf.mut_args(|arg| match arg.get_id().as_str() {
-                    "target" | "workspace_id" | "database" | "port" => {
+                    "target" | "workspace_id" | "database" | "port" | "dolt_bin" => {
                         arg.action(ArgAction::Append)
                     }
                     _ => arg,
@@ -1371,7 +1387,7 @@ fn recover_unknown_long(
     let (action, _) = matched.subcommand()?;
     if !matches!(
         (domain, action),
-        ("workspace", "init" | "status") | (_, "list" | "show")
+        ("workspace", "init" | "status" | "start" | "stop") | (_, "list" | "show")
     ) {
         return None;
     }
@@ -2016,7 +2032,7 @@ impl Command {
                 Self::Validate(args) => args.validate_dolt_selection(common),
                 Self::Area(command) => command.validate_dolt_selection(common),
                 Self::Resource(command) => command.validate_dolt_selection(common),
-                Self::Workspace(WorkspaceCommand::Status(target)) => {
+                Self::Workspace(WorkspaceAction::Runtime(WorkspaceCommand::Status(target))) => {
                     if common.project.is_some()
                         || common.project_root.is_some()
                         || !matches!(common.view, View::WorkingTree)
@@ -2028,6 +2044,20 @@ impl Command {
                     if target.has_any() && !target.has_all() {
                         return Err(
                             "Database inspection requires --workspace-id, --database, and --port.",
+                        );
+                    }
+                    Ok(())
+                }
+                Self::Workspace(WorkspaceAction::Runtime(
+                    WorkspaceCommand::Start { .. } | WorkspaceCommand::Stop,
+                )) => {
+                    if common.workspace.is_none()
+                        || common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Workspace lifecycle requires an explicit --workspace and working view.",
                         );
                     }
                     Ok(())
@@ -2088,7 +2118,7 @@ impl Command {
                 Self::Project(_) => Err("Use contract 2 Project read options."),
                 Self::Bot(command) => command.validate(common),
                 Self::Directive(command) => command.validate(common),
-                Self::Workspace(WorkspaceCommand::Init { .. })
+                Self::Workspace(WorkspaceAction::Init { .. })
                     if common.workspace.is_some()
                         || common.project.is_some()
                         || common.project_root.is_some()

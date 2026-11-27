@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use cli::{
     AreaCommand, BotCommand, Command, ConfigCommand, Contract, ConversationCommand,
     DirectiveCommand, DoltArtifactCommand, Invocation, IssueCommand, ParseFailure, ResourceCommand,
-    WorkspaceCommand,
+    WorkspaceAction,
 };
 use error::{ErrorCode, HiveError};
 
@@ -94,18 +94,14 @@ fn dispatch(invocation: Invocation) -> ExitCode {
 fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let name = &invocation.command_name;
     let format = invocation.common.format.unwrap_or_default();
-    if let Command::Workspace(WorkspaceCommand::Init {
-        target,
-        register_runtime,
-    }) = &invocation.command
-    {
-        return match workspace_init::run(target, *register_runtime) {
-            Ok(data) => output::success(Contract::V2, format, name, None, &data),
-            Err(error) => output::failure(Contract::V2, format, Some(name), None, error),
+    if let Command::Workspace(action) = &invocation.command {
+        let (format, result) = match action {
+            WorkspaceAction::Init {
+                target,
+                register_runtime,
+            } => (format, workspace_init::run(target, *register_runtime)),
+            WorkspaceAction::Runtime(command) => workspace_status::run(&invocation.common, command),
         };
-    }
-    if let Command::Workspace(WorkspaceCommand::Status(target)) = &invocation.command {
-        let (format, result) = workspace_status::observe(&invocation.common, target);
         return match result {
             Ok(data) => output::success(Contract::V2, format, name, None, &data),
             Err(error) => output::failure(Contract::V2, format, Some(name), None, error),

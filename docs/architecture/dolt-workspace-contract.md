@@ -207,7 +207,7 @@ $XDG_RUNTIME_DIR/hive/v2/         # Used only when XDG_RUNTIME_DIR is absolute a
 
 `hive --contract 2 --json workspace status [--workspace PATH]` uses the descriptor selector with explicit workspace, applicable local binding, user configuration, and XDG candidate precedence. It opens the versioned state directory and selected UUID directory without following symlinks. Missing state is valid. Status reports the descriptor UUID, canonical root, selection source, policy pin, and storage schema version. It makes no network connection by default.
 
-Status consumes two strict UTF-8 JSON records, each bounded to 64 KiB, with integer `version: 2` and no extra or duplicate fields. Future lifecycle commands can share this representation.
+Status and the lifecycle commands consume two strict UTF-8 JSON records, each bounded to 64 KiB, with integer `version: 2` and no extra or duplicate fields.
 
 | Record | Required fields in addition to `version` |
 | --- | --- |
@@ -219,6 +219,19 @@ The server record requires a matching registration. Its endpoint denotes TCP on 
 Supply all of `--workspace-id UUID --database NAME --port PORT` to inspect committed identity using the existing SELECT-only reader and `HIVE_DOLT_USER` and `HIVE_DOLT_PASSWORD`. The expected UUID must match the descriptor, and the target must match the recorded endpoint when one exists. A successful read verifies the selected database, Dolt version, committed main snapshot, supported schema, and workspace UUID. With a server record it upgrades the endpoint observation to `committed_identity_verified`. This verifies the SQL identity returned through the endpoint. Binding that endpoint to the recorded process and on-disk root requires further evidence. Status reports endpoint ownership as `unverified` and operational state as `unknown`.
 
 A safely readable `pending-request.json` is enough to report `recovery_required`, even if its contents are incomplete. Status does not interpret its payload. Status observes files without taking the writer lock, so lifecycle commands must reverify under that lock. These observations grant no mutation authority and provide no evidence about worker execution, claims or stop.
+
+#### Workspace start and stop
+
+```sh
+hive --contract 2 --json --workspace PATH workspace start --dolt-bin PATH --port PORT
+hive --contract 2 --json --workspace PATH workspace stop
+```
+
+Use an existing bootstrapped workspace and an already registered canonical root. The Linux lifecycle requires a workspace state directory owned by the caller with mode `0700`, Dolt 2.7.6, procfs, pidfds, a local filesystem exposing the Dolt storage lock, and a free loopback port from 1024 through 65535. Both commands acquire the stable workspace-ID lock. A pending request blocks start and is preserved by stop.
+
+Start provisions launch-specific credentials in a private directory beneath the workspace state directory. The reader receives database SELECT. The initial writer receives database SELECT and UPDATE on `workspace_counters` for the scoped transaction verification. The running response identifies the reader account and private password file for use with the existing reader environment variables.
+
+Start and stop verify the boot and process start identity, the launched executable and arguments, the process's exclusive kernel lock on the selected `db/.dolt/noms/LOCK` inode, and its exact loopback listener. The launch-specific reader then verifies the committed workspace UUID and schema, bracketed by process, store, and listener checks. Stop sends SIGTERM through the verified pidfd and waits for process exit before removing the local server record. An interrupted launch or stale server record requires inspection.
 
 ## Private Queen conversation file contract
 
