@@ -1777,6 +1777,69 @@ fn v2_explicit_unbound_resource_precedes_malformed_user_config() {
 }
 
 #[test]
+fn v2_exact_resource_validates_its_workspace_before_output_preferences() {
+    let fixture = Sandbox::new();
+    let user = fixture.0.join("xdg/hive/v2/config.yml");
+    let bindings = user.with_file_name("bindings.yml");
+    for name in ["workspace", "foreign"] {
+        write(
+            &fixture.0.join(name).join("hive-workspace.yml"),
+            V2_DESCRIPTOR,
+        );
+    }
+    let exact = ["--contract", "2", "config", "show", "--resource", "."];
+    let pair = [&exact[..], &["--workspace", "../workspace"]].concat();
+    let header = "version: 2\nbindings:\n";
+    let same_path = v2_binding("../../../invocation", "../../../workspace");
+    let wrong_id = format!("{same_path}    workspace_id: {OVERRIDE}\n");
+    let malformed = "synthetic-private: [";
+    for (binding, args, exit, code) in [
+        (
+            v2_binding("../../../invocation", "../../../foreign"),
+            pair.as_slice(),
+            3,
+            "NOT_FOUND",
+        ),
+        (wrong_id.clone(), pair.as_slice(), 7, "AUTHORITY_UNVERIFIED"),
+        (wrong_id, exact.as_slice(), 7, "AUTHORITY_UNVERIFIED"),
+    ] {
+        write(&bindings, format!("{header}{binding}"));
+        write(&user, "version: 2\n");
+        let baseline = fixture.run(args);
+        assert_eq!(baseline.status.code(), Some(exit));
+        assert!(baseline.stdout.is_empty());
+        write(&user, malformed);
+        let output = fixture.run(args);
+        assert_eq!(output.status.code(), baseline.status.code());
+        assert_eq!(output.stdout, baseline.stdout);
+        assert_eq!(output.stderr, baseline.stderr);
+        let output = fixture.run(&[args, &["--json"]].concat());
+        v2_error(output, exit, code);
+    }
+
+    // A matching workspace ID alone still needs the configured workspace path.
+    let id = "0195f1b2-3c4d-7e8f-9a0b-1c2d3e4f5a6b";
+    write(
+        &bindings,
+        format!(
+            "{header}  - path: ../../../invocation\n    resource_id: {RESOURCE}\n    workspace_id: {id}\n"
+        ),
+    );
+    let json_pair = [&pair[..], &["--json"]].concat();
+    v2_error(fixture.run(&json_pair), 2, "INVALID_CONFIG");
+    write(
+        &user,
+        "version: 2\nworkspace: ../../../workspace\noutput: {format: json}\n",
+    );
+    let report = v2_json(fixture.run(&pair), 0);
+    assert_eq!(report["data"]["user_config"], user.to_str().unwrap());
+    assert_eq!(report["data"]["sources"]["output_format"], "user");
+    write(&bindings, format!("{header}{same_path}"));
+    let report = v2_json(fixture.run(&pair), 0);
+    assert_eq!(report["data"]["sources"]["output_format"], "user");
+}
+
+#[test]
 fn v2_workspace_scope_preserves_descriptor_failure_diagnostics() {
     let fixture = Sandbox::new();
     for (selection, exit, code, message) in [

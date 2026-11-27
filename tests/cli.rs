@@ -1192,6 +1192,14 @@ fn duplicate_and_missing_config_scope_options_preserve_v2_parse_errors() {
             &["--resource"],
             "An argument has a missing or invalid value.",
         ),
+        (
+            &["--resource="],
+            "An argument has a missing or invalid value.",
+        ),
+        (
+            &["--area="],
+            "CLI --area must be a canonical lowercase UUIDv7.",
+        ),
     ] {
         let early = sandbox.run(&[&selectors[..], &command, invalid].concat());
         let late = sandbox.run(&[&command[..], invalid, &selectors].concat());
@@ -1210,6 +1218,8 @@ fn duplicate_and_missing_config_scope_options_preserve_v2_parse_errors() {
     for args in [
         &["--area=--json", "--area"][..],
         &["--resource=--json", "--resource"],
+        &["--resource=", "--area=--json"],
+        &["--resource=", "--area=--contract"],
     ] {
         let output = sandbox.run(&[&command[..], args, &["--contract", "2"]].concat());
         assert_eq!(output.status.code(), Some(2), "{args:?}");

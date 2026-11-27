@@ -5,7 +5,9 @@ use std::str::FromStr;
 use clap::{
     Arg, ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand,
     ValueEnum,
-    builder::{NonEmptyStringValueParser, StringValueParser, TypedValueParser},
+    builder::{
+        NonEmptyStringValueParser, OsStringValueParser, StringValueParser, TypedValueParser,
+    },
     error::ErrorKind,
     value_parser,
 };
@@ -895,9 +897,13 @@ fn retry_config_show(
     match retry.clone().try_get_matches_from(args) {
         Ok(matches) => is_v2_config(&matches).then_some(Ok(matches)),
         Err(error) => {
-            // Allow duplicates and missing values only while recovering metadata
-            // for this failure. Clap still distinguishes flags from values.
-            let relaxed = |arg: Arg| arg.action(ArgAction::Append).num_args(0..=1);
+            // Recover metadata past duplicate, missing, or empty values.
+            // Clap still distinguishes flags from values.
+            let relaxed = |arg: Arg| {
+                arg.action(ArgAction::Append)
+                    .num_args(0..=1)
+                    .value_parser(OsStringValueParser::new())
+            };
             *error_matches = retry
                 .mut_subcommand("config", |config| {
                     config.mut_subcommand("show", |show| {

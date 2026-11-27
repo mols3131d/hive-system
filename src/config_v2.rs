@@ -125,21 +125,22 @@ mod unix {
             None
         };
 
-        // Resolve the format first when it might come from user configuration,
-        // so an implicit binding failure uses the selected output format.
-        let mut user = if options.format.is_none() {
-            read_user(home)?
+        let mut read_user_for_report = || -> Result<_, HiveError> {
+            let user = read_user(home)?;
+            if options.format.is_none()
+                && let Some(user_format) = user.as_ref().and_then(|source| source.format)
+            {
+                *format = user_format;
+            }
+            Ok(user)
+        };
+        // Implicit lookup errors use the configured format. Exact Resource
+        // lookup only reads user config early when it supplies the workspace.
+        let format_from_user_early = options.format.is_none() && resource_root.is_none();
+        let mut user = if format_from_user_early {
+            read_user_for_report()?
         } else {
             None
-        };
-        let output = user.as_ref().and_then(|source| source.format);
-        let output_source = match (options.format, output) {
-            (Some(_), _) => "cli",
-            (None, Some(user_format)) => {
-                *format = user_format;
-                "user"
-            }
-            (None, None) => "default",
         };
 
         if resolved && resource_root.is_none() {
@@ -148,8 +149,8 @@ mod unix {
         let needs_user_workspace = binding.as_ref().map_or(explicit.is_none(), |selected| {
             selected.binding.workspace.is_none()
         });
-        if options.format.is_some() && needs_user_workspace {
-            user = read_user(home)?;
+        if needs_user_workspace && !format_from_user_early {
+            user = read_user_for_report()?;
         }
         let user_workspace = user.as_ref().and_then(|source| {
             source
@@ -188,6 +189,17 @@ mod unix {
             (candidate, "xdg-default")
         };
 
+        if options.format.is_none() && resource_root.is_some() && !needs_user_workspace {
+            user = read_user_for_report()?;
+        }
+        let output_source = match (
+            options.format,
+            user.as_ref().and_then(|source| source.format),
+        ) {
+            (Some(_), _) => "cli",
+            (None, Some(_)) => "user",
+            (None, None) => "default",
+        };
         let descriptor = candidate.descriptor;
         let mut report = json!({
             "scope": if resolved { "resolved" } else { "workspace" },
