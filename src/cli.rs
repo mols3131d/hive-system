@@ -2412,30 +2412,66 @@ fn bot_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedP
                 .about("Register a Queen from a reviewed, committed Soul."),
         )))
     });
+    let register_help = || CommonArgs::augment_args(clap::Command::new("register"));
     let recovery = extended_error_options(extended.clone().disable_help_subcommand(true))
         .mut_subcommand("bot", |bot| {
-            extended_help_probe(bot).mut_subcommand("register", extended_error_options)
-        });
-    let partial = match recovery.clone().try_get_matches_from(args) {
-        Ok(matches) => matches,
+            extended_help_probe(bot.disable_help_subcommand(true))
+                .mut_subcommand("register", extended_error_options)
+                .subcommand(clap::Command::new("help").subcommand(register_help()))
+        })
+        .subcommand(
+            clap::Command::new("help")
+                .subcommand(clap::Command::new("bot").subcommand(register_help())),
+        );
+    let (partial, complete) = match recovery.clone().try_get_matches_from(args) {
+        Ok(matches) => (matches, true),
         Err(error) => {
             let partial = recovery
                 .clone()
                 .ignore_errors(true)
                 .try_get_matches_from(args)
                 .ok()?;
-            retry_write_failure(&extended, args, error.kind(), "bot", &["register"])
+            let matches = retry_write_failure(&extended, args, error.kind(), "bot", &["register"])
                 .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "bot"))
-                .unwrap_or(partial)
+                .unwrap_or(partial);
+            (matches, false)
         }
     };
-    let leaf = partial
-        .subcommand_matches("bot")?
-        .subcommand_matches("register")?;
-    (requested_contract(Some(&partial), Some(leaf)) == Contract::V2).then(|| ExtendedParse {
-        parsed: extended.clone().try_get_matches_from(args),
-        cli: extended,
-        partial: Some(partial),
+    let help_leaf = if complete {
+        partial
+            .subcommand_matches("help")
+            .and_then(|help| help.subcommand_matches("bot"))
+            .or_else(|| {
+                partial
+                    .subcommand_matches("bot")?
+                    .subcommand_matches("help")
+            })
+            .and_then(|help| help.subcommand_matches("register"))
+    } else {
+        None
+    };
+    let help_requested = help_leaf.is_some();
+    let leaf = help_leaf.or_else(|| {
+        partial
+            .subcommand_matches("bot")?
+            .subcommand_matches("register")
+    })?;
+    (requested_contract(Some(&partial), Some(leaf)) == Contract::V2).then(|| {
+        let parsed = if help_requested {
+            extended.clone().try_get_matches_from([
+                args[0].clone(),
+                OsString::from("bot"),
+                OsString::from("register"),
+                OsString::from("--help"),
+            ])
+        } else {
+            extended.clone().try_get_matches_from(args)
+        };
+        ExtendedParse {
+            parsed,
+            cli: extended,
+            partial: Some(partial),
+        }
     })
 }
 
