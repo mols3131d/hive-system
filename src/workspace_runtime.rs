@@ -461,6 +461,13 @@ impl WriterRuntime<'_> {
         &self.server.nonce
     }
 
+    pub(crate) fn writer_grantee(&self) -> String {
+        format!(
+            "'{}'@'127.0.0.1'",
+            credential_name("writer", &self.server.nonce)
+        )
+    }
+
     pub(crate) fn has_pending(&self) -> Result<bool, HiveError> {
         self.state.contains(c"pending-request.json")
     }

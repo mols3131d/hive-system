@@ -14,7 +14,8 @@ use crate::dolt::{
     issue_note_fingerprint::{KIND, MAX_BODY_BYTES, NoteFingerprint},
     issue_note_receipt::{self, NoteEvidence, NoteResult, ScopedNote},
     read_error,
-    receipt_history::{HistoricalReceipt, receipt_at, receipt_introduction},
+    receipt_history::{HistoricalReceipt, has_receipt_history, receipt_at, receipt_introduction},
+    scope::require_active_area,
 };
 use crate::workspace_status::{WriterRuntime, token, with_writer_runtime};
 
@@ -99,6 +100,9 @@ pub(super) fn write(
             request.verify_decision(&decision, observe_time()?)?;
             ("replayed", receipt.base_commit, introduced, note.result)
         } else {
+            if has_receipt_history(snapshot, &args.request_id).map_err(|_| uncertain())? {
+                return Err(uncertain());
+            }
             let (introduced, result) = apply(runtime, &request, &decision, &commit)?;
             ("confirmed", commit.clone(), introduced, result)
         };
@@ -251,7 +255,8 @@ fn guard_issue(db: &mut impl Queryable, request: &Request<'_>) -> Result<(), Hiv
             (&args.issue,),
         )
         .map_err(read_error)?;
-    verify_issue(issue, claim, request)
+    verify_issue(issue, claim, request)?;
+    require_active_area(db, &args.area)
 }
 
 fn verify_issue(
@@ -290,7 +295,7 @@ fn apply(
     decision: &Decision,
     base: &str,
 ) -> Result<(String, NoteResult), HiveError> {
-    let mut writer = runtime.open(true)?;
+    let mut writer = open_verified_writer(runtime, false)?;
     require_clean(&mut writer.connection, base)?;
     let db = &mut writer.connection;
     let session_id = visible_session(db, None)?;
@@ -408,17 +413,20 @@ fn apply(
 }
 
 fn reconcile(runtime: &WriterRuntime<'_>, workspace: &str) -> Result<Option<Snapshot>, HiveError> {
-    let Some(entry) = runtime.pending().map_err(|_| uncertain())? else {
+    if !runtime.has_pending()? {
         return Ok(None);
-    };
+    }
+    let mut observer = open_verified_writer(runtime, true)?;
+    let entry = runtime
+        .pending()
+        .map_err(|_| uncertain())?
+        .ok_or_else(uncertain)?;
     let marker: Pending = workflow::parse_json_object::<_, serde_json::Error>(
         serde_json::from_slice(&entry.bytes).map_err(|_| uncertain())?,
     )
     .map_err(|_| uncertain())?;
     marker.validate(workspace, runtime.launch_nonce())?;
-    let mut observer = runtime.open(true).map_err(|_| uncertain())?;
     visible_session(&mut observer.connection, Some(marker.session_id)).map_err(|_| uncertain())?;
-    drop(observer);
 
     // Take the committed snapshot only after positive same-launch session evidence.
     let mut snapshot = runtime.open(false).map_err(|_| uncertain())?;
@@ -426,10 +434,12 @@ fn reconcile(runtime: &WriterRuntime<'_>, workspace: &str) -> Result<Option<Snap
         .map_err(|_| uncertain())?
         .is_none()
     {
-        require_clean(&mut snapshot.connection, &marker.base_commit).map_err(|_| uncertain())?;
-        if snapshot.commit != marker.base_commit {
+        if snapshot.commit != marker.base_commit
+            || has_receipt_history(&mut snapshot, &marker.request_id).map_err(|_| uncertain())?
+        {
             return Err(uncertain());
         }
+        require_clean(&mut snapshot.connection, &marker.base_commit).map_err(|_| uncertain())?;
     }
     runtime.clear_pending(entry).map_err(|_| uncertain())?;
     Ok(Some(snapshot))
@@ -458,6 +468,49 @@ impl Pending {
         }
         Ok(())
     }
+}
+
+fn open_verified_writer(runtime: &WriterRuntime<'_>, pending: bool) -> Result<Snapshot, HiveError> {
+    let mut writer = runtime.open(true)?;
+    verify_writer_grants(&mut writer.connection, &runtime.writer_grantee(), pending)?;
+    Ok(writer)
+}
+
+fn verify_writer_grants(
+    db: &mut impl Queryable,
+    grantee: &str,
+    pending: bool,
+) -> Result<(), HiveError> {
+    let grants: Vec<(String, String, String)> = db
+        .exec(
+            "SELECT GRANTEE, TABLE_NAME, PRIVILEGE_TYPE FROM information_schema.TABLE_PRIVILEGES
+         WHERE TABLE_SCHEMA = 'db' AND GRANTEE = ?
+         AND TABLE_NAME IN ('issues', 'issue_updates', 'operation_receipts')",
+            (grantee,),
+        )
+        .map_err(read_error)?;
+    if [
+        ("issues", "UPDATE"),
+        ("issue_updates", "INSERT"),
+        ("operation_receipts", "INSERT"),
+    ]
+    .into_iter()
+    .all(|(table, privilege)| {
+        grants
+            .iter()
+            .any(|row| row.0 == grantee && row.1 == table && row.2 == privilege)
+    }) {
+        return Ok(());
+    }
+    let guidance = if pending {
+        "Use explicit workspace stop to preserve the pending request, then complete reviewed recovery before workspace start."
+    } else {
+        "Use explicit workspace stop, then workspace start with the updated Hive binary."
+    };
+    Err(HiveError::new(
+        ErrorCode::RuntimeUnavailable,
+        format!("The owned Dolt launch lacks the required Issue note writer grants. {guidance}"),
+    ))
 }
 
 fn visible_session(db: &mut impl Queryable, prior: Option<u64>) -> Result<u64, HiveError> {

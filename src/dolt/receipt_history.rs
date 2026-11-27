@@ -95,17 +95,7 @@ pub(super) fn receipt_introduction(
         return Err(invalid_record("The receipt has a malformed base commit."));
     }
     let observed = snapshot.commit.clone();
-    type Delta = (String, String, String, Option<String>, Option<String>);
-    let changes: Vec<Delta> = snapshot.exec_rows(
-        |commit| {
-            format!(
-                "SELECT from_commit, to_commit, diff_type, from_request_id, to_request_id
-                 FROM dolt_diff_operation_receipts AS OF '{commit}'
-                 WHERE from_request_id = ? OR to_request_id = ? LIMIT 2"
-            )
-        },
-        (request_id, request_id),
-    )?;
+    let changes = receipt_changes(snapshot, request_id)?;
     let [(base, introduced, kind, None, Some(added_request))] = changes.as_slice() else {
         return Err(workflow::unverified());
     };
@@ -139,6 +129,33 @@ pub(super) fn receipt_introduction(
         return Err(workflow::unverified());
     }
     Ok(introduced.clone())
+}
+
+/// A request ID remains reserved even when its receipt has been deleted.
+#[cfg(target_os = "linux")]
+pub(super) fn has_receipt_history(
+    snapshot: &mut Snapshot,
+    request_id: &str,
+) -> Result<bool, HiveError> {
+    receipt_changes(snapshot, request_id).map(|changes| !changes.is_empty())
+}
+
+type Delta = (String, String, String, Option<String>, Option<String>);
+
+fn receipt_changes(snapshot: &mut Snapshot, request_id: &str) -> Result<Vec<Delta>, HiveError> {
+    if !is_uuid(request_id) {
+        return Err(invalid_record("The receipt request ID is malformed."));
+    }
+    snapshot.exec_rows(
+        |commit| {
+            format!(
+                "SELECT from_commit, to_commit, diff_type, from_request_id, to_request_id
+                 FROM dolt_diff_operation_receipts AS OF '{commit}'
+                 WHERE from_request_id = ? OR to_request_id = ? LIMIT 2"
+            )
+        },
+        (request_id, request_id),
+    )
 }
 
 pub(super) fn valid_sha256(value: &str) -> bool {

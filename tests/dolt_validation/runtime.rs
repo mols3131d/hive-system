@@ -668,8 +668,8 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
     drop(listener);
     let fixture_root = fixture.root.clone();
     let dolt = fixture.dolt.clone();
-    let invoke = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_hive"))
+    let invoke_as = |binary: &std::ffi::OsStr, args: &[&str]| {
+        Command::new(binary)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap())
             .env("HOME", fixture_root.join("home"))
@@ -685,6 +685,7 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
             .args(args)
             .output()
     };
+    let invoke = |args: &[&str]| invoke_as(std::ffi::OsStr::new(env!("CARGO_BIN_EXE_hive")), args);
     let run = |args: &[&str], exit| {
         let output = invoke(args).unwrap();
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -1016,7 +1017,49 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
     assert_eq!(still_confirmed["data"]["confirmed_commit"], note_commit);
     assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
 
-    issue_note_writer_fixture(&state, &fixture_root, &port, &revision, &run);
+    let restart = |change: Option<&str>, baseline: Option<&std::ffi::OsStr>| {
+        let stopped = run(&["workspace", "stop"], 0);
+        assert_eq!(stopped["data"]["process_exit"], "pidfd_verified");
+        if let Some(change) = change {
+            let fixture = cleanup.fixture.as_ref().expect("armed runtime fixture");
+            let db = root.join("db");
+            fixture.local_at(&db, &["sql"], Some(change));
+            fixture.local_at(&db, &["add", "."], None);
+            fixture.local_at(
+                &db,
+                &[
+                    "commit",
+                    "-m",
+                    "Synthetic retained-history or ancestry change",
+                ],
+                None,
+            );
+        }
+        let start = [
+            "workspace",
+            "start",
+            "--dolt-bin",
+            dolt.to_str().unwrap(),
+            "--port",
+            &port,
+        ];
+        if let Some(binary) = baseline {
+            let output = invoke_as(binary, &start).unwrap();
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(output.status.success(), "{report}");
+        } else {
+            run(&start, 0);
+        }
+    };
+    issue_note_writer_fixture(
+        &state,
+        &fixture_root,
+        &port,
+        &revision,
+        &run,
+        &restart,
+        &dolt,
+    );
     assert!(cleanup.finish(), "Verified runtime fixture stop failed");
 }
 
@@ -1026,6 +1069,8 @@ fn issue_note_writer_fixture(
     port: &str,
     revision: &str,
     run: &impl Fn(&[&str], i32) -> Value,
+    restart: &impl Fn(Option<&str>, Option<&std::ffi::OsStr>),
+    dolt: &Path,
 ) {
     use sha2::{Digest, Sha256};
     let workspace = id(1);
@@ -1155,10 +1200,14 @@ fn issue_note_writer_fixture(
     let stale = note(&id(62), "fixture-holder", revision, body, 5);
     assert_eq!(stale["error"]["code"], "STALE_REVISION");
 
-    let server: Value =
-        serde_json::from_slice(&fs::read(state.join("server.json")).unwrap()).unwrap();
-    let nonce = server["nonce"].as_str().unwrap();
+    let launch_nonce = || {
+        let server: Value =
+            serde_json::from_slice(&fs::read(state.join("server.json")).unwrap()).unwrap();
+        server["nonce"].as_str().unwrap().to_owned()
+    };
+    let nonce = launch_nonce();
     let connect = |role: &str| {
+        let nonce = launch_nonce();
         let password =
             fs::read_to_string(state.join(format!("run-{nonce}/{role}-password"))).unwrap();
         let user = format!("{role}_{}", &nonce.replace('-', "")[..24]);
@@ -1252,4 +1301,100 @@ fn issue_note_writer_fixture(
     let recovered = note(&id(60), "fixture-holder", revision, body, 0);
     assert_eq!(recovered["data"], replayed["data"]);
     assert!(!marker.exists());
+
+    drop(reader);
+    drop(observer);
+    let owner_parent = id(2);
+    let archived_root = id(70);
+    restart(Some(&format!(
+        "INSERT INTO areas (id, slug, name, revision, archived_at)
+            VALUES ('{archived_root}', 'archive-fixture', 'Archive fixture', '{}', UTC_TIMESTAMP(6));
+         UPDATE areas SET parent_id = '{archived_root}' WHERE id = '{owner_parent}';", id(4)
+    )), None);
+    let mut reader = connect("reader");
+    let archived_base = storage_state(&mut reader);
+    let current_revision = written["data"]["result"]["issue_revision"]
+        .as_str()
+        .unwrap();
+    let archived = note(&id(64), "fixture-holder", current_revision, body, 4);
+    assert_eq!(archived["error"]["code"], "INVALID_TRANSITION");
+    let archived_replay = note(&id(60), "fixture-holder", revision, body, 0);
+    assert_eq!(archived_replay["data"], replayed["data"]);
+    let other_actor = note(&id(60), "fixture-other", revision, body, 7);
+    assert_eq!(other_actor["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert_eq!(storage_state(&mut reader), archived_base);
+    assert!(!marker.exists());
+
+    drop(reader);
+    restart(
+        Some(&format!(
+            "UPDATE areas SET archived_at = NULL WHERE id = '{archived_root}';
+         DELETE FROM operation_receipts WHERE request_id = '{}';",
+            id(60)
+        )),
+        None,
+    );
+    let mut reader = connect("reader");
+    let deleted_base = storage_state(&mut reader);
+    let effect =
+        |db: &mut Conn| -> (u64, u64, String) {
+            db.exec_first(
+            "SELECT (SELECT COUNT(*) FROM operation_receipts WHERE CAST(request_id AS BINARY) = ?),
+                    (SELECT COUNT(*) FROM issue_updates WHERE CAST(issue_id AS BINARY) = ?),
+                    revision FROM issues WHERE CAST(id AS BINARY) = ?",
+            (id(60), &issue, &issue),
+        ).unwrap().unwrap()
+        };
+    let deleted_effect = effect(&mut reader);
+    assert_eq!(deleted_effect.0, 0);
+    assert_eq!(deleted_effect.2, current_revision);
+    let reused = note(&id(60), "fixture-holder", current_revision, body, 8);
+    assert_eq!(reused["error"]["code"], "COMMIT_UNCERTAIN");
+    assert_eq!(storage_state(&mut reader), deleted_base);
+    assert_eq!(effect(&mut reader), deleted_effect);
+    assert!(!marker.exists());
+
+    if let Some(baseline) = std::env::var_os("HIVE_ISSUE_NOTE_BASELINE_BIN") {
+        drop(reader);
+        restart(None, Some(&baseline));
+        let mut reader = connect("reader");
+        let legacy_base = storage_state(&mut reader);
+        let legacy = note(&id(65), "fixture-holder", current_revision, body, 7);
+        assert_eq!(legacy["error"]["code"], "RUNTIME_UNAVAILABLE");
+        let message = legacy["error"]["message"].as_str().unwrap();
+        assert!(message.contains("lacks the required Issue note writer grants"));
+        assert!(message.contains("workspace stop") && message.contains("workspace start"));
+        assert!(!message.contains("writer_") && !message.contains(&launch_nonce()));
+        assert!(!marker.exists());
+
+        let old_pending = b"synthetic unresolved pending request";
+        fs::write(&marker, old_pending).unwrap();
+        let legacy = note(&id(65), "fixture-holder", current_revision, body, 7);
+        assert_eq!(legacy["error"]["code"], "RUNTIME_UNAVAILABLE");
+        assert!(
+            legacy["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reviewed recovery")
+        );
+        assert_eq!(storage_state(&mut reader), legacy_base);
+        drop(reader);
+        let stopped = run(&["workspace", "stop"], 0);
+        assert_eq!(stopped["data"]["pending_request"], "recorded");
+        assert_eq!(fs::read(&marker).unwrap(), old_pending);
+        let start = [
+            "workspace",
+            "start",
+            "--dolt-bin",
+            dolt.to_str().unwrap(),
+            "--port",
+            port,
+        ];
+        let blocked = run(&start, 7);
+        assert_eq!(blocked["error"]["code"], "AUTHORITY_UNVERIFIED");
+        assert_eq!(fs::read(&marker).unwrap(), old_pending);
+        // Only the fixture removes its deliberately fabricated marker.
+        fs::remove_file(&marker).unwrap();
+        run(&start, 0);
+    }
 }
