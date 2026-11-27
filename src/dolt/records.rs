@@ -1,4 +1,5 @@
 mod artifacts;
+pub(super) use artifacts::is_kind as is_artifact_kind;
 mod bots;
 mod directives;
 mod issue_updates;

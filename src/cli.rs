@@ -10,7 +10,8 @@ use clap::{
     builder::{
         NonEmptyStringValueParser, OsStringValueParser, StringValueParser, TypedValueParser,
     },
-    error::ErrorKind,
+    error::{ContextKind, ContextValue, ErrorKind},
+    parser::ValueSource,
     value_parser,
 };
 
@@ -239,6 +240,8 @@ pub(crate) enum Command {
     /// Read or manage artifacts.
     #[command(subcommand)]
     Artifact(ArtifactCommand),
+    #[command(skip)]
+    DoltArtifact(DoltArtifactCommand),
     /// List or read directives.
     #[command(subcommand)]
     Directive(DirectiveCommand),
@@ -555,6 +558,38 @@ pub(crate) enum ArtifactCommand {
     },
 }
 
+pub(crate) enum DoltArtifactCommand {
+    List(ArtifactListArgs),
+    Show(ArtifactShowArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ArtifactListArgs {
+    /// Select one direct scope as area:UUID, project:UUID, issue:UUID, or resource:UUID.
+    #[arg(long, value_name = "KIND:ID", allow_negative_numbers = true)]
+    pub(crate) scope: Option<String>,
+    /// Page size (default 25, maximum 100).
+    #[arg(long, default_value = "25", allow_negative_numbers = true)]
+    pub(crate) limit: String,
+    /// Continue from the previous page's next_cursor.
+    #[arg(long, allow_negative_numbers = true)]
+    pub(crate) cursor: Option<String>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct ArtifactShowArgs {
+    /// Exact Artifact UUIDv7.
+    #[arg(value_name = "ID", allow_negative_numbers = true)]
+    pub(crate) id: String,
+    /// Cover a direct link as KIND:ID. Repeat for every linked scope.
+    #[arg(long, value_name = "KIND:ID", allow_negative_numbers = true)]
+    pub(crate) scope: Vec<String>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
 #[derive(Args)]
 #[group(required = true, multiple = false)]
 #[allow(dead_code, reason = "Artifact operations follow the CLI bootstrap")]
@@ -847,6 +882,9 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             })
         },
     );
+    if let Some(result) = parse_dolt_artifact(&cli, &args) {
+        return result;
+    }
     if let Some(project) = project_v2::parse(&cli, &args) {
         return project;
     }
@@ -979,6 +1017,222 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             message: message.to_owned(),
         }),
     }
+}
+
+fn parse_dolt_artifact(
+    cli: &clap::Command,
+    args: &[OsString],
+) -> Option<Result<Invocation, ParseFailure>> {
+    if !args.iter().any(|arg| arg == "artifact") {
+        return None;
+    }
+    let v2 = cli.clone().mut_subcommand("artifact", |artifact| {
+        artifact
+            .mut_subcommand("list", |_| {
+                CommonArgs::augment_args(ArtifactListArgs::augment_args(
+                    clap::Command::new("list")
+                        .about("List committed Artifact metadata in one scope."),
+                ))
+            })
+            .mut_subcommand("show", |_| {
+                CommonArgs::augment_args(ArtifactShowArgs::augment_args(
+                    clap::Command::new("show")
+                        .about("Read one committed Artifact with explicit scope coverage."),
+                ))
+            })
+    });
+
+    // Recover known malformed options to locate the contract and output format.
+    // Only the strict parser can supply arguments to dispatch.
+    let recover_value = |arg: clap::Arg| {
+        arg.value_parser(OsStringValueParser::new())
+            .action(ArgAction::Append)
+            .allow_negative_numbers(true)
+            .num_args(0..=1)
+    };
+    let recover_common = |command: clap::Command| {
+        command.mut_args(|arg| match arg.get_id().as_str() {
+            "project" | "workspace" | "at" | "project_root" => recover_value(arg),
+            _ => arg,
+        })
+    };
+    let probe = recover_common(v2.clone()).mut_subcommand("artifact", |artifact| {
+        artifact.mut_subcommands(|leaf| {
+            if !matches!(leaf.get_name(), "list" | "show") {
+                return leaf;
+            }
+            let list = leaf.get_name() == "list";
+            let leaf = recover_common(leaf)
+                .disable_help_flag(true)
+                .arg(
+                    clap::Arg::new("help")
+                        .long("help")
+                        .short('h')
+                        .action(ArgAction::SetTrue),
+                )
+                .mut_args(|arg| match arg.get_id().as_str() {
+                    "database" | "workspace_id" | "port" | "scope" | "limit" | "cursor" => {
+                        recover_value(arg)
+                    }
+                    "id" => arg
+                        .value_parser(OsStringValueParser::new())
+                        .required(false)
+                        .num_args(0..),
+                    _ => arg,
+                })
+                .arg(
+                    clap::Arg::new("standalone")
+                        .long("standalone")
+                        .action(ArgAction::SetTrue)
+                        .overrides_with("standalone"),
+                );
+            let leaf = [
+                "task", "kind", "status", "after", "file", "actor", "approval",
+            ]
+            .into_iter()
+            .fold(leaf, |leaf, name| {
+                leaf.arg(recover_value(clap::Arg::new(name).long(name)))
+            });
+            if list {
+                leaf.arg(
+                    clap::Arg::new("extra")
+                        .value_parser(OsStringValueParser::new())
+                        .num_args(0..),
+                )
+            } else {
+                leaf
+            }
+        })
+    });
+    let (matched, recovery_error) = match probe.clone().try_get_matches_from(args) {
+        Ok(matches) => (matches, None),
+        Err(error) if error.kind() == ErrorKind::UnknownArgument => {
+            let partial = probe
+                .clone()
+                .ignore_errors(true)
+                .try_get_matches_from(args)
+                .ok()?;
+            // Keep probe-only positionals from absorbing a detached value.
+            let retry = probe.mut_subcommand("artifact", |artifact| {
+                artifact
+                    .mut_subcommand("list", |list| list.mut_arg("extra", |arg| arg.last(true)))
+                    .mut_subcommand("show", |show| show.mut_arg("id", |arg| arg.num_args(0..=1)))
+            });
+            let matches =
+                recover_unknown_long(&retry, args, "artifact", &partial, &error).unwrap_or(partial);
+            (matches, Some(error.kind()))
+        }
+        Err(_) => return None,
+    };
+    let (command_name, leaf) = matched_leaf(&v2, &matched)?;
+    if !matches!(command_name.as_str(), "artifact list" | "artifact show")
+        || requested_contract(Some(&matched), Some(leaf)) != Contract::V2
+    {
+        return None;
+    }
+    let format = requested_format(Some(&matched), Some(leaf));
+    let invalid = |message: &str| ParseFailure::Invalid {
+        contract: Contract::V2,
+        format,
+        command: Some(command_name.clone()),
+        message: message.to_owned(),
+    };
+
+    if let Some(error) = recovery_error {
+        return Some(Err(invalid(safe_parse_message(error))));
+    }
+
+    Some((|| {
+        let matches = v2.try_get_matches_from(args).map_err(|error| {
+            if error.kind() == ErrorKind::DisplayHelp {
+                ParseFailure::Display(error)
+            } else {
+                invalid(safe_parse_message(error.kind()))
+            }
+        })?;
+        let (_, leaf) = matched_leaf(cli, &matches).expect("matched Artifact read");
+        let common = CommonArgs::from_arg_matches(&matches)
+            .and_then(|root| CommonArgs::from_arg_matches(leaf).map(|options| (root, options)))
+            .map_err(|error| invalid(safe_parse_message(error.kind())))?;
+        let common = common.0.resolve(common.1).map_err(invalid)?;
+        let command = if command_name == "artifact list" {
+            ArtifactListArgs::from_arg_matches(leaf).map(DoltArtifactCommand::List)
+        } else {
+            ArtifactShowArgs::from_arg_matches(leaf).map(DoltArtifactCommand::Show)
+        }
+        .map_err(|error| invalid(safe_parse_message(error.kind())))?;
+        let target = match &command {
+            DoltArtifactCommand::List(args) => &args.target,
+            DoltArtifactCommand::Show(args) => &args.target,
+        };
+        target
+            .validate_common(
+                &common,
+                "Dolt Artifact reads use an explicit local target and --scope.",
+            )
+            .map_err(invalid)?;
+        Ok(Invocation {
+            common,
+            command: Command::DoltArtifact(command),
+            command_name: command_name.clone(),
+        })
+    })())
+}
+
+fn recover_unknown_long(
+    cli: &clap::Command,
+    args: &[OsString],
+    domain: &str,
+    partial: &ArgMatches,
+    error: &clap::Error,
+) -> Option<ArgMatches> {
+    if error.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    let (action @ ("list" | "show"), _) = partial.subcommand_matches(domain)?.subcommand()? else {
+        return None;
+    };
+    let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
+        return None;
+    };
+    let long = invalid.strip_prefix("--")?.split('=').next()?;
+    if !long.starts_with(|ch: char| ch.is_ascii_alphanumeric())
+        || !long
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
+    if leaf.get_arguments().any(|arg| {
+        arg.get_long() == Some(long)
+            || arg
+                .get_all_aliases()
+                .is_some_and(|aliases| aliases.contains(&long))
+    }) {
+        return None;
+    }
+
+    // Let Clap replay the original tokens. The temporary option can take an
+    // attached value, and the original parse error still determines the result.
+    const UNKNOWN_LONG: &str = "recovered_unknown_long";
+    let retry = cli.clone().mut_subcommand(domain, |command| {
+        command.mut_subcommand(action, |leaf| {
+            leaf.arg(
+                Arg::new(UNKNOWN_LONG)
+                    .long(long.to_owned())
+                    .num_args(0..=1)
+                    .require_equals(true)
+                    .value_parser(OsStringValueParser::new())
+                    .hide(true),
+            )
+        })
+    });
+    let matches = retry.try_get_matches_from(args).ok()?;
+    let recovered = matches
+        .subcommand_matches(domain)?
+        .subcommand_matches(action)?;
+    (recovered.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine)).then_some(matches)
 }
 
 struct ResourceParse {
@@ -1509,6 +1763,9 @@ impl Command {
                 ) => args.validate_dolt_selection(common),
                 Self::Project(_) => Err("Use contract 2 Project read options."),
                 Self::Bot(command) => command.validate(common),
+                Self::Artifact(ArtifactCommand::List { .. } | ArtifactCommand::Show { .. }) => {
+                    Err("Use Dolt Artifact read options with --contract 2.")
+                }
                 _ => Ok(()),
             };
         }

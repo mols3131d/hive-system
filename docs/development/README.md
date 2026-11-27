@@ -145,6 +145,27 @@ List orders summaries by Project ID and accepts exact `active`, `completed`, or 
 
 Show takes a canonical lowercase UUIDv7 and returns Project details and up to 25 direct member Issue IDs across Areas. The `issues.truncated` field indicates additional members. Use `issue list --project UUID` to page through member summaries.
 
+## Committed Artifact inspection
+
+Use an explicit Dolt target and SELECT-only account for contract 2 Artifact reads.
+
+```sh
+hive --contract 2 --json artifact list \
+  --scope area:01900000-0000-7000-8000-000000000002 \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+
+hive --contract 2 --json artifact show 01900000-0000-7000-8000-000000000004 \
+  --scope area:01900000-0000-7000-8000-000000000002 \
+  --scope project:01900000-0000-7000-8000-000000000003 \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+List selects exactly one direct scope using `area:UUID`, `project:UUID`, `issue:UUID`, or `resource:UUID` and returns only Artifact ID, kind, title, and revision. It defaults to 25 items and caps pages at 100. Pass `next_cursor` as `--cursor` with the same target, scope, and page size. A changed commit or query returns `STALE_CURSOR`.
+
+Show takes an exact canonical lowercase UUIDv7. An exact ID alone suffices for a standalone Artifact. For a linked Artifact, repeat `--scope` to explicitly cover every direct link. The CLI verifies the Artifact and each selected scope at the same committed snapshot before returning up to 64 KiB of Markdown. Incomplete coverage returns `UNAUTHORIZED` without disclosing linked scopes or body content.
+
 ## Committed Bot metadata
 
 Use the same explicit Dolt target and SELECT-only account for contract 2 Bot reads.
