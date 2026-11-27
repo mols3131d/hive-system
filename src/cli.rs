@@ -1196,7 +1196,7 @@ fn retry_workspace_conflict(
         .mut_subcommand("workspace", |workspace| {
             workspace.mut_subcommands(|leaf| {
                 leaf.mut_args(|arg| match arg.get_id().as_str() {
-                    "target" | "workspace_id" | "database" | "port" => {
+                    "target" | "workspace_id" | "database" | "port" | "dolt_bin" => {
                         arg.action(ArgAction::Append)
                     }
                     _ => arg,

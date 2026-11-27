@@ -2846,54 +2846,79 @@ fn workspace_init_recovers_output_flags_after_an_unknown_option_value() {
 }
 
 #[test]
-fn workspace_status_recovers_output_flags_after_a_duplicate_target() {
+fn workspace_recovers_output_flags_after_a_duplicate_target() {
     let sandbox = Sandbox::new();
-    let command = ["workspace", "status"];
-    let duplicate = ["--database", "a", "--database", "b"];
     let options = ["--contract", "2", "--json"];
-    let mut original_error = None;
-    for args in [
-        [&options[..], &command, &duplicate].concat(),
-        [&command[..], &duplicate, &options].concat(),
-        [&command[..], &duplicate, &options, &["--", "--database=c"]].concat(),
+    for (command, name, flag) in [
+        (
+            &["workspace", "status"][..],
+            "workspace status",
+            "--database",
+        ),
+        (
+            &["workspace", "start", "--workspace", ".", "--port", "3307"][..],
+            "workspace start",
+            "--dolt-bin",
+        ),
     ] {
-        let output = sandbox.run(&args);
-        assert_eq!(output.status.code(), Some(2), "{args:?}");
-        assert!(output.stderr.is_empty(), "{args:?}");
-        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(report["schema_version"], 2);
-        assert_eq!(report["command"], "workspace status");
-        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
-        assert_eq!(
-            original_error.get_or_insert_with(|| report["error"].clone()),
-            &report["error"]
+        let duplicate = [flag, "a", flag, "b"];
+        let after_terminator = format!("{flag}=c");
+        let mut original_error = None;
+        for args in [
+            [&options[..], command, &duplicate].concat(),
+            [command, &duplicate, &options].concat(),
+            [
+                command,
+                &duplicate,
+                &options,
+                &["--", after_terminator.as_str()],
+            ]
+            .concat(),
+        ] {
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert!(output.stderr.is_empty(), "{args:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], name);
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+            assert_eq!(
+                original_error.get_or_insert_with(|| report["error"].clone()),
+                &report["error"]
+            );
+        }
+
+        let literal_json = format!("{flag}=--json");
+        let output = sandbox.run(
+            &[
+                command,
+                &[
+                    literal_json.as_str(),
+                    flag,
+                    "b",
+                    "--contract",
+                    "2",
+                    "--",
+                    "--json",
+                ],
+            ]
+            .concat(),
         );
-    }
-
-    let output = sandbox.run(&[
-        "workspace",
-        "status",
-        "--database=--json",
-        "--database",
-        "b",
-        "--contract",
-        "2",
-        "--",
-        "--json",
-    ]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("workspace status"));
-
-    for tail in [
-        &["--database=--contract", "--database", "b"][..],
-        &[&duplicate[..], &["--", "--contract", "2", "--json"]].concat(),
-    ] {
-        let output = sandbox.run(&[&["--json"][..], &command, tail].concat());
         assert_eq!(output.status.code(), Some(2));
-        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(report["schema_version"], 1);
-        assert_ne!(report["command"], "workspace status");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(name));
+
+        let literal_contract = format!("{flag}=--contract");
+        for tail in [
+            &[literal_contract.as_str(), flag, "b"][..],
+            &[&duplicate[..], &["--", "--contract", "2", "--json"]].concat(),
+        ] {
+            let output = sandbox.run(&[&["--json"][..], command, tail].concat());
+            assert_eq!(output.status.code(), Some(2));
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 1);
+            assert_ne!(report["command"], name);
+        }
     }
     sandbox.assert_empty();
 }
