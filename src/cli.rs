@@ -272,10 +272,36 @@ pub(crate) enum Command {
     Conversation(ConversationCommand),
     #[command(skip)]
     ConversationList(ConversationListArgs),
+    /// Inspect a committed operation under contract 2.
+    #[command(subcommand, hide = true)]
+    Operation(OperationCommand),
     /// Validate workspace records.
     Validate(ValidateArgs),
     /// Check the local environment and workspace.
     Doctor,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum OperationCommand {
+    /// Inspect the durable outcome of one request.
+    Show(OperationShowArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct OperationShowArgs {
+    pub(crate) request_id: Option<String>,
+    #[arg(long)]
+    pub(crate) area: Option<String>,
+    #[arg(long)]
+    pub(crate) issue: Option<String>,
+    #[arg(long)]
+    pub(crate) actor: Option<String>,
+    #[arg(long)]
+    pub(crate) invocation_id: Option<String>,
+    #[arg(long)]
+    pub(crate) evidence_file: Option<PathBuf>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Args)]
@@ -2243,6 +2269,20 @@ impl Command {
         if common.contract == Contract::V2 {
             return match self {
                 Self::Validate(args) => args.validate_dolt_selection(common),
+                Self::Operation(OperationCommand::Show(args)) => {
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Operation show requires --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err("Operation show requires exact current Area and Issue scope.");
+                    }
+                    Ok(())
+                }
                 Self::Context(ContextArgs {
                     command: Some(ContextCommand::Resolve(args)),
                 }) => {
@@ -2400,6 +2440,7 @@ impl Command {
             Self::Project(ProjectCommand::Show { project_id }) => {
                 common.check_project(project_id.as_ref())
             }
+            Self::Operation(_) => Err("Operation show requires --contract 2."),
             Self::Area(_) => Err("Area commands require --contract 2."),
             Self::Issue(_) => Err("Issue commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),

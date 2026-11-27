@@ -233,7 +233,7 @@ fn preflight(
 }
 
 #[cfg(target_os = "linux")]
-fn observe_time() -> Result<time::OffsetDateTime, HiveError> {
+pub(super) fn observe_time() -> Result<time::OffsetDateTime, HiveError> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -243,7 +243,7 @@ fn observe_time() -> Result<time::OffsetDateTime, HiveError> {
         .ok_or_else(|| {
             HiveError::new(
                 ErrorCode::RuntimeUnavailable,
-                "The context observation time is unavailable.",
+                "The snapshot observation time is unavailable.",
             )
         })
 }

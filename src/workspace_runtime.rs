@@ -298,6 +298,24 @@ pub(crate) fn with_owned_snapshot<T>(
     target: DoltTarget<'_>,
     read: impl FnOnce(&mut Snapshot) -> Result<T, HiveError>,
 ) -> Result<T, HiveError> {
+    with_owned_snapshot_inner(workspace, target, false, |snapshot, _| read(snapshot))
+}
+
+/// Inspection reads committed history even while a pending marker is retained.
+pub(crate) fn with_operation_snapshot<T>(
+    workspace: &Candidate,
+    target: DoltTarget<'_>,
+    read: impl FnOnce(&mut Snapshot, bool) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
+    with_owned_snapshot_inner(workspace, target, true, read)
+}
+
+fn with_owned_snapshot_inner<T>(
+    workspace: &Candidate,
+    target: DoltTarget<'_>,
+    inspect_pending: bool,
+    read: impl FnOnce(&mut Snapshot, bool) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
     let id = workspace.workspace_id();
     let root = json_path(&workspace.root.path)?;
     let state = find_state(id, &workspace.root.path)?
@@ -310,7 +328,7 @@ pub(crate) fn with_owned_snapshot<T>(
         ));
     }
     let lock = lock_file(regular(&state, "lock")?, libc::LOCK_SH)?;
-    let check_selection = || -> Result<(), HiveError> {
+    let check_selection = || -> Result<bool, HiveError> {
         let selected = read_explicit(&workspace.root.path)?;
         let lock_now = regular(&state, "lock")?.metadata().map_err(io_error)?;
         let held = lock.metadata().map_err(io_error)?;
@@ -334,14 +352,15 @@ pub(crate) fn with_owned_snapshot<T>(
             id,
             root,
         )?;
-        if state.contains(c"starting")? || state.contains(c"pending-request.json")? {
+        let pending = state.contains(c"pending-request.json")?;
+        if state.contains(c"starting")? || (!inspect_pending && pending) {
             return Err(unverified(
                 "The workspace has an unresolved runtime or write intent.",
             ));
         }
-        Ok(())
+        Ok(pending)
     };
-    check_selection()?;
+    let pending = check_selection()?;
     let server: Server = read_json(Some(&state), "server.json")?
         .ok_or_else(|| unverified("No owned server is recorded."))?;
     check_server(&server, id, root)?;
@@ -361,8 +380,14 @@ pub(crate) fn with_owned_snapshot<T>(
     let run = child_dir(&state, &format!("run-{}", server.nonce))?;
     require_private_dir(&run)?;
     let handle = pidfd(server.pid)?;
-    let result = verify_with(&server, &state, &run, &noms, &handle, read);
-    check_selection()?;
+    let result = verify_with(&server, &state, &run, &noms, &handle, |snapshot| {
+        read(snapshot, pending)
+    });
+    if pending != check_selection()? {
+        return Err(unverified(
+            "The pending request state changed during inspection.",
+        ));
+    }
     result
 }
 

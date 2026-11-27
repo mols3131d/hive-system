@@ -3202,3 +3202,55 @@ fn conversation_export_preserves_v2_error_and_literal_boundaries() {
     assert_eq!(report["schema_version"], 1);
     sandbox.assert_empty();
 }
+
+#[test]
+fn operation_show_requires_v2_and_exact_current_selection() {
+    let sandbox = Sandbox::new();
+    let id = "01900000-0000-7000-8000-000000000001";
+    for (contract, request, extra, exit, code) in [
+        ("1", id, &[][..], 2, "INVALID_ARGUMENT"),
+        ("2", "INVALID", &[][..], 2, "INVALID_ARGUMENT"),
+        (
+            "2",
+            id,
+            &["--project", "fixture"][..],
+            2,
+            "INVALID_ARGUMENT",
+        ),
+        ("2", id, &[][..], 7, "AUTHORITY_UNVERIFIED"),
+    ] {
+        let mut args = vec![
+            "--contract",
+            contract,
+            "--json",
+            "--workspace",
+            "fixture",
+            "operation",
+            "show",
+            request,
+            "--workspace-id",
+            id,
+            "--database",
+            "db",
+            "--port",
+            "12345",
+            "--area",
+            id,
+            "--issue",
+            id,
+            "--invocation-id",
+            id,
+            "--actor",
+            "fixture-actor",
+        ];
+        args.extend(extra);
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{report}");
+        assert_eq!(report["command"], "operation show");
+        assert_eq!(report["schema_version"], contract.parse::<u32>().unwrap());
+        assert_eq!(report["error"]["code"], code);
+        assert!(report.get("data").is_none());
+    }
+    sandbox.assert_empty();
+}

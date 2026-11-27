@@ -48,6 +48,7 @@ pub(super) fn read_required(
     let operation = match kind {
         RecordKind::IssueUpdate => Operation::ReadHandoffBody,
         RecordKind::Artifact => Operation::DiscloseArtifactBody,
+        RecordKind::OperationReceipt => return Err(workflow::unverified()),
     };
     workflow::verify(
         request,
@@ -83,6 +84,7 @@ pub(super) fn read_required(
             read_artifact_body(snapshot, scope, work, &id, &revision, remaining)
                 .map_err(|error| error.context_limit_ref("artifact", &id))?
         }
+        RecordKind::OperationReceipt => return Err(workflow::unverified()),
     };
     Ok(Some(HandoffBody {
         kind,
@@ -123,6 +125,7 @@ fn select_handoff(
                 .into_iter()
                 .next()
                 .map(|(id, revision)| (RecordKind::Artifact, id, revision)),
+            RecordKind::OperationReceipt => None,
         };
         return selected.map(Some).ok_or_else(|| {
             HiveError::new(

@@ -36,6 +36,7 @@ pub(crate) enum ErrorCode {
     IoError,
     NotImplemented,
     UnknownWriteOutcome,
+    CommitUncertain,
 }
 
 impl ErrorCode {
@@ -68,7 +69,7 @@ impl ErrorCode {
             | Self::PolicyUnavailable
             | Self::IoError
             | Self::NotImplemented => 7,
-            Self::UnknownWriteOutcome => 8,
+            Self::UnknownWriteOutcome | Self::CommitUncertain => 8,
         }
     }
 }

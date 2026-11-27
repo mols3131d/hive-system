@@ -507,6 +507,59 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
     )));
     fixture.local(&["add", "."], None);
     fixture.local(&["commit", "-m", "Synthetic atomic activation"], None);
+    let head = || {
+        fixture
+            .local(
+                &["sql", "-r", "csv", "-q", "SELECT DOLT_HASHOF('HEAD')"],
+                None,
+            )
+            .lines()
+            .last()
+            .unwrap()
+            .to_owned()
+    };
+    let note_base = head();
+    let request = id(46);
+    let note = id(47);
+    let revision = id(48);
+    let note_fingerprint = "b".repeat(64);
+    let note_evidence = serde_json::json!({
+        "version": 1, "operation": "issue.note", "workspace_id": workspace,
+        "request_id": request, "fingerprint": note_fingerprint, "actor_ref": "fixture-holder",
+        "area_id": area, "issue_id": issue, "expected_issue_revision": id(4),
+        "claim_id": id(14), "authorization_ref": "fixture-note-auth",
+        "evidence_id": "fixture-note-evidence", "revision": "r1",
+        "source_ref": "fixture-note-source", "issuer_ref": "fixture-note-issuer",
+        "valid_from": "2025-01-01T00:00:00Z", "expires_at": "2027-01-01T00:00:00Z",
+        "withdrawn": false,
+    });
+    let unverified_request = id(50);
+    let mut unverified_evidence = note_evidence.clone();
+    unverified_evidence["request_id"] = unverified_request.clone().into();
+    let note_result = serde_json::json!({
+        "version": 1, "area_id": area, "issue_id": issue, "note_id": note,
+        "issue_revision": revision,
+    });
+    fixture.local(&["sql"], Some(&format!(
+        "INSERT INTO issue_updates VALUES
+             ('{note}', '{issue}', 'progress', 'Synthetic receipt note body', 'fixture-holder', '2026-01-01', NULL);
+         UPDATE issues SET revision = '{revision}' WHERE id = '{issue}';
+         INSERT INTO operation_receipts VALUES
+             ('{request}', 'issue.note', '{note_fingerprint}', 'fixture-holder', 'fixture-note-auth',
+              '{note_evidence}', '{note_base}', '{note_result}', '2026-01-01'),
+             ('{unverified_request}', 'issue.note', '{note_fingerprint}', 'fixture-holder', 'fixture-note-auth',
+              '{unverified_evidence}', '{base}', '{note_result}', '2026-01-01');"
+    )));
+    fixture.local(&["add", "."], None);
+    fixture.local(&["commit", "-m", "Synthetic atomic Issue note"], None);
+    let note_commit = head();
+    fixture.local(
+        &["sql"],
+        Some("UPDATE areas SET name = 'Renamed root' WHERE slug = 'root';"),
+    );
+    fixture.local(&["add", "."], None);
+    fixture.local(&["commit", "-m", "Synthetic later commit"], None);
+
     let root = fixture.root.join("workspace");
     fs::create_dir(&root).unwrap();
     fs::rename(fixture.root.join(DATABASE), root.join("db")).unwrap();
@@ -780,5 +833,134 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
     let dirty = run(&inspect, 5);
     assert_eq!(dirty["error"]["code"], "DIRTY_CONFLICT");
     assert!(dirty.get("data").is_none());
+    let show_path = fixture_root.join("operation-evidence.json");
+    let operation = |request_id: &str,
+                     area_id: &str,
+                     issue_id: &str,
+                     actor: &str,
+                     evidence: Option<&Value>,
+                     exit| {
+        let mut args = vec![
+            "operation",
+            "show",
+            request_id,
+            "--database",
+            "db",
+            "--port",
+            &port,
+            "--workspace-id",
+            &workspace,
+            "--area",
+            area_id,
+            "--issue",
+            issue_id,
+            "--actor",
+            actor,
+            "--invocation-id",
+            &invocation,
+        ];
+        if let Some(proof) = evidence {
+            fs::write(&show_path, proof.to_string()).unwrap();
+            args.extend(["--evidence-file", show_path.to_str().unwrap()]);
+        }
+        let report = run(&args, exit);
+        assert_eq!(report["command"], "operation show");
+        assert_eq!(report["schema_version"], 2);
+        for private in [
+            "Synthetic receipt note body",
+            "fixture-note-auth",
+            "fixture-note-evidence",
+            "reader-password",
+        ] {
+            assert!(!report.to_string().contains(private), "{private}");
+        }
+        report
+    };
+    let operation_proof = |id: &str| {
+        let mut proof = declaration(
+            "operation_receipt",
+            "inspect_operation_receipt",
+            request.as_str(),
+            commit,
+        );
+        proof["record"]["id"] = id.into();
+        proof["bot_id"] = Value::Null;
+        proof["actor_ref"] = "fixture-holder".into();
+        proof
+    };
+    let proof = operation_proof(&request);
+    let report = operation(&request, &area, &issue, "fixture-holder", Some(&proof), 0);
+    assert_eq!(report["data"]["result"], note_result);
+    assert_eq!(report["data"]["base_commit"], note_base);
+    assert_eq!(report["data"]["confirmed_commit"], note_commit);
+    assert_eq!(report["data"]["outcome"], "confirmed");
+    assert_eq!(report["context"]["db_commit"], commit);
+    assert_ne!(commit, note_commit);
+    assert_eq!(report["data"]["current_claim"]["claim_id"], id(14));
+    let no_evidence = operation(&request, &area, &issue, "fixture-holder", None, 7);
+    assert_eq!(no_evidence["error"]["code"], "AUTHORITY_UNVERIFIED");
+    let wrong_actor = operation(&request, &area, &issue, "fixture-other", Some(&proof), 6);
+    assert_eq!(wrong_actor["error"]["code"], "UNAUTHORIZED");
+    let mut out_of_scope = proof.clone();
+    out_of_scope["issue_id"] = id(13).into();
+    let wrong_issue = operation(
+        &request,
+        &area,
+        &id(13),
+        "fixture-holder",
+        Some(&out_of_scope),
+        7,
+    );
+    assert_eq!(wrong_issue["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert!(wrong_issue.get("data").is_none());
+    let unsupported = operation(
+        &activation,
+        &area,
+        &issue,
+        "fixture-holder",
+        Some(&operation_proof(&activation)),
+        7,
+    );
+    assert_eq!(unsupported["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert!(unsupported.get("data").is_none());
+
+    let unverified_history = operation(
+        &unverified_request,
+        &area,
+        &issue,
+        "fixture-holder",
+        Some(&operation_proof(&unverified_request)),
+        8,
+    );
+    assert_eq!(unverified_history["error"]["code"], "COMMIT_UNCERTAIN");
+    assert!(unverified_history.get("data").is_none());
+
+    let missing = id(49);
+    let missing_proof = operation_proof(&missing);
+    let absent = operation(
+        &missing,
+        &area,
+        &issue,
+        "fixture-holder",
+        Some(&missing_proof),
+        3,
+    );
+    assert_eq!(absent["error"]["code"], "NOT_FOUND");
+    let marker = state.join("pending-request.json");
+    let marker_bytes = b"synthetic incomplete pending intent";
+    fs::write(&marker, marker_bytes).unwrap();
+    let unknown = operation(
+        &missing,
+        &area,
+        &issue,
+        "fixture-holder",
+        Some(&missing_proof),
+        8,
+    );
+    assert_eq!(unknown["error"]["code"], "COMMIT_UNCERTAIN");
+    let still_confirmed = operation(&request, &area, &issue, "fixture-holder", Some(&proof), 0);
+    assert_eq!(still_confirmed["data"]["confirmed_commit"], note_commit);
+    assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+
     assert!(cleanup.finish(), "Verified runtime fixture stop failed");
 }

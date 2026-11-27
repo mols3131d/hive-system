@@ -15,11 +15,11 @@ use crate::dolt::{
     Snapshot,
     directive::{METADATA, MetadataRow, Scope as DirectiveScope},
     is_commit_hash, is_uuid,
+    receipt_history::{HistoricalReceipt, receipt_at, receipt_introduction},
 };
 use crate::error::{ErrorCode, HiveError};
 
 pub(super) const MAX_DIRECTIVES: usize = 100;
-const MAX_RECEIPT_BYTES: usize = 256 * 1024;
 
 pub(super) struct Candidate {
     db_commit: String,
@@ -179,27 +179,6 @@ fn currently_applicable(
         && end.is_none_or(|value| observed_at < value))
 }
 
-type ReceiptRow = (
-    String,
-    String,
-    String,
-    bool,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-);
-
-#[derive(PartialEq, Eq)]
-pub(super) struct HistoricalReceipt {
-    fingerprint: String,
-    base_commit: String,
-    created_at: String,
-    pub(super) actor_ref: String,
-    pub(super) workflow_evidence: String,
-    pub(super) result: String,
-}
-
 /// This is a historical lookup only. The caller supplies an exact request ID
 /// from reviewed provenance; approval_ref is an opaque locator, not that ID.
 pub(super) fn lookup_activation_receipt(
@@ -220,120 +199,13 @@ pub(super) fn lookup_activation_receipt(
         ));
     }
     let observed = snapshot.commit.clone();
-    receipt_at(snapshot, candidate, request_id, &observed)?.ok_or_else(workflow::unverified)
-}
-
-fn receipt_at(
-    snapshot: &mut Snapshot,
-    candidate: &Candidate,
-    request_id: &str,
-    commit: &str,
-) -> Result<Option<HistoricalReceipt>, HiveError> {
-    // Dolt requires a literal AS OF revision. Never interpolate unvalidated history.
-    if !is_commit_hash(commit) {
-        return Err(invalid_record("A receipt history commit is malformed."));
-    }
-    let rows: Vec<ReceiptRow> = snapshot.exec_rows(
-        |_| {
-            format!(
-                "SELECT kind, actor_ref, fingerprint, CAST(authorization_ref AS BINARY) = ?,
-                base_commit, DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'),
-                CASE WHEN OCTET_LENGTH(workflow_evidence_json) + OCTET_LENGTH(result_json) <= ?
-                     THEN workflow_evidence_json END,
-                CASE WHEN OCTET_LENGTH(workflow_evidence_json) + OCTET_LENGTH(result_json) <= ?
-                     THEN result_json END
-             FROM operation_receipts AS OF '{commit}' WHERE CAST(request_id AS BINARY) = ? LIMIT 2"
-            )
-        },
-        (
-            &candidate.approval_ref,
-            MAX_RECEIPT_BYTES,
-            MAX_RECEIPT_BYTES,
-            request_id,
-        ),
-    )?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    let [(kind, actor, fingerprint, matches_approval, base_commit, created_at, evidence, result)] =
-        rows.as_slice()
-    else {
-        return Err(workflow::unverified());
-    };
-    if kind != activation_receipt::KIND
-        || !*matches_approval
-        || !workflow::valid_ref(actor)
-        || fingerprint.len() != 64
-        || !fingerprint
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    let receipt = receipt_at(snapshot, request_id, &observed)?.ok_or_else(workflow::unverified)?;
+    if receipt.kind != activation_receipt::KIND
+        || receipt.authorization_ref != candidate.approval_ref
     {
         return Err(workflow::unverified());
     }
-    Ok(Some(HistoricalReceipt {
-        fingerprint: fingerprint.clone(),
-        base_commit: base_commit.clone(),
-        created_at: created_at.clone(),
-        actor_ref: actor.clone(),
-        workflow_evidence: receipt_object(evidence.as_deref())?.to_owned(),
-        result: receipt_object(result.as_deref())?.to_owned(),
-    }))
-}
-
-/// Inspect changes to the exact receipt in the retained, committed view.
-fn receipt_introduction(
-    snapshot: &mut Snapshot,
-    candidate: &Candidate,
-    request_id: &str,
-    receipt: &HistoricalReceipt,
-) -> Result<String, HiveError> {
-    if !is_commit_hash(&receipt.base_commit) {
-        return Err(invalid_record("The receipt has a malformed base commit."));
-    }
-    let observed = snapshot.commit.clone();
-    type Delta = (String, String, String, Option<String>, Option<String>);
-    let changes: Vec<Delta> = snapshot.exec_rows(
-        |commit| {
-            format!(
-                "SELECT from_commit, to_commit, diff_type, from_request_id, to_request_id
-                 FROM dolt_diff_operation_receipts AS OF '{commit}'
-                 WHERE from_request_id = ? OR to_request_id = ? LIMIT 2"
-            )
-        },
-        (request_id, request_id),
-    )?;
-    let [(base, introduced, kind, None, Some(added_request))] = changes.as_slice() else {
-        return Err(workflow::unverified());
-    };
-    if kind != "added"
-        || added_request != request_id
-        || base != &receipt.base_commit
-        || !is_commit_hash(introduced)
-        || introduced == base
-    {
-        return Err(workflow::unverified());
-    }
-
-    // Anchor the edge to the paired Snapshot and require the receipt's base
-    // to be the introducing commit's sole parent.
-    let merger: Vec<Option<String>> = snapshot.exec_rows(
-        |_| "SELECT DOLT_MERGE_BASE(?, ?)".to_owned(),
-        (introduced, &observed),
-    )?;
-    let parents: Vec<String> = snapshot.exec_rows(
-        |_| {
-            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? LIMIT 2".to_owned()
-        },
-        (introduced,),
-    )?;
-    if !matches!(merger.as_slice(), [Some(ancestor)] if ancestor == introduced)
-        || !matches!(parents.as_slice(), [parent] if parent == base)
-        || receipt_at(snapshot, candidate, request_id, base)?.is_some()
-        || receipt_at(snapshot, candidate, request_id, introduced)?.as_ref() != Some(receipt)
-    {
-        return Err(workflow::unverified());
-    }
-    Ok(introduced.clone())
+    Ok(receipt)
 }
 
 type DirectiveVersion = (
@@ -409,7 +281,7 @@ pub(super) fn read_approved(
 ) -> Result<String, HiveError> {
     let receipt = lookup_activation_receipt(snapshot, candidate, request_id)?;
     verify_receipt(candidate, &receipt, &snapshot.workspace_id, request_id)?;
-    let introduced_at = receipt_introduction(snapshot, candidate, request_id, &receipt)?;
+    let introduced_at = receipt_introduction(snapshot, request_id, &receipt)?;
     let observed_at = snapshot.commit.clone();
     let before = directive_version(snapshot, &candidate.id, &receipt.base_commit)?;
     let introduced = directive_version(snapshot, &candidate.id, &introduced_at)?;
@@ -468,17 +340,6 @@ fn verify_receipt(
     Ok(())
 }
 
-fn receipt_object(value: Option<&str>) -> Result<&str, HiveError> {
-    let value =
-        value.ok_or_else(|| limit("The historical receipt exceeds the provenance read limit."))?;
-    match serde_json::from_str(value) {
-        Ok(serde_json::Value::Object(_)) => Ok(value),
-        _ => Err(invalid_record(
-            "The historical receipt has invalid provenance JSON.",
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,21 +365,6 @@ mod tests {
         let mut edited = activated.clone();
         edited.6 = "edited-fingerprint".to_owned();
         assert!(verify_activation(&before, &activated, &edited, "r1").is_err());
-    }
-
-    #[test]
-    fn accepts_only_historical_provenance_objects_within_the_read_limit() {
-        assert_eq!(receipt_object(Some("{}")).unwrap(), "{}");
-        for malformed in ["[]", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] {
-            assert!(matches!(
-                receipt_object(Some(malformed)).unwrap_err().code,
-                ErrorCode::InvalidRecord
-            ));
-        }
-        assert!(matches!(
-            receipt_object(None).unwrap_err().code,
-            ErrorCode::ContextLimit
-        ));
     }
 
     #[test]
@@ -548,6 +394,8 @@ mod tests {
         });
         let result = serde_json::json!({"version": 1, "directive": target});
         let mut receipt = HistoricalReceipt {
+            kind: activation_receipt::KIND.to_owned(),
+            authorization_ref: candidate.approval_ref.clone(),
             fingerprint: "fingerprint".to_owned(),
             base_commit: "base".to_owned(),
             created_at: "fixture-date".to_owned(),
