@@ -6,6 +6,7 @@ mod config_v2;
 mod dolt;
 mod error;
 mod output;
+mod workspace_init;
 mod workspace_status;
 
 use std::io::Write;
@@ -14,7 +15,7 @@ use std::process::ExitCode;
 use cli::{
     AreaCommand, BotCommand, Command, ConfigCommand, ContextArgs, ContextCommand, Contract,
     ConversationCommand, DirectiveCommand, DoltArtifactCommand, Invocation, IssueCommand,
-    ParseFailure, ResourceCommand,
+    ParseFailure, ResourceCommand, WorkspaceCommand,
 };
 use error::{ErrorCode, HiveError};
 
@@ -93,7 +94,13 @@ fn dispatch(invocation: Invocation) -> ExitCode {
 fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let name = &invocation.command_name;
     let format = invocation.common.format.unwrap_or_default();
-    if let Command::Workspace(cli::WorkspaceCommand::Status(target)) = &invocation.command {
+    if let Command::Workspace(WorkspaceCommand::Init { target }) = &invocation.command {
+        return match workspace_init::run(target) {
+            Ok(data) => output::success(Contract::V2, format, name, None, &data),
+            Err(error) => output::failure(Contract::V2, format, Some(name), None, error),
+        };
+    }
+    if let Command::Workspace(WorkspaceCommand::Status(target)) = &invocation.command {
         let (format, result) = workspace_status::observe(&invocation.common, target);
         return match result {
             Ok(data) => output::success(Contract::V2, format, name, None, &data),
@@ -135,7 +142,19 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
             cursor,
             ..
         }) => dolt::bot::list(&target, status.as_deref(), page.limit, cursor.as_deref()),
-        Command::Bot(BotCommand::Show { target, bot_id }) => dolt::bot::show(&target, &bot_id),
+        Command::Bot(BotCommand::Show {
+            target,
+            bot_id,
+            asset_commit,
+        }) => dolt::bot::show(
+            &target,
+            &bot_id,
+            invocation
+                .common
+                .workspace
+                .as_deref()
+                .zip(asset_commit.as_deref()),
+        ),
         Command::Directive(DirectiveCommand::List {
             selection,
             status,

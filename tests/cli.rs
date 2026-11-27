@@ -1175,6 +1175,25 @@ fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
         check(&args, leaf, code, exit);
     }
 
+    let report = check(
+        &[
+            "bot",
+            "show",
+            "01900000-0000-7000-8000-00000000000a",
+            "--asset-commit",
+            REVISION,
+            "--asset-commit",
+            REVISION,
+            "--contract",
+            "2",
+            "--json",
+        ],
+        "show",
+        "INVALID_ARGUMENT",
+        2,
+    );
+    assert_eq!(report["error"]["message"], "Arguments conflict.");
+
     let command = ["bot", "list"];
     let trailing = ["--contract", "2", "--json"];
     for (flag, value) in [
@@ -2596,6 +2615,34 @@ fn conversation_show_recovers_output_for_target_and_scope_errors() {
 }
 
 #[test]
+fn soul_inspection_requires_contract_two_and_an_explicit_root() {
+    let sandbox = Sandbox::new();
+    for (contract, expected) in [
+        ("1", "Dolt Bot options require --contract 2."),
+        ("2", "Soul inspection requires an explicit --workspace."),
+    ] {
+        let args = [
+            "--contract",
+            contract,
+            "--json",
+            "bot",
+            "show",
+            "01900000-0000-7000-8000-00000000000a",
+            "--asset-commit",
+            REVISION,
+        ];
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{report}");
+        assert_eq!(report["schema_version"], contract.parse::<u32>().unwrap());
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(report["error"]["message"], expected);
+        assert!(output.stderr.is_empty());
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn dolt_label_list_keeps_legacy_and_late_json_boundaries() {
     let sandbox = Sandbox::new();
     let id = "01900000-0000-7000-8000-000000000001";
@@ -2743,6 +2790,58 @@ fn conversation_list_recovers_scoped_v2_output_without_consuming_values_as_flags
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(legacy["schema_version"], 1);
     assert_ne!(legacy["command"], "conversation list");
+    sandbox.assert_empty();
+}
+
+#[test]
+fn workspace_init_recovers_output_flags_after_an_unknown_option_value() {
+    let sandbox = Sandbox::new();
+    let command = ["workspace", "init"];
+    let unknown = ["--database", "fixture"];
+    let options = ["--contract", "2", "--json"];
+    let mut original_error = None;
+    for args in [
+        [&options[..], &command, &unknown].concat(),
+        [&command[..], &unknown, &options].concat(),
+        [&command[..], &["--database"], &options].concat(),
+        [&command[..], &["--database=--"], &options].concat(),
+        [&command[..], &unknown, &options, &["--", "--target=after"]].concat(),
+    ] {
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "workspace init");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(
+            report["error"]["message"],
+            "An argument or command is not recognized."
+        );
+        assert_eq!(
+            original_error.get_or_insert_with(|| report["error"].clone()),
+            &report["error"]
+        );
+    }
+
+    for tail in [
+        &["--database=--json", "--contract", "2"][..],
+        &[&unknown[..], &["--", "--contract", "2", "--json"]].concat(),
+    ] {
+        let output = sandbox.run(&[&command[..], tail].concat());
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    for tail in [
+        &["--database=--contract", "2"][..],
+        &[&unknown[..], &["--", "--contract", "2"]].concat(),
+    ] {
+        let output = sandbox.run(&[&["--json"][..], &command, tail].concat());
+        assert_eq!(output.status.code(), Some(2));
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert_ne!(report["command"], "workspace init");
+    }
     sandbox.assert_empty();
 }
 

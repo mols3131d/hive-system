@@ -734,6 +734,9 @@ pub(crate) enum BotCommand {
     Show {
         #[arg(value_name = "BOT-ID", value_parser = parse_slug)]
         bot_id: String,
+        /// Inspect the Soul at this full asset Git commit (contract 2, requires --workspace).
+        #[arg(long, hide = true)]
+        asset_commit: Option<String>,
         #[command(flatten)]
         target: DoltTargetArgs,
     },
@@ -773,6 +776,11 @@ pub(crate) struct DoltTargetArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum WorkspaceCommand {
+    /// Initialize a new workspace in an existing empty directory.
+    Init {
+        #[arg(long, value_name = "EMPTY_DIR")]
+        target: PathBuf,
+    },
     /// Observe the selected workspace and local runtime evidence.
     Status(DoltTargetArgs),
 }
@@ -1176,7 +1184,7 @@ fn workspace_parser(legacy: &clap::Command, args: &[OsString]) -> Option<clap::C
     // Probe only the v2 grammar so v1 help and unknown-command errors stay identical.
     let cli = legacy.clone().subcommand(
         WorkspaceCommand::augment_subcommands(
-            clap::Command::new("workspace").about("Inspect the v2 workspace."),
+            clap::Command::new("workspace").about("Initialize or inspect a v2 workspace."),
         )
         .subcommand_required(true)
         .mut_subcommands(add_leaf_options),
@@ -1225,7 +1233,7 @@ fn retry_workspace_conflict(
     }
     cli.find_subcommand("workspace")?;
     // Accept repeated target options only to recover contract and output flags.
-    // Status takes no positional values. A standalone -- ends options, while
+    // Workspace commands take no positional values. A standalone -- ends options, while
     // attached values stay intact for Clap. Keep the original parse error.
     let end = args
         .iter()
@@ -1235,9 +1243,11 @@ fn retry_workspace_conflict(
         .map_or(args.len(), |(index, _)| index);
     cli.clone()
         .mut_subcommand("workspace", |workspace| {
-            workspace.mut_subcommand("status", |status| {
-                status.mut_args(|arg| match arg.get_id().as_str() {
-                    "workspace_id" | "database" | "port" => arg.action(ArgAction::Append),
+            workspace.mut_subcommands(|leaf| {
+                leaf.mut_args(|arg| match arg.get_id().as_str() {
+                    "target" | "workspace_id" | "database" | "port" => {
+                        arg.action(ArgAction::Append)
+                    }
                     _ => arg,
                 })
             })
@@ -1423,7 +1433,7 @@ fn recover_unknown_long(
     let (action, _) = matched.subcommand()?;
     if !matches!(
         (domain, action),
-        ("workspace", "status") | (_, "list" | "show")
+        ("workspace", "init" | "status") | (_, "list" | "show")
     ) {
         return None;
     }
@@ -1448,13 +1458,21 @@ fn recover_unknown_long(
         return None;
     }
 
-    // Let Clap replay the original tokens. Label list has no positionals, so
-    // its temporary option can also take one plain separated value. The
-    // original parse error still determines the result.
-    let allow_separated_value = domain == "label" && action == "list";
+    // Let Clap replay the original tokens. Init and Label list take no
+    // positionals, so the temporary option can take one plain separated
+    // value. The original parse error still determines the result.
+    let workspace_init = (domain, action) == ("workspace", "init");
+    let allow_separated_value = workspace_init || (domain, action) == ("label", "list");
     const UNKNOWN_LONG: &str = "recovered_unknown_long";
     let retry = cli.clone().mut_subcommand(domain, |command| {
         command.mut_subcommand(action, |leaf| {
+            // A missing init target must not prevent recovery of the original
+            // unknown-option error and its explicit output flags.
+            let leaf = if workspace_init {
+                leaf.mut_arg("target", |arg| arg.required(false))
+            } else {
+                leaf
+            };
             leaf.arg(
                 Arg::new(UNKNOWN_LONG)
                     .long(long.to_owned())
@@ -1465,7 +1483,16 @@ fn recover_unknown_long(
             )
         })
     });
-    let matches = retry.try_get_matches_from(args).ok()?;
+    let end = if workspace_init {
+        args.iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, arg)| *arg == "--")
+            .map_or(args.len(), |(index, _)| index)
+    } else {
+        args.len()
+    };
+    let matches = retry.try_get_matches_from(&args[..end]).ok()?;
     let recovered = matches
         .subcommand_matches(domain)?
         .subcommand_matches(action)?;
@@ -2142,6 +2169,14 @@ impl Command {
                 Self::Project(_) => Err("Use contract 2 Project read options."),
                 Self::Bot(command) => command.validate(common),
                 Self::Directive(command) => command.validate(common),
+                Self::Workspace(WorkspaceCommand::Init { .. })
+                    if common.workspace.is_some()
+                        || common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree) =>
+                {
+                    Err("workspace init accepts only --target and output selection.")
+                }
                 Self::Artifact(ArtifactCommand::List { .. } | ArtifactCommand::Show { .. }) => {
                     Err("Use Dolt Artifact read options with --contract 2.")
                 }
@@ -2167,6 +2202,7 @@ impl Command {
             }
             Self::Area(_) => Err("Area commands require --contract 2."),
             Self::Issue(_) => Err("Issue commands require --contract 2."),
+            Self::Workspace(_) => Err("Workspace commands require --contract 2."),
             Self::Conversation(_) => Err("Conversation commands require --contract 2."),
             Self::Bot(command) => command.validate(common),
             Self::Directive(command) => command.validate(common),
@@ -2247,6 +2283,9 @@ impl BotCommand {
                     } | Self::List {
                         cursor: Some(_),
                         ..
+                    } | Self::Show {
+                        asset_commit: Some(_),
+                        ..
                     }
                 )
             {
@@ -2254,10 +2293,28 @@ impl BotCommand {
             }
             return Ok(());
         }
-        target.validate_common(
-            common,
-            "Dolt Bot inspection accepts only an explicit local database and workspace ID.",
-        )?;
+        if matches!(
+            self,
+            Self::Show {
+                asset_commit: Some(_),
+                ..
+            }
+        ) {
+            if common.workspace.is_none() {
+                return Err("Soul inspection requires an explicit --workspace.");
+            }
+            if common.project.is_some()
+                || common.project_root.is_some()
+                || !matches!(common.view, View::WorkingTree)
+            {
+                return Err("Soul inspection accepts only explicit workspace and Bot selection.");
+            }
+        } else {
+            target.validate_common(
+                common,
+                "Dolt Bot inspection accepts only an explicit local database and workspace ID.",
+            )?;
+        }
         if !target.has_all() {
             return Err("Dolt Bot inspection requires --workspace-id, --database, and --port.");
         }
