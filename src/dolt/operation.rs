@@ -244,18 +244,17 @@ fn inspect(
 
 #[cfg(target_os = "linux")]
 fn current_claim(snapshot: &mut Snapshot, issue: &str, status: &str) -> Result<Value, HiveError> {
-    let claims: Vec<(String, String)> = snapshot.exec_rows(
-        |commit| format!("SELECT claim_id, holder_ref FROM issue_claims AS OF '{commit}' WHERE CAST(issue_id AS BINARY) = ? LIMIT 2"),
-        (issue,),
+    let claim = super::issue_transition::Claim::read(
+        &mut snapshot.connection,
+        issue,
+        Some(&snapshot.commit),
     )?;
-    match claims.as_slice() {
-        [] if matches!(status, "backlog" | "todo" | "review" | "done" | "cancelled") => {
+    match claim {
+        None if matches!(status, "backlog" | "todo" | "review" | "done" | "cancelled") => {
             Ok(Value::Null)
         }
-        [(claim, holder)]
-            if status == "in-progress" && is_uuid_v7(claim) && workflow::valid_ref(holder) =>
-        {
-            Ok(json!({"claim_id": claim, "holder_ref": holder}))
+        Some(claim) if status == "in-progress" => {
+            Ok(json!({"claim_id": claim.id, "holder_ref": claim.holder}))
         }
         _ => Err(workflow::unverified()),
     }

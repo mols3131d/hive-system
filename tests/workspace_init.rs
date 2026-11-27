@@ -259,6 +259,25 @@ fn doctor_terminates_version_helpers_before_reaping_the_wrapper() {
         loop {
             match fs::symlink_metadata(&scratch_fd) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // procfs can deny descriptor access after exit but before
+                    // the process is reaped. Require separate proof of exit.
+                    let exited = match fs::read_to_string(format!("/proc/{helper}/stat")) {
+                        Ok(stat) => matches!(
+                            stat.rsplit_once(") ")
+                                .and_then(|(_, fields)| fields.split_ascii_whitespace().next()),
+                            Some("Z" | "X")
+                        ),
+                        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                    };
+                    if exited {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "could not inspect the version helper's descriptor or verify exit: {error}"
+                    );
+                }
                 Err(error) => panic!("could not inspect the version helper's descriptor: {error}"),
                 Ok(_) => assert!(
                     Instant::now() < deadline,
