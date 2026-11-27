@@ -73,6 +73,18 @@ HIVE_DOLT_BIN=/absolute/path/to/dolt cargo test --locked --test dolt_validation 
   reproduces_initial_schema_manifest_across_inherited_collations -- --exact --ignored --nocapture
 ```
 
+## Committed Issue inspection
+
+Use the same synthetic Dolt target and SELECT-only account for `issue show`. Supply a canonical lowercase UUIDv7 or quote a positive Issue number so the shell passes the `#` prefix.
+
+```sh
+hive --contract 2 --json issue show '#42' \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+The result includes the verified workspace and Dolt commit, the selected Issue, and bounded direct relation IDs. A missing Issue returns `NOT_FOUND` at the verified commit. Each relation list returns up to 25 IDs and sets `truncated` if more exist. Use explicit selection to inspect other records as their read commands become available.
+
 ## Agent-assisted development
 
 Use [instruction ownership](agents/rule-ownership.md) to place scoped guidance, [asset lifecycle](agents/assets.md) when selecting or updating reusable Agent Assets, and [harness verification](agents/harness.md) to distinguish configuration from observed runtime behavior.

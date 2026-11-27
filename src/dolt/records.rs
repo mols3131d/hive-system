@@ -39,7 +39,7 @@ impl IssueRow {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum IssueStatus {
+pub(super) enum IssueStatus {
     Backlog,
     Todo,
     InProgress,
@@ -49,7 +49,7 @@ enum IssueStatus {
 }
 
 impl IssueStatus {
-    fn parse(value: &str) -> Option<Self> {
+    pub(super) fn parse(value: &str) -> Option<Self> {
         // SQL CHECK comparisons can accept other spellings under a case-insensitive collation.
         match value {
             "backlog" => Some(Self::Backlog),
@@ -62,7 +62,7 @@ impl IssueStatus {
         }
     }
 
-    fn is_terminal(self) -> bool {
+    pub(super) fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Cancelled)
     }
 
@@ -88,7 +88,7 @@ pub(crate) struct Diagnostics {
 }
 
 impl Diagnostics {
-    fn add(
+    pub(super) fn add(
         &mut self,
         code: &'static str,
         table: &'static str,
@@ -130,7 +130,7 @@ impl Diagnostics {
         });
     }
 
-    fn check_id(&mut self, table: &'static str, id: &str, owner: &[&str]) {
+    pub(super) fn check_id(&mut self, table: &'static str, id: &str, owner: &[&str]) {
         if !is_uuid_v7(id) {
             self.add(
                 "INVALID_ID",
