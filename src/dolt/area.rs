@@ -4,10 +4,33 @@ use mysql::Value as SqlValue;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::cli::{AreaListArgs, AreaShowArgs, AreaTreeArgs, is_slug};
+use crate::cli::{
+    AreaCreateArgs, AreaListArgs, AreaShowArgs, AreaTreeArgs, CommonOptions, is_slug,
+};
 use crate::error::{ErrorCode, HiveError};
 
 use super::{DoltFailure, DoltSuccess, Snapshot, is_uuid_v7};
+
+#[cfg(target_os = "linux")]
+pub(super) mod create;
+
+pub(crate) fn create(
+    common: &CommonOptions,
+    args: &AreaCreateArgs,
+) -> Result<DoltSuccess, Box<DoltFailure>> {
+    #[cfg(target_os = "linux")]
+    {
+        create::write(common, args).map_err(DoltFailure::without_context)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (common, args);
+        Err(DoltFailure::without_context(HiveError::new(
+            ErrorCode::NotImplemented,
+            "Area create requires a verified Linux workspace runtime.",
+        )))
+    }
+}
 
 const MAX_LIMIT: u64 = 100;
 const MAX_TREE_NODES: u64 = 100;

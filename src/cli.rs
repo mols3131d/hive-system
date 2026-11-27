@@ -670,6 +670,7 @@ pub(crate) enum DoltArtifactCommand {
     List(ArtifactListArgs),
     Show(ArtifactShowArgs),
     Create(ArtifactCreateArgs),
+    Update(ArtifactUpdateArgs),
 }
 
 #[derive(Args)]
@@ -685,6 +686,31 @@ pub(crate) struct ArtifactCreateArgs {
     #[arg(long)]
     pub(crate) title: String,
     /// UTF-8 Markdown file, up to 64 KiB.
+    #[arg(long)]
+    pub(crate) file: PathBuf,
+    #[arg(long)]
+    pub(crate) actor: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct ArtifactUpdateArgs {
+    /// Exact Artifact UUIDv7.
+    #[arg(value_name = "ID")]
+    pub(crate) id: String,
+    /// The Artifact's single direct Area link. Omit for a standalone Artifact.
+    #[arg(long)]
+    pub(crate) area: Option<String>,
+    /// Expected Artifact revision as ARTIFACT=REV.
+    #[arg(long)]
+    pub(crate) if_match: String,
+    /// Replacement UTF-8 Markdown file, up to 64 KiB.
     #[arg(long)]
     pub(crate) file: PathBuf,
     #[arg(long)]
@@ -952,6 +978,31 @@ pub(crate) enum AreaCommand {
     Tree(AreaTreeArgs),
     /// Show one committed Area.
     Show(AreaShowArgs),
+    /// Create a root Area or a direct child of an explicit parent.
+    Create(AreaCreateArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct AreaCreateArgs {
+    #[arg(long)]
+    pub(crate) slug: String,
+    #[arg(long)]
+    pub(crate) name: String,
+    /// Exact parent UUIDv7. Omit for a root Area.
+    #[arg(long)]
+    pub(crate) parent: Option<String>,
+    /// Expected revision of the selected parent as PARENT=REV.
+    #[arg(long)]
+    pub(crate) if_match: Option<String>,
+    #[arg(long)]
+    pub(crate) actor: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Args)]
@@ -1586,6 +1637,12 @@ fn parse_dolt_artifact(
                 clap::Command::new("create")
                     .about("Create a standalone or directly Area-linked Artifact."),
             )))
+            .mut_subcommand("update", |_| {
+                add_leaf_options(ArtifactUpdateArgs::augment_args(
+                    clap::Command::new("update")
+                        .about("Replace the Markdown body of one Artifact."),
+                ))
+            })
     });
 
     // Recover known malformed options to locate the contract and output format.
@@ -1604,12 +1661,16 @@ fn parse_dolt_artifact(
     };
     let probe = recover_common(v2.clone()).mut_subcommand("artifact", |artifact| {
         artifact.mut_subcommands(|leaf| {
-            if leaf.get_name() == "create" {
+            if matches!(leaf.get_name(), "create" | "update") {
                 return extended_error_options(leaf).mut_args(|arg| match arg.get_id().as_str() {
                     "area" | "if_match" | "kind" | "title" | "file" | "actor" | "request_id"
                     | "evidence_file" | "database" | "workspace_id" | "port" => {
                         recover_value(arg).required(false)
                     }
+                    "id" => arg
+                        .value_parser(OsStringValueParser::new())
+                        .required(false)
+                        .num_args(0..=1),
                     _ => arg,
                 });
             }
@@ -1682,7 +1743,7 @@ fn parse_dolt_artifact(
     let (command_name, leaf) = matched_leaf(&v2, &matched)?;
     if !matches!(
         command_name.as_str(),
-        "artifact list" | "artifact show" | "artifact create"
+        "artifact list" | "artifact show" | "artifact create" | "artifact update"
     ) || requested_contract(Some(&matched), Some(leaf)) != Contract::V2
     {
         return None;
@@ -1719,39 +1780,40 @@ fn parse_dolt_artifact(
             "artifact show" => {
                 ArtifactShowArgs::from_arg_matches(leaf).map(DoltArtifactCommand::Show)
             }
-            _ => ArtifactCreateArgs::from_arg_matches(leaf).map(DoltArtifactCommand::Create),
+            "artifact create" => {
+                ArtifactCreateArgs::from_arg_matches(leaf).map(DoltArtifactCommand::Create)
+            }
+            _ => ArtifactUpdateArgs::from_arg_matches(leaf).map(DoltArtifactCommand::Update),
         }
         .map_err(|error| invalid(safe_parse_message(error.kind())))?;
-        let target = match &command {
-            DoltArtifactCommand::List(args) => &args.target,
-            DoltArtifactCommand::Show(args) => &args.target,
-            DoltArtifactCommand::Create(args) => {
-                if common.workspace.is_none() || !args.target.has_all() {
-                    return Err(invalid(
-                        "Artifact create requires --workspace, --workspace-id, --database, and --port.",
-                    ));
-                }
-                if common.project.is_some()
-                    || common.project_root.is_some()
-                    || !matches!(common.view, View::WorkingTree)
-                {
-                    return Err(invalid(
-                        "Artifact create requires a current workspace and an explicit link selection.",
-                    ));
-                }
-                return Ok(Invocation {
-                    common,
-                    command: Command::DoltArtifact(command),
-                    command_name: command_name.clone(),
-                });
-            }
+        let (target, write) = match &command {
+            DoltArtifactCommand::List(args) => (&args.target, None),
+            DoltArtifactCommand::Show(args) => (&args.target, None),
+            DoltArtifactCommand::Create(args) => (&args.target, Some("create")),
+            DoltArtifactCommand::Update(args) => (&args.target, Some("update")),
         };
-        target
-            .validate_common(
-                &common,
-                "Dolt Artifact reads use an explicit local target and --scope.",
-            )
-            .map_err(invalid)?;
+        if let Some(write) = write {
+            if common.workspace.is_none() || !target.has_all() {
+                return Err(invalid(&format!(
+                    "Artifact {write} requires --workspace, --workspace-id, --database, and --port."
+                )));
+            }
+            if common.project.is_some()
+                || common.project_root.is_some()
+                || !matches!(common.view, View::WorkingTree)
+            {
+                return Err(invalid(&format!(
+                    "Artifact {write} requires a current workspace and an explicit link selection."
+                )));
+            }
+        } else {
+            target
+                .validate_common(
+                    &common,
+                    "Dolt Artifact reads use an explicit local target and --scope.",
+                )
+                .map_err(invalid)?;
+        }
         Ok(Invocation {
             common,
             command: Command::DoltArtifact(command),
@@ -3099,6 +3161,20 @@ impl AreaCommand {
             Self::List(args) => &args.target,
             Self::Tree(args) => &args.target,
             Self::Show(args) => &args.target,
+            Self::Create(args) => {
+                if common.workspace.is_none() || !args.target.has_all() {
+                    return Err(
+                        "Area create requires --workspace, --workspace-id, --database, and --port.",
+                    );
+                }
+                if common.project.is_some()
+                    || common.project_root.is_some()
+                    || !matches!(common.view, View::WorkingTree)
+                {
+                    return Err("Area create requires explicit workspace or exact parent scope.");
+                }
+                return Ok(());
+            }
         };
         target.validate_common(
             common,

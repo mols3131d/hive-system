@@ -152,6 +152,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::DoltArtifact(DoltArtifactCommand::Create(args)) => {
             dolt::artifact::create(&invocation.common, &args)
         }
+        Command::DoltArtifact(DoltArtifactCommand::Update(args)) => {
+            dolt::artifact::update(&invocation.common, &args)
+        }
         Command::Validate(args) => dolt::validate(&args),
         Command::Operation(cli::OperationCommand::Show(args)) => {
             dolt::operation::show(&invocation.common, &args)
@@ -162,6 +165,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
+        Command::Area(AreaCommand::Create(args)) => dolt::area::create(&invocation.common, &args),
         Command::Label(cli::LabelCommand::List(args)) => {
             dolt::label::list(&args, invocation.common.project.as_ref())
         }

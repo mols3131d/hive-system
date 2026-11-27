@@ -3,7 +3,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::cli::{
-    ArtifactCreateArgs, ArtifactListArgs, ArtifactShowArgs, CommonOptions, DoltTargetArgs,
+    ArtifactCreateArgs, ArtifactListArgs, ArtifactShowArgs, ArtifactUpdateArgs, CommonOptions,
+    DoltTargetArgs,
 };
 use crate::error::{ErrorCode, HiveError};
 
@@ -17,6 +18,10 @@ const MAX_BODY_BYTES: u32 = 64 * 1024;
 
 #[cfg(target_os = "linux")]
 pub(super) mod create;
+#[cfg(target_os = "linux")]
+pub(super) mod update;
+#[cfg(target_os = "linux")]
+mod writes;
 
 pub(crate) fn create(
     common: &CommonOptions,
@@ -32,6 +37,24 @@ pub(crate) fn create(
         Err(DoltFailure::without_context(HiveError::new(
             ErrorCode::NotImplemented,
             "Artifact create requires a verified Linux workspace runtime.",
+        )))
+    }
+}
+
+pub(crate) fn update(
+    common: &CommonOptions,
+    args: &ArtifactUpdateArgs,
+) -> Result<DoltSuccess, Box<DoltFailure>> {
+    #[cfg(target_os = "linux")]
+    {
+        update::write(common, args).map_err(DoltFailure::without_context)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (common, args);
+        Err(DoltFailure::without_context(HiveError::new(
+            ErrorCode::NotImplemented,
+            "Artifact update requires a verified Linux workspace runtime.",
         )))
     }
 }
