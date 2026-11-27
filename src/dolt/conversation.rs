@@ -1,3 +1,6 @@
+#[cfg(target_os = "linux")]
+pub(crate) mod archive;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod list;
 
