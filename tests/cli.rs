@@ -4138,6 +4138,8 @@ fn stopped_issue_transitions_keep_output_options_and_literal_boundaries() {
         for invalid in [
             &["--unknown=--contract=1", issue][..],
             &["-Z", issue],
+            &[issue, "--unknown", "--another"],
+            &["--unknown=--json", issue, "-Z", "--another=--contract=1"],
             &[issue, "--claim"],
             &[issue, "--holder", "a", "--holder", "b"],
         ] {
@@ -4159,6 +4161,7 @@ fn stopped_issue_transitions_keep_output_options_and_literal_boundaries() {
         for literal in [
             &["--contract", "2", "--stop-evidence=--json", issue][..],
             &["--contract", "2", "--unknown=--json", issue],
+            &["--contract", "2", "--unknown=--json", issue, "--another"],
             &["--contract", "2", "--", "--json"],
         ] {
             let report = sandbox.run(&[&command[..], literal].concat());

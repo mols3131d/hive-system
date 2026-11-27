@@ -2085,6 +2085,17 @@ fn recover_context_resolve(
     let ("resolve", _) = context.subcommand()? else {
         return None;
     };
+    replay_unknown_options(cli, args, error, ("context", "resolve"), true, false)
+}
+
+fn replay_unknown_options(
+    cli: &clap::Command,
+    args: &[OsString],
+    error: &clap::Error,
+    (domain, action): (&str, &str),
+    require_equals: bool,
+    allow_missing: bool,
+) -> Option<ArgMatches> {
     let mut retry = cli.clone();
     let mut error = error;
     let mut next_error;
@@ -2099,9 +2110,7 @@ fn recover_context_resolve(
         let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
             return None;
         };
-        let leaf = retry
-            .find_subcommand("context")?
-            .find_subcommand("resolve")?;
+        let leaf = retry.find_subcommand(domain)?.find_subcommand(action)?;
         let option = if let Some(long) = unknown_long_name(leaf, invalid) {
             Arg::new(format!("recovered_unknown_--{long}")).long(long.to_owned())
         } else {
@@ -2114,27 +2123,30 @@ fn recover_context_resolve(
         let option = option
             .action(ArgAction::Append)
             .num_args(0..=1)
-            .require_equals(true)
+            .require_equals(require_equals)
             .value_parser(OsStringValueParser::new())
             .hide(true);
-        retry = retry.mut_subcommand("context", |context| {
-            context.mut_subcommand("resolve", |resolve| resolve.arg(option))
+        retry = retry.mut_subcommand(domain, |command| {
+            command.mut_subcommand(action, |leaf| leaf.arg(option))
         });
-        match retry.clone().try_get_matches_from(args) {
-            Ok(matches) => {
-                let leaf = matches
-                    .subcommand_matches("context")?
-                    .subcommand_matches("resolve")?;
-                return recovered_ids
-                    .iter()
-                    .all(|id| leaf.value_source(id.as_str()) == Some(ValueSource::CommandLine))
-                    .then_some(matches);
+        let matches = match retry.clone().try_get_matches_from(args) {
+            Ok(matches) => matches,
+            Err(error) if allow_missing && error.kind() == ErrorKind::MissingRequiredArgument => {
+                retry.ignore_errors(true).try_get_matches_from(args).ok()?
             }
-            Err(error) => {
-                next_error = error;
+            Err(failure) => {
+                next_error = failure;
+                error = &next_error;
+                continue;
             }
-        }
-        error = &next_error;
+        };
+        let leaf = matches
+            .subcommand_matches(domain)?
+            .subcommand_matches(action)?;
+        return recovered_ids
+            .iter()
+            .all(|id| leaf.value_source(id.as_str()) == Some(ValueSource::CommandLine))
+            .then_some(matches);
     }
     None
 }
@@ -2154,6 +2166,14 @@ fn recover_unknown_long(
         return None;
     }
     let (action, _) = matched.subcommand()?;
+    if matches!(
+        (domain, action),
+        ("issue", "release" | "recover" | "submit")
+    ) {
+        return [true, false].into_iter().find_map(|equals| {
+            replay_unknown_options(cli, args, error, (domain, action), equals, true)
+        });
+    }
     let named_write = matches!(
         (domain, action),
         ("area" | "project", "create") | ("bot", "register")
@@ -2191,16 +2211,7 @@ fn recover_unknown_long(
     };
     let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
     const UNKNOWN_OPTION: &str = "recovered_unknown_long";
-    let recovered = if let Some(long) = unknown_long_name(leaf, invalid) {
-        Arg::new(UNKNOWN_OPTION).long(long.to_owned())
-    } else if matches!(
-        (domain, action),
-        ("issue", "release" | "recover" | "submit")
-    ) {
-        Arg::new(UNKNOWN_OPTION).short(unknown_short_name(leaf, invalid)?)
-    } else {
-        return None;
-    };
+    let recovered = Arg::new(UNKNOWN_OPTION).long(unknown_long_name(leaf, invalid)?.to_owned());
 
     let workspace_init = (domain, action) == ("workspace", "init");
     let allow_incomplete = named_write || positional_write;
