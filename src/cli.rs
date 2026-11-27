@@ -274,6 +274,10 @@ pub(crate) enum Command {
     #[command(skip)]
     IssueClaim(IssueClaimArgs),
     #[command(skip)]
+    IssueCancel(IssueReconcileArgs),
+    #[command(skip)]
+    IssueReopen(IssueReconcileArgs),
+    #[command(skip)]
     IssueRelease(IssueReleaseArgs, bool),
     #[command(skip)]
     IssueSubmit(IssueSubmitArgs),
@@ -1345,6 +1349,15 @@ pub(crate) struct IssueClaimArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueReconcileArgs {
+    #[command(flatten)]
+    pub(crate) transition: IssueTransitionArgs,
+    /// Reviewed reason for the lifecycle change.
+    #[arg(long)]
+    pub(crate) reason: String,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueStopArgs {
     #[command(flatten)]
     pub(crate) claim_args: IssueClaimArgs,
@@ -1624,6 +1637,17 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                     IssueClaimArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
+            }
+            Some(("issue", issue))
+                if matches!(issue.subcommand_name(), Some("cancel" | "reopen")) =>
+            {
+                let args = IssueReconcileArgs::from_arg_matches(leaf)
+                    .map_err(|error| safe_parse_message(error.kind()))?;
+                if issue.subcommand_name() == Some("cancel") {
+                    Command::IssueCancel(args)
+                } else {
+                    Command::IssueReopen(args)
+                }
             }
             Some(("issue", issue)) if issue.subcommand_name() == Some("set-parent") => {
                 Command::IssueParent(
@@ -2168,7 +2192,10 @@ fn recover_unknown_long(
     let (action, _) = matched.subcommand()?;
     if matches!(
         (domain, action),
-        ("issue", "set-parent" | "release" | "recover" | "submit")
+        (
+            "issue",
+            "set-parent" | "release" | "recover" | "submit" | "cancel" | "reopen"
+        )
     ) {
         return [true, false].into_iter().find_map(|equals| {
             replay_unknown_options(cli, args, error, (domain, action), equals, true)
@@ -2312,6 +2339,12 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             .subcommand(add_leaf_options(IssueClaimArgs::augment_args(
                 clap::Command::new("claim").about("Record an exclusive Claim for a ready Issue."),
             )))
+            .subcommand(add_leaf_options(IssueReconcileArgs::augment_args(
+                clap::Command::new("cancel").about("Cancel an Issue after execution has stopped."),
+            )))
+            .subcommand(add_leaf_options(IssueReconcileArgs::augment_args(
+                clap::Command::new("reopen").about("Return a reconciled terminal Issue to todo."),
+            )))
             .subcommand(add_leaf_options(IssueReleaseArgs::augment_args(
                 clap::Command::new("release").about("Release the exact stopped execution Claim."),
             )))
@@ -2347,6 +2380,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             "release",
             "recover",
             "submit",
+            "cancel",
+            "reopen",
             "add-dependency",
             "remove-dependency",
         ]
@@ -2363,6 +2398,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .mut_subcommand("update", extended_error_options)
                 .mut_subcommand("select", extended_error_options)
                 .mut_subcommand("claim", extended_error_options)
+                .mut_subcommand("cancel", extended_error_options)
+                .mut_subcommand("reopen", extended_error_options)
                 .mut_subcommand("set-parent", extended_error_options)
                 .mut_subcommand("release", extended_error_options)
                 .mut_subcommand("recover", extended_error_options)
@@ -2390,6 +2427,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                     "remove-dependency",
                     "select",
                     "claim",
+                    "cancel",
+                    "reopen",
                     "set-parent",
                     "release",
                     "recover",
@@ -2413,7 +2452,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
         Some(("issue", issue)) => match issue.subcommand() {
             Some((
                 "note" | "create" | "update" | "select" | "claim" | "release" | "recover"
-                | "submit" | "add-dependency" | "remove-dependency" | "set-parent",
+                | "submit" | "cancel" | "reopen" | "add-dependency" | "remove-dependency"
+                | "set-parent",
                 leaf,
             )) => Some(leaf),
             Some(("help", _)) => help_leaf.map(|(_, leaf)| leaf),
@@ -3420,6 +3460,12 @@ impl Command {
                 }
                 Self::IssueSelect(args)
                 | Self::IssueClaim(IssueClaimArgs {
+                    transition: args, ..
+                })
+                | Self::IssueCancel(IssueReconcileArgs {
+                    transition: args, ..
+                })
+                | Self::IssueReopen(IssueReconcileArgs {
                     transition: args, ..
                 })
                 | Self::IssueRelease(

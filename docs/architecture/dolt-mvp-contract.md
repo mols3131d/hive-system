@@ -204,7 +204,7 @@ Command arguments below are required unless in brackets. Common flags above appl
 | issue submit | ISSUE --claim ID --holder REF --stop-evidence REF --evidence REF --file PATH | review; append result note, clear claim |
 | issue submit-epic | ISSUE --evidence REF --file PATH | review; children resolved, no claim |
 | issue request-changes / accept | ISSUE --submission ID --file PATH --approval REF | todo/done; review binds current submission and revision |
-| issue cancel / reopen | ISSUE --reason TEXT --approval REF | terminal/todo; cancel running only after explicit release, reopen checks dependents |
+| issue cancel / reopen | ISSUE --reason TEXT --evidence-file PATH | terminal/todo; cancel running only after explicit release, reopen checks dependents |
 | issue note | ISSUE --kind KIND --file PATH [--claim ID] | note ID; claim required for holder-sensitive updates; transition kind reserved for domain operations |
 | issue set-parent | ISSUE --parent ID or --clear | relation receipt |
 | issue add-dependency / remove-dependency | ISSUE PREREQUISITE | relation receipt, DAG validation |
@@ -425,6 +425,12 @@ Use the same request-bound `allow` decision envelope with the applicable operati
 Compute the lowercase SHA-256 fingerprint of compact UTF-8 JSON `[1,operation,workspace_id,area_id,issue_id,actor_ref,expected_issue_revision,stop,body_sha256,result_evidence_ref]`. Sort the keys of the `stop` object lexicographically. The body digest covers the exact UTF-8 reason bytes or the exact submission file bytes. Use JSON null for the result evidence reference on release and recover.
 
 One version commit deletes the exact Claim, advances the Issue, and writes the typed transition update and receipt. The update body holds the reason or submission bytes. The typed effect records the stop evidence and body digest, and on submit also the result evidence reference. The transition stores the original Issue states and revisions, the transition ID and request ID. The historical record retains the former holder and the original revision pair after later Issue edits. Confirmation and recovery check the original Claim, stop observation, stored body digest and exact commit delta. Replay requires current matching decision evidence and returns the original result. Use `operation show` with current inspection evidence to verify that result and inspect the current Claim separately.
+
+On Linux, use `issue cancel ISSUE --reason TEXT` or `issue reopen ISSUE --reason TEXT` with the same explicit target, exact owning Area, Issue revision, actor, request UUID and evidence file as select. Supply a reason with at least one non-whitespace character and at most 4096 UTF-8 bytes. Hive preserves the submitted text verbatim.
+
+Cancel moves backlog, todo or review to cancelled. Running work must be released or recovered first. A Claim row blocks either command. Cancel records the decision actor, transaction time and exact reason in `closed_by_ref`, `closed_at` and `resolution_note`. Reopen moves done or cancelled to todo and clears all three fields. Both commands check active Area ancestry and the stored work graph. Reconcile a review or done parent before changing its child's outcome. Reopening a prerequisite requires prior reconciliation of any dependent in progress, review or done. Each command updates only the selected Issue and its own transition and receipt.
+
+Use the same decision envelope as select with `operation` set to `issue.cancel` or `issue.reopen` and no holder. The fingerprint is the lowercase SHA-256 of compact UTF-8 JSON `[1,operation,workspace_id,area_id,issue_id,actor_ref,expected_issue_revision,reason_sha256]`, where `reason_sha256` is the lowercase SHA-256 of the exact reason bytes. The typed transition stores the reason in the update body and its digest in the effect. The receipt binds the typed metadata and omits the body. Replay, scoped operation inspection and recovery verify the original graph and lifecycle preconditions, closure change, transition and receipt. These commands use the existing Issue update and receipt grants, and v4 pending markers.
 
 See [workspace start, stop, and recovery](dolt-workspace-contract.md#workspace-start-stop-and-recovery) for the marker inventory and launch grants.
 

@@ -15,6 +15,8 @@ mod bot_register;
 mod issue_dependency;
 #[path = "runtime/issue_parent.rs"]
 mod issue_parent;
+#[path = "runtime/issue_reconcile.rs"]
+mod issue_reconcile;
 #[path = "runtime/issue_transition.rs"]
 mod issue_transition;
 #[path = "runtime/issue_update.rs"]
@@ -1313,6 +1315,7 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
         &restart,
         &dolt,
     );
+    issue_reconcile::exercise(&state, &fixture_root, &port, &dolt, &run, &restart);
     issue_dependency::exercise(&state, &fixture_root, &port, &dolt, &invoke, &restart);
     issue_parent::exercise(&state, &fixture_root, &port, &dolt, &invoke, &restart);
     issue_update::exercise(&state, &fixture_root, &port, &dolt, &run, &restart);

@@ -90,6 +90,8 @@ impl Kind {
             Self::BotRegister => "Bot register",
             Self::Transition(issue_transition::Operation::Select) => "Issue select",
             Self::Transition(issue_transition::Operation::Claim) => "Issue claim",
+            Self::Transition(issue_transition::Operation::Cancel) => "Issue cancel",
+            Self::Transition(issue_transition::Operation::Reopen) => "Issue reopen",
             Self::SetParent => "Issue set-parent",
             Self::Transition(operation) => operation.name(),
         }
@@ -107,12 +109,21 @@ impl Kind {
                 ("issue_claims", "INSERT"),
                 ("operation_receipts", "INSERT"),
             ],
-            Self::Note | Self::Transition(issue_transition::Operation::Select) => &[
+            Self::Note
+            | Self::Transition(
+                issue_transition::Operation::Select
+                | issue_transition::Operation::Cancel
+                | issue_transition::Operation::Reopen,
+            ) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
                 ("operation_receipts", "INSERT"),
             ],
-            Self::Transition(_) => &[
+            Self::Transition(
+                issue_transition::Operation::Release
+                | issue_transition::Operation::Recover
+                | issue_transition::Operation::Submit,
+            ) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
                 ("issue_claims", "DELETE"),
@@ -1146,6 +1157,8 @@ mod tests {
             ("issue.release", issue_transition::Operation::Release),
             ("issue.recover", issue_transition::Operation::Recover),
             ("issue.submit", issue_transition::Operation::Submit),
+            ("issue.cancel", issue_transition::Operation::Cancel),
+            ("issue.reopen", issue_transition::Operation::Reopen),
         ] {
             transition["kind"] = json!(name);
             let marker = read(&transition).unwrap();
