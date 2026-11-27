@@ -367,7 +367,6 @@ mod filesystem {
     }
 
     impl ScopedDirectory {
-        #[cfg(target_os = "linux")]
         pub(crate) fn directory_file(&self) -> &File {
             &self.file
         }
