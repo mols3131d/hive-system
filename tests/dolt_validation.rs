@@ -17,6 +17,8 @@ mod issue_readiness;
 mod issue_show;
 #[path = "dolt_validation/issue_updates.rs"]
 mod issue_updates;
+#[path = "dolt_validation/label.rs"]
+mod label;
 #[path = "dolt_validation/migration.rs"]
 mod migration;
 #[path = "dolt_validation/project.rs"]
@@ -249,15 +251,19 @@ impl Fixture {
     }
 
     fn run_hive(&self, args: &[&str], password: &str) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_hive"))
+        self.hive_command(args, password).output().unwrap()
+    }
+
+    fn hive_command(&self, args: &[&str], password: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hive"));
+        command
             .args(args)
             .current_dir(&self.root)
             .env_clear()
             .env("HOME", self.root.join("home"))
             .env("HIVE_DOLT_USER", READER)
-            .env("HIVE_DOLT_PASSWORD", password)
-            .output()
-            .unwrap()
+            .env("HIVE_DOLT_PASSWORD", password);
+        command
     }
 
     fn validate(&self, workspace_id: &str, password: &str, port: u16) -> Output {

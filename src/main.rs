@@ -8,6 +8,7 @@ mod error;
 mod output;
 mod workspace_status;
 
+use std::io::Write;
 use std::process::ExitCode;
 
 use cli::{
@@ -117,6 +118,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
+        Command::Label(cli::LabelCommand::List(args)) => {
+            dolt::label::list(&args, invocation.common.project.as_ref())
+        }
         Command::Resource(ResourceCommand::List(args)) => dolt::resource::list(&args),
         Command::Resource(ResourceCommand::Show(args)) => dolt::resource::show(&args),
         Command::ProjectRead(args) => dolt::project_read(&args),
@@ -145,8 +149,12 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         }
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
         Command::Conversation(ConversationCommand::Show(args)) => {
-            dolt::conversation_show(&invocation.common, &args)
+            dolt::conversation_read(&invocation.common, &args, None)
         }
+        Command::Conversation(ConversationCommand::Export {
+            selection,
+            destination: Some(destination),
+        }) => dolt::conversation_read(&invocation.common, &selection, Some(&destination)),
         Command::ConversationList(args) => dolt::conversation_list(&invocation.common, &args),
         Command::Issue(IssueCommand::List(args)) => dolt::issue_list(
             &args,
@@ -169,13 +177,22 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         ))),
     };
     match result {
-        Ok(report) => output::success(
-            Contract::V2,
-            format,
-            name,
-            Some(&report.context),
-            &report.data,
-        ),
+        Ok(report) => {
+            let status = output::success(
+                Contract::V2,
+                format,
+                name,
+                Some(&report.context),
+                &report.data,
+            );
+            if status != ExitCode::SUCCESS && name == "conversation export" {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "error: The conversation export was published, but its success response could not be written."
+                );
+            }
+            status
+        }
         Err(failure) => output::failure(
             Contract::V2,
             format,

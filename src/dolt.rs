@@ -8,12 +8,14 @@ mod graph;
 mod issue;
 mod issue_list;
 mod issue_readiness;
+pub(crate) mod label;
 mod project;
 mod records;
 pub(crate) mod resource;
 
 use std::ffi::OsStr;
 use std::num::NonZeroU16;
+use std::path::Path;
 use std::time::Duration;
 
 use mysql::prelude::{FromRow, Queryable};
@@ -22,7 +24,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::cli::{
-    CommonOptions, ConversationListArgs, ConversationShowArgs, DoltTargetArgs, IssueShowArgs,
+    CommonOptions, ConversationListArgs, ConversationSelectionArgs, DoltTargetArgs, IssueShowArgs,
     ValidateArgs,
 };
 use crate::error::{ErrorCode, HiveError};
@@ -63,15 +65,16 @@ impl DoltFailure {
     }
 }
 
-pub(crate) fn conversation_show(
+pub(crate) fn conversation_read(
     common: &CommonOptions,
-    args: &ConversationShowArgs,
+    args: &ConversationSelectionArgs,
+    destination: Option<&Path>,
 ) -> Result<DoltSuccess, Box<DoltFailure>> {
     let bot_id = conversation_selector(args.bot.as_deref(), "--bot")?;
     let conversation_id = conversation_selector(args.id.as_deref(), "--id")?;
     #[cfg(unix)]
     {
-        conversation::read(common, args, bot_id, conversation_id)
+        conversation::read(common, args, bot_id, conversation_id, destination)
             .map_err(DoltFailure::without_context)
     }
     #[cfg(not(unix))]
@@ -79,7 +82,11 @@ pub(crate) fn conversation_show(
         let _ = (common, bot_id, conversation_id);
         Err(DoltFailure::without_context(HiveError::new(
             ErrorCode::NotImplemented,
-            "Conversation inspection is unavailable on this platform.",
+            if destination.is_some() {
+                "Conversation export is unavailable on this platform."
+            } else {
+                "Conversation inspection is unavailable on this platform."
+            },
         )))
     }
 }
@@ -196,7 +203,47 @@ pub(crate) fn is_database_name(database: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-pub(crate) fn parse_port(port: &std::ffi::OsStr) -> Result<NonZeroU16, HiveError> {
+pub(crate) struct DoltTarget<'a> {
+    pub(crate) database: &'a str,
+    pub(crate) port: NonZeroU16,
+    pub(crate) workspace_id: &'a str,
+}
+
+impl<'a> DoltTarget<'a> {
+    pub(crate) fn parse(target: &'a DoltTargetArgs) -> Result<Self, HiveError> {
+        let (Some(database), Some(port), Some(workspace_id)) = (
+            target.database.as_deref(),
+            target.port.as_deref(),
+            target.workspace_id.as_deref(),
+        ) else {
+            return Err(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "Supply the database, port, and expected workspace ID.",
+            ));
+        };
+        // Parse the value after clap has recognized the contract and output options.
+        let port = parse_port(port)?;
+        if !is_uuid(workspace_id) {
+            return Err(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "The expected workspace ID must be a lowercase UUID.",
+            ));
+        }
+        if !is_database_name(database) {
+            return Err(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "Supply a Dolt database name using letters, digits, underscores, or hyphens.",
+            ));
+        }
+        Ok(Self {
+            database,
+            port,
+            workspace_id,
+        })
+    }
+}
+
+pub(crate) fn parse_port(port: &OsStr) -> Result<NonZeroU16, HiveError> {
     port.to_str()
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| {
@@ -208,8 +255,8 @@ pub(crate) fn parse_port(port: &std::ffi::OsStr) -> Result<NonZeroU16, HiveError
 }
 
 #[cfg(unix)]
-pub(crate) fn committed_identity(target: &DoltTargetArgs) -> Result<Value, HiveError> {
-    let (snapshot, workspace_id) = Snapshot::open(target)?;
+pub(crate) fn committed_identity(target: DoltTarget<'_>) -> Result<Value, HiveError> {
+    let (snapshot, workspace_id) = Snapshot::open_target(target)?;
     Ok(identity_report(&snapshot, workspace_id))
 }
 
@@ -219,7 +266,8 @@ pub(crate) fn runtime_identity(
     user: &str,
     password: &str,
 ) -> Result<Value, HiveError> {
-    let (snapshot, workspace_id) = Snapshot::open_with_reader(target, Some((user, password)))?;
+    let (snapshot, workspace_id) =
+        Snapshot::open_with_reader(DoltTarget::parse(target)?, user, password)?;
     Ok(identity_report(&snapshot, workspace_id))
 }
 
@@ -235,46 +283,25 @@ fn identity_report(snapshot: &Snapshot, workspace_id: String) -> Value {
 
 impl Snapshot {
     fn open(target: &DoltTargetArgs) -> Result<(Self, String), HiveError> {
-        Self::open_with_reader(target, None)
+        Self::open_target(DoltTarget::parse(target)?)
+    }
+
+    fn open_target(target: DoltTarget<'_>) -> Result<(Self, String), HiveError> {
+        let user = reader_credential("HIVE_DOLT_USER")?;
+        let password = reader_credential("HIVE_DOLT_PASSWORD")?;
+        Self::open_with_reader(target, &user, &password)
     }
 
     fn open_with_reader(
-        target: &DoltTargetArgs,
-        reader: Option<(&str, &str)>,
+        target: DoltTarget<'_>,
+        user: &str,
+        password: &str,
     ) -> Result<(Self, String), HiveError> {
-        let (Some(database), Some(port), Some(workspace_id)) = (
-            target.database.as_deref(),
-            target.port.as_deref(),
-            target.workspace_id.as_deref(),
-        ) else {
-            return Err(HiveError::new(
-                ErrorCode::InvalidArgument,
-                "Supply the database, port, and expected workspace ID.",
-            ));
-        };
-        // Parse the value after clap has recognized the contract and output options.
-        let port = parse_port(port)?;
-
-        if !is_uuid(workspace_id) {
-            return Err(HiveError::new(
-                ErrorCode::InvalidArgument,
-                "The expected workspace ID must be a lowercase UUID.",
-            ));
-        }
-        if !is_database_name(database) {
-            return Err(HiveError::new(
-                ErrorCode::InvalidArgument,
-                "Supply a Dolt database name using letters, digits, underscores, or hyphens.",
-            ));
-        }
-
-        let (user, password) = match reader {
-            Some((user, password)) => (user.to_owned(), password.to_owned()),
-            None => (
-                reader_credential("HIVE_DOLT_USER")?,
-                reader_credential("HIVE_DOLT_PASSWORD")?,
-            ),
-        };
+        let DoltTarget {
+            database,
+            port,
+            workspace_id,
+        } = target;
         if user.eq_ignore_ascii_case("root") {
             return Err(HiveError::new(
                 ErrorCode::InvalidArgument,

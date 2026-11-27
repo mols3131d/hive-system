@@ -58,7 +58,7 @@ mod unix {
     use crate::config_file::ScopedDirectory;
     use crate::config_v2::{select_workspace, xdg_root};
     use crate::dolt::{
-        STORAGE_SCHEMA_VERSION, committed_identity, is_database_name, is_uuid, parse_port,
+        DoltTarget, STORAGE_SCHEMA_VERSION, committed_identity, is_database_name, is_uuid,
     };
     use crate::error::{ErrorCode, HiveError};
 
@@ -95,6 +95,10 @@ mod unix {
         target: &DoltTargetArgs,
         format: &mut Format,
     ) -> Result<Value, HiveError> {
+        let target = target
+            .has_any()
+            .then(|| DoltTarget::parse(target))
+            .transpose()?;
         let (workspace, source) = select_workspace(options, format)?;
         let workspace_id = workspace.workspace_id();
         let root = json_path(&workspace.root.path)?;
@@ -129,24 +133,15 @@ mod unix {
 
         let pending = read_state(state, "pending-request.json")?.is_some();
         let mut committed = None;
-        if let (Some(expected), Some(port)) =
-            (target.workspace_id.as_deref(), target.port.as_deref())
-        {
-            if !is_uuid(expected) {
-                return Err(HiveError::new(
-                    ErrorCode::InvalidArgument,
-                    "The expected workspace ID must be a lowercase UUID.",
-                ));
-            }
-            if expected != workspace_id {
+        if let Some(target) = target {
+            if target.workspace_id != workspace_id {
                 return Err(unverified(
                     "The expected workspace ID does not match the descriptor.",
                 ));
             }
-            let port = parse_port(port)?;
             if let Some(server) = &server
-                && (Some(server.endpoint.database.as_str()) != target.database.as_deref()
-                    || server.endpoint.port != port)
+                && (server.endpoint.database != target.database
+                    || server.endpoint.port != target.port)
             {
                 return Err(unverified(
                     "The explicit database target differs from the recorded endpoint.",
