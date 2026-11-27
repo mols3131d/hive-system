@@ -10,7 +10,8 @@ use clap::{
     builder::{
         NonEmptyStringValueParser, OsStringValueParser, StringValueParser, TypedValueParser,
     },
-    error::ErrorKind,
+    error::{ContextKind, ContextValue, ErrorKind},
+    parser::ValueSource,
     value_parser,
 };
 
@@ -258,6 +259,8 @@ pub(crate) enum Command {
     Issue(IssueCommand),
     #[command(skip)]
     Resource(ResourceCommand),
+    #[command(skip)]
+    Label(LabelCommand),
     /// Inspect preserved Queen conversations under contract 2.
     #[command(subcommand, hide = true)]
     Conversation(ConversationCommand),
@@ -766,6 +769,33 @@ pub(crate) struct ResourceShowArgs {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum LabelCommand {
+    /// List committed Labels in one explicit scope.
+    List(LabelListArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct LabelListArgs {
+    /// Select all workspace Labels, including unlinked Labels.
+    #[arg(long)]
+    pub(crate) all: bool,
+    /// Select Labels on Issues owned directly by this Area UUIDv7.
+    #[arg(long, value_name = "ID", allow_negative_numbers = true)]
+    pub(crate) area: Option<String>,
+    /// Select Labels linked directly to this Issue UUIDv7.
+    #[arg(long, value_name = "ID", allow_negative_numbers = true)]
+    pub(crate) issue: Option<String>,
+    /// Page size (default 25, maximum 100).
+    #[arg(long, default_value = "25", allow_negative_numbers = true)]
+    pub(crate) limit: String,
+    /// Continue from the previous page's next_cursor.
+    #[arg(long, allow_negative_numbers = true)]
+    pub(crate) cursor: Option<String>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Subcommand)]
 pub(crate) enum IssueCommand {
     /// Show an Issue and its bounded direct relation IDs.
     Show(IssueShowArgs),
@@ -851,10 +881,10 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
         return project;
     }
     let mut config_error_matches = None;
-    let resource = resource_parser(&cli, &args);
-    let (parsed, resource_matches) = if let Some(resource) = resource {
-        cli = resource.cli;
-        (resource.parsed, resource.partial)
+    let extension = resource_parser(&cli, &args).or_else(|| label_parser(&cli, &args));
+    let (parsed, extension_matches) = if let Some(extension) = extension {
+        cli = extension.cli;
+        (extension.parsed, extension.partial)
     } else {
         (
             cli.clone().try_get_matches_from(&args).or_else(|error| {
@@ -891,7 +921,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 }
                 _ => None,
             };
-            let partial = resource_matches
+            let partial = extension_matches
                 .or(config_error_matches)
                 .or(area_matches)
                 .or_else(|| retry_bot_failure(&cli, &args, error.kind()))
@@ -944,6 +974,11 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 ResourceCommand::from_arg_matches(resource)
                     .map_err(|error| safe_parse_message(error.kind()))?,
             )
+        } else if let Some(("label", label)) = matches.subcommand() {
+            Command::Label(
+                LabelCommand::from_arg_matches(label)
+                    .map_err(|error| safe_parse_message(error.kind()))?,
+            )
         } else {
             Cli::from_arg_matches(&matches)
                 .map_err(|error| safe_parse_message(error.kind()))?
@@ -981,13 +1016,13 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     }
 }
 
-struct ResourceParse {
+struct ExtendedParse {
     cli: clap::Command,
     parsed: Result<ArgMatches, clap::Error>,
     partial: Option<ArgMatches>,
 }
 
-fn resource_parser(cli: &clap::Command, args: &[OsString]) -> Option<ResourceParse> {
+fn resource_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedParse> {
     if !args.iter().any(|arg| arg == "resource") {
         return None;
     }
@@ -1003,7 +1038,7 @@ fn resource_parser(cli: &clap::Command, args: &[OsString]) -> Option<ResourcePar
     let parsed = extended.clone().try_get_matches_from(args);
     let partial = if parsed.is_err() {
         let recovery =
-            resource_error_options(extended.clone()).mut_subcommand("resource", |domain| {
+            extended_error_options(extended.clone()).mut_subcommand("resource", |domain| {
                 // List options on show still have known token boundaries.
                 let list_options = domain
                     .find_subcommand("list")
@@ -1017,10 +1052,10 @@ fn resource_parser(cli: &clap::Command, args: &[OsString]) -> Option<ResourcePar
                     })
                     .cloned()
                     .collect::<Vec<_>>();
-                resource_help_probe(domain)
-                    .mut_subcommand("list", resource_error_options)
+                extended_help_probe(domain)
+                    .mut_subcommand("list", extended_error_options)
                     .mut_subcommand("show", |show| {
-                        resource_error_options(show.args(list_options))
+                        extended_error_options(show.args(list_options))
                     })
             });
         recovery.ignore_errors(true).try_get_matches_from(args).ok()
@@ -1030,17 +1065,111 @@ fn resource_parser(cli: &clap::Command, args: &[OsString]) -> Option<ResourcePar
     let matches = parsed.as_ref().ok().or(partial.as_ref())?;
     let domain = matches.subcommand_matches("resource")?;
     let leaf = domain.subcommand().map(|(_, leaf)| leaf);
-    (requested_contract(Some(matches), leaf) == Contract::V2).then_some(ResourceParse {
+    (requested_contract(Some(matches), leaf) == Contract::V2).then_some(ExtendedParse {
         cli: extended,
         parsed,
         partial,
     })
 }
 
-fn resource_error_options(command: clap::Command) -> clap::Command {
+fn label_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedParse> {
+    if !args.iter().any(|arg| arg == "label") {
+        return None;
+    }
+    let extended = defer_project_check(cli.clone()).subcommand(
+        add_leaf_options(LabelCommand::augment_subcommands(
+            clap::Command::new("label")
+                .subcommand_required(true)
+                .hide(true),
+        ))
+        .mut_subcommand("list", |list| {
+            defer_project_check(list).mut_arg("project", |arg| {
+                arg.help("Select Labels on direct member Issues of this Project UUIDv7.")
+            })
+        }),
+    );
+    let parsed = extended.clone().try_get_matches_from(args);
+    let partial = parsed.as_ref().err().and_then(|error| {
+        let recovery = extended_error_options(extended.clone()).mut_subcommand("label", |label| {
+            extended_help_probe(label).mut_subcommand("list", extended_error_options)
+        });
+        let partial = recovery
+            .clone()
+            .ignore_errors(true)
+            .try_get_matches_from(args)
+            .ok()?;
+        Some(recover_unknown_long(&recovery, args, &partial, error, "label").unwrap_or(partial))
+    });
+    let matches = parsed.as_ref().ok().or(partial.as_ref())?;
+    let domain = matches.subcommand_matches("label")?;
+    let leaf = domain.subcommand().map(|(_, leaf)| leaf);
+    (requested_contract(Some(matches), leaf) == Contract::V2).then_some(ExtendedParse {
+        cli: extended,
+        parsed,
+        partial,
+    })
+}
+
+fn recover_unknown_long(
+    cli: &clap::Command,
+    args: &[OsString],
+    partial: &ArgMatches,
+    error: &clap::Error,
+    domain: &'static str,
+) -> Option<ArgMatches> {
+    if error.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    let (action @ ("list" | "show"), _) = partial.subcommand_matches(domain)?.subcommand()? else {
+        return None;
+    };
+    let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
+        return None;
+    };
+    let long = invalid.strip_prefix("--")?.split('=').next()?;
+    if !long.starts_with(|ch: char| ch.is_ascii_alphanumeric())
+        || !long
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
+    if leaf.get_arguments().any(|arg| {
+        arg.get_long() == Some(long)
+            || arg
+                .get_all_aliases()
+                .is_some_and(|aliases| aliases.contains(&long))
+    }) {
+        return None;
+    }
+
+    // Let Clap replay the original tokens. The temporary option can take an
+    // attached value, and the original parse error still determines the result.
+    const UNKNOWN_LONG: &str = "unknown_long";
+    let retry = cli.clone().mut_subcommand(domain, |command| {
+        command.mut_subcommand(action, |leaf| {
+            leaf.arg(
+                Arg::new(UNKNOWN_LONG)
+                    .long(long.to_owned())
+                    .num_args(0..=1)
+                    .require_equals(true)
+                    .value_parser(OsStringValueParser::new())
+                    .hide(true),
+            )
+        })
+    });
+    let matches = retry.try_get_matches_from(args).ok()?;
+    let recovered = matches
+        .subcommand_matches(domain)?
+        .subcommand_matches(action)?;
+    (recovered.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine)).then_some(matches)
+}
+
+fn extended_error_options(command: clap::Command) -> clap::Command {
     // Recover only output selection. Keep Clap's token boundaries, including
     // attached literal values and everything after the end-of-options marker.
-    resource_help_probe(command)
+    extended_help_probe(command)
         .args_override_self(true)
         .mut_args(|arg| {
             let arg = match arg.get_id().as_str() {
@@ -1064,7 +1193,7 @@ fn resource_error_options(command: clap::Command) -> clap::Command {
                 })),
                 _ => arg,
             };
-            if arg.is_positional() || arg.get_id() == "resource_help_probe" {
+            if arg.is_positional() || arg.get_id() == "extended_help_probe" {
                 arg
             } else if arg.get_action().takes_values() {
                 arg.allow_negative_numbers(true).num_args(0..=1)
@@ -1079,9 +1208,9 @@ fn resource_error_options(command: clap::Command) -> clap::Command {
         })
 }
 
-fn resource_help_probe(command: clap::Command) -> clap::Command {
+fn extended_help_probe(command: clap::Command) -> clap::Command {
     command.disable_help_flag(true).arg(
-        Arg::new("resource_help_probe")
+        Arg::new("extended_help_probe")
             .short('h')
             .long("help")
             .action(ArgAction::SetTrue),
@@ -1485,6 +1614,18 @@ impl Command {
                 Self::Validate(args) => args.validate_dolt_selection(common),
                 Self::Area(command) => command.validate_dolt_selection(common),
                 Self::Resource(command) => command.validate_dolt_selection(common),
+                Self::Label(LabelCommand::List(args)) => {
+                    if !args.target.has_all()
+                        || common.workspace.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Dolt Label reads require --workspace-id, --database, and --port with explicit scope.",
+                        );
+                    }
+                    Ok(())
+                }
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
                 Self::Conversation(ConversationCommand::Show(args)) => {
                     if common.workspace.is_none() || !args.target.has_all() {
