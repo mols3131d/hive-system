@@ -1,3 +1,5 @@
+#[path = "dolt_validation/area.rs"]
+mod area;
 #[path = "dolt_validation/artifacts.rs"]
 mod artifacts;
 #[path = "dolt_validation/bots.rs"]
