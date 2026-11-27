@@ -25,6 +25,7 @@ pub(crate) enum ErrorCode {
     StaleRevision,
     StaleCursor,
     ConcurrentChange,
+    LockBusy,
     DirtyConflict,
     Unauthorized,
     AuthorityUnavailable,
@@ -57,6 +58,7 @@ impl ErrorCode {
             | Self::StaleRevision
             | Self::StaleCursor
             | Self::ConcurrentChange
+            | Self::LockBusy
             | Self::DirtyConflict => 5,
             Self::Unauthorized => 6,
             Self::AuthorityUnavailable

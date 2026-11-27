@@ -3,6 +3,15 @@ use serde_json::Value;
 use crate::cli::{CommonOptions, DoltTargetArgs, Format};
 use crate::error::HiveError;
 
+#[cfg(unix)]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Registration {
+    pub(crate) version: u32,
+    pub(crate) workspace_id: String,
+    pub(crate) workspace_root: String,
+}
+
 pub(crate) fn observe(
     options: &CommonOptions,
     target: &DoltTargetArgs,
@@ -34,6 +43,7 @@ mod unix {
     use serde::{Deserialize, de::DeserializeOwned};
     use serde_json::{Value, json};
 
+    use super::Registration;
     use crate::cli::{CommonOptions, DoltTargetArgs, Format};
     use crate::config::{absolute_env, json_path};
     use crate::config_file::ScopedDirectory;
@@ -42,14 +52,6 @@ mod unix {
         DoltTarget, STORAGE_SCHEMA_VERSION, committed_identity, is_database_name, is_uuid,
     };
     use crate::error::{ErrorCode, HiveError};
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Registration {
-        version: u32,
-        workspace_id: String,
-        workspace_root: String,
-    }
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]

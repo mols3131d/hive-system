@@ -94,8 +94,12 @@ fn dispatch(invocation: Invocation) -> ExitCode {
 fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let name = &invocation.command_name;
     let format = invocation.common.format.unwrap_or_default();
-    if let Command::Workspace(WorkspaceCommand::Init { target }) = &invocation.command {
-        return match workspace_init::run(target) {
+    if let Command::Workspace(WorkspaceCommand::Init {
+        target,
+        register_runtime,
+    }) = &invocation.command
+    {
+        return match workspace_init::run(target, *register_runtime) {
             Ok(data) => output::success(Contract::V2, format, name, None, &data),
             Err(error) => output::failure(Contract::V2, format, Some(name), None, error),
         };

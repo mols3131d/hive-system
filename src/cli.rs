@@ -733,6 +733,9 @@ pub(crate) enum WorkspaceCommand {
     Init {
         #[arg(long, value_name = "EMPTY_DIR")]
         target: PathBuf,
+        /// Register this new workspace for the local runtime.
+        #[arg(long)]
+        register_runtime: bool,
     },
     /// Observe the selected workspace and local runtime evidence.
     Status(DoltTargetArgs),
