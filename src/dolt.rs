@@ -28,6 +28,7 @@ pub(crate) mod issue_parent;
 mod issue_readiness;
 #[cfg(target_os = "linux")]
 mod issue_relation;
+pub(crate) mod issue_transition;
 pub(crate) mod issue_update;
 #[cfg(target_os = "linux")]
 pub(crate) mod issue_writer;

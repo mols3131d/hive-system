@@ -173,6 +173,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Resource(ResourceCommand::Show(args)) => dolt::resource::show(&args),
         Command::ProjectRead(args) => dolt::project_read(&args),
         Command::ProjectWrite(args) => dolt::project_write(&invocation.common, &args),
+        Command::Bot(BotCommand::Register(args)) => dolt::bot::register(&invocation.common, &args),
         Command::Bot(BotCommand::List {
             target,
             status,
@@ -212,6 +213,12 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::IssueNote(args) => dolt::issue_note::write(&invocation.common, &args),
         Command::IssueCreate(args) => dolt::issue_create::write(&invocation.common, &args),
         Command::IssueUpdate(args) => dolt::issue_update::write(&invocation.common, &args),
+        Command::IssueSelect(args) => {
+            dolt::issue_transition::write(&invocation.common, &args, None)
+        }
+        Command::IssueClaim(args) => {
+            dolt::issue_transition::write(&invocation.common, &args.transition, Some(&args.holder))
+        }
         Command::IssueDependency(args, add) => {
             dolt::issue_dependency::write(&invocation.common, &args, add)
         }

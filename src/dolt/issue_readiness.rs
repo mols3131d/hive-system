@@ -13,9 +13,9 @@ use super::{MAX_ROWS_PER_TABLE, Snapshot, is_uuid_v7};
 // Match a non-whitespace character using Unicode White_Space, as Rust str::trim does.
 pub(super) const NON_WHITESPACE: &str = r"[^\x{0009}-\x{000D}\x{0020}\x{0085}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]";
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(super) enum Blocker {
+pub(crate) enum Blocker {
     Hold,
     CurrentClaim,
     PrerequisiteNotDone,

@@ -109,13 +109,7 @@ impl Edit {
         args
     }
 
-    fn marker(
-        &self,
-        state: &Path,
-        session: u64,
-        base: &str,
-        receipt: &issue_update::Receipt,
-    ) -> Value {
+    fn marker(&self, state: &Path, session: u64, base: &str, receipt: &Receipt) -> Value {
         json!({
             "version": 2, "kind": "issue.set-parent", "workspace_id": id(1),
             "launch_nonce": launch_nonce(state), "session_id": session,
@@ -371,12 +365,12 @@ pub(super) fn exercise(
     assert_eq!(storage_state(&mut reader), cleared_state);
 
     // Recover a confirmed clear, then recover an uncommitted attach after positive server-stop evidence.
-    let receipt = issue_update::stored_receipt(&mut reader, &clear.request);
+    let receipt = stored_receipt(&mut reader, &clear.request);
     let session = reader
         .query_first("SELECT CONNECTION_ID()")
         .unwrap()
         .unwrap();
-    issue_update::record_intent(state, &clear.marker(state, session, &receipt.4, &receipt));
+    record_intent(state, &clear.marker(state, session, &receipt.4, &receipt));
     drop(reader);
     stop();
     recover("confirmed");
@@ -401,7 +395,7 @@ pub(super) fn exercise(
         )
         .unwrap();
     assert_eq!(writer.affected_rows(), 1);
-    issue_update::record_intent(
+    record_intent(
         state,
         &attach.marker(state, session, &cleared_state.0, &receipt),
     );

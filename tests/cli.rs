@@ -40,7 +40,7 @@ impl Sandbox {
         Self(path)
     }
 
-    fn run(&self, args: &[&str]) -> Output {
+    fn run(&self, args: &[impl AsRef<std::ffi::OsStr> + std::fmt::Debug]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_hive"))
             .args(args)
             .env_clear()
@@ -1638,7 +1638,11 @@ fn malformed_area_create_values_and_conflicts_keep_the_v2_envelope() {
         "3307",
     ];
     let flags = ["--contract", "2", "--json"];
-    for invalid in [&["--project", "BAD!"][..], &["--slug", "duplicate-slug"]] {
+    for invalid in [
+        &["--project", "BAD!"][..],
+        &["--slug", "duplicate-slug"],
+        &["unexpected-position"],
+    ] {
         for args in [
             [&flags[..], &command, invalid].concat(),
             [&command[..], invalid, &flags].concat(),
@@ -1663,6 +1667,31 @@ fn malformed_area_create_values_and_conflicts_keep_the_v2_envelope() {
     assert_eq!(result.status.code(), Some(2));
     assert!(result.stdout.is_empty());
     assert!(!result.stderr.is_empty());
+    let before_end = [
+        &command[..],
+        &["unexpected-position", "--", "--contract", "2", "--json"],
+    ]
+    .concat();
+    let result = sandbox.run(&before_end);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(result.stdout.is_empty());
+
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let mut invalid: Vec<_> = command.iter().map(OsString::from).collect();
+        let name = command.iter().position(|arg| *arg == "--name").unwrap();
+        invalid[name + 1] = OsString::from_vec(vec![255]);
+        invalid.extend(flags.into_iter().map(OsString::from));
+        let output = sandbox.run(&invalid);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "area create");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    }
     sandbox.assert_empty();
 }
 
@@ -2403,13 +2432,14 @@ fn unknown_project_long_option_keeps_original_error_with_late_v2_json() {
 }
 
 #[test]
-fn unknown_dependency_options_keep_the_late_v2_envelope() {
+fn malformed_dependency_options_keep_the_late_v2_envelope() {
     let sandbox = Sandbox::new();
     let issue = "01900000-0000-7000-8000-000000000003";
     let prerequisite = "01900000-0000-7000-8000-000000000004";
     for (action, unknown) in [
         ("add-dependency", &["--unknown=--contract=1"][..]),
         ("remove-dependency", &["--unknown", "fixture-value"]),
+        ("add-dependency", &["unexpected-position"]),
     ] {
         let args = [
             &["issue", action][..],
@@ -2446,6 +2476,31 @@ fn unknown_dependency_options_keep_the_late_v2_envelope() {
     assert_eq!(literal.status.code(), Some(2));
     assert!(literal.stdout.is_empty());
     assert!(!literal.stderr.is_empty());
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let mut args: Vec<_> = [
+            "issue",
+            "add-dependency",
+            issue,
+            prerequisite,
+            "--contract",
+            "2",
+            "--json",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        args[3] = OsString::from_vec(vec![255]);
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "issue add-dependency");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    }
     sandbox.assert_empty();
 }
 
@@ -2518,6 +2573,87 @@ fn unknown_project_write_options_keep_the_late_v2_envelope() {
     assert_eq!(literal.status.code(), Some(2));
     assert!(literal.stdout.is_empty());
     assert!(!literal.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
+fn malformed_project_write_values_keep_the_v2_envelope() {
+    let sandbox = Sandbox::new();
+    let workspace = "01900000-0000-7000-8000-000000000001";
+    let project = "01900000-0000-7000-8000-000000000002";
+    let issue = "01900000-0000-7000-8000-000000000003";
+    let binding = [
+        "--workspace",
+        ".",
+        "--workspace-id",
+        workspace,
+        "--database",
+        "fixture",
+        "--port",
+        "3307",
+        "--actor",
+        "fixture",
+        "--request-id",
+        issue,
+        "--evidence-file",
+        "fixture.json",
+    ];
+    let create = [&["project", "create", "--name", "Fixture"][..], &binding].concat();
+    let add = [
+        &[
+            "project",
+            "add-issue",
+            project,
+            issue,
+            "--area",
+            workspace,
+            "--if-match",
+            "fixture",
+        ][..],
+        &binding,
+    ]
+    .concat();
+    for (command, invalid) in [
+        (&create, &["--project", "BAD!"][..]),
+        (&create, &["--name", "fixture-copy"]),
+        (&create, &["unexpected-position"]),
+        (&add, &["--area", workspace]),
+        (&add, &["unexpected-position"]),
+    ] {
+        for args in [
+            [&["--contract", "2", "--json"][..], command, invalid].concat(),
+            [&command[..], invalid, &["--contract", "2", "--json"]].concat(),
+        ] {
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+            assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2, "{args:?}");
+            assert_eq!(report["command"], format!("project {}", command[1]));
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        for (command, index) in [(&create, 3), (&add, 2)] {
+            let mut invalid: Vec<_> = command.iter().map(OsString::from).collect();
+            invalid[index] = OsString::from_vec(vec![255]);
+            invalid.extend(
+                ["--contract", "2", "--json"]
+                    .into_iter()
+                    .map(OsString::from),
+            );
+            let output = sandbox.run(&invalid);
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], format!("project {}", command[1]));
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        }
+    }
     sandbox.assert_empty();
 }
 
@@ -3837,6 +3973,30 @@ fn issue_create_is_registered_only_in_v2_grammar() {
     assert_eq!(invalid.status.code(), Some(2));
     assert_eq!(report["command"], "issue create");
     assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    sandbox.assert_empty();
+}
+
+#[test]
+fn issue_transitions_are_scoped_to_v2_issue_commands() {
+    let sandbox = Sandbox::new();
+    for (action, holder) in [("select", false), ("claim", true)] {
+        for selection in [&[][..], &["--contract", "1"][..]] {
+            let help = sandbox.run(&[selection, &["issue", action, "--help"]].concat());
+            let unknown = sandbox.run(&[selection, &["issue", "unknown-leaf", "--help"]].concat());
+            assert_eq!(help.status.code(), Some(2));
+            assert_eq!(help.stdout, unknown.stdout);
+            assert_eq!(help.stderr, unknown.stderr);
+        }
+        let help = sandbox.run(&["issue", action, "--help", "--contract", "2"]);
+        assert!(help.status.success(), "{help:?}");
+        let text = String::from_utf8(help.stdout).unwrap();
+        assert!(text.contains("--if-match") && text.contains("--evidence-file"));
+        assert_eq!(text.contains("--holder"), holder);
+
+        let root_help = sandbox.run(&["--contract", "2", "--help"]);
+        let text = String::from_utf8(root_help.stdout).unwrap();
+        assert!(!text.contains(&format!("issue-{action}")));
+    }
     sandbox.assert_empty();
 }
 

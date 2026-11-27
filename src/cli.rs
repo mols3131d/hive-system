@@ -270,6 +270,10 @@ pub(crate) enum Command {
     #[command(skip)]
     IssueUpdate(IssueUpdateArgs),
     #[command(skip)]
+    IssueSelect(IssueTransitionArgs),
+    #[command(skip)]
+    IssueClaim(IssueClaimArgs),
+    #[command(skip)]
     IssueDependency(IssueDependencyArgs, bool),
     #[command(skip)]
     IssueParent(IssueParentArgs),
@@ -827,6 +831,9 @@ pub(crate) enum DirectiveStatus {
 
 #[derive(Subcommand)]
 pub(crate) enum BotCommand {
+    /// Register a Queen from a reviewed, committed Soul (contract 2).
+    #[command(hide = true)]
+    Register(BotRegisterArgs),
     /// List registered Manager Bots.
     List {
         #[command(flatten)]
@@ -850,6 +857,27 @@ pub(crate) enum BotCommand {
         #[command(flatten)]
         target: DoltTargetArgs,
     },
+}
+
+#[derive(Args)]
+pub(crate) struct BotRegisterArgs {
+    /// Canonical lowercase kebab-case registry slug.
+    #[arg(long)]
+    pub(crate) slug: String,
+    #[arg(long)]
+    pub(crate) name: String,
+    /// Exact lowercase Git commit object ID of the clean asset HEAD.
+    #[arg(long, value_name = "REV")]
+    pub(crate) asset_revision: String,
+    #[arg(long)]
+    pub(crate) actor: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Subcommand)]
@@ -1216,6 +1244,29 @@ pub(crate) struct IssueUpdateArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueTransitionArgs {
+    /// Exact Issue UUIDv7.
+    pub(crate) issue: String,
+    /// Exact owning Area UUIDv7.
+    #[arg(long)]
+    pub(crate) area: String,
+    /// Operator-selected actor reference.
+    #[arg(long)]
+    pub(crate) actor: String,
+    /// Expected Issue revision as ISSUE=REV.
+    #[arg(long)]
+    pub(crate) if_match: String,
+    /// Exact request UUID.
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision file.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueDependencyArgs {
     /// Exact dependent Issue UUIDv7.
     pub(crate) issue: String,
@@ -1281,6 +1332,15 @@ pub(crate) struct IssueParentArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueClaimArgs {
+    #[command(flatten)]
+    pub(crate) transition: IssueTransitionArgs,
+    /// Exact execution holder reference.
+    #[arg(long)]
+    pub(crate) holder: String,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueListArgs {
     /// Select Issues across the workspace.
     #[arg(long)]
@@ -1342,6 +1402,9 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     for domain in ["bot", "directive"] {
         cli = cli.mut_subcommand(domain, |command| {
             command.mut_subcommands(|leaf| {
+                if leaf.get_name() == "register" {
+                    return leaf;
+                }
                 leaf.mut_args(|arg| match arg.get_id().as_str() {
                     "workspace_id" | "database" | "port" => arg.hide(true),
                     _ => arg,
@@ -1418,7 +1481,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             let partial = extension_matches
                 .or(config_error_matches)
                 .or(area_matches)
-                .or_else(|| retry_area_create_failure(&cli, &args, error.kind()))
+                .or_else(|| retry_write_failure(&cli, &args, error.kind(), "area", &["create"]))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "context"))
@@ -1506,6 +1569,18 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             Some(("issue", issue)) if issue.subcommand_name() == Some("update") => {
                 Command::IssueUpdate(
                     IssueUpdateArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("select") => {
+                Command::IssueSelect(
+                    IssueTransitionArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("claim") => {
+                Command::IssueClaim(
+                    IssueClaimArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
             }
@@ -2027,7 +2102,7 @@ fn recover_unknown_long(
         ("project", "add-issue")
             | (
                 "issue",
-                "add-dependency" | "remove-dependency" | "set-parent"
+                "add-dependency" | "remove-dependency" | "select" | "claim" | "set-parent"
             )
     );
     if !(named_write
@@ -2143,6 +2218,12 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 clap::Command::new("update")
                     .about("Edit an Issue with a current operator decision."),
             )))
+            .subcommand(add_leaf_options(IssueTransitionArgs::augment_args(
+                clap::Command::new("select").about("Select a backlog Issue for planning."),
+            )))
+            .subcommand(add_leaf_options(IssueClaimArgs::augment_args(
+                clap::Command::new("claim").about("Record an exclusive Claim for a ready Issue."),
+            )))
             .subcommand(add_leaf_options(IssueParentArgs::augment_args(
                 clap::Command::new("set-parent")
                     .about("Attach, move or clear an exact Issue parent."),
@@ -2163,6 +2244,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .mut_subcommand("note", extended_error_options)
                 .mut_subcommand("create", extended_error_options)
                 .mut_subcommand("update", extended_error_options)
+                .mut_subcommand("select", extended_error_options)
+                .mut_subcommand("claim", extended_error_options)
                 .mut_subcommand("set-parent", extended_error_options)
                 .mut_subcommand("add-dependency", extended_error_options)
                 .mut_subcommand("remove-dependency", extended_error_options)
@@ -2175,14 +2258,28 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .ignore_errors(true)
                 .try_get_matches_from(args)
                 .ok()?;
-            recover_unknown_long(&recovery, args, &partial, &error, "issue").unwrap_or(partial)
+            retry_write_failure(
+                &extended,
+                args,
+                error.kind(),
+                "issue",
+                &[
+                    "add-dependency",
+                    "remove-dependency",
+                    "select",
+                    "claim",
+                    "set-parent",
+                ],
+            )
+            .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "issue"))
+            .unwrap_or(partial)
         }
     };
     let leaf = match partial.subcommand() {
         Some(("issue", issue)) => match issue.subcommand() {
             Some((
-                "note" | "create" | "update" | "add-dependency" | "remove-dependency"
-                | "set-parent",
+                "note" | "create" | "update" | "select" | "claim" | "add-dependency"
+                | "remove-dependency" | "set-parent",
                 leaf,
             )) => Some(leaf),
             None => None,
@@ -2380,7 +2477,14 @@ fn extended_error_options(command: clap::Command) -> clap::Command {
 }
 
 fn extended_help_probe(command: clap::Command) -> clap::Command {
-    command.disable_help_flag(true).arg(
+    let command = command.disable_help_flag(true);
+    if command
+        .get_arguments()
+        .any(|arg| arg.get_long() == Some("help"))
+    {
+        return command;
+    }
+    command.arg(
         Arg::new("extended_help_probe")
             .short('h')
             .long("help")
@@ -2652,28 +2756,61 @@ fn retry_conversation_failure(
         .then_some(matches)
 }
 
-fn retry_area_create_failure(
+fn retry_write_failure(
     cli: &clap::Command,
     args: &[OsString],
     kind: ErrorKind,
+    domain: &str,
+    actions: &[&str],
 ) -> Option<ArgMatches> {
     if !matches!(
         kind,
         ErrorKind::ValueValidation
             | ErrorKind::InvalidValue
             | ErrorKind::ArgumentConflict
+            | ErrorKind::UnknownArgument
             | ErrorKind::TooManyValues
             | ErrorKind::InvalidUtf8
     ) {
         return None;
     }
-    let retry = extended_error_options(cli.clone().disable_help_subcommand(true))
-        .mut_subcommand("area", |area| {
-            extended_help_probe(area).mut_subcommand("create", extended_error_options)
-        });
+    let recover_values = |command| {
+        extended_error_options(command).mut_args(|arg| {
+            if (arg.get_long().is_some() || arg.is_positional())
+                && !matches!(
+                    arg.get_id().as_str(),
+                    "contract" | "format" | "json" | "extended_help_probe"
+                )
+            {
+                arg.required(false).value_parser(OsStringValueParser::new())
+            } else {
+                arg
+            }
+        })
+    };
+    let retry = recover_values(cli.clone().disable_help_subcommand(true)).mut_subcommand(
+        domain,
+        |command| {
+            extended_help_probe(command).mut_subcommands(|leaf| {
+                if !actions.contains(&leaf.get_name()) {
+                    return leaf;
+                }
+                recover_values(leaf).arg(
+                    Arg::new("write_error_extra_values")
+                        .num_args(0..)
+                        .action(ArgAction::Append)
+                        .value_parser(OsStringValueParser::new())
+                        .hide(true),
+                )
+            })
+        },
+    );
     let matches = retry.try_get_matches_from(args).ok()?;
     let (command, leaf) = matched_leaf(cli, &matches)?;
-    (command == "area create" && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+    let (actual_domain, action) = command.split_once(' ')?;
+    (actual_domain == domain
+        && actions.contains(&action)
+        && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }
 
@@ -3060,6 +3197,25 @@ impl Command {
                     }
                     Ok(())
                 }
+                Self::IssueSelect(args)
+                | Self::IssueClaim(IssueClaimArgs {
+                    transition: args, ..
+                }) => {
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Issue transitions require --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Issue transitions require exact current Area and Issue scope.",
+                        );
+                    }
+                    Ok(())
+                }
                 Self::IssueDependency(args, _) => {
                     if common.workspace.is_none() || !args.target.has_all() {
                         return Err(
@@ -3189,6 +3345,8 @@ impl Command {
             | Self::IssueNote(_)
             | Self::IssueCreate(_)
             | Self::IssueUpdate(_)
+            | Self::IssueSelect(_)
+            | Self::IssueClaim(_)
             | Self::IssueParent(_)
             | Self::IssueDependency(_, _) => Err("Issue commands require --contract 2."),
             Self::Backup(_) => Err("Backup commands require --contract 2."),
@@ -3261,6 +3419,20 @@ impl DirectiveCommand {
 impl BotCommand {
     fn validate(&self, common: &CommonOptions) -> Result<(), &'static str> {
         let target = match self {
+            Self::Register(args) => {
+                if common.contract != Contract::V2 {
+                    return Err("Bot register requires --contract 2.");
+                }
+                if common.workspace.is_none() || !args.target.has_all() {
+                    return Err(
+                        "Bot register requires --workspace, --workspace-id, --database, and --port.",
+                    );
+                }
+                if common.project.is_some() || common.project_root.is_some() {
+                    return Err("Bot register applies to the selected workspace.");
+                }
+                return common.require_working_tree();
+            }
             Self::List { target, .. } | Self::Show { target, .. } => target,
         };
         if common.contract == Contract::V1 {
