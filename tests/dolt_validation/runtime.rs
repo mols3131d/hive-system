@@ -15,6 +15,8 @@ mod bot_register;
 mod issue_dependency;
 #[path = "runtime/issue_parent.rs"]
 mod issue_parent;
+#[path = "runtime/issue_review.rs"]
+mod issue_review;
 #[path = "runtime/issue_transition.rs"]
 mod issue_transition;
 #[path = "runtime/issue_update.rs"]

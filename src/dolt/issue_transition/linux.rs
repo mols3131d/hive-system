@@ -1,12 +1,17 @@
+use std::path::Path;
+
 use mysql::{Transaction, prelude::Queryable};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use crate::cli::{
-    CommonOptions, IssueReleaseArgs, IssueStopArgs, IssueSubmitArgs, IssueTransitionArgs,
+    CommonOptions, IssueReleaseArgs, IssueReviewArgs, IssueStopArgs, IssueSubmitArgs,
+    IssueSubmitEpicArgs, IssueTransitionArgs,
 };
 use crate::error::{ErrorCode, HiveError};
+
+mod submission_history;
 
 use super::super::{
     DoltSuccess, DoltTarget, MAX_ROWS_PER_TABLE, Snapshot,
@@ -35,6 +40,12 @@ pub(in crate::dolt) enum Operation {
     Recover,
     #[serde(rename = "issue.submit")]
     Submit,
+    #[serde(rename = "issue.submit-epic")]
+    SubmitEpic,
+    #[serde(rename = "issue.request-changes")]
+    RequestChanges,
+    #[serde(rename = "issue.accept")]
+    Accept,
 }
 
 impl Operation {
@@ -45,6 +56,9 @@ impl Operation {
             "issue.release" => Some(Self::Release),
             "issue.recover" => Some(Self::Recover),
             "issue.submit" => Some(Self::Submit),
+            "issue.submit-epic" => Some(Self::SubmitEpic),
+            "issue.request-changes" => Some(Self::RequestChanges),
+            "issue.accept" => Some(Self::Accept),
             _ => None,
         }
     }
@@ -54,8 +68,19 @@ impl Operation {
             Self::Select => "issue.select",
             Self::Claim => "issue.claim",
             Self::Submit => "issue.submit",
+            Self::SubmitEpic => "issue.submit-epic",
+            Self::RequestChanges => "issue.request-changes",
+            Self::Accept => "issue.accept",
             Self::Recover => "issue.recover",
             Self::Release => "issue.release",
+        }
+    }
+
+    fn body_limit(self) -> usize {
+        match self {
+            Self::Accept => MAX_RESOLUTION_BYTES,
+            Self::Submit | Self::SubmitEpic | Self::RequestChanges => MAX_RESULT_BYTES,
+            _ => MAX_REASON_BYTES,
         }
     }
 
@@ -65,6 +90,9 @@ impl Operation {
             Self::Claim => ("todo", "in-progress"),
             Self::Release | Self::Recover => ("in-progress", "todo"),
             Self::Submit => ("in-progress", "review"),
+            Self::SubmitEpic => ("todo", "review"),
+            Self::RequestChanges => ("review", "todo"),
+            Self::Accept => ("review", "done"),
         }
     }
 }
@@ -81,6 +109,52 @@ struct EvidenceRefs {
 
 const MAX_REASON_BYTES: usize = 1024;
 const MAX_RESULT_BYTES: usize = 256 * 1024;
+const MAX_RESOLUTION_BYTES: usize = 65_535;
+const MAX_CANCELLED_CHILDREN: usize = 256;
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EpicSubmission {
+    result_evidence_ref: String,
+    body_sha256: String,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewBinding {
+    submission_id: String,
+    body_sha256: String,
+    cancelled_child_ids: Vec<String>,
+}
+
+impl ReviewBinding {
+    fn valid(&self) -> bool {
+        is_uuid_v7(&self.submission_id)
+            && valid_sha256(&self.body_sha256)
+            && self.cancelled_child_ids.len() <= MAX_CANCELLED_CHILDREN
+            && self.cancelled_child_ids.iter().all(|id| is_uuid_v7(id))
+            && self
+                .cancelled_child_ids
+                .windows(2)
+                .all(|ids| ids[0] < ids[1])
+    }
+}
+
+#[derive(Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReviewOutcome {
+    RequestChanges,
+    Accept,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewDecision {
+    binding: ReviewBinding,
+    outcome: ReviewOutcome,
+    reviewer_ref: String,
+    reviewed_at: String,
+}
 
 #[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +232,12 @@ struct Evidence {
         skip_serializing_if = "Option::is_none"
     )]
     recovery_review: Option<RecoveryReview>,
+    #[serde(
+        default,
+        deserialize_with = "optional_object",
+        skip_serializing_if = "Option::is_none"
+    )]
+    review: Option<ReviewDecision>,
 }
 
 fn optional_object<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
@@ -199,6 +279,12 @@ enum Effect {
         stopped: Stopped,
         result_evidence_ref: String,
     },
+    #[serde(rename = "issue.submit-epic")]
+    SubmitEpic { submission: EpicSubmission },
+    #[serde(rename = "issue.request-changes")]
+    RequestChanges { review: ReviewBinding },
+    #[serde(rename = "issue.accept")]
+    Accept { review: ReviewBinding },
 }
 
 impl Effect {
@@ -209,6 +295,9 @@ impl Effect {
             Self::Release { .. } => Operation::Release,
             Self::Recover { .. } => Operation::Recover,
             Self::Submit { .. } => Operation::Submit,
+            Self::SubmitEpic { .. } => Operation::SubmitEpic,
+            Self::RequestChanges { .. } => Operation::RequestChanges,
+            Self::Accept { .. } => Operation::Accept,
         }
     }
 
@@ -227,7 +316,7 @@ impl Effect {
             Self::Release { stopped }
             | Self::Recover { stopped }
             | Self::Submit { stopped, .. } => Some(stopped),
-            Self::Select { .. } | Self::Claim { .. } => None,
+            _ => None,
         }
     }
 
@@ -270,42 +359,39 @@ struct Request<'a> {
     holder: Option<&'a str>,
     stopped: Option<&'a Stopped>,
     result_evidence_ref: Option<&'a str>,
+    epic: Option<&'a EpicSubmission>,
+    review: Option<&'a ReviewBinding>,
 }
 
 impl Request<'_> {
     fn fingerprint(&self) -> String {
+        let mut fields = vec![
+            json!(1),
+            json!(self.operation),
+            json!(self.workspace),
+            json!(self.area),
+            json!(self.issue),
+            json!(self.actor),
+            json!(self.expected),
+        ];
         if let Some(stopped) = self.stopped {
-            return digest(
-                json!([
-                    1,
-                    self.operation,
-                    self.workspace,
-                    self.area,
-                    self.issue,
-                    self.actor,
-                    self.expected,
-                    stopped.stop,
-                    stopped.body_sha256,
-                    self.result_evidence_ref,
-                ])
-                .to_string()
-                .as_bytes(),
-            );
+            fields.extend([
+                json!(stopped.stop),
+                json!(stopped.body_sha256),
+                json!(self.result_evidence_ref),
+            ]);
+        } else if let Some(epic) = self.epic {
+            fields.extend([json!(epic.result_evidence_ref), json!(epic.body_sha256)]);
+        } else if let Some(review) = self.review {
+            fields.extend([
+                json!(review.submission_id),
+                json!(review.body_sha256),
+                json!(review.cancelled_child_ids),
+            ]);
+        } else {
+            fields.push(json!(self.holder));
         }
-        digest(
-            json!([
-                1,
-                self.operation,
-                self.workspace,
-                self.area,
-                self.issue,
-                self.actor,
-                self.expected,
-                self.holder,
-            ])
-            .to_string()
-            .as_bytes(),
-        )
+        digest(Value::Array(fields).to_string().as_bytes())
     }
 
     fn verify(
@@ -339,6 +425,26 @@ impl Request<'_> {
                 (Some(start), Some(end)) if start <= now && now < end)
         {
             return Err(workflow::unverified());
+        }
+        if let Some(epic) = self.epic
+            && (!workflow::valid_ref(&epic.result_evidence_ref) || !valid_sha256(&epic.body_sha256))
+        {
+            return Err(workflow::unverified());
+        }
+        match (self.review, &evidence.review, self.operation) {
+            (Some(binding), Some(review), Operation::RequestChanges | Operation::Accept)
+                if binding.valid()
+                    && binding == &review.binding
+                    && (review.outcome == ReviewOutcome::Accept)
+                        == (self.operation == Operation::Accept)
+                    && (self.operation == Operation::Accept
+                        || binding.cancelled_child_ids.is_empty())
+                    && review.reviewer_ref == self.actor
+                    && review.reviewer_ref == evidence.issuer_ref
+                    && workflow::parse_time(&review.reviewed_at)
+                        .is_some_and(|time| time <= now) => {}
+            (None, None, _) => {}
+            _ => return Err(workflow::unverified()),
         }
         if self.stopped.map(|stopped| &stopped.stop) != evidence.stop.as_ref() {
             return Err(workflow::unverified());
@@ -398,13 +504,98 @@ pub(super) fn write(
     } else {
         Operation::Select
     };
-    execute(common, args, holder, operation, None)
+    execute(common, args, holder, operation, Input::Empty)
 }
 
 struct StoppedInput<'a> {
     args: &'a IssueStopArgs,
     body: String,
     result_evidence_ref: Option<&'a str>,
+}
+
+enum Input<'a> {
+    Empty,
+    Stopped(StoppedInput<'a>),
+    Epic {
+        body: String,
+        evidence: &'a str,
+    },
+    Review {
+        body: String,
+        binding: ReviewBinding,
+        approval: &'a str,
+    },
+}
+
+pub(super) fn submit_epic(
+    common: &CommonOptions,
+    args: &IssueSubmitEpicArgs,
+) -> Result<DoltSuccess, HiveError> {
+    if !workflow::valid_ref(&args.evidence) {
+        return Err(invalid("Supply a valid result evidence reference."));
+    }
+    execute(
+        common,
+        &args.transition,
+        None,
+        Operation::SubmitEpic,
+        Input::Epic {
+            body: read_body(&args.file, MAX_RESULT_BYTES)?,
+            evidence: &args.evidence,
+        },
+    )
+}
+
+pub(super) fn review(
+    common: &CommonOptions,
+    args: &IssueReviewArgs,
+    acknowledged: Option<&[String]>,
+) -> Result<DoltSuccess, HiveError> {
+    let operation = if acknowledged.is_some() {
+        Operation::Accept
+    } else {
+        Operation::RequestChanges
+    };
+    if !is_uuid_v7(&args.submission) || !workflow::valid_ref(&args.approval) {
+        return Err(invalid(
+            "Supply an exact submission UUIDv7 and a valid approval reference.",
+        ));
+    }
+    let body = read_body(&args.file, operation.body_limit())?;
+    let mut cancelled_child_ids = acknowledged.unwrap_or_default().to_vec();
+    cancelled_child_ids.sort_unstable();
+    let binding = ReviewBinding {
+        submission_id: args.submission.clone(),
+        body_sha256: digest(body.as_bytes()),
+        cancelled_child_ids,
+    };
+    if !binding.valid() {
+        return Err(invalid(
+            "Supply at most 256 distinct cancelled child UUIDv7s.",
+        ));
+    }
+    execute(
+        common,
+        &args.transition,
+        None,
+        operation,
+        Input::Review {
+            body,
+            binding,
+            approval: &args.approval,
+        },
+    )
+}
+
+fn read_body(path: &Path, limit: usize) -> Result<String, HiveError> {
+    let bytes = read_evidence_bytes(path, limit)?;
+    let body = String::from_utf8(bytes).map_err(|_| invalid("The body file must be UTF-8."))?;
+    if !valid_result(&body) {
+        return Err(invalid(
+            "Supply a nonblank UTF-8 body file without NUL bytes.",
+        ));
+    }
+    Ok(body)
 }
 
 pub(super) fn release(
@@ -439,14 +630,7 @@ pub(super) fn submit(
     if !workflow::valid_ref(&args.evidence) {
         return Err(invalid("Supply a valid result evidence reference."));
     }
-    let bytes = read_evidence_bytes(&args.file, MAX_RESULT_BYTES)?;
-    let body =
-        String::from_utf8(bytes).map_err(|_| invalid("The submission file must be UTF-8."))?;
-    if !valid_result(&body) {
-        return Err(invalid(
-            "Supply a nonblank UTF-8 submission file without NUL bytes.",
-        ));
-    }
+    let body = read_body(&args.file, MAX_RESULT_BYTES)?;
     execute_stopped(
         common,
         Operation::Submit,
@@ -477,7 +661,7 @@ fn execute_stopped(
         &args.transition,
         Some(&args.holder),
         operation,
-        Some(input),
+        Input::Stopped(input),
     )
 }
 
@@ -486,7 +670,7 @@ fn execute(
     args: &IssueTransitionArgs,
     holder: Option<&str>,
     operation: Operation,
-    input: Option<StoppedInput<'_>>,
+    input: Input<'_>,
 ) -> Result<DoltSuccess, HiveError> {
     let target = DoltTarget::parse(&args.target)?;
     let workspace =
@@ -508,9 +692,13 @@ fn execute(
         .map(|(_, rev)| rev)
         .ok_or_else(|| invalid("Supply one Issue revision as --if-match ISSUE=REV."))?;
     let decision: Decision<Evidence> = issue_writer::read_decision(&args.evidence_file)?;
-    let stopped = input
-        .as_ref()
-        .map(|input| {
+    let mut stopped = None;
+    let mut result_evidence_ref = None;
+    let mut epic = None;
+    let mut review = None;
+    let body = match input {
+        Input::Empty => String::new(),
+        Input::Stopped(input) => {
             let args = input.args;
             if !is_uuid_v7(&args.claim) || !workflow::valid_ref(&args.stop_evidence) {
                 return Err(invalid(
@@ -525,12 +713,32 @@ fn execute(
                     stop.evidence_ref == args.stop_evidence && stop.claim_id == args.claim
                 })
                 .ok_or_else(workflow::unverified)?;
-            Ok(Stopped {
+            stopped = Some(Stopped {
                 stop: stop.clone(),
                 body_sha256: digest(input.body.as_bytes()),
-            })
-        })
-        .transpose()?;
+            });
+            result_evidence_ref = input.result_evidence_ref;
+            input.body
+        }
+        Input::Epic { body, evidence } => {
+            epic = Some(EpicSubmission {
+                result_evidence_ref: evidence.to_owned(),
+                body_sha256: digest(body.as_bytes()),
+            });
+            body
+        }
+        Input::Review {
+            body,
+            binding,
+            approval,
+        } => {
+            if decision.evidence.authorization_ref != approval {
+                return Err(workflow::unverified());
+            }
+            review = Some(binding);
+            body
+        }
+    };
     let request = Request {
         operation,
         workspace: workspace.workspace_id(),
@@ -541,13 +749,15 @@ fn execute(
         expected,
         holder,
         stopped: stopped.as_ref(),
-        result_evidence_ref: input.as_ref().and_then(|input| input.result_evidence_ref),
+        result_evidence_ref,
+        epic: epic.as_ref(),
+        review: review.as_ref(),
     };
     let transition = Transition {
         fingerprint: request.fingerprint(),
         request,
         decision,
-        body: input.map(|input| input.body).unwrap_or_default(),
+        body,
     };
     issue_writer::execute(&workspace, target, &transition)
 }
@@ -597,7 +807,11 @@ impl Mutation for Transition<'_> {
         }
     }
 
-    fn guard(&self, db: &mut Transaction<'_>, _: &mut Snapshot) -> Result<Self::Guard, HiveError> {
+    fn guard(
+        &self,
+        db: &mut Transaction<'_>,
+        snapshot: &mut Snapshot,
+    ) -> Result<Self::Guard, HiveError> {
         let request = &self.request;
         let issue = Issue::read(db, request.issue, None)?;
         request.check_issue(&issue)?;
@@ -607,6 +821,10 @@ impl Mutation for Transition<'_> {
             None
         };
         request.check_readiness(db, &issue, None)?;
+        if let Some(review) = &self.decision.evidence.review {
+            let base = snapshot.commit.clone();
+            submission_history::verify(snapshot, &base, request, review)?;
+        }
         Ok(claim)
     }
 
@@ -634,6 +852,20 @@ impl Mutation for Transition<'_> {
                 },
                 _ => return Err(workflow::unverified()),
             }
+        } else if let Some(epic) = request.epic {
+            Effect::SubmitEpic {
+                submission: epic.clone(),
+            }
+        } else if let Some(review) = request.review {
+            match request.operation {
+                Operation::RequestChanges => Effect::RequestChanges {
+                    review: review.clone(),
+                },
+                Operation::Accept => Effect::Accept {
+                    review: review.clone(),
+                },
+                _ => return Err(workflow::unverified()),
+            }
         } else if let Some(holder) = request.holder {
             Effect::Claim {
                 claim_id: new_uuid_v7(now)?,
@@ -657,14 +889,23 @@ impl Mutation for Transition<'_> {
             effect,
         };
         record.require_new_ids(db, None)?;
+        let closure = (request.operation == Operation::Accept).then_some((
+            sql_time,
+            request.actor,
+            self.body.as_str(),
+        ));
         db.exec_drop(
-            "UPDATE issues SET status = ?, revision = ?, updated_at = ?
+            "UPDATE issues SET status = ?, revision = ?, updated_at = ?,
+                closed_at = ?, closed_by_ref = ?, resolution_note = ?
              WHERE CAST(id AS BINARY) = ? AND CAST(area_id AS BINARY) = ?
                AND CAST(revision AS BINARY) = ? AND CAST(status AS BINARY) = ?",
             (
                 status,
                 &record.issue_revision,
                 sql_time,
+                closure.map(|(time, _, _)| time),
+                closure.map(|(_, actor, _)| actor),
+                closure.map(|(_, _, body)| body),
                 request.issue,
                 request.area,
                 request.expected,
@@ -723,6 +964,9 @@ struct Issue {
     claimed: bool,
     valid_open_fields: bool,
     unchanged_fields: String,
+    closed_at: Option<String>,
+    closed_by: Option<String>,
+    resolution_digest: Option<String>,
 }
 
 fn as_of(commit: Option<&str>) -> Result<String, HiveError> {
@@ -736,7 +980,8 @@ fn as_of(commit: Option<&str>) -> Result<String, HiveError> {
 impl Issue {
     fn read(db: &mut impl Queryable, issue: &str, commit: Option<&str>) -> Result<Self, HiveError> {
         let at = as_of(commit)?;
-        let (area, kind, status, revision, updated_at, acceptance, hold, claimed, valid_open_fields, unchanged_fields) =
+        let (area, kind, status, revision, updated_at, acceptance, hold, claimed, valid_open_fields,
+            unchanged_fields, closure): (_, _, _, _, _, _, _, _, _, _, String) =
             db.exec_first(
                 format!(
                     "SELECT i.area_id, i.type, i.status, i.revision,
@@ -747,12 +992,15 @@ impl Issue {
                          AND (i.priority IS NULL OR i.priority BETWEEN 0 AND 3)
                          AND i.closed_at IS NULL AND i.closed_by_ref IS NULL AND i.resolution_note IS NULL,
                      JSON_ARRAY(i.number, i.parent_id, i.title, LOWER(SHA2(CAST(i.body AS BINARY), 256)),
-                                i.acceptance_criteria, i.priority, i.hold_reason, i.created_at,
-                                i.closed_at, i.closed_by_ref, i.resolution_note)
+                                i.acceptance_criteria, i.priority, i.hold_reason, i.created_at),
+                     JSON_ARRAY(DATE_FORMAT(i.closed_at, '%Y-%m-%dT%H:%i:%s.%fZ'), i.closed_by_ref,
+                                LOWER(SHA2(CAST(i.resolution_note AS BINARY), 256)))
                      FROM issues{at} i WHERE CAST(i.id AS BINARY) = ?"
                 ),
                 (NON_WHITESPACE, NON_WHITESPACE, issue),
             ).map_err(read_error)?.ok_or_else(|| invalid_record("The exact Issue is missing."))?;
+        let (closed_at, closed_by, resolution_digest) =
+            serde_json::from_str(&closure).map_err(|_| workflow::unverified())?;
         Ok(Self {
             area,
             kind,
@@ -764,6 +1012,9 @@ impl Issue {
             claimed,
             valid_open_fields,
             unchanged_fields,
+            closed_at,
+            closed_by,
+            resolution_digest,
         })
     }
 }
@@ -842,7 +1093,13 @@ impl Request<'_> {
             return Err(stale());
         }
         if issue.status != self.operation.states().0
-            || (self.operation != Operation::Select && issue.kind == "epic")
+            || match self.operation {
+                Operation::SubmitEpic => issue.kind != "epic",
+                Operation::Claim | Operation::Release | Operation::Recover | Operation::Submit => {
+                    issue.kind == "epic"
+                }
+                _ => false,
+            }
         {
             return Err(HiveError::new(
                 ErrorCode::InvalidTransition,
@@ -894,7 +1151,10 @@ impl Request<'_> {
             Some(commit) => require_active_area_at(db, self.area, commit, archived),
             None => require_active_area(db, self.area, archived),
         };
-        if self.operation == Operation::Select {
+        if matches!(
+            self.operation,
+            Operation::Select | Operation::RequestChanges
+        ) {
             return active;
         }
         let mut blockers = Vec::new();
@@ -968,11 +1228,85 @@ impl Request<'_> {
         if unmet {
             blockers.push(Blocker::PrerequisiteNotDone);
         }
-        if blockers.is_empty() {
-            Ok(())
-        } else {
-            Err(HiveError::blocked(blockers))
+        if !blockers.is_empty() {
+            return Err(HiveError::blocked(blockers));
         }
+        if matches!(self.operation, Operation::SubmitEpic | Operation::Accept) {
+            self.check_children(db, &at)?;
+        }
+        Ok(())
+    }
+
+    fn check_children(&self, db: &mut impl Queryable, at: &str) -> Result<(), HiveError> {
+        type Child = (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            bool,
+            bool,
+        );
+        let children: Vec<Child> = db
+            .exec(
+                format!(
+                    "SELECT c.id, c.type, c.status, c.revision, a.id, c.closed_by_ref,
+                    COALESCE(YEAR(c.closed_at) > 0 AND c.resolution_note REGEXP ?, FALSE),
+                    EXISTS(SELECT 1 FROM issue_claims{at} cl WHERE cl.issue_id = c.id)
+                 FROM issues{at} c LEFT JOIN areas{at} a
+                    ON CAST(a.id AS BINARY) = CAST(c.area_id AS BINARY)
+                 WHERE CAST(c.parent_id AS BINARY) = ? LIMIT ?"
+                ),
+                (NON_WHITESPACE, self.issue, MAX_ROWS_PER_TABLE + 1),
+            )
+            .map_err(read_error)?;
+        if children.len() > MAX_ROWS_PER_TABLE {
+            return Err(HiveError::new(
+                ErrorCode::ContextLimit,
+                "The Issue exceeds the child read limit.",
+            ));
+        }
+        let mut cancelled = Vec::new();
+        for (id, kind, status, revision, area, reviewer, closed, claimed) in children {
+            let status = IssueStatus::parse(&status).ok_or_else(|| {
+                invalid_record("An immediate child has an invalid lifecycle state.")
+            })?;
+            if id == self.issue
+                || !is_uuid_v7(&id)
+                || !is_issue_type(&kind)
+                || !valid_revision(&revision)
+                || !area.as_deref().is_some_and(is_uuid_v7)
+            {
+                return Err(invalid_record(
+                    "An immediate child has invalid Issue metadata.",
+                ));
+            }
+            if !status.is_terminal() {
+                return Err(HiveError::new(
+                    ErrorCode::InvalidTransition,
+                    "An immediate child is unresolved.",
+                ));
+            }
+            if claimed || !closed || !reviewer.as_deref().is_some_and(workflow::valid_ref) {
+                return Err(invalid_record(
+                    "An immediate child has invalid closure or Claim metadata.",
+                ));
+            }
+            if status == IssueStatus::Cancelled {
+                cancelled.push(id);
+            }
+        }
+        if let Some(review) = self.review {
+            cancelled.sort_unstable();
+            if review.cancelled_child_ids != cancelled {
+                return Err(HiveError::new(
+                    ErrorCode::InvalidTransition,
+                    "Acknowledge exactly the cancelled immediate children in the reviewed scope change.",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1051,6 +1385,14 @@ impl Record {
             }),
             stopped: self.effect.stopped(),
             result_evidence_ref: self.effect.result_evidence_ref(),
+            epic: match &self.effect {
+                Effect::SubmitEpic { submission } => Some(submission),
+                _ => None,
+            },
+            review: match &self.effect {
+                Effect::RequestChanges { review } | Effect::Accept { review } => Some(review),
+                _ => None,
+            },
         }
     }
 }
@@ -1115,6 +1457,24 @@ pub(in crate::dolt) fn verify_effect(
     receipt: &HistoricalReceipt,
     record: &Record,
 ) -> Result<Value, HiveError> {
+    let binding = record.request(&snapshot.workspace_id);
+    if binding.review.is_some() {
+        let evidence: Evidence =
+            serde_json::from_str(&receipt.workflow_evidence).map_err(|_| workflow::unverified())?;
+        let review = evidence.review.as_ref().ok_or_else(workflow::unverified)?;
+        let workspace = snapshot.workspace_id.clone();
+        let binding = record.request(&workspace);
+        submission_history::verify(snapshot, &receipt.base_commit, &binding, review)?;
+    }
+    verify_rows(snapshot, introduced, receipt, record)
+}
+
+fn verify_rows(
+    snapshot: &mut Snapshot,
+    introduced: &str,
+    receipt: &HistoricalReceipt,
+    record: &Record,
+) -> Result<Value, HiveError> {
     let base = &receipt.base_commit;
     let db = &mut snapshot.connection;
     let binding = record.request(&snapshot.workspace_id);
@@ -1141,6 +1501,25 @@ pub(in crate::dolt) fn verify_effect(
         return Err(workflow::unverified());
     }
 
+    let expected_closure = if binding.operation == Operation::Accept {
+        let review = binding.review.ok_or_else(workflow::unverified)?;
+        (
+            Some(receipt.created_at.as_str()),
+            Some(record.actor_ref.as_str()),
+            Some(review.body_sha256.as_str()),
+        )
+    } else {
+        (None, None, None)
+    };
+    if (
+        after.closed_at.as_deref(),
+        after.closed_by.as_deref(),
+        after.resolution_digest.as_deref(),
+    ) != expected_closure
+    {
+        return Err(workflow::unverified());
+    }
+
     // Read only the exact update and expected Claim, and compare the complete row.
     let at = as_of(Some(introduced))?;
     type UpdateRow = (
@@ -1155,7 +1534,7 @@ pub(in crate::dolt) fn verify_effect(
         format!("SELECT issue_id, kind, CASE WHEN OCTET_LENGTH(body) <= ? THEN body END, author_ref, DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'),
                  CASE WHEN OCTET_LENGTH(transition_json) <= ? THEN transition_json END
                  FROM issue_updates{at} WHERE CAST(id AS BINARY) = ?"),
-        (if binding.operation == Operation::Submit { MAX_RESULT_BYTES } else { MAX_REASON_BYTES },
+        (binding.operation.body_limit(),
          workflow::MAX_DECLARATION_BYTES, &record.transition_id),
     ).map_err(read_error)?;
     if !matches!(update, Some((issue, kind, Some(body), actor, created, Some(typed)))
@@ -1164,7 +1543,14 @@ pub(in crate::dolt) fn verify_effect(
        && match binding.stopped {
             Some(stopped) => digest(body.as_bytes()) == stopped.body_sha256
                 && if binding.operation == Operation::Submit { valid_result(&body) } else { valid_reason(&body) },
-            None => body.is_empty(),
+            None => {
+                let sha = binding.epic.map(|epic| epic.body_sha256.as_str())
+                    .or_else(|| binding.review.map(|review| review.body_sha256.as_str()));
+                match sha {
+                    Some(sha) => valid_result(&body) && digest(body.as_bytes()) == sha,
+                    None => body.is_empty(),
+                }
+            },
        })
     {
         return Err(workflow::unverified());
@@ -1209,6 +1595,14 @@ pub(in crate::dolt) fn verify_effect(
             result["result_evidence_ref"] = json!(reference);
             result["result_sha256"] = json!(stopped.body_sha256);
         }
+    }
+    if let Some(epic) = binding.epic {
+        result["result_evidence_ref"] = json!(epic.result_evidence_ref);
+        result["result_sha256"] = json!(epic.body_sha256);
+    }
+    if let Some(review) = binding.review {
+        result["submission_id"] = json!(review.submission_id);
+        result["cancelled_child_ids"] = json!(review.cancelled_child_ids);
     }
     Ok(result)
 }

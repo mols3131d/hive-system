@@ -4171,6 +4171,60 @@ fn stopped_issue_transitions_keep_output_options_and_literal_boundaries() {
 }
 
 #[test]
+fn reviewed_issue_commands_preserve_contract_and_literal_boundaries() {
+    let sandbox = Sandbox::new();
+    let root_help = sandbox.run(&["--help"]);
+    assert!(root_help.status.success(), "{root_help:?}");
+    let root_help = String::from_utf8(root_help.stdout).unwrap();
+    for misplaced in ["issue-submit-epic", "issue-request-changes", "issue-accept"] {
+        assert!(!root_help.contains(misplaced), "{root_help}");
+    }
+    let issue = "01900000-0000-7000-8000-000000000003";
+    for (action, required) in [
+        ("submit-epic", "--evidence"),
+        ("request-changes", "--submission"),
+        ("accept", "--approval"),
+    ] {
+        let help = sandbox.run(&["--contract", "2", "issue", action, "--help"]);
+        assert!(help.status.success(), "{help:?}");
+        let v1 = sandbox.run(&["--contract", "1", "issue", action, "--help"]);
+        assert!(!v1.status.success(), "{v1:?}");
+        for invalid in [
+            &[issue, required][..],
+            &[issue, required, "x", required, "y"],
+            &["--unknown=--contract=1", issue],
+            &["-Z", issue],
+        ] {
+            let command = ["issue", action];
+            let options = ["--contract", "2", "--json"];
+            let early = sandbox.run(&[&options[..], &command, invalid].concat());
+            let late = sandbox.run(&[&command[..], invalid, &options].concat());
+            assert_eq!(early.stdout, late.stdout, "{action} {invalid:?}");
+            for output in [early, late] {
+                assert_eq!(output.status.code(), Some(2), "{output:?}");
+                assert!(output.stderr.is_empty(), "{output:?}");
+                let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(envelope["schema_version"], 2);
+                assert_eq!(envelope["command"], format!("issue {action}"));
+                assert_eq!(envelope["error"]["code"], "INVALID_ARGUMENT");
+            }
+        }
+        for literal in [
+            &["--file=--json", issue][..],
+            &["--unknown=--json", issue],
+            &["--", "--json"],
+        ] {
+            let report =
+                sandbox.run(&[&["issue", action, "--contract", "2"][..], literal].concat());
+            assert_eq!(report.status.code(), Some(2), "{report:?}");
+            assert!(report.stdout.is_empty(), "{report:?}");
+            assert!(!report.stderr.is_empty(), "{report:?}");
+        }
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn issue_set_parent_keeps_late_v2_errors_and_literal_argument_boundaries() {
     let sandbox = Sandbox::new();
     let issue = "01900000-0000-7000-8000-000000000001";

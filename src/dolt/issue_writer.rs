@@ -107,7 +107,13 @@ impl Kind {
                 ("issue_claims", "INSERT"),
                 ("operation_receipts", "INSERT"),
             ],
-            Self::Note | Self::Transition(issue_transition::Operation::Select) => &[
+            Self::Note
+            | Self::Transition(
+                issue_transition::Operation::Select
+                | issue_transition::Operation::SubmitEpic
+                | issue_transition::Operation::RequestChanges
+                | issue_transition::Operation::Accept,
+            ) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
                 ("operation_receipts", "INSERT"),
@@ -1146,13 +1152,19 @@ mod tests {
             ("issue.release", issue_transition::Operation::Release),
             ("issue.recover", issue_transition::Operation::Recover),
             ("issue.submit", issue_transition::Operation::Submit),
+            ("issue.submit-epic", issue_transition::Operation::SubmitEpic),
+            (
+                "issue.request-changes",
+                issue_transition::Operation::RequestChanges,
+            ),
+            ("issue.accept", issue_transition::Operation::Accept),
         ] {
             transition["kind"] = json!(name);
             let marker = read(&transition).unwrap();
             assert!(matches!(marker.operation(), Ok(Kind::Transition(kind)) if kind == operation));
             assert_eq!(json!(marker), transition);
         }
-        transition["kind"] = json!("issue.submit-epic");
+        transition["kind"] = json!("issue.unknown-transition");
         assert!(read(&transition).is_err());
 
         let legacy_bytes = serde_json::to_string(&legacy).unwrap();
