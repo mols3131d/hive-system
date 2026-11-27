@@ -8,6 +8,8 @@ use serde_saphyr::{DuplicateKeyPolicy, MergeKeyPolicy, Tagged};
 use crate::cli::{Format, ProjectId};
 use crate::error::{ErrorCode, HiveError};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use filesystem::open_regular_child;
 pub(crate) use filesystem::read_scoped;
 #[cfg(unix)]
 pub(crate) use filesystem::{ScopedDirectory, read_regular};
@@ -323,6 +325,20 @@ mod filesystem {
         name: &OsStr,
         directories: &[&OsStr],
     ) -> Result<Option<File>, HiveError> {
+        let child_directory = open_scoped_directory(directory, directories)?;
+        let Some(child_directory) = child_directory
+            .as_ref()
+            .or_else(|| directories.is_empty().then_some(directory))
+        else {
+            return Ok(None);
+        };
+        open_child(child_directory, name, libc::O_NONBLOCK)
+    }
+
+    fn open_scoped_directory(
+        directory: &File,
+        directories: &[&OsStr],
+    ) -> Result<Option<File>, HiveError> {
         // Open each child relative to the descriptor so replacing a path component
         // cannot redirect a subsequent open through a symlink.
         let mut child_directory = None;
@@ -337,11 +353,7 @@ mod filesystem {
             };
             child_directory = Some(child);
         }
-        open_child(
-            child_directory.as_ref().unwrap_or(directory),
-            name,
-            libc::O_NONBLOCK,
-        )
+        Ok(child_directory)
     }
 
     pub(crate) struct ScopedDirectory {
@@ -537,6 +549,21 @@ mod filesystem {
                 .transpose()
         }
 
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(crate) fn open_directory(
+            &self,
+            components: &[&OsStr],
+        ) -> Result<Option<File>, HiveError> {
+            open_scoped_directory(&self.file, components)
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(crate) fn file_identity(&self) -> Result<(u64, u64), HiveError> {
+            use std::os::unix::fs::MetadataExt;
+            let info = self.file.metadata().map_err(read_error)?;
+            Ok((info.dev(), info.ino()))
+        }
+
         pub(crate) fn read_bounded(
             &self,
             components: &[&OsStr],
@@ -556,14 +583,7 @@ mod filesystem {
         name: &OsStr,
         flags: libc::c_int,
     ) -> Result<Option<File>, HiveError> {
-        if name.is_empty()
-            || matches!(name.as_bytes(), b"." | b"..")
-            || name.as_bytes().contains(&b'/')
-        {
-            return Err(invalid("Scoped source has an invalid path component"));
-        }
-        let name = CString::new(name.as_bytes())
-            .map_err(|_| invalid("Configuration source has an invalid path component"))?;
+        let name = child_name(name)?;
         // SAFETY: The descriptor and NUL-terminated component remain valid for this call.
         let descriptor = unsafe {
             libc::openat(
@@ -582,6 +602,54 @@ mod filesystem {
         }
         // SAFETY: openat returned a newly owned descriptor.
         Ok(Some(unsafe { File::from_raw_fd(descriptor) }))
+    }
+
+    fn child_name(name: &OsStr) -> Result<CString, HiveError> {
+        if name.is_empty()
+            || matches!(name.as_bytes(), b"." | b"..")
+            || name.as_bytes().contains(&b'/')
+        {
+            return Err(invalid("Scoped source has an invalid path component"));
+        }
+        CString::new(name.as_bytes())
+            .map_err(|_| invalid("Configuration source has an invalid path component"))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn open_regular_child(
+        directory: &File,
+        name: &OsStr,
+    ) -> Result<Option<File>, HiveError> {
+        let c_name = child_name(name)?;
+        let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: The anchored descriptor, name and output buffer are valid.
+        let result = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                c_name.as_ptr(),
+                info.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            let error = Error::last_os_error();
+            return if error.kind() == ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(read_error(error))
+            };
+        }
+        // SAFETY: fstatat succeeded and initialized the metadata.
+        if unsafe { info.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(invalid("Scoped source must be a regular file"));
+        }
+        let file = open_child(directory, name, libc::O_NONBLOCK)?;
+        if let Some(file) = &file
+            && !file.metadata().map_err(read_error)?.is_file()
+        {
+            return Err(invalid("Scoped source must be a regular file"));
+        }
+        Ok(file)
     }
 
     fn read_file(file: File, limit: usize) -> Result<Vec<u8>, HiveError> {

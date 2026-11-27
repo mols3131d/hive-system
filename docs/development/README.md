@@ -238,6 +238,16 @@ hive --contract 2 --json conversation show --workspace /example/hive-v2-userdata
 
 The read returns validated metadata and the verbatim Markdown body for an active or retired Queen. Hive matches the portable workspace UUID across the descriptor, committed Dolt target, and conversation header. The header must also match the committed Queen UUID and slug. Copies can share a workspace UUID, so select the filesystem copy and its Dolt target explicitly. Physical database-to-root binding and active-root authority are outside this inspection. See the [conversation file contract](../architecture/dolt-workspace-contract.md#private-queen-conversation-file-contract).
 
+On Linux and macOS, list a Queen's published conversation metadata with the same explicit workspace and Dolt selection.
+
+```sh
+hive --contract 2 --json conversation list --workspace /example/hive-v2-userdata \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001 \
+  --bot 01900000-0000-7000-8000-00000000000a --limit 25
+```
+
+List returns metadata in descending conversation UUID order for one active or retired Queen. The default page size is 25 and the maximum is 100. To continue, pass `next_cursor` as `--cursor` with the same selection and page size. The observed revision is a digest of the published frontmatter. A different workspace copy, Dolt target, committed snapshot, Queen, page size, or published metadata set returns `STALE_CURSOR`. List stops at the closing frontmatter delimiter of each file and skips unpublished staging files. It returns `CONTEXT_LIMIT` if the full scan exceeds 4,096 directory entries (including staging) or 4 MiB of frontmatter, including delimiters.
+
 ## Agent-assisted development
 
 Use [instruction ownership](agents/rule-ownership.md) to place scoped guidance, [asset lifecycle](agents/assets.md) when selecting or updating reusable Agent Assets, and [harness verification](agents/harness.md) to distinguish configuration from observed runtime behavior.

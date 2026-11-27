@@ -22,7 +22,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::cli::{
-    CommonOptions, ConversationShowArgs, DoltTargetArgs, IssueShowArgs, ValidateArgs,
+    CommonOptions, ConversationListArgs, ConversationShowArgs, DoltTargetArgs, IssueShowArgs,
+    ValidateArgs,
 };
 use crate::error::{ErrorCode, HiveError};
 
@@ -79,6 +80,36 @@ pub(crate) fn conversation_show(
         Err(DoltFailure::without_context(HiveError::new(
             ErrorCode::NotImplemented,
             "Conversation inspection is unavailable on this platform.",
+        )))
+    }
+}
+
+pub(crate) fn conversation_list(
+    common: &CommonOptions,
+    args: &ConversationListArgs,
+) -> Result<DoltSuccess, Box<DoltFailure>> {
+    let bot_id = conversation_selector(args.bot.as_deref(), "--bot")?;
+    let limit = args
+        .limit
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| (1..=100).contains(limit))
+        .ok_or_else(|| {
+            DoltFailure::without_context(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "Use a page size between 1 and 100.",
+            ))
+        })?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        conversation::list(common, args, bot_id, limit)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (common, bot_id, limit, &args.cursor);
+        Err(DoltFailure::without_context(HiveError::new(
+            ErrorCode::NotImplemented,
+            "Conversation listing is unavailable on this platform.",
         )))
     }
 }
