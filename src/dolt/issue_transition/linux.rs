@@ -958,7 +958,7 @@ impl Request<'_> {
             Some(commit) => require_active_area_at(db, self.area, commit, archived),
             None => require_active_area(db, self.area, archived),
         };
-        if self.operation != Operation::Claim {
+        if !matches!(self.operation, Operation::Claim | Operation::Submit) {
             return active;
         }
         let mut blockers = Vec::new();
