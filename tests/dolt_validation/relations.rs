@@ -228,3 +228,85 @@ fn reports_missing_join_endpoints_only_in_the_committed_snapshot() {
     assert_diagnostics(&report, &expected);
     assert_eq!(fixture.check(4, &mut admin), report);
 }
+
+#[test]
+#[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
+fn validates_committed_label_names_and_redacts_malformed_values() {
+    let fixture = Fixture::start();
+    let mut admin = fixture.connect(ADMIN);
+    let boundary = "é".repeat(100);
+    for (number, name) in [
+        (0x31, "Fíxture QA"),
+        (0x32, "버그 수정"),
+        (0x33, "e\u{0301}tiquette"),
+        (0x34, boundary.as_str()),
+    ] {
+        admin
+            .exec_drop(
+                "INSERT INTO labels (id, name, revision) VALUES (?, ?, 'fixture-revision')",
+                (id(number), name),
+            )
+            .unwrap();
+    }
+    commit(&mut admin);
+    let valid = fixture.check(0, &mut admin);
+    let baseline = storage_state(&mut admin);
+
+    let invalid_id = "invalid-label-id-fixture";
+    let malformed = [
+        (id(0x35), ""),
+        (id(0x36), "   "),
+        (id(0x37), "\u{00A0}leading"),
+        (id(0x38), "trailing\u{3000}"),
+        (id(0x39), "interior\tcontrol"),
+        (invalid_id.to_owned(), "bad\ncontrol"),
+    ];
+    for (label_id, name) in &malformed {
+        admin
+            .exec_drop(
+                "INSERT INTO labels (id, name, revision) VALUES (?, ?, 'fixture-revision')",
+                (label_id, name),
+            )
+            .unwrap();
+    }
+    let dirty = storage_state(&mut admin);
+    assert_ne!(dirty.1, baseline.1);
+    assert_eq!(dirty.2, baseline.2);
+    assert_eq!(fixture.check(0, &mut admin), valid);
+    admin.query_drop("CALL DOLT_ADD('labels')").unwrap();
+    assert_eq!(storage_state(&mut admin).2, dirty.1);
+    assert_eq!(fixture.check(0, &mut admin), valid);
+
+    commit(&mut admin);
+    let report = fixture.check(4, &mut admin);
+    let (id35, id36, id37, id38, id39) = (id(0x35), id(0x36), id(0x37), id(0x38), id(0x39));
+    assert_diagnostics(
+        &report,
+        &[
+            ("INVALID_LABEL_NAME", "labels", &[&id35]),
+            ("INVALID_LABEL_NAME", "labels", &[&id36]),
+            ("INVALID_LABEL_NAME", "labels", &[&id37]),
+            ("INVALID_LABEL_NAME", "labels", &[&id38]),
+            ("INVALID_LABEL_NAME", "labels", &[&id39]),
+            ("INVALID_ID", "labels", &[]),
+            ("INVALID_LABEL_NAME", "labels", &[]),
+        ],
+    );
+    let report_text = report.to_string();
+    assert!(!report_text.contains(invalid_id));
+    for (_, name) in &malformed {
+        if !name.trim().is_empty() {
+            assert!(!report_text.contains(name));
+        }
+    }
+    assert_eq!(fixture.check(4, &mut admin), report);
+
+    for (label_id, _) in &malformed {
+        admin
+            .exec_drop("DELETE FROM labels WHERE id=?", (label_id,))
+            .unwrap();
+    }
+    commit(&mut admin);
+    let restored = fixture.check(0, &mut admin);
+    assert_eq!(restored["data"], valid["data"]);
+}
