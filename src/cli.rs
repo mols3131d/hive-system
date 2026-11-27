@@ -2192,7 +2192,10 @@ fn recover_unknown_long(
     let (action, _) = matched.subcommand()?;
     if matches!(
         (domain, action),
-        ("issue", "set-parent" | "release" | "recover" | "submit")
+        (
+            "issue",
+            "set-parent" | "release" | "recover" | "submit" | "cancel" | "reopen"
+        )
     ) {
         return [true, false].into_iter().find_map(|equals| {
             replay_unknown_options(cli, args, error, (domain, action), equals, true)
@@ -2214,8 +2217,6 @@ fn recover_unknown_long(
                     | "release"
                     | "recover"
                     | "submit"
-                    | "cancel"
-                    | "reopen"
                     | "set-parent"
             )
     );
@@ -2379,6 +2380,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             "release",
             "recover",
             "submit",
+            "cancel",
+            "reopen",
             "add-dependency",
             "remove-dependency",
         ]
@@ -2430,8 +2433,6 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                     "release",
                     "recover",
                     "submit",
-                    "cancel",
-                    "reopen",
                 ],
             )
             .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "issue"))

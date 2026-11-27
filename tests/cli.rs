@@ -4348,6 +4348,14 @@ fn issue_reconciliation_preserves_contract_selection_and_structured_errors() {
     let id = "01900000-0000-7000-8000-000000000001";
     let revision = format!("{id}=fixture-r1");
     for action in ["cancel", "reopen"] {
+        for args in [
+            ["help", "issue", action, "--contract", "2"],
+            ["issue", "help", action, "--contract", "2"],
+        ] {
+            let output = sandbox.run(&args);
+            assert!(output.status.success(), "{args:?} {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("--reason"));
+        }
         let command = [
             "issue",
             action,
@@ -4375,6 +4383,7 @@ fn issue_reconciliation_preserves_contract_selection_and_structured_errors() {
             &[][..],
             &["--reason", "fixture-reason", "--reason", "fixture-reason"][..],
             &["--reason=--json", "--unknown", "fixture-value"][..],
+            &["--reason=--json", "-Z", "--unknown=--contract=1"][..],
         ] {
             let output =
                 sandbox.run(&[&command[..], suffix, &["--contract", "2", "--json"]].concat());
