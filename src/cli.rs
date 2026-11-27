@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::{
-    ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+    Arg, ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand,
+    ValueEnum,
     builder::{NonEmptyStringValueParser, StringValueParser, TypedValueParser},
     error::ErrorKind,
     value_parser,
@@ -257,7 +258,7 @@ pub(crate) enum Command {
 )]
 pub(crate) enum ConfigCommand {
     /// Show configuration and its provenance.
-    Show(ConfigScopeArgs),
+    Show(ConfigShowArgs),
     /// Validate configuration at the selected scope.
     Validate(ConfigScopeArgs),
     /// Create a project binding for an existing workspace scope.
@@ -272,6 +273,16 @@ pub(crate) enum ConfigCommand {
 pub(crate) struct ConfigScopeArgs {
     #[arg(long, value_enum, default_value = "resolved")]
     pub(crate) scope: ConfigScope,
+}
+
+#[derive(Args)]
+pub(crate) struct ConfigShowArgs {
+    #[command(flatten)]
+    pub(crate) target: ConfigScopeArgs,
+    #[arg(skip)]
+    pub(crate) area: Option<String>,
+    #[arg(skip)]
+    pub(crate) resource: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -699,8 +710,11 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     // retain every occurrence at the root and at the selected leaf.
     let mut cli = CommonArgs::augment_args(cli.mut_subcommands(add_leaf_options));
     let matches = match cli.clone().try_get_matches_from(&args).or_else(|error| {
-        if error.kind() == ErrorKind::ValueValidation {
-            retry_issue_list(&cli, &args).ok_or(error)
+        if matches!(
+            error.kind(),
+            ErrorKind::ValueValidation | ErrorKind::UnknownArgument
+        ) {
+            retry_v2_scope(&cli, &args, error.kind()).ok_or(error)
         } else {
             Err(error)
         }
@@ -756,11 +770,19 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     let parsed = || -> Result<_, &'static str> {
         let root = CommonArgs::from_arg_matches(&matches)
             .map_err(|error| safe_parse_message(error.kind()))?;
-        let leaf =
+        let leaf_common =
             CommonArgs::from_arg_matches(leaf).map_err(|error| safe_parse_message(error.kind()))?;
-        let common = root.resolve(leaf)?;
-        let Cli { command } =
+        let common = root.resolve(leaf_common)?;
+        let Cli { mut command } =
             Cli::from_arg_matches(&matches).map_err(|error| safe_parse_message(error.kind()))?;
+        if let Command::Config(ConfigCommand::Show(args)) = &mut command {
+            args.area = leaf.try_get_one::<String>("area").ok().flatten().cloned();
+            args.resource = leaf
+                .try_get_one::<PathBuf>("resource")
+                .ok()
+                .flatten()
+                .cloned();
+        }
         command.validate(&common)?;
         Ok((common, command))
     };
@@ -779,20 +801,41 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     }
 }
 
-fn retry_issue_list(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {
-    // A malformed Project must reach the v2 UUID check after Clap has read
-    // the contract and format. Keep the original parser for all other commands.
+fn retry_v2_scope(
+    cli: &clap::Command,
+    args: &[OsString],
+    error_kind: ErrorKind,
+) -> Option<ArgMatches> {
+    // Defer v2 UUID validation until Clap has read the contract and format.
+    // Add v2-only config options here to preserve legacy help and errors.
     let defer_project_check = |command: clap::Command| {
         command.mut_arg("project", |arg| {
             arg.value_parser(StringValueParser::new().map(ProjectId::Ordinary))
+                .allow_negative_numbers(true)
         })
     };
-    let retry = defer_project_check(cli.clone().mut_subcommand("issue", |issue| {
-        issue.mut_subcommand("list", defer_project_check)
-    }));
+    let retry = defer_project_check(
+        cli.clone()
+            .mut_subcommand("issue", |issue| {
+                issue.mut_subcommand("list", defer_project_check)
+            })
+            .mut_subcommand("config", |config| {
+                config.mut_subcommand("show", |show| {
+                    defer_project_check(show)
+                        .arg(Arg::new("area").long("area").allow_negative_numbers(true))
+                        .arg(
+                            Arg::new("resource")
+                                .long("resource")
+                                .value_parser(value_parser!(PathBuf)),
+                        )
+                })
+            }),
+    );
     let matches = retry.try_get_matches_from(args).ok()?;
     let (command, leaf) = matched_leaf(cli, &matches)?;
-    (command == "issue list" && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+    ((command == "config show"
+        || (command == "issue list" && error_kind == ErrorKind::ValueValidation))
+        && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }
 

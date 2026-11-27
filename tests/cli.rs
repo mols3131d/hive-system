@@ -917,3 +917,57 @@ fn malformed_dolt_list_project_preserves_late_v2_and_json_options() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8(output.stderr).unwrap().contains("UUIDv7"));
 }
+
+#[test]
+fn malformed_dolt_config_scope_preserves_late_v2_and_json_options() {
+    let sandbox = Sandbox::new();
+    let command = ["config", "show"];
+    let assert_scope_error = |args: &[&str], flag: &str| {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["ok"], false, "{args:?}");
+        assert_eq!(report["command"], "config show", "{args:?}");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT", "{args:?}");
+        let message = report["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(flag) && message.contains("UUIDv7"),
+            "{args:?}"
+        );
+    };
+    for (flag, value) in [
+        ("--area", "-1"),
+        ("--area", "123"),
+        ("--project", "-1"),
+        ("--project", "01900000-0000-7000-8000-00000000000A"),
+    ] {
+        let args = [
+            command.as_slice(),
+            &[flag, value, "--contract", "2", "--json"],
+        ]
+        .concat();
+        assert_scope_error(&args, flag);
+    }
+
+    for (flag, json_literal, contract_literal) in [
+        ("--area", "--area=--json", "--area=--contract"),
+        ("--project", "--project=--json", "--project=--contract"),
+    ] {
+        let args = [command.as_slice(), &[json_literal, "--contract", "2"]].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("UUIDv7"), "{args:?}");
+        assert!(!stderr.contains("--json"), "{args:?}");
+
+        let args = [
+            command.as_slice(),
+            &[contract_literal, "--contract", "2", "--json"],
+        ]
+        .concat();
+        assert_scope_error(&args, flag);
+    }
+}
