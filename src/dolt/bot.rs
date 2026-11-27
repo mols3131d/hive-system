@@ -1,11 +1,10 @@
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::cli::{DoltTargetArgs, is_slug};
 use crate::error::{ErrorCode, HiveError};
 
-use super::{DoltFailure, DoltSuccess, Snapshot, is_uuid_v7};
+use super::{DoltFailure, DoltSuccess, Snapshot, encode_id_cursor, id_cursor_key, is_uuid_v7};
 
 const COLUMNS: &str =
     "id, slug, display_name, revision, DATE_FORMAT(retired_at, '%Y-%m-%dT%H:%i:%s.%fZ')";
@@ -71,7 +70,11 @@ pub(crate) fn list(
         return Err(invalid("Use a page size between 1 and 100."));
     }
     let cursor = cursor
-        .map(parse_cursor)
+        .map(|cursor| {
+            id_cursor_key(cursor)
+                .map(|id| (id, cursor))
+                .ok_or_else(stale_cursor)
+        })
         .transpose()
         .map_err(DoltFailure::without_context)?;
 
@@ -85,7 +88,7 @@ pub(crate) fn list(
             limit
         ]);
         let (comparison, after) = match cursor {
-            Some((id, cursor)) if cursor == encode_cursor(id, &binding) => (">", id),
+            Some((id, cursor)) if cursor == encode_id_cursor(id, &binding) => (">", id),
             Some(_) => return Err(stale_cursor()),
             None => (">=", ""),
         };
@@ -107,7 +110,7 @@ pub(crate) fn list(
         let next_cursor = items
             .last()
             .filter(|_| truncated)
-            .map(|item| encode_cursor(&item.id, &binding));
+            .map(|item| encode_id_cursor(&item.id, &binding));
         Ok(json!({
             "items": items,
             "next_cursor": next_cursor,
@@ -153,24 +156,6 @@ fn read(
 
 fn invalid(message: &str) -> Box<DoltFailure> {
     DoltFailure::without_context(HiveError::new(ErrorCode::InvalidArgument, message))
-}
-
-fn encode_cursor(id: &str, binding: &Value) -> String {
-    let digest = Sha256::digest(json!([binding, id]).to_string());
-    format!("{id}.{digest:x}")
-}
-
-fn parse_cursor(cursor: &str) -> Result<(&str, &str), HiveError> {
-    if cursor.len() == 36 + 1 + 64
-        && let Some((id, digest)) = cursor.split_once('.')
-        && is_uuid_v7(id)
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return Ok((id, cursor));
-    }
-    Err(stale_cursor())
 }
 
 fn stale_cursor() -> HiveError {

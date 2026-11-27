@@ -632,7 +632,6 @@ pub(crate) enum ArtifactStatus {
 }
 
 #[derive(Subcommand)]
-#[allow(dead_code, reason = "Directive operations follow the CLI bootstrap")]
 pub(crate) enum DirectiveCommand {
     /// List directives in the selected scope.
     List {
@@ -640,12 +639,28 @@ pub(crate) enum DirectiveCommand {
         status: DirectiveStatus,
         #[command(flatten)]
         page: ListArgs,
+        #[arg(long, hide = true)]
+        cursor: Option<String>,
+        #[command(flatten)]
+        selection: DirectiveSelection,
     },
     /// Read a directive in the selected scope.
     Show {
         #[arg(value_parser = parse_slug)]
         id: String,
+        #[command(flatten)]
+        selection: DirectiveSelection,
     },
+}
+
+#[derive(Args)]
+pub(crate) struct DirectiveSelection {
+    #[arg(long, hide = true)]
+    pub(crate) workspace_scope: bool,
+    #[arg(long, hide = true, allow_negative_numbers = true)]
+    pub(crate) area: Option<String>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -880,20 +895,19 @@ pub(crate) struct ValidateArgs {
 
 pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     let args: Vec<_> = std::env::args_os().collect();
-    let cli = Cli::command();
     // Global clap arguments propagate values across levels. Separate declarations
     // retain every occurrence at the root and at the selected leaf.
-    let mut cli = CommonArgs::augment_args(cli.mut_subcommands(add_leaf_options)).mut_subcommand(
-        "bot",
-        |bot| {
-            bot.mut_subcommands(|leaf| {
+    let mut cli = CommonArgs::augment_args(Cli::command().mut_subcommands(add_leaf_options));
+    for domain in ["bot", "directive"] {
+        cli = cli.mut_subcommand(domain, |command| {
+            command.mut_subcommands(|leaf| {
                 leaf.mut_args(|arg| match arg.get_id().as_str() {
                     "workspace_id" | "database" | "port" => arg.hide(true),
                     _ => arg,
                 })
             })
-        },
-    );
+        });
+    }
     if let Some(result) = parse_dolt_artifact(&cli, &args) {
         return result;
     }
@@ -944,7 +958,8 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             let partial = resource_matches
                 .or(config_error_matches)
                 .or(area_matches)
-                .or_else(|| retry_bot_failure(&cli, &args, error.kind()))
+                .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "bot"))
+                .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
                 .or_else(|| retry_conversation_failure(&cli, &args, error.kind()))
                 .or_else(|| {
                     cli.clone()
@@ -1000,7 +1015,8 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 .command
         };
         if common.contract == Contract::V2
-            && let Command::Bot(BotCommand::List { page, .. }) = &mut command
+            && let Command::Bot(BotCommand::List { page, .. })
+            | Command::Directive(DirectiveCommand::List { page, .. }) = &mut command
             && leaf.value_source("limit") == Some(clap::parser::ValueSource::DefaultValue)
         {
             page.limit = 25;
@@ -1422,17 +1438,19 @@ fn retry_config_show(
     }
 }
 
-fn retry_bot_failure(
+fn retry_scoped_read_failure(
     cli: &clap::Command,
     args: &[OsString],
-    kind: ErrorKind,
+    error: &clap::Error,
+    domain: &str,
 ) -> Option<ArgMatches> {
     if !matches!(
-        kind,
+        error.kind(),
         ErrorKind::ValueValidation
             | ErrorKind::InvalidValue
             | ErrorKind::UnknownArgument
             | ErrorKind::ArgumentConflict
+            | ErrorKind::TooManyValues
     ) {
         return None;
     }
@@ -1449,24 +1467,45 @@ fn retry_bot_failure(
             "at" | "workspace" | "project_root" => {
                 recover_value(arg.value_parser(StringValueParser::new()))
             }
+            "authority" | "workspace_scope" if domain == "directive" => {
+                recover_value(arg.value_parser(StringValueParser::new())).require_equals(true)
+            }
             _ => arg,
         })
     };
-    let retry = recover_scope(cli.clone().mut_subcommand("bot", |bot| {
-        bot.mut_subcommands(|leaf| {
+    let retry = recover_scope(cli.clone().mut_subcommand(domain, |command| {
+        command.mut_subcommands(|leaf| {
             recover_scope(leaf).mut_args(|arg| match arg.get_id().as_str() {
-                "database" | "workspace_id" | "port" | "cursor" | "status" => recover_value(arg),
-                "limit" | "after" => recover_value(arg.value_parser(StringValueParser::new())),
-                "bot_id" => arg
+                "database" | "workspace_id" | "port" | "cursor" | "area" => recover_value(arg),
+                "status" | "limit" | "after" => {
+                    recover_value(arg.value_parser(StringValueParser::new()))
+                }
+                "bot_id" | "id" => arg
                     .value_parser(StringValueParser::new())
                     .allow_negative_numbers(true),
                 _ => arg,
             })
         })
     }));
-    let matches = retry.try_get_matches_from(args).ok()?;
+    let matches = retry.clone().try_get_matches_from(args).ok().or_else(|| {
+        if domain != "directive" || error.kind() != ErrorKind::UnknownArgument {
+            return None;
+        }
+        let partial = retry
+            .clone()
+            .ignore_errors(true)
+            .try_get_matches_from(args)
+            .ok()?;
+        // Recovery only needs output metadata, even if show has no ID.
+        let retry = retry.mut_subcommand(domain, |command| {
+            command.mut_subcommand("show", |show| show.mut_arg("id", |id| id.required(false)))
+        });
+        recover_unknown_long(&retry, args, domain, &partial, error)
+    })?;
     let (command, leaf) = matched_leaf(cli, &matches)?;
-    (matches!(command.as_str(), "bot list" | "bot show")
+    (command
+        .split_once(' ')
+        .is_some_and(|(matched, _)| matched == domain)
         && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }
@@ -1775,6 +1814,7 @@ impl Command {
                 ) => args.validate_dolt_selection(common),
                 Self::Project(_) => Err("Use contract 2 Project read options."),
                 Self::Bot(command) => command.validate(common),
+                Self::Directive(command) => command.validate(common),
                 Self::Workspace(_)
                     if common.workspace.is_some()
                         || common.project.is_some()
@@ -1808,6 +1848,7 @@ impl Command {
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),
             Self::Conversation(_) => Err("Conversation commands require --contract 2."),
             Self::Bot(command) => command.validate(common),
+            Self::Directive(command) => command.validate(common),
             Self::Validate(args) => {
                 if args.all || args.target.has_any() {
                     return Err("Dolt validation requires --contract 2.");
@@ -1821,6 +1862,52 @@ impl Command {
             Self::Artifact(command) => command.validate(common),
             _ => Ok(()),
         }
+    }
+}
+
+impl DirectiveCommand {
+    fn validate(&self, common: &CommonOptions) -> Result<(), &'static str> {
+        let selection = match self {
+            Self::List { selection, .. } | Self::Show { selection, .. } => selection,
+        };
+        let cursor = matches!(
+            self,
+            Self::List {
+                cursor: Some(_),
+                ..
+            }
+        );
+        if common.contract == Contract::V1 {
+            if selection.target.has_any()
+                || selection.workspace_scope
+                || selection.area.is_some()
+                || cursor
+            {
+                return Err("Dolt Directive options require --contract 2.");
+            }
+            return Ok(());
+        }
+        if common.workspace.is_some()
+            || common.project_root.is_some()
+            || !matches!(common.view, View::WorkingTree)
+        {
+            return Err(
+                "Dolt Directive reads require an explicit local database and workspace ID.",
+            );
+        }
+        if !selection.target.has_all() {
+            return Err("Dolt Directive reads require --workspace-id, --database, and --port.");
+        }
+        if matches!(
+            self,
+            Self::List {
+                page: ListArgs { after: Some(_), .. },
+                ..
+            }
+        ) {
+            return Err("Use --cursor for Dolt Directive pagination.");
+        }
+        Ok(())
     }
 }
 
