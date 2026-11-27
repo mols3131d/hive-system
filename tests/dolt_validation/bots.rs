@@ -106,7 +106,7 @@ fn validates_committed_queen_registry_and_redacts_malformed_values() {
 fn inspects_committed_bot_metadata_and_pins_page_continuations() {
     use serde_json::{Value, json};
 
-    let fixture = Fixture::start();
+    let fixture = Fixture::start_empty();
     let mut admin = fixture.connect(ADMIN);
     let active = id(0x9a);
     let second = id(0x9b);
