@@ -266,6 +266,8 @@ pub(crate) enum Command {
     #[command(skip)]
     IssueCreate(IssueCreateArgs),
     #[command(skip)]
+    IssueUpdate(IssueUpdateArgs),
+    #[command(skip)]
     Resource(ResourceCommand),
     #[command(skip)]
     Workspace(WorkspaceAction),
@@ -1092,6 +1094,44 @@ pub(crate) struct IssueCreateArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueUpdateArgs {
+    /// Exact Issue UUIDv7.
+    pub(crate) issue: String,
+    /// Exact owning Area UUIDv7.
+    #[arg(long)]
+    pub(crate) area: String,
+    #[arg(long)]
+    pub(crate) title: Option<String>,
+    /// Replacement UTF-8 Issue body file.
+    #[arg(long)]
+    pub(crate) file: Option<PathBuf>,
+    /// Replacement UTF-8 acceptance criteria file.
+    #[arg(long)]
+    pub(crate) acceptance_file: Option<PathBuf>,
+    /// Priority (0–3).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=3))]
+    pub(crate) priority: Option<u8>,
+    /// Set a hold reason.
+    #[arg(long, conflicts_with = "clear_hold")]
+    pub(crate) hold: Option<String>,
+    /// Remove the current hold.
+    #[arg(long)]
+    pub(crate) clear_hold: bool,
+    #[arg(long)]
+    pub(crate) actor: String,
+    /// Expected Issue revision as ISSUE=REV.
+    #[arg(long)]
+    pub(crate) if_match: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Fresh, request-bound operator decision file.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueListArgs {
     /// Select Issues across the workspace.
     #[arg(long)]
@@ -1309,6 +1349,12 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             Some(("issue", issue)) if issue.subcommand_name() == Some("create") => {
                 Command::IssueCreate(
                     IssueCreateArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("update") => {
+                Command::IssueUpdate(
+                    IssueUpdateArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
             }
@@ -1833,6 +1879,10 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                     "Create a backlog Issue under an exact Area with a current operator decision.",
                 ),
             )))
+            .subcommand(add_leaf_options(IssueUpdateArgs::augment_args(
+                clap::Command::new("update")
+                    .about("Edit an Issue with a current operator decision."),
+            )))
     });
     // Probe contract selection through Clap so a file name or an actor that
     // resembles a switch does not introduce the new leaf into the v1 grammar.
@@ -1841,6 +1891,7 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             extended_help_probe(issue)
                 .mut_subcommand("note", extended_error_options)
                 .mut_subcommand("create", extended_error_options)
+                .mut_subcommand("update", extended_error_options)
         });
     let partial = match recovery.clone().try_get_matches_from(args) {
         Ok(matches) => matches,
@@ -1855,7 +1906,7 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
     };
     let leaf = match partial.subcommand() {
         Some(("issue", issue)) => match issue.subcommand() {
-            Some(("note" | "create", leaf)) => Some(leaf),
+            Some(("note" | "create" | "update", leaf)) => Some(leaf),
             None => None,
             _ => return None,
         },
@@ -2692,6 +2743,20 @@ impl Command {
                     }
                     Ok(())
                 }
+                Self::IssueUpdate(args) => {
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Issue update requires --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err("Issue update requires exact current Area and Issue scope.");
+                    }
+                    Ok(())
+                }
                 Self::IssueNote(args) => {
                     if args.kind != "progress" {
                         return Err("Issue note requires --kind progress.");
@@ -2785,7 +2850,7 @@ impl Command {
             }
             Self::Operation(_) => Err("Operation show requires --contract 2."),
             Self::Area(_) => Err("Area commands require --contract 2."),
-            Self::Issue(_) | Self::IssueNote(_) | Self::IssueCreate(_) => {
+            Self::Issue(_) | Self::IssueNote(_) | Self::IssueCreate(_) | Self::IssueUpdate(_) => {
                 Err("Issue commands require --contract 2.")
             }
             Self::Backup(_) => Err("Backup commands require --contract 2."),

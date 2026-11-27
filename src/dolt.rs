@@ -24,6 +24,7 @@ mod issue_note_fingerprint;
 #[cfg(target_os = "linux")]
 mod issue_note_receipt;
 mod issue_readiness;
+pub(crate) mod issue_update;
 #[cfg(target_os = "linux")]
 pub(crate) mod issue_writer;
 pub(crate) mod label;

@@ -3,6 +3,8 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
+#[path = "runtime/issue_update.rs"]
+mod issue_update;
 
 fn random_uuid() -> String {
     fs::read_to_string("/proc/sys/kernel/random/uuid")
@@ -1269,6 +1271,7 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
         &restart,
         &dolt,
     );
+    issue_update::exercise(&state, &fixture_root, &port, &dolt, &run, &restart);
     issue_create_writer_fixture(&state, &fixture_root, &port, &dolt, &run, &restart);
     assert!(cleanup.finish(), "Verified runtime fixture stop failed");
 }
