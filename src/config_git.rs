@@ -6,7 +6,7 @@ use std::process::{Command, Output, Stdio};
 
 use crate::error::{ErrorCode, HiveError};
 
-const MAX_BLOB_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_BLOB_BYTES: usize = 128 * 1024;
 
 pub(crate) struct GitWorkspace {
     pub(crate) root: PathBuf,
@@ -346,8 +346,9 @@ impl<'a> PinnedAssets<'a> {
             .read(OsStr::new("config"))?
             .unwrap_or_default();
         let reader = AssetObjectReader::new(&repository.objects, &config, revision.len())?;
-        let tree = reader.commit_tree(revision)?;
-        reader.verified_object("tree", &tree, 1024 * 1024)?;
+        let git = || reader.command();
+        let tree = committed_asset_tree(&git, revision)?;
+        verified_asset_object(&git, "tree", &tree, 1024 * 1024)?;
         let pinned = Self {
             root,
             repository,
@@ -429,11 +430,14 @@ impl<'a> PinnedAssets<'a> {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) const ASSET_BACKUP_REF: &str = "refs/heads/inspection";
+
+#[cfg(target_os = "linux")]
 pub(crate) fn with_asset_bundle<T>(
     root: &crate::config_file::ScopedDirectory,
     scratch: &Path,
     bundle: &Path,
-    complete: impl FnOnce(&str, &dyn Fn() -> Result<(), HiveError>) -> Result<T, HiveError>,
+    complete: impl FnOnce(&str, &Path, &dyn Fn() -> Result<(), HiveError>) -> Result<T, HiveError>,
 ) -> Result<T, HiveError> {
     let repository = AssetRepository::open(root)?;
     let head = execute_asset(
@@ -464,7 +468,7 @@ pub(crate) fn with_asset_bundle<T>(
         .unwrap_or_default();
     let reader =
         AssetObjectReader::new_in(&pinned.repository.objects, &config, revision.len(), scratch)?;
-    let head_ref = "refs/heads/inspection";
+    let head_ref = ASSET_BACKUP_REF;
     let check = |command: &mut Command| {
         let result = execute_asset(command, 64 * 1024, None)?;
         if !result.status.success() {
@@ -504,9 +508,118 @@ pub(crate) fn with_asset_bundle<T>(
     }
     check(command().args(["update-ref", head_ref, revision]))?;
     check(command().args(["fsck", "--full", "--no-reflogs", revision]))?;
+    verify_checkout_tree(command, revision)?;
     // The artifact contains only the verified bundle; Git's local metadata
     // lives in scratch and will be removed with it.
-    complete(revision, &recheck)
+    complete(revision, &verify, &recheck)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_checkout_tree(
+    git: impl Fn() -> Command,
+    revision: &str,
+) -> Result<HashSet<PathBuf>, HiveError> {
+    use std::collections::{HashMap, VecDeque};
+    use std::os::unix::ffi::OsStrExt;
+
+    let invalid = || {
+        HiveError::new(
+            ErrorCode::AuthorityUnverified,
+            "The asset tree contains an unsupported entry or unsafe symbolic link.",
+        )
+    };
+    let read = |args: &[&str], limit| {
+        let output = execute_asset(git().args(args), limit, None).map_err(|_| invalid())?;
+        if !output.status.success() {
+            return Err(invalid());
+        }
+        Ok(output.stdout)
+    };
+    // These are verified Git objects. Use raw path bytes and resolve every link
+    // against the tree before checkout, without traversing host paths.
+    let listing = read(&["ls-tree", "-r", "-z", revision], 64 * 1024 * 1024)?;
+    let mut files = HashSet::new();
+    let mut directories = HashSet::new();
+    let mut links = HashMap::new();
+    let mut link_blobs = HashMap::new();
+    let mut entries = listing.split(|byte| *byte == 0);
+    if entries.next_back() != Some(&[][..]) {
+        return Err(invalid());
+    }
+    for entry in entries {
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(invalid)?;
+        let (metadata, name) = (&entry[..tab], &entry[tab + 1..]);
+        if let Some(oid) = metadata.strip_prefix(b"120000 blob ") {
+            let oid = std::str::from_utf8(oid)
+                .ok()
+                .filter(|oid| oid.len() == revision.len() && is_full_lowercase_oid(oid))
+                .ok_or_else(invalid)?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = link_blobs.entry(oid) {
+                let target = read(&["cat-file", "blob", oid], 4095)?;
+                if target.is_empty() || target.starts_with(b"/") || target.contains(&0) {
+                    return Err(invalid());
+                }
+                entry.insert(target);
+            }
+            links.insert(name, oid);
+        } else if metadata.starts_with(b"100644 blob ") || metadata.starts_with(b"100755 blob ") {
+            files.insert(name);
+        } else {
+            return Err(invalid());
+        }
+        // A Git subtree with no checkout entries does not create a directory.
+        let mut parent = name;
+        while let Some(slash) = parent.iter().rposition(|byte| *byte == b'/') {
+            parent = &parent[..slash];
+            if !directories.insert(parent) {
+                break;
+            }
+        }
+    }
+
+    let mut validated = HashSet::new();
+    for name in links.keys() {
+        let mut pending: VecDeque<_> = name.split(|byte| *byte == b'/').collect();
+        let mut path = Vec::new();
+        let mut followed = 0;
+        while let Some(part) = pending.pop_front() {
+            match part {
+                b"" | b"." => continue,
+                b".." => {
+                    if path.is_empty() {
+                        return Err(invalid());
+                    }
+                    path.truncate(path.iter().rposition(|byte| *byte == b'/').unwrap_or(0));
+                }
+                _ => {
+                    let parent_len = path.len();
+                    if parent_len != 0 {
+                        path.push(b'/');
+                    }
+                    path.extend_from_slice(part);
+                    if let Some(oid) = links.get(path.as_slice()) {
+                        followed += 1;
+                        if followed > 40 {
+                            return Err(invalid());
+                        }
+                        path.truncate(parent_len);
+                        for part in link_blobs[oid].rsplit(|byte| *byte == b'/') {
+                            pending.push_front(part);
+                        }
+                    } else if !(directories.contains(path.as_slice())
+                        || pending.is_empty() && files.contains(path.as_slice()))
+                    {
+                        return Err(invalid());
+                    }
+                }
+            }
+        }
+        validated.insert(PathBuf::from(OsStr::from_bytes(name)));
+    }
+    Ok(validated)
 }
 
 #[cfg(target_os = "linux")]
@@ -588,16 +701,10 @@ impl AssetRepository {
     }
 
     fn read(&self, revision: &str, relative: &Path) -> Result<Option<Vec<u8>>, HiveError> {
-        if !is_full_oid(revision) {
-            return Err(HiveError::new(
-                ErrorCode::InvalidArgument,
-                "A snapshot requires a full Git commit object ID",
-            ));
-        }
-        relative_git_path(relative)?;
+        validate_asset_blob_selection(revision, relative)?;
         let config = self.git_dir.read(OsStr::new("config"))?.unwrap_or_default();
         let reader = AssetObjectReader::new(&self.objects, &config, revision.len())?;
-        reader.read(revision, relative)
+        read_committed_asset_blob(&|| reader.command(), revision, relative)
     }
 }
 
@@ -678,56 +785,81 @@ impl<'a> AssetObjectReader<'a> {
         command.env("GIT_OBJECT_DIRECTORY", objects);
         Ok(command)
     }
+}
 
-    fn read(&self, revision: &str, relative: &Path) -> Result<Option<Vec<u8>>, HiveError> {
-        const MAX_METADATA_BYTES: usize = 1024 * 1024;
-
-        let mut oid = self.commit_tree(revision)?;
-        let mut path = relative.components().peekable();
-        while let Some(component) = path.next() {
-            let tree = self.verified_object("tree", &oid, MAX_METADATA_BYTES)?;
-            let Some(child) = asset_tree_child(
-                &tree,
-                component.as_os_str().as_encoded_bytes(),
-                revision.len() / 2,
-                path.peek().is_none(),
-            )?
-            else {
-                return Ok(None);
-            };
-            oid = child;
-        }
-        self.verified_object("blob", &oid, MAX_BLOB_BYTES).map(Some)
+#[cfg(target_os = "linux")]
+fn validate_asset_blob_selection(revision: &str, relative: &Path) -> Result<(), HiveError> {
+    if !is_full_oid(revision) {
+        return Err(HiveError::new(
+            ErrorCode::InvalidArgument,
+            "A snapshot requires a full Git commit object ID",
+        ));
     }
+    relative_git_path(relative)?;
+    Ok(())
+}
 
-    fn commit_tree(&self, revision: &str) -> Result<String, HiveError> {
-        let commit = self.verified_object("commit", &revision.to_ascii_lowercase(), 1024 * 1024)?;
-        commit
-            .split(|byte| *byte == b'\n')
-            .next()
-            .and_then(|line| line.strip_prefix(b"tree "))
-            .and_then(|oid| str::from_utf8(oid).ok())
-            .filter(|oid| oid.len() == revision.len() && is_full_oid(oid))
-            .map(str::to_ascii_lowercase)
-            .ok_or_else(unavailable_blob)
+#[cfg(target_os = "linux")]
+pub(crate) fn read_committed_asset_blob(
+    git: &impl Fn() -> Result<Command, HiveError>,
+    revision: &str,
+    relative: &Path,
+) -> Result<Option<Vec<u8>>, HiveError> {
+    validate_asset_blob_selection(revision, relative)?;
+    let mut oid = committed_asset_tree(git, revision)?;
+    let mut path = relative.components().peekable();
+    while let Some(component) = path.next() {
+        let tree = verified_asset_object(git, "tree", &oid, 1024 * 1024)?;
+        let Some(child) = asset_tree_child(
+            &tree,
+            component.as_os_str().as_encoded_bytes(),
+            revision.len() / 2,
+            path.peek().is_none(),
+        )?
+        else {
+            return Ok(None);
+        };
+        oid = child;
     }
+    verified_asset_object(git, "blob", &oid, MAX_BLOB_BYTES).map(Some)
+}
 
-    fn verified_object(&self, kind: &str, oid: &str, limit: usize) -> Result<Vec<u8>, HiveError> {
-        let result = execute_asset(self.command()?.args(["cat-file", kind, oid]), limit, None)?;
-        if !result.status.success() {
-            return Err(unavailable_blob());
-        }
-        let hash = execute_asset(
-            self.command()?
-                .args(["hash-object", "-t", kind, "--stdin", "--no-filters"]),
-            65,
-            Some(&result.stdout),
-        )?;
-        if !hash.status.success() || git_line(&hash.stdout) != Some(oid.as_bytes()) {
-            return Err(unavailable_blob());
-        }
-        Ok(result.stdout)
+#[cfg(target_os = "linux")]
+fn committed_asset_tree(
+    git: &impl Fn() -> Result<Command, HiveError>,
+    revision: &str,
+) -> Result<String, HiveError> {
+    let commit = verified_asset_object(git, "commit", &revision.to_ascii_lowercase(), 1024 * 1024)?;
+    commit
+        .split(|byte| *byte == b'\n')
+        .next()
+        .and_then(|line| line.strip_prefix(b"tree "))
+        .and_then(|oid| std::str::from_utf8(oid).ok())
+        .filter(|oid| oid.len() == revision.len() && is_full_oid(oid))
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(unavailable_blob)
+}
+
+#[cfg(target_os = "linux")]
+fn verified_asset_object(
+    git: &impl Fn() -> Result<Command, HiveError>,
+    kind: &str,
+    oid: &str,
+    limit: usize,
+) -> Result<Vec<u8>, HiveError> {
+    let result = execute_asset(git()?.args(["cat-file", kind, oid]), limit, None)?;
+    if !result.status.success() {
+        return Err(unavailable_blob());
     }
+    let hash = execute_asset(
+        git()?.args(["hash-object", "-t", kind, "--stdin", "--no-filters"]),
+        65,
+        Some(&result.stdout),
+    )?;
+    if !hash.status.success() || git_line(&hash.stdout) != Some(oid.as_bytes()) {
+        return Err(unavailable_blob());
+    }
+    Ok(result.stdout)
 }
 
 #[cfg(target_os = "linux")]
@@ -1275,6 +1407,14 @@ mod tests {
         let read = |revision| read_asset_blob(&directory, revision, relative);
         assert_eq!(read(&committed).unwrap().unwrap(), b"committed");
         assert!(read(&missing).unwrap().is_none());
+        let read_snapshot = |revision| {
+            read_committed_asset_blob(&|| Ok(isolated_git_command(&assets)), revision, relative)
+        };
+        assert_eq!(read_snapshot(&committed).unwrap().unwrap(), b"committed");
+        assert!(matches!(
+            read_snapshot(&linked).unwrap_err().code,
+            ErrorCode::InvalidConfig
+        ));
         for (revision, expected) in [
             (&linked[..], ErrorCode::InvalidConfig),
             (&oversized, ErrorCode::InvalidConfig),

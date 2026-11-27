@@ -1,9 +1,9 @@
-use super::{Diagnostics, HiveError, Snapshot};
+use super::{Diagnostics, HiveError, RecordReader};
 
 const TABLE: &str = "artifacts";
 
 pub(super) fn validate(
-    snapshot: &mut Snapshot,
+    snapshot: &mut RecordReader<'_>,
     diagnostics: &mut Diagnostics,
 ) -> Result<Vec<String>, HiveError> {
     let rows = snapshot.records::<(String, String, bool, bool)>(

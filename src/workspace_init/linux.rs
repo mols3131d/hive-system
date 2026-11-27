@@ -15,7 +15,7 @@ use crate::{config_file, config_v2};
 
 mod registration;
 mod tools;
-pub(crate) use tools::Installed;
+pub(crate) use tools::{Installed, restrict_db_modes};
 
 const POLICY_REVISION: &str = "c66b3c50150e18426485d134de92c6b311dac125";
 // Assets init fixes the Git object format to SHA-1.
@@ -317,7 +317,7 @@ fn check_target_path(target: &Path, parent: &File, original: &File) -> Result<()
     Ok(())
 }
 
-fn lock_target(target: &File) -> Result<(), HiveError> {
+pub(crate) fn lock_target(target: &File) -> Result<(), HiveError> {
     // SAFETY: The descriptor stays open through preparation and publication.
     if unsafe { libc::flock(target.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Ok(());
@@ -336,7 +336,7 @@ fn lock_target(target: &File) -> Result<(), HiveError> {
     })
 }
 
-fn require_entries(target: &File, expected: &[&str]) -> Result<(), HiveError> {
+pub(crate) fn require_entries(target: &File, expected: &[&str]) -> Result<(), HiveError> {
     let mut count = 0;
     for entry in fs::read_dir(fd_path(target))
         .map_err(|_| io_error("Could not inspect the workspace target contents."))?
@@ -455,12 +455,25 @@ fn sync_directory(directory: &File) -> Result<(), HiveError> {
 }
 
 pub(crate) fn sync_tree(directory: &File) -> Result<(), HiveError> {
+    sync_tree_with_links(directory, Path::new(""), &std::collections::HashSet::new())
+}
+
+pub(crate) fn sync_tree_with_links(
+    directory: &File,
+    relative: &Path,
+    links: &std::collections::HashSet<PathBuf>,
+) -> Result<(), HiveError> {
     let sync_error = |_| io_error("Could not sync the verified workspace payload.");
     for entry in fs::read_dir(fd_path(directory)).map_err(sync_error)? {
         let entry = entry.map_err(sync_error)?;
-        if entry.file_type().map_err(sync_error)?.is_dir() {
+        let file_type = entry.file_type().map_err(sync_error)?;
+        let path = relative.join(entry.file_name());
+        if file_type.is_dir() {
             let child = open_directory(&entry.path())?;
-            sync_tree(&child)?;
+            sync_tree_with_links(&child, &path, links)?;
+        } else if file_type.is_symlink() && links.contains(&path) {
+            // The containing directory sync persists the link itself.
+            continue;
         } else {
             let file = config_file::open_regular_child(directory, &entry.file_name())?.ok_or_else(
                 || {
@@ -609,8 +622,8 @@ fn rename_entry(
     ))
 }
 
-fn inspect(target: &Path) -> Result<(File, File), HiveError> {
-    let name = target
+pub(crate) fn inspect_target_parent(target: &Path) -> Result<File, HiveError> {
+    target
         .file_name()
         .ok_or_else(|| invalid_target("The workspace target must name an empty directory."))?;
     if config_v2::has_init_stage_component(target)
@@ -642,9 +655,20 @@ fn inspect(target: &Path) -> Result<(File, File), HiveError> {
     }
     refuse_workspace_ancestor(&directory)?;
     require_local_filesystem(&directory)?;
+    Ok(directory)
+}
+
+fn inspect(target: &Path) -> Result<(File, File), HiveError> {
+    let directory = inspect_target_parent(target)?;
+    let name = target.file_name().expect("inspected target has a name");
     let original = open_directory(&fd_path(&directory).join(name))?;
-    let child = dir_metadata(&original)?;
-    if child.dev() != dir_metadata(&directory)?.dev() {
+    verify_target_directory(&directory, &original)?;
+    Ok((directory, original))
+}
+
+pub(crate) fn verify_target_directory(parent: &File, original: &File) -> Result<(), HiveError> {
+    let child = dir_metadata(original)?;
+    if child.dev() != dir_metadata(parent)?.dev() {
         return Err(invalid_target(
             "The workspace target must share its parent's filesystem.",
         ));
@@ -655,7 +679,7 @@ fn inspect(target: &Path) -> Result<(File, File), HiveError> {
             "The empty target must be owned by the invoking user and protected from other writers.",
         ));
     }
-    Ok((directory, original))
+    Ok(())
 }
 
 fn open_directory(path: &Path) -> Result<File, HiveError> {
@@ -685,7 +709,7 @@ fn dir_metadata(directory: &File) -> Result<Metadata, HiveError> {
         .map_err(|_| io_error("Could not inspect workspace directory ownership."))
 }
 
-fn same_directory(left: &File, right: &File) -> Result<bool, HiveError> {
+pub(crate) fn same_directory(left: &File, right: &File) -> Result<bool, HiveError> {
     let left = dir_metadata(left)?;
     let right = dir_metadata(right)?;
     Ok(same_inode(&left, &right))
