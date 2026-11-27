@@ -38,14 +38,23 @@ pub(super) fn run(
     with_registered(
         options,
         format,
-        false,
-        |workspace, state, db, _, noms, _| {
+        !matches!(command, WorkspaceCommand::Start { .. }),
+        |workspace, state, check_selection| {
             let id = workspace.workspace_id();
             let root = json_path(&workspace.root.path)?;
-
-            if state.contains(c"starting")? {
-                return Err(unverified("An interrupted launch requires inspection."));
+            if let WorkspaceCommand::Recover { dolt_bin } = command {
+                return recovery::recover(
+                    state,
+                    &workspace.root,
+                    id,
+                    root,
+                    dolt_bin,
+                    check_selection,
+                );
             }
+
+            require_no_launch_intent(state)?;
+            let store = recovery::Store::open(&workspace.root)?;
             let server: Option<Server> = read_json(Some(state), "server.json")?;
             match command {
                 WorkspaceCommand::Start { dolt_bin, port } => {
@@ -59,15 +68,23 @@ pub(super) fn run(
                             "A pending request requires recovery before start.",
                         ));
                     }
-                    start(state, db, noms, id, root, dolt_bin, parse_port(port)?)
+                    start(
+                        state,
+                        &store.db,
+                        &store.noms,
+                        id,
+                        root,
+                        dolt_bin,
+                        parse_port(port)?,
+                    )
                 }
                 WorkspaceCommand::Stop => {
                     let server =
                         server.ok_or_else(|| unverified("No owned server is recorded."))?;
                     check_server(&server, id, root)?;
-                    stop(state, noms, &server)
+                    stop(state, &store, &server, check_selection)
                 }
-                WorkspaceCommand::Status(_) => unreachable!(),
+                WorkspaceCommand::Recover { .. } | WorkspaceCommand::Status(_) => unreachable!(),
             }
         },
     )
@@ -80,10 +97,7 @@ fn with_registered<T>(
     operation: impl FnOnce(
         &Candidate,
         &ScopedDirectory,
-        &ScopedDirectory,
-        &ScopedDirectory,
-        &ScopedDirectory,
-        &File,
+        &dyn Fn() -> Result<(), HiveError>,
     ) -> Result<T, HiveError>,
 ) -> Result<T, HiveError> {
     let workspace = select_workspace(options, format)?.candidate;
@@ -93,7 +107,7 @@ fn with_registered<T>(
         .ok_or_else(|| unverified("No active-root registration exists for this workspace."))?;
     require_private_dir(&state)?;
     require_local_filesystem(&state)?;
-    let held_lock = if existing_lock {
+    let held = if existing_lock {
         lock_file(regular(&state, "lock")?, libc::LOCK_EX)?
     } else {
         lock(&state)?
@@ -101,32 +115,30 @@ fn with_registered<T>(
 
     // Resolve again after taking the lock. A moved path or replaced descriptor
     // must not give a different root or UUID access to this state.
-    let selected = read_explicit(&workspace.root.path)?;
-    if workspace.root.file_identity()? != selected.root.file_identity()?
-        || selected.workspace_id() != id
-        || find_state(id, &workspace.root.path)?
-            .ok_or_else(|| unverified("The workspace state directory disappeared."))?
-            .file_identity()?
-            != state.file_identity()?
-    {
-        return Err(unverified("The selected workspace or its state changed."));
-    }
-    let registration: Registration = read_json(Some(&state), "active-root.json")?
-        .ok_or_else(|| unverified("No active-root registration exists for this workspace."))?;
-    check_identity(
-        registration.version,
-        &registration.workspace_id,
-        &registration.workspace_root,
-        id,
-        root,
-    )?;
-    let db = child_dir(&workspace.root, DATABASE)?;
-    let native = child_dir(&db, ".dolt")?;
-    let noms = child_dir(&native, "noms")?;
-    require_local_filesystem(&noms)?;
-    regular(&noms, "manifest")?;
-
-    operation(&workspace, &state, &db, &native, &noms, &held_lock)
+    let check_selection = || -> Result<(), HiveError> {
+        let selected = read_explicit(&workspace.root.path)?;
+        if !same_file(&held, &regular(&state, "lock")?)?
+            || workspace.root.file_identity()? != selected.root.file_identity()?
+            || selected.workspace_id() != id
+            || find_state(id, &workspace.root.path)?
+                .ok_or_else(|| unverified("The workspace state directory disappeared."))?
+                .file_identity()?
+                != state.file_identity()?
+        {
+            return Err(unverified("The selected workspace or its state changed."));
+        }
+        let registration: Registration = read_json(Some(&state), "active-root.json")?
+            .ok_or_else(|| unverified("No active-root registration exists for this workspace."))?;
+        check_identity(
+            registration.version,
+            &registration.workspace_id,
+            &registration.workspace_root,
+            id,
+            root,
+        )
+    };
+    check_selection()?;
+    operation(&workspace, &state, &check_selection)
 }
 
 pub(super) fn backup(
@@ -138,26 +150,15 @@ pub(super) fn backup(
         options,
         format,
         true,
-        |workspace, state, db, native, noms, held_lock| {
+        |workspace, state, check_selection| {
+            let store = recovery::Store::open(&workspace.root)?;
+            let (db, native, noms) = (&store.db, &store.dolt, &store.noms);
             let check_stopped = || {
+                check_selection()?;
                 for dir in [&workspace.root, state, db, native, noms] {
                     require_current_directory(dir)?;
                 }
-                let expected = held_lock.metadata().map_err(io_error)?;
-                let current = regular(state, "lock")?.metadata().map_err(io_error)?;
-                if (expected.dev(), expected.ino()) != (current.dev(), current.ino()) {
-                    return Err(unverified("The workspace lock file changed."));
-                }
                 let selected = read_explicit(&workspace.root.path)?;
-                let registration: Registration = read_json(Some(state), "active-root.json")?
-                    .ok_or_else(|| unverified("The active-root registration disappeared."))?;
-                check_identity(
-                    registration.version,
-                    &registration.workspace_id,
-                    &registration.workspace_root,
-                    workspace.workspace_id(),
-                    json_path(&workspace.root.path)?,
-                )?;
                 if selected.workspace_id() != workspace.workspace_id()
                     || selected.policy_revision() != workspace.policy_revision()
                     || state.contains(c"pending-request.json")?
@@ -171,13 +172,21 @@ pub(super) fn backup(
                 }
                 for entry in fs::read_dir(at(state, "")).map_err(io_error)? {
                     let entry = entry.map_err(io_error)?;
-                    if !matches!(
-                        entry.file_name().to_str(),
-                        Some("lock" | "active-root.json")
-                    ) {
-                        return Err(unverified(
-                            "Unrecognized workspace runtime state requires inspection.",
-                        ));
+                    match entry.file_name().to_str() {
+                        Some("lock" | "active-root.json") => {}
+                        // Recovery clears the marker durably before removing this proof.
+                        // A leftover proof cannot authorize recovery without that marker.
+                        Some(recovery::PROOF) => {
+                            let proof = regular(state, recovery::PROOF).map_err(|_| {
+                                unverified("The retained recovery proof is unsafe.")
+                            })?;
+                            require_private_file(&proof)?;
+                        }
+                        _ => {
+                            return Err(unverified(
+                                "Unrecognized workspace runtime state requires inspection.",
+                            ));
+                        }
                     }
                 }
                 // Dolt takes its native lock when opening the store. Probe it
@@ -308,21 +317,7 @@ fn start(
                 database: DATABASE.to_owned(),
             },
         };
-        let deadline = Instant::now() + WAIT;
-        loop {
-            if exited(&handle, Duration::ZERO)? {
-                return Err(unavailable("Dolt exited before becoming ready."));
-            }
-            if owns_listener(&proc, port)? {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err(unavailable(
-                    "Dolt did not acquire the requested loopback listener.",
-                ));
-            }
-            thread::sleep(RETRY);
-        }
+        wait_for_listener(&handle, &proc, port)?;
         let identity = verify(&server, state, &run, noms, &handle)?;
         let bytes = serde_json::to_vec(&server)
             .map_err(|_| unavailable("Could not encode the server record."))?;
@@ -362,8 +357,9 @@ fn start(
 
 fn stop(
     state: &ScopedDirectory,
-    noms: &ScopedDirectory,
+    store: &recovery::Store,
     server: &Server,
+    check_selection: &dyn Fn() -> Result<(), HiveError>,
 ) -> Result<Value, HiveError> {
     if server.endpoint.database != DATABASE {
         return Err(unverified(
@@ -374,16 +370,30 @@ fn stop(
     require_private_dir(&run)?;
     // Acquire a kernel process handle before checking mutable procfs entries.
     let handle = pidfd(server.pid)?;
-    verify(server, state, &run, noms, &handle)?;
+    let capture = verify_with(server, state, &run, &store.noms, &handle, |_, check| {
+        let capture = recovery::capture(state, store, server, &run)?;
+        check_selection()?;
+        require_no_launch_intent(state)?;
+        check()?;
+        Ok(capture)
+    })?;
     send_signal(&handle, libc::SIGTERM)?;
     if !exited(&handle, WAIT)? {
         return Err(unavailable(
             "Dolt exit was not confirmed; runtime state was preserved.",
         ));
     }
-    fs::remove_file(at(state, "server.json")).map_err(io_error)?;
-    sync(state)?;
-    remove_run(&run)?;
+    check_selection()?;
+    require_no_launch_intent(state)?;
+    if read_json::<Server>(Some(state), "server.json")?.as_ref() != Some(server) {
+        return Err(unverified(
+            "The owned Dolt server record changed during stop.",
+        ));
+    }
+    if let Some(capture) = capture {
+        capture.record_exit(state, store, server)?;
+    }
+    finish_owned_stop(state, &run)?;
     Ok(json!({
         "state": "stopped",
         "workspace_id": server.workspace_id,
@@ -391,6 +401,21 @@ fn stop(
         "process_exit": "pidfd_verified",
         "pending_request": if state.contains(c"pending-request.json")? { "recorded" } else { "unrecorded" },
     }))
+}
+
+fn finish_owned_stop(state: &ScopedDirectory, run: &ScopedDirectory) -> Result<(), HiveError> {
+    // A failed credential-directory cleanup must not leave a dead server
+    // recorded as active. Any pending exit proof has already been synced.
+    fs::remove_file(at(state, "server.json")).map_err(io_error)?;
+    sync(state)?;
+    remove_run(run)
+}
+
+fn require_no_launch_intent(state: &ScopedDirectory) -> Result<(), HiveError> {
+    if state.contains(c"starting")? {
+        return Err(unverified("An interrupted launch requires inspection."));
+    }
+    Ok(())
 }
 
 /// Hold the existing lifecycle lock and process handle around one authenticated read.
@@ -624,6 +649,8 @@ impl WriterRuntime<'_> {
 
 #[path = "workspace_runtime/pending.rs"]
 mod pending;
+#[path = "workspace_runtime/recovery.rs"]
+mod recovery;
 
 fn verify(
     server: &Server,
@@ -761,6 +788,24 @@ fn owns_listener(proc: &Path, port: NonZeroU16) -> Result<bool, HiveError> {
             && sockets.iter().any(|inode| inode == fields[6])
     });
     Ok(!unix_listener && listeners == [format!("0100007F:{:04X}", port.get())])
+}
+
+fn wait_for_listener(handle: &OwnedFd, process: &Path, port: NonZeroU16) -> Result<(), HiveError> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if exited(handle, Duration::ZERO)? {
+            return Err(unavailable("Dolt exited before becoming ready."));
+        }
+        if owns_listener(process, port)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(unavailable(
+                "Dolt did not acquire the requested loopback listener.",
+            ));
+        }
+        thread::sleep(RETRY);
+    }
 }
 
 fn pidfd(pid: i32) -> Result<OwnedFd, HiveError> {
@@ -1017,6 +1062,12 @@ fn regular(directory: &ScopedDirectory, name: &str) -> Result<File, HiveError> {
         .ok_or_else(|| unverified("A required workspace or runtime file is missing."))
 }
 
+fn same_file(first: &File, second: &File) -> Result<bool, HiveError> {
+    let first = first.metadata().map_err(io_error)?;
+    let second = second.metadata().map_err(io_error)?;
+    Ok((first.dev(), first.ino()) == (second.dev(), second.ino()))
+}
+
 fn read_private(directory: &ScopedDirectory, name: &str) -> Result<String, HiveError> {
     let file = regular(directory, name)?;
     require_private_file(&file)?;
@@ -1142,6 +1193,24 @@ fn io_error(error: io::Error) -> HiveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_server_record_is_removed_even_when_run_cleanup_refuses() {
+        let scratch = tempfile::tempdir().unwrap();
+        let state = ScopedDirectory::open_absolute(scratch.path()).unwrap();
+        let run = create_run(&state, "fixture").unwrap();
+        write_new(&state, "server.json", b"synthetic exited server").unwrap();
+        let retained = scratch.path().join("retained-run");
+        fs::rename(&run.path, &retained).unwrap();
+        let replacement = create_run(&state, "fixture").unwrap();
+
+        let error = finish_owned_stop(&state, &run).unwrap_err();
+
+        assert!(matches!(error.code, ErrorCode::AuthorityUnverified));
+        assert!(!state.contains(c"server.json").unwrap());
+        assert!(retained.is_dir());
+        require_current_directory(&replacement).unwrap();
+    }
 
     #[test]
     fn pidfd_requires_one_matching_positive_procfs_pid() {

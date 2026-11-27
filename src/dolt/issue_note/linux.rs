@@ -43,7 +43,7 @@ fn deserialize_evidence<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Pending {
+pub(crate) struct Pending {
     version: u8,
     workspace_id: String,
     launch_nonce: String,
@@ -421,31 +421,38 @@ fn reconcile(runtime: &WriterRuntime<'_>, workspace: &str) -> Result<Option<Snap
         .pending()
         .map_err(|_| uncertain())?
         .ok_or_else(uncertain)?;
-    let marker: Pending = workflow::parse_json_object::<_, serde_json::Error>(
-        serde_json::from_slice(&entry.bytes).map_err(|_| uncertain())?,
-    )
-    .map_err(|_| uncertain())?;
-    marker.validate(workspace, runtime.launch_nonce())?;
+    let marker = Pending::read(&entry.bytes, workspace, runtime.launch_nonce())?;
     visible_session(&mut observer.connection, Some(marker.session_id)).map_err(|_| uncertain())?;
 
     // Take the committed snapshot only after positive same-launch session evidence.
     let mut snapshot = runtime.open(false).map_err(|_| uncertain())?;
-    if confirm(&mut snapshot, &marker)
-        .map_err(|_| uncertain())?
-        .is_none()
-    {
-        if snapshot.commit != marker.base_commit
-            || has_receipt_history(&mut snapshot, &marker.request_id).map_err(|_| uncertain())?
-        {
-            return Err(uncertain());
-        }
-        require_clean(&mut snapshot.connection, &marker.base_commit).map_err(|_| uncertain())?;
-    }
+    marker.resolve(&mut snapshot).map_err(|_| uncertain())?;
     runtime.clear_pending(entry).map_err(|_| uncertain())?;
     Ok(Some(snapshot))
 }
 
 impl Pending {
+    pub(crate) fn read(bytes: &[u8], workspace: &str, nonce: &str) -> Result<Self, HiveError> {
+        let marker: Self = workflow::parse_json_object::<_, serde_json::Error>(
+            serde_json::from_slice(bytes).map_err(|_| uncertain())?,
+        )
+        .map_err(|_| uncertain())?;
+        marker.validate(workspace, nonce)?;
+        Ok(marker)
+    }
+
+    /// Requires positive prior-session termination and a fresh verified snapshot.
+    pub(crate) fn resolve(&self, snapshot: &mut Snapshot) -> Result<&'static str, HiveError> {
+        if confirm(snapshot, self)?.is_some() {
+            return Ok("confirmed");
+        }
+        if snapshot.commit != self.base_commit || has_receipt_history(snapshot, &self.request_id)? {
+            return Err(uncertain());
+        }
+        require_clean(&mut snapshot.connection, &self.base_commit)?;
+        Ok("rolled_back")
+    }
+
     fn validate(&self, workspace: &str, nonce: &str) -> Result<(), HiveError> {
         if self.version != 1
             || self.workspace_id != workspace

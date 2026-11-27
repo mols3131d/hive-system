@@ -156,7 +156,7 @@ mod unix {
     };
     use crate::error::{ErrorCode, HiveError};
 
-    #[derive(Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub(super) struct Server {
         pub(super) version: u32,
@@ -169,7 +169,7 @@ mod unix {
         pub(super) endpoint: Loopback,
     }
 
-    #[derive(Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub(super) struct Loopback {
         pub(super) port: NonZeroU16,
