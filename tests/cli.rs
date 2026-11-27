@@ -4169,6 +4169,16 @@ fn issue_set_parent_keeps_late_v2_errors_and_literal_argument_boundaries() {
         "--port",
         "3306",
     ];
+    for args in [
+        &["--contract", "2", "help", "issue", "set-parent"][..],
+        &["help", "issue", "set-parent", "--contract", "2"],
+        &["issue", "help", "set-parent", "--contract", "2"],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(0), "{args:?} {output:?}");
+        assert!(output.stderr.is_empty(), "{args:?} {output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("--parent-area"));
+    }
     for suffix in [
         &["--clear", "--evidence-file", "fixture.json"][..],
         &["--parent", parent, "--evidence-file", "fixture.json"],
@@ -4178,6 +4188,16 @@ fn issue_set_parent_keeps_late_v2_errors_and_literal_argument_boundaries() {
             "--parent-area",
             issue,
             "--clear",
+            "--evidence-file",
+            "fixture.json",
+        ],
+        &[
+            "--parent",
+            parent,
+            "--parent-area",
+            issue,
+            "-X",
+            "--unknown=--contract=1",
             "--evidence-file",
             "fixture.json",
         ],
