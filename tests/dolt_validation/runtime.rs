@@ -11,6 +11,8 @@ mod artifact_create;
 mod artifact_update;
 #[path = "runtime/bot_register.rs"]
 mod bot_register;
+#[path = "runtime/bot_retire.rs"]
+mod bot_retire;
 #[path = "runtime/issue_dependency.rs"]
 mod issue_dependency;
 #[path = "runtime/issue_update.rs"]

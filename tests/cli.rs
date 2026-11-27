@@ -2715,6 +2715,53 @@ fn malformed_bot_register_keeps_the_late_v2_envelope() {
 }
 
 #[test]
+fn bot_retire_uses_only_the_v2_help_and_error_surface() {
+    let sandbox = Sandbox::new();
+    for command in [
+        ["bot", "retire", "--help"],
+        ["help", "bot", "retire"],
+        ["bot", "help", "retire"],
+    ] {
+        for prefix in [&[][..], &["--contract", "1"][..]] {
+            let output = sandbox.run(&[prefix, &command].concat());
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+        }
+        for args in [
+            [&["--contract", "2"][..], &command].concat(),
+            [&command[..], &["--contract", "2"]].concat(),
+        ] {
+            let output = sandbox.run(&args);
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            let help = String::from_utf8_lossy(&output.stdout);
+            assert!(help.contains("--if-match") && help.contains("--evidence-file"));
+        }
+    }
+    for invalid in [
+        &[][..],
+        &["--if-match", "duplicate"][..],
+        &["--unknown", "ignored-value"][..],
+        &["--unknown=--contract=1"][..],
+        &["extra-position"][..],
+    ] {
+        let output = sandbox.run(
+            &[
+                &["bot", "retire", "fixture", "--if-match", "revision"][..],
+                invalid,
+                &["--contract", "2", "--json"],
+            ]
+            .concat(),
+        );
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stderr.is_empty());
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "bot retire");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn unknown_project_long_option_recovery_keeps_literals_and_legacy_boundaries() {
     let sandbox = Sandbox::new();
     for args in [
