@@ -8,6 +8,8 @@ mod directives;
 mod issue_show;
 #[path = "dolt_validation/issue_updates.rs"]
 mod issue_updates;
+#[path = "dolt_validation/migration.rs"]
+mod migration;
 #[path = "dolt_validation/receipts.rs"]
 mod receipts;
 #[path = "dolt_validation/relations.rs"]
@@ -51,7 +53,15 @@ impl Fixture {
         Self::start_with_collation(CASE_INSENSITIVE)
     }
 
+    fn start_empty() -> Self {
+        Self::start_with_seed(&empty_seed_sql(CASE_INSENSITIVE))
+    }
+
     fn start_with_collation(collation: &str) -> Self {
+        Self::start_with_seed(&seed_sql(collation))
+    }
+
+    fn start_with_seed(seed: &str) -> Self {
         let dolt = PathBuf::from(
             std::env::var_os("HIVE_DOLT_BIN")
                 .expect("point HIVE_DOLT_BIN at the pinned Dolt binary"),
@@ -102,7 +112,7 @@ impl Fixture {
             ],
             None,
         );
-        fixture.local(&["sql"], Some(&seed_sql(collation)));
+        fixture.local(&["sql"], Some(seed));
         fixture.local(&["add", "."], None);
         fixture.local(&["commit", "-m", "Synthetic baseline"], None);
         let password = &fixture.password;
@@ -267,6 +277,18 @@ impl Drop for Fixture {
         }
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn empty_seed_sql(collation: &str) -> String {
+    let schema_digest = format!("{:x}", Sha256::digest(SCHEMA.as_bytes()));
+    let workspace = id(1);
+    format!(
+        "ALTER DATABASE {DATABASE} COLLATE {collation};
+         {SCHEMA}
+         INSERT INTO workspace_meta VALUES (1, '{workspace}');
+         INSERT INTO schema_migrations VALUES (1, '{schema_digest}', UTC_TIMESTAMP(6));
+         INSERT INTO workspace_counters VALUES ('issue_number', 1);"
+    )
 }
 
 fn seed_sql(collation: &str) -> String {
