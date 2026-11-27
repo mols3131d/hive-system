@@ -29,6 +29,9 @@ mod receipts;
 mod relations;
 #[path = "dolt_validation/resource.rs"]
 mod resource;
+#[cfg(target_os = "linux")]
+#[path = "dolt_validation/runtime.rs"]
+mod runtime;
 
 use std::fs;
 use std::io::Write;
@@ -77,6 +80,47 @@ impl Fixture {
     }
 
     fn start_with_seed(seed: &str) -> Self {
+        let mut fixture = Self::initialize(seed);
+        let password = &fixture.password;
+        fixture.local(
+            &["sql"],
+            Some(&format!(
+                "CREATE USER '{READER}'@'{HOST}' IDENTIFIED BY '{password}';
+                 CREATE USER '{ADMIN}'@'{HOST}' IDENTIFIED BY '{password}';
+                 GRANT SELECT ON {DATABASE}.* TO '{READER}'@'{HOST}';
+                 GRANT ALL ON {DATABASE}.* TO '{ADMIN}'@'{HOST}';
+                 DROP USER 'root'@'localhost';"
+            )),
+        );
+
+        let available = TcpListener::bind((HOST, 0)).unwrap();
+        fixture.port = available.local_addr().unwrap().port();
+        let config = fixture.root.join("server.yml");
+        fs::write(
+            &config,
+            format!(
+                "log_level: warning\nmax_logged_query_len: -1\nlistener:\n  host: {HOST}\n  port: {}\n",
+                fixture.port
+            ),
+        )
+        .unwrap();
+        drop(available);
+        fixture.server = Some(
+            fixture
+                .dolt_command()
+                .args(["sql-server", "--config"])
+                .arg(config)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        fixture.wait_for_listener();
+        fixture
+    }
+
+    fn initialize(seed: &str) -> Self {
         let dolt = PathBuf::from(
             std::env::var_os("HIVE_DOLT_BIN")
                 .expect("point HIVE_DOLT_BIN at the pinned Dolt binary"),
@@ -88,7 +132,7 @@ impl Fixture {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("hive-dolt-{}-{nonce}", std::process::id()));
         fs::create_dir(&root).unwrap();
-        let mut fixture = Self {
+        let fixture = Self {
             root,
             dolt,
             password: format!("fixture-password-{nonce:x}"),
@@ -130,50 +174,19 @@ impl Fixture {
         fixture.local(&["sql"], Some(seed));
         fixture.local(&["add", "."], None);
         fixture.local(&["commit", "-m", "Synthetic baseline"], None);
-        let password = &fixture.password;
-        fixture.local(
-            &["sql"],
-            Some(&format!(
-                "CREATE USER '{READER}'@'{HOST}' IDENTIFIED BY '{password}';
-                 CREATE USER '{ADMIN}'@'{HOST}' IDENTIFIED BY '{password}';
-                 GRANT SELECT ON {DATABASE}.* TO '{READER}'@'{HOST}';
-                 GRANT ALL ON {DATABASE}.* TO '{ADMIN}'@'{HOST}';
-                 DROP USER 'root'@'localhost';"
-            )),
-        );
+        fixture
+    }
 
-        let available = TcpListener::bind((HOST, 0)).unwrap();
-        fixture.port = available.local_addr().unwrap().port();
-        let config = fixture.root.join("server.yml");
-        fs::write(
-            &config,
-            format!(
-                "log_level: warning\nmax_logged_query_len: -1\nlistener:\n  host: {HOST}\n  port: {}\n",
-                fixture.port
-            ),
-        )
-        .unwrap();
-        drop(available);
-        fixture.server = Some(
-            fixture
-                .dolt_command()
-                .args(["sql-server", "--config"])
-                .arg(config)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
+    fn wait_for_listener(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let server = fixture.server.as_mut().unwrap();
+            let server = self.server.as_mut().unwrap();
             assert!(
                 server.try_wait().unwrap().is_none(),
                 "fixture server exited"
             );
-            if TcpStream::connect((HOST, fixture.port)).is_ok() {
-                return fixture;
+            if TcpStream::connect((HOST, self.port)).is_ok() {
+                return;
             }
             assert!(Instant::now() < deadline, "fixture server did not start");
             thread::sleep(Duration::from_millis(50));
