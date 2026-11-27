@@ -2311,6 +2311,78 @@ fn unknown_project_long_option_keeps_original_error_with_late_v2_json() {
 }
 
 #[test]
+fn unknown_project_write_options_keep_the_late_v2_envelope() {
+    let sandbox = Sandbox::new();
+    let project = "01900000-0000-7000-8000-000000000003";
+    let issue = "01900000-0000-7000-8000-000000000004";
+    for (command, args) in [
+        (
+            "project create",
+            &["project", "create", "--unknown=synthetic"][..],
+        ),
+        (
+            "project create",
+            &[
+                "project",
+                "create",
+                "--name",
+                "Fixture",
+                "--unknown",
+                "synthetic",
+            ],
+        ),
+        (
+            "project add-issue",
+            &[
+                "project",
+                "add-issue",
+                "--unknown=--contract=1",
+                project,
+                issue,
+            ],
+        ),
+        (
+            "project add-issue",
+            &[
+                "project",
+                "add-issue",
+                "--unknown",
+                "synthetic",
+                project,
+                issue,
+            ],
+        ),
+        (
+            "project add-issue",
+            &["project", "add-issue", "--unknown", project, issue],
+        ),
+    ] {
+        let args = [args, &["--contract", "2", "--json"]].concat();
+        let result = sandbox.run(&args);
+        assert_eq!(result.status.code(), Some(2), "{args:?}");
+        assert!(result.stderr.is_empty(), "{args:?}: {result:?}");
+        let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "schema_version": 2, "ok": false, "command": command,
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "An argument or command is not recognized.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+    let literal = sandbox.run(&["project", "create", "--unknown=--json", "--contract", "2"]);
+    assert_eq!(literal.status.code(), Some(2));
+    assert!(literal.stdout.is_empty());
+    assert!(!literal.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
 fn unknown_project_long_option_recovery_keeps_literals_and_legacy_boundaries() {
     let sandbox = Sandbox::new();
     for args in [

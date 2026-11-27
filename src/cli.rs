@@ -1938,6 +1938,7 @@ fn recover_unknown_long(
             "workspace",
             "init" | "status" | "start" | "stop" | "recover"
         ) | ("artifact", "create")
+            | ("project", "create" | "add-issue")
             | (_, "list" | "show")
     ) {
         return None;
@@ -1948,32 +1949,40 @@ fn recover_unknown_long(
     let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
     let long = unknown_long_name(leaf, invalid)?;
 
-    // Let Clap replay the original tokens. These selected leaves take no
-    // positionals, so the temporary option can take one plain separated
-    // value. The original parse error still determines the result.
     let workspace_init = (domain, action) == ("workspace", "init");
-    let allow_separated_value =
-        workspace_init || matches!((domain, action), ("label", "list") | ("artifact", "create"));
+    let project_write = matches!((domain, action), ("project", "create" | "add-issue"));
+    let accept_value = workspace_init
+        || matches!(
+            (domain, action),
+            ("label", "list") | ("artifact", "create") | ("project", "create")
+        );
+    // When the command has positional IDs, first let those slots consume
+    // ordinary tokens. Try a separated unknown-option value if that fails.
+    let modes: &[bool] = if (domain, action) == ("project", "add-issue") {
+        &[false, true]
+    } else {
+        &[accept_value]
+    };
     const UNKNOWN_LONG: &str = "recovered_unknown_long";
-    let retry = cli.clone().mut_subcommand(domain, |command| {
-        command.mut_subcommand(action, |leaf| {
-            // A missing init target must not prevent recovery of the original
-            // unknown-option error and its explicit output flags.
-            let leaf = if workspace_init {
-                leaf.mut_arg("target", |arg| arg.required(false))
-            } else {
-                leaf
-            };
-            leaf.arg(
-                Arg::new(UNKNOWN_LONG)
-                    .long(long.to_owned())
-                    .num_args(0..=1)
-                    .require_equals(!allow_separated_value)
-                    .value_parser(OsStringValueParser::new())
-                    .hide(true),
-            )
+    let build_retry = |accept_value: bool| {
+        cli.clone().mut_subcommand(domain, |command| {
+            command.mut_subcommand(action, |leaf| {
+                let leaf = if workspace_init {
+                    leaf.mut_arg("target", |arg| arg.required(false))
+                } else {
+                    leaf
+                };
+                leaf.arg(
+                    Arg::new(UNKNOWN_LONG)
+                        .long(long.to_owned())
+                        .num_args(0..=1)
+                        .require_equals(!accept_value)
+                        .value_parser(OsStringValueParser::new())
+                        .hide(true),
+                )
+            })
         })
-    });
+    };
     let end = if workspace_init {
         args.iter()
             .enumerate()
@@ -1983,11 +1992,28 @@ fn recover_unknown_long(
     } else {
         args.len()
     };
-    let matches = retry.try_get_matches_from(&args[..end]).ok()?;
-    let recovered = matches
-        .subcommand_matches(domain)?
-        .subcommand_matches(action)?;
-    (recovered.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine)).then_some(matches)
+    let recognized = |matches: &ArgMatches| {
+        matches
+            .subcommand_matches(domain)
+            .and_then(|command| command.subcommand_matches(action))
+            .is_some_and(|leaf| leaf.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine))
+    };
+    let mut missing = None;
+    for &accept_value in modes {
+        let retry = build_retry(accept_value);
+        match retry.clone().try_get_matches_from(&args[..end]) {
+            Ok(matches) if recognized(&matches) => return Some(matches),
+            Err(error) if project_write && error.kind() == ErrorKind::MissingRequiredArgument => {
+                missing = retry
+                    .ignore_errors(true)
+                    .try_get_matches_from(&args[..end])
+                    .ok()
+                    .filter(recognized);
+            }
+            _ => {}
+        }
+    }
+    missing
 }
 
 struct ExtendedParse {
