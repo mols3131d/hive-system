@@ -4,14 +4,18 @@ use serde_json::Value;
 
 use crate::error::HiveError;
 
-pub(crate) fn run(source: &Path, target: &Path) -> Result<Value, HiveError> {
+pub(crate) fn run(
+    source: &Path,
+    target: &Path,
+    include_conversations: bool,
+) -> Result<Value, HiveError> {
     #[cfg(target_os = "linux")]
     {
-        linux::restore(source, target)
+        linux::restore(source, target, include_conversations)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (source, target);
+        let _ = (source, target, include_conversations);
         Err(HiveError::new(
             crate::error::ErrorCode::NotImplemented,
             "Backup restoration is supported only on Linux.",
@@ -31,15 +35,16 @@ mod linux {
     use std::path::{Component, Path, PathBuf};
 
     use rustix::fs::{RenameFlags, renameat_with};
-    use serde::Deserialize;
-    use serde_json::{Value, json};
+    use serde::{Deserialize, Deserializer};
+    use serde_json::{Value, json, value::RawValue};
 
     use crate::config::json_path;
     use crate::config_file::ScopedDirectory;
     use crate::config_git::{ASSET_BACKUP_REF, is_full_lowercase_oid, verify_checkout_tree};
     use crate::config_v2::{BOOTSTRAP_LAYOUT, MARKER, verify_bootstrap_layout};
     use crate::dolt::{
-        DOLT_VERSION, STORAGE_SCHEMA_VERSION, is_commit_hash, is_uuid, validate_restored_records,
+        DOLT_VERSION, STORAGE_SCHEMA_VERSION, conversation_archive, is_commit_hash, is_uuid,
+        validate_restored_records,
     };
     use crate::error::{ErrorCode, HiveError};
     use crate::workspace_backup::{
@@ -66,10 +71,16 @@ mod linux {
         _created_at_unix_seconds: u64,
         consistency_state: String,
         conversations_included: bool,
+        #[serde(default, deserialize_with = "present_raw")]
+        conversations: Option<Box<RawValue>>,
         files: Vec<DigestEntry>,
     }
 
-    pub(super) fn restore(source: &Path, target: &Path) -> Result<Value, HiveError> {
+    pub(super) fn restore(
+        source: &Path,
+        target: &Path,
+        include_conversations: bool,
+    ) -> Result<Value, HiveError> {
         let source = ScopedDirectory::open_absolute(&absolute_path(source)?)?;
         require_local_filesystem(&source)?;
         let target = absolute_path(target)?;
@@ -88,6 +99,18 @@ mod linux {
         }
 
         let manifest = read_manifest(&source)?;
+        let conversations = if include_conversations {
+            let section = manifest
+                .conversations
+                .as_ref()
+                .ok_or_else(|| unverified("This backup has no conversation archive section."))?;
+            Some(
+                serde_json::from_str::<conversation_archive::Conversations>(section.get())
+                    .map_err(|_| unverified("The conversation archive section is invalid."))?,
+            )
+        } else {
+            None
+        };
         require_inactive_target(&manifest.workspace_id, &target)?;
         let stage = tempfile::Builder::new()
             .prefix(crate::config_v2::INIT_STAGE_PREFIX)
@@ -95,6 +118,9 @@ mod linux {
             .tempdir_in(fd_path(&parent))
             .map_err(io_error)?;
         let stage_dir = open_target(stage.path())?.ok_or_else(changed_target)?;
+        stage_dir
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(io_error)?;
         let stage_path = fd_path(&stage_dir);
         let snapshot = stage_path.join("snapshot");
         let scratch = stage_path.join("scratch");
@@ -106,14 +132,19 @@ mod linux {
         ] {
             create_private_directory(directory)?;
         }
-        copy_payload(&source, &snapshot, manifest.files)?;
+        copy_payload(
+            &source,
+            &snapshot,
+            manifest.files,
+            manifest.conversations_included,
+        )?;
 
         let scratch_dir = create_private_directory(&scratch)?;
         let payload_dir = create_private_directory(&payload)?;
         lock_target(&payload_dir)?;
         let assets = payload.join("assets");
         create_private_directory(&assets)?;
-        create_private_directory(&payload.join("conversations"))?;
+        let conversation_dir = create_private_directory(&payload.join("conversations"))?;
         let installed = Installed::check(&scratch_dir)?;
         installed.prepare_dolt_restore()?;
         // Use a fixed ASCII path to our verified copy, even when the caller's
@@ -155,13 +186,16 @@ mod linux {
             &format!("{snapshot_path}/assets.bundle"),
             &manifest.asset_git_commit,
         )?;
-        validate_restored_records(
+        let queens = validate_restored_records(
             &installed,
             &db,
             &manifest.dolt_commit,
             &manifest.workspace_id,
             |path| installed.read_committed_soul(&assets, &manifest.asset_git_commit, path),
         )?;
+        if let Some(conversations) = conversations {
+            conversations.restore(&source, &conversation_dir, &manifest.workspace_id, &queens)?;
+        }
         verify_bootstrap_layout(&payload_dir)?;
         let mut descriptor = private_file(&payload.join(MARKER))?;
         write!(
@@ -228,7 +262,7 @@ mod linux {
             "db_commit": manifest.dolt_commit,
             "asset_commit": manifest.asset_git_commit,
             "active_root": "inactive",
-            "conversations_restored": false,
+            "conversations_restored": include_conversations,
         }))
     }
 
@@ -279,6 +313,13 @@ mod linux {
             .map_err(io_error)
     }
 
+    // Recognize the format envelope without decoding unselected conversation entries.
+    fn present_raw<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Box<RawValue>>, D::Error> {
+        Box::<RawValue>::deserialize(deserializer).map(Some)
+    }
+
     fn read_manifest(source: &ScopedDirectory) -> Result<Manifest, HiveError> {
         let rejected = || unverified("The backup manifest is invalid or unsupported.");
         let file = source
@@ -296,11 +337,20 @@ mod linux {
             return Err(rejected());
         }
         let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|_| rejected())?;
-        if manifest.format_version != 1
+        if !matches!(
+            (
+                manifest.format_version,
+                manifest.conversations_included,
+                &manifest.conversations
+            ),
+            (1, false, None) | (conversation_archive::FORMAT_VERSION, true, Some(_))
+        ) || manifest
+            .conversations
+            .as_ref()
+            .is_some_and(|section| !section.get().starts_with('{'))
             || manifest.storage_schema_version != STORAGE_SCHEMA_VERSION
             || manifest.dolt_version != DOLT_VERSION
             || manifest.consistency_state != "verified_stopped_committed"
-            || manifest.conversations_included
             || !is_uuid(&manifest.workspace_id)
             || !is_commit_hash(&manifest.dolt_commit)
             || !is_full_lowercase_oid(&manifest.asset_git_commit)
@@ -317,6 +367,7 @@ mod linux {
         source: &ScopedDirectory,
         snapshot: &Path,
         files: Vec<DigestEntry>,
+        has_conversations: bool,
     ) -> Result<(), HiveError> {
         let rejected =
             || unverified("Backup files do not match the manifest or exceed the payload limits.");
@@ -332,7 +383,7 @@ mod linux {
             }
         }
 
-        visit_payload(source, |directory, name, path| {
+        visit_payload(source, has_conversations, |directory, name, path| {
             // Only the enumerated, native-layout paths reach filesystem APIs.
             let entry = expected.remove(&path).ok_or_else(rejected)?;
             let output = private_file(&snapshot.join(&path))?;
