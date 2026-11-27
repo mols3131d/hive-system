@@ -145,6 +145,22 @@ List orders summaries by Project ID and accepts exact `active`, `completed`, or 
 
 Show takes a canonical lowercase UUIDv7 and returns Project details and up to 25 direct member Issue IDs across Areas. The `issues.truncated` field indicates additional members. Use `issue list --project UUID` to page through member summaries.
 
+## Committed Directive inspection
+
+Use the explicit Dolt target and SELECT-only account under contract 2. Select exactly one scope with `--workspace-scope`, `--area UUID`, or `--project UUID`. Area and Project selectors match exact scopes without expanding to descendants or members. Scope and Directive IDs use canonical lowercase UUIDv7.
+
+```sh
+hive --contract 2 --json directive list --workspace-scope --status all \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+hive --contract 2 --json directive show 01900000-0000-7000-8000-000000000061 \
+  --area 01900000-0000-7000-8000-000000000002 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+List returns metadata ordered by ascending Directive ID. The status defaults to `active` and also accepts `proposed`, `superseded`, `withdrawn`, and `all`. The default page size is 25 and the maximum is 100. Pass `next_cursor` as `--cursor` with the same target and query. A changed commit or query returns `STALE_CURSOR`.
+
+Show returns the selected Directive at the verified commit, including historical statuses. The combined inline body and provenance reference limit is 64 KiB. References are returned as stored values. Workflow applicability requires separate verification of scope, issuer, validity, and approval provenance.
+
 ## Committed Artifact inspection
 
 Use an explicit Dolt target and SELECT-only account for contract 2 Artifact reads.
