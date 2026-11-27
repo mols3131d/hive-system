@@ -10,8 +10,8 @@ mod output;
 use std::process::ExitCode;
 
 use cli::{
-    AreaCommand, BotCommand, Command, ConfigCommand, Contract, ConversationCommand, Invocation,
-    IssueCommand, ParseFailure,
+    AreaCommand, BotCommand, Command, ConfigCommand, Contract, ConversationCommand,
+    DirectiveCommand, DoltArtifactCommand, Invocation, IssueCommand, ParseFailure, ResourceCommand,
 };
 use error::{ErrorCode, HiveError};
 
@@ -103,10 +103,14 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         };
     }
     let result = match invocation.command {
+        Command::DoltArtifact(DoltArtifactCommand::List(args)) => dolt::artifact::list(&args),
+        Command::DoltArtifact(DoltArtifactCommand::Show(args)) => dolt::artifact::show(&args),
         Command::Validate(args) => dolt::validate(&args),
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
+        Command::Resource(ResourceCommand::List(args)) => dolt::resource::list(&args),
+        Command::Resource(ResourceCommand::Show(args)) => dolt::resource::show(&args),
         Command::ProjectRead(args) => dolt::project_read(&args),
         Command::Bot(BotCommand::List {
             target,
@@ -116,6 +120,21 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
             ..
         }) => dolt::bot::list(&target, status.as_deref(), page.limit, cursor.as_deref()),
         Command::Bot(BotCommand::Show { target, bot_id }) => dolt::bot::show(&target, &bot_id),
+        Command::Directive(DirectiveCommand::List {
+            selection,
+            status,
+            page,
+            cursor,
+        }) => dolt::directive::list(
+            &selection,
+            invocation.common.project.as_ref(),
+            status,
+            page.limit,
+            cursor.as_deref(),
+        ),
+        Command::Directive(DirectiveCommand::Show { selection, id }) => {
+            dolt::directive::show(&selection, invocation.common.project.as_ref(), &id)
+        }
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
         Command::Conversation(ConversationCommand::Show(args)) => {
             dolt::conversation_show(&invocation.common, &args)

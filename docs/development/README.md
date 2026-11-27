@@ -145,6 +145,43 @@ List orders summaries by Project ID and accepts exact `active`, `completed`, or 
 
 Show takes a canonical lowercase UUIDv7 and returns Project details and up to 25 direct member Issue IDs across Areas. The `issues.truncated` field indicates additional members. Use `issue list --project UUID` to page through member summaries.
 
+## Committed Directive inspection
+
+Use the explicit Dolt target and SELECT-only account under contract 2. Select exactly one scope with `--workspace-scope`, `--area UUID`, or `--project UUID`. Area and Project selectors match exact scopes without expanding to descendants or members. Scope and Directive IDs use canonical lowercase UUIDv7.
+
+```sh
+hive --contract 2 --json directive list --workspace-scope --status all \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+hive --contract 2 --json directive show 01900000-0000-7000-8000-000000000061 \
+  --area 01900000-0000-7000-8000-000000000002 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+List returns metadata ordered by ascending Directive ID. The status defaults to `active` and also accepts `proposed`, `superseded`, `withdrawn`, and `all`. The default page size is 25 and the maximum is 100. Pass `next_cursor` as `--cursor` with the same target and query. A changed commit or query returns `STALE_CURSOR`.
+
+Show returns the selected Directive at the verified commit, including historical statuses. The combined inline body and provenance reference limit is 64 KiB. References are returned as stored values. Workflow applicability requires separate verification of scope, issuer, validity, and approval provenance.
+
+## Committed Artifact inspection
+
+Use an explicit Dolt target and SELECT-only account for contract 2 Artifact reads.
+
+```sh
+hive --contract 2 --json artifact list \
+  --scope area:01900000-0000-7000-8000-000000000002 \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+
+hive --contract 2 --json artifact show 01900000-0000-7000-8000-000000000004 \
+  --scope area:01900000-0000-7000-8000-000000000002 \
+  --scope project:01900000-0000-7000-8000-000000000003 \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+List selects exactly one direct scope using `area:UUID`, `project:UUID`, `issue:UUID`, or `resource:UUID` and returns only Artifact ID, kind, title, and revision. It defaults to 25 items and caps pages at 100. Pass `next_cursor` as `--cursor` with the same target, scope, and page size. A changed commit or query returns `STALE_CURSOR`.
+
+Show takes an exact canonical lowercase UUIDv7. An exact ID alone suffices for a standalone Artifact. For a linked Artifact, repeat `--scope` to explicitly cover every direct link. The CLI verifies the Artifact and each selected scope at the same committed snapshot before returning up to 64 KiB of Markdown. Incomplete coverage returns `UNAUTHORIZED` without disclosing linked scopes or body content.
+
 ## Committed Bot metadata
 
 Use the same explicit Dolt target and SELECT-only account for contract 2 Bot reads.
@@ -159,6 +196,21 @@ hive --contract 2 --json bot show 01900000-0000-7000-8000-00000000000a \
 `bot list` defaults to `--status active` and accepts `retired` or `all`. It orders entries by ascending Bot UUID, with 25 results per page by default and a maximum of 100. Pass `next_cursor` as `--cursor` with the same target, status and page size. Changes to the committed snapshot or query return `STALE_CURSOR`.
 
 `bot show` takes an exact lowercase UUIDv7 and can inspect retired Queens. Both commands return registry metadata and the verified Dolt commit. Registry status describes retirement. Committed Soul inspection requires the workspace and asset repository pairing from [#18](https://github.com/mols3131d/hive-system/issues/18).
+
+## Committed Resource reads
+
+Use the same explicit Dolt target and SELECT-only account for contract 2 Resource reads.
+
+```sh
+hive --contract 2 --json resource list --area 01900000-0000-7000-8000-000000000002 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+hive --contract 2 --json resource show 01900000-0000-7000-8000-000000000014 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+`resource list` requires exactly one of `--all`, `--area UUID`, or `--issue UUID`. Scope and Resource selectors use canonical lowercase UUIDv7 IDs. Area and Issue scopes include only directly linked Resources. A known scope with no links returns an empty page, and an unknown scope returns `NOT_FOUND`.
+
+List pages contain Resource IDs, kinds, names, and revisions in ascending bytewise ID order, with 25 items by default and a maximum of 100. Pass `next_cursor` as `--cursor` with the same target, scope, and page size. A changed snapshot or query returns `STALE_CURSOR`. Exact-ID `resource show` adds the stored URI to the selected record. Both commands report the verified Dolt commit and leave URIs unopened.
 
 ## Historical Queen conversations
 

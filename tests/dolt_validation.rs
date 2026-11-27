@@ -25,6 +25,8 @@ mod project;
 mod receipts;
 #[path = "dolt_validation/relations.rs"]
 mod relations;
+#[path = "dolt_validation/resource.rs"]
+mod resource;
 
 use std::fs;
 use std::io::Write;

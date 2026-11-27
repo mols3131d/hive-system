@@ -1,16 +1,14 @@
 use std::ffi::OsString;
 
-use clap::{
-    Arg, ArgAction, ArgMatches, Args, FromArgMatches, Subcommand,
-    builder::OsStringValueParser,
-    error::{ContextKind, ContextValue, ErrorKind},
-    parser::ValueSource,
-};
+use clap::{Arg, ArgAction, Args, FromArgMatches, Subcommand};
 
 use super::{
     Command, CommonArgs, Contract, DoltTargetArgs, Invocation, ParseFailure, matched_leaf,
     requested_contract, requested_format, safe_parse_message,
 };
+
+// The conversation parser uses this path to the shared recovery helper.
+pub(super) use super::recover_unknown_long;
 
 #[derive(Subcommand)]
 pub(crate) enum ProjectRead {
@@ -132,62 +130,6 @@ pub(super) fn parse(
         command: Some(name),
         message: message.to_owned(),
     }))
-}
-
-pub(super) fn recover_unknown_long(
-    cli: &clap::Command,
-    args: &[OsString],
-    partial: &ArgMatches,
-    error: &clap::Error,
-    domain: &str,
-) -> Option<ArgMatches> {
-    if error.kind() != ErrorKind::UnknownArgument {
-        return None;
-    }
-    let (action @ ("list" | "show"), _) = partial.subcommand_matches(domain)?.subcommand()? else {
-        return None;
-    };
-    let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
-        return None;
-    };
-    let long = invalid.strip_prefix("--")?.split('=').next()?;
-    if !long.starts_with(|ch: char| ch.is_ascii_alphanumeric())
-        || !long
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return None;
-    }
-    let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
-    if leaf.get_arguments().any(|arg| {
-        arg.get_long() == Some(long)
-            || arg
-                .get_all_aliases()
-                .is_some_and(|aliases| aliases.contains(&long))
-    }) {
-        return None;
-    }
-
-    // Let Clap replay the original tokens. The temporary option can take an
-    // attached value, and the original parse error still determines the result.
-    const UNKNOWN_LONG: &str = "recovered_unknown_long";
-    let retry = cli.clone().mut_subcommand(domain, |command| {
-        command.mut_subcommand(action, |leaf| {
-            leaf.arg(
-                Arg::new(UNKNOWN_LONG)
-                    .long(long.to_owned())
-                    .num_args(0..=1)
-                    .require_equals(true)
-                    .value_parser(OsStringValueParser::new())
-                    .hide(true),
-            )
-        })
-    });
-    let matches = retry.try_get_matches_from(args).ok()?;
-    let recovered = matches
-        .subcommand_matches(domain)?
-        .subcommand_matches(action)?;
-    (recovered.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine)).then_some(matches)
 }
 
 fn add_options(command: clap::Command) -> clap::Command {

@@ -1,13 +1,16 @@
 pub(crate) mod area;
+pub(crate) mod artifact;
 pub(crate) mod bot;
 #[cfg(unix)]
 mod conversation;
+pub(crate) mod directive;
 mod graph;
 mod issue;
 mod issue_list;
 mod issue_readiness;
 mod project;
 mod records;
+pub(crate) mod resource;
 
 use std::ffi::OsStr;
 use std::num::NonZeroU16;
@@ -148,6 +151,24 @@ pub(crate) fn validate(args: &ValidateArgs) -> Result<DoltSuccess, Box<DoltFailu
             "diagnostics": diagnostics.items,
         }),
     })
+}
+
+fn encode_id_cursor(id: &str, binding: &Value) -> String {
+    let digest = Sha256::digest(json!([binding, id]).to_string());
+    format!("{id}.{digest:x}")
+}
+
+fn id_cursor_key(cursor: &str) -> Option<&str> {
+    if cursor.len() == 36 + 1 + 64
+        && let Some((id, digest)) = cursor.split_once('.')
+        && is_uuid_v7(id)
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Some(id);
+    }
+    None
 }
 
 fn reader_credential(name: &'static str) -> Result<String, HiveError> {
