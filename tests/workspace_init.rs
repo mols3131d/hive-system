@@ -1410,7 +1410,17 @@ Two lines.
     execute(assets(&asset_root).args(["add", soul]));
     execute(assets(&asset_root).args(["commit", "-m", "Add earlier synthetic Soul"]));
     fs::write(asset_root.join(soul), source_soul).unwrap();
-    execute(assets(&asset_root).args(["add", soul]));
+    let linked_soul = "bots/synthetic/current.md";
+    symlink("SOUL.md", asset_root.join(linked_soul)).unwrap();
+    let linked_directory = "synthetic-assets";
+    symlink("bots/synthetic", asset_root.join(linked_directory)).unwrap();
+    let linked_chain = "bots/synthetic/linked.md";
+    symlink(
+        "../../synthetic-assets/current.md",
+        asset_root.join(linked_chain),
+    )
+    .unwrap();
+    execute(assets(&asset_root).args(["add", "."]));
     execute(assets(&asset_root).args(["commit", "-m", "Revise synthetic Soul"]));
     let previous = initial["db_commit"].as_str().unwrap();
     let changes = format!(
@@ -1657,6 +1667,58 @@ Two lines.
             .output()
             .unwrap()
     };
+
+    // Also construct format-1 inputs directly, as the older backup command
+    // could publish the checked-out Git modes without verifying their targets.
+    let make_legacy_bundle = || {
+        let bundle = fixture.0.join("legacy.bundle");
+        execute(assets(&asset_root).args(["branch", "inspection"]));
+        execute(
+            assets(&asset_root)
+                .args(["bundle", "create"])
+                .arg(&bundle)
+                .arg("refs/heads/inspection"),
+        );
+        execute(assets(&asset_root).args(["branch", "-D", "inspection"]));
+        let bytes = fs::read(&bundle).unwrap();
+        fs::remove_file(bundle).unwrap();
+        bytes
+    };
+    let saved_assets = manifest["asset_git_commit"].as_str().unwrap();
+    let backup_manifest = backup.join("manifest.json");
+    let backup_bundle = backup.join("assets.bundle");
+    let saved_manifest = fs::read(&backup_manifest).unwrap();
+    let saved_bundle = fs::read(&backup_bundle).unwrap();
+    let substitute_legacy_bundle = || {
+        let revision = execute(assets(&asset_root).args(["rev-parse", "HEAD"]));
+        let bytes = make_legacy_bundle();
+        let mut replacement = manifest.clone();
+        replacement["asset_git_commit"] = String::from_utf8(revision).unwrap().trim().into();
+        let entry = replacement["files"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["path"] == "assets.bundle")
+            .unwrap();
+        entry["bytes"] = bytes.len().into();
+        entry["sha256"] = format!("{:x}", Sha256::digest(&bytes)).into();
+        fs::write(&backup_bundle, bytes).unwrap();
+        fs::write(&backup_manifest, serde_json::to_vec(&replacement).unwrap()).unwrap();
+    };
+    for target in ["missing", "../conversations/private.md", ".git/HEAD"] {
+        symlink(target, asset_root.join("unsafe")).unwrap();
+        execute(assets(&asset_root).args(["add", "unsafe"]));
+        execute(assets(&asset_root).args(["commit", "-m", "Add unsafe synthetic link"]));
+        expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
+
+        substitute_legacy_bundle();
+        let refused = response(run_restore(&backup, "unsafe-restore"), 7);
+        assert_eq!(refused["error"]["code"], "AUTHORITY_UNVERIFIED");
+        assert!(!fixture.0.join("unsafe-restore").exists());
+        execute(assets(&asset_root).args(["reset", "--hard", saved_assets]));
+    }
+    fs::write(&backup_bundle, &saved_bundle).unwrap();
+    fs::write(&backup_manifest, &saved_manifest).unwrap();
     let restored = fixture.dir("restored");
     let result = response(run_restore(&backup, "restored"), 0);
     assert_eq!(result["data"]["active_root"], "inactive");
@@ -1680,10 +1742,16 @@ Two lines.
             .unwrap();
     assert_eq!(repo_state["remotes"], serde_json::json!({}));
     assert_eq!(repo_state["backups"], serde_json::json!({}));
+    substitute_legacy_bundle();
+    let legacy = response(run_restore(&backup, "new restored"), 0);
+    assert_eq!(legacy["data"]["active_root"], "inactive");
+    assert_eq!(legacy["data"]["asset_commit"], manifest["asset_git_commit"]);
     assert_eq!(
-        response(run_restore(&backup, "new restored"), 0)["data"]["active_root"],
-        "inactive"
+        fs::read_link(fixture.0.join("new restored/assets").join(linked_soul)).unwrap(),
+        Path::new("SOUL.md")
     );
+    fs::write(&backup_bundle, saved_bundle).unwrap();
+    fs::write(&backup_manifest, saved_manifest).unwrap();
     let stale_target = fixture.0.join("stale-active-root");
     let stale_state = fixture
         .0
@@ -1836,6 +1904,17 @@ Two lines.
     );
 
     let checked = restored.join("assets");
+    for (path, target) in [
+        (linked_soul, "SOUL.md"),
+        (linked_directory, "bots/synthetic"),
+        (linked_chain, "../../synthetic-assets/current.md"),
+    ] {
+        assert_eq!(
+            fs::read_link(checked.join(path)).unwrap(),
+            Path::new(target)
+        );
+    }
+    assert_eq!(fs::read(checked.join(linked_chain)).unwrap(), source_soul);
     let revision = manifest["asset_git_commit"].as_str().unwrap();
     assert_eq!(
         execute(assets(&checked).args(["show", &format!("{revision}:{soul}")])),

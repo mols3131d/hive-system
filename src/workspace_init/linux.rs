@@ -455,12 +455,25 @@ fn sync_directory(directory: &File) -> Result<(), HiveError> {
 }
 
 pub(crate) fn sync_tree(directory: &File) -> Result<(), HiveError> {
+    sync_tree_with_links(directory, Path::new(""), &std::collections::HashSet::new())
+}
+
+pub(crate) fn sync_tree_with_links(
+    directory: &File,
+    relative: &Path,
+    links: &std::collections::HashSet<PathBuf>,
+) -> Result<(), HiveError> {
     let sync_error = |_| io_error("Could not sync the verified workspace payload.");
     for entry in fs::read_dir(fd_path(directory)).map_err(sync_error)? {
         let entry = entry.map_err(sync_error)?;
-        if entry.file_type().map_err(sync_error)?.is_dir() {
+        let file_type = entry.file_type().map_err(sync_error)?;
+        let path = relative.join(entry.file_name());
+        if file_type.is_dir() {
             let child = open_directory(&entry.path())?;
-            sync_tree(&child)?;
+            sync_tree_with_links(&child, &path, links)?;
+        } else if file_type.is_symlink() && links.contains(&path) {
+            // The containing directory sync persists the link itself.
+            continue;
         } else {
             let file = config_file::open_regular_child(directory, &entry.file_name())?.ok_or_else(
                 || {

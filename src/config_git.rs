@@ -507,9 +507,118 @@ pub(crate) fn with_asset_bundle<T>(
     }
     check(command().args(["update-ref", head_ref, revision]))?;
     check(command().args(["fsck", "--full", "--no-reflogs", revision]))?;
+    verify_checkout_tree(command, revision)?;
     // The artifact contains only the verified bundle; Git's local metadata
     // lives in scratch and will be removed with it.
     complete(revision, &recheck)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_checkout_tree(
+    git: impl Fn() -> Command,
+    revision: &str,
+) -> Result<HashSet<PathBuf>, HiveError> {
+    use std::collections::{HashMap, VecDeque};
+    use std::os::unix::ffi::OsStrExt;
+
+    let invalid = || {
+        HiveError::new(
+            ErrorCode::AuthorityUnverified,
+            "The asset tree contains an unsupported entry or unsafe symbolic link.",
+        )
+    };
+    let read = |args: &[&str], limit| {
+        let output = execute_asset(git().args(args), limit, None).map_err(|_| invalid())?;
+        if !output.status.success() {
+            return Err(invalid());
+        }
+        Ok(output.stdout)
+    };
+    // These are verified Git objects. Use raw path bytes and resolve every link
+    // against the tree before checkout, without traversing host paths.
+    let listing = read(&["ls-tree", "-r", "-z", revision], 64 * 1024 * 1024)?;
+    let mut files = HashSet::new();
+    let mut directories = HashSet::new();
+    let mut links = HashMap::new();
+    let mut link_blobs = HashMap::new();
+    let mut entries = listing.split(|byte| *byte == 0);
+    if entries.next_back() != Some(&[][..]) {
+        return Err(invalid());
+    }
+    for entry in entries {
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(invalid)?;
+        let (metadata, name) = (&entry[..tab], &entry[tab + 1..]);
+        if let Some(oid) = metadata.strip_prefix(b"120000 blob ") {
+            let oid = std::str::from_utf8(oid)
+                .ok()
+                .filter(|oid| oid.len() == revision.len() && is_full_lowercase_oid(oid))
+                .ok_or_else(invalid)?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = link_blobs.entry(oid) {
+                let target = read(&["cat-file", "blob", oid], 4095)?;
+                if target.is_empty() || target.starts_with(b"/") || target.contains(&0) {
+                    return Err(invalid());
+                }
+                entry.insert(target);
+            }
+            links.insert(name, oid);
+        } else if metadata.starts_with(b"100644 blob ") || metadata.starts_with(b"100755 blob ") {
+            files.insert(name);
+        } else {
+            return Err(invalid());
+        }
+        // A Git subtree with no checkout entries does not create a directory.
+        let mut parent = name;
+        while let Some(slash) = parent.iter().rposition(|byte| *byte == b'/') {
+            parent = &parent[..slash];
+            if !directories.insert(parent) {
+                break;
+            }
+        }
+    }
+
+    let mut validated = HashSet::new();
+    for name in links.keys() {
+        let mut pending: VecDeque<_> = name.split(|byte| *byte == b'/').collect();
+        let mut path = Vec::new();
+        let mut followed = 0;
+        while let Some(part) = pending.pop_front() {
+            match part {
+                b"" | b"." => continue,
+                b".." => {
+                    if path.is_empty() {
+                        return Err(invalid());
+                    }
+                    path.truncate(path.iter().rposition(|byte| *byte == b'/').unwrap_or(0));
+                }
+                _ => {
+                    let parent_len = path.len();
+                    if parent_len != 0 {
+                        path.push(b'/');
+                    }
+                    path.extend_from_slice(part);
+                    if let Some(oid) = links.get(path.as_slice()) {
+                        followed += 1;
+                        if followed > 40 {
+                            return Err(invalid());
+                        }
+                        path.truncate(parent_len);
+                        for part in link_blobs[oid].rsplit(|byte| *byte == b'/') {
+                            pending.push_front(part);
+                        }
+                    } else if !(directories.contains(path.as_slice())
+                        || pending.is_empty() && files.contains(path.as_slice()))
+                    {
+                        return Err(invalid());
+                    }
+                }
+            }
+        }
+        validated.insert(PathBuf::from(OsStr::from_bytes(name)));
+    }
+    Ok(validated)
 }
 
 #[cfg(target_os = "linux")]

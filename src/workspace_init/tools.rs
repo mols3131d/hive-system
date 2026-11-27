@@ -288,7 +288,7 @@ impl<'a> Installed<'a> {
         run(command, "Git", args[0])
     }
 
-    fn git_command(&self, cwd: &Path) -> Command {
+    pub(crate) fn git_command(&self, cwd: &Path) -> Command {
         let mut command = self.command(&self.git, cwd);
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")

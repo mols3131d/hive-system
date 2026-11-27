@@ -13,7 +13,7 @@ pub(crate) use linux::{Installed, fd_path, inspect_empty_target, probe_versions,
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
     inspect_target_parent, lock_target, require_entries, restrict_db_modes, same_directory,
-    verify_target_directory,
+    sync_tree_with_links, verify_target_directory,
 };
 
 pub(crate) fn run(target: &Path, register_runtime: bool) -> Result<Value, HiveError> {

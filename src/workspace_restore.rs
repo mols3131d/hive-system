@@ -22,6 +22,7 @@ pub(crate) fn run(source: &Path, target: &Path) -> Result<Value, HiveError> {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::BTreeMap;
+    use std::collections::HashSet;
     use std::ffi::OsStr;
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read, Write};
@@ -35,7 +36,9 @@ mod linux {
 
     use crate::config::json_path;
     use crate::config_file::ScopedDirectory;
-    use crate::config_git::{ASSET_BACKUP_REF, MAX_BLOB_BYTES, is_full_lowercase_oid};
+    use crate::config_git::{
+        ASSET_BACKUP_REF, MAX_BLOB_BYTES, is_full_lowercase_oid, verify_checkout_tree,
+    };
     use crate::config_v2::{BOOTSTRAP_LAYOUT, MARKER, verify_bootstrap_layout};
     use crate::dolt::{
         DOLT_VERSION, STORAGE_SCHEMA_VERSION, is_commit_hash, is_uuid, validate_restored_records,
@@ -47,7 +50,7 @@ mod linux {
     };
     use crate::workspace_init::{
         Installed, fd_path, inspect_target_parent, lock_target, require_entries, restrict_db_modes,
-        same_directory, sync_tree, verify_target_directory,
+        same_directory, sync_tree_with_links, verify_target_directory,
     };
     use crate::workspace_status::{require_inactive_target, require_local_filesystem};
 
@@ -148,7 +151,7 @@ mod linux {
         )?;
         restrict_db_modes(&db)?;
 
-        restore_assets(
+        let links = restore_assets(
             &installed,
             &assets,
             &format!("{snapshot_path}/assets.bundle"),
@@ -179,7 +182,7 @@ mod linux {
             "version: 2\nworkspace_id: {}\nschema_version: {STORAGE_SCHEMA_VERSION}\npolicy_revision: {}\nbootstrap_layout: {BOOTSTRAP_LAYOUT}\n",
             manifest.workspace_id, manifest.policy_revision,
         ).map_err(io_error)?;
-        sync_tree(&payload_dir)?;
+        sync_tree_with_links(&payload_dir, Path::new(""), &links)?;
 
         let current_parent = inspect_target_parent(&target)?;
         require_inactive_target(&manifest.workspace_id, &target)?;
@@ -362,7 +365,7 @@ mod linux {
         assets: &Path,
         bundle: &str,
         revision: &str,
-    ) -> Result<(), HiveError> {
+    ) -> Result<HashSet<PathBuf>, HiveError> {
         let object_format = if revision.len() == 64 {
             "sha256"
         } else {
@@ -388,22 +391,15 @@ mod linux {
                 "The restored asset revision differs from the manifest.",
             ));
         }
-        // Validate modes before checkout so the visible workspace contains
-        // only ordinary files and directories. Historical objects stay intact.
-        let modes = git(&["ls-tree", "-r", "--format=%(objectmode)", revision])?;
-        if modes
-            .lines()
-            .any(|mode| !matches!(mode, "100644" | "100755"))
-        {
-            return Err(unverified(
-                "The asset tree contains an unsupported entry type.",
-            ));
-        }
-        git(&["reset", "--hard", revision])?;
+        let links = verify_checkout_tree(|| installed.git_command(assets), revision)?;
+        git(&["-c", "core.symlinks=true", "reset", "--hard", revision])?;
         if !git(&["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
             return Err(unverified("The restored asset worktree is not clean."));
         }
-        Ok(())
+        Ok(links
+            .into_iter()
+            .map(|link| Path::new("assets").join(link))
+            .collect())
     }
 
     fn changed_target() -> HiveError {
