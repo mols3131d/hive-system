@@ -266,6 +266,8 @@ pub(crate) enum Command {
     #[command(skip)]
     Workspace(WorkspaceAction),
     #[command(skip)]
+    Backup(BackupCommand),
+    #[command(skip)]
     Label(LabelCommand),
     /// Inspect preserved Queen conversations under contract 2.
     #[command(subcommand, hide = true)]
@@ -812,6 +814,18 @@ pub(crate) enum WorkspaceAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum BackupCommand {
+    /// Create a local backup of a stopped, registered workspace.
+    Create {
+        #[arg(long, value_name = "NEW_DIR")]
+        destination: PathBuf,
+        /// Request private conversation inclusion (currently unavailable).
+        #[arg(long)]
+        include_conversations: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum WorkspaceCommand {
     /// Observe the selected workspace and local runtime evidence.
     Status(DoltTargetArgs),
@@ -1053,6 +1067,9 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     if let Some(workspace) = workspace_parser(&cli, &args) {
         cli = workspace;
     }
+    if let Some(backup) = backup_parser(&cli, &args) {
+        cli = backup;
+    }
     if !has_context_v2_selection(&cli, &args) {
         cli = cli.mut_subcommand("context", |_| {
             CommonArgs::augment_args(
@@ -1183,6 +1200,10 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 WorkspaceAction::from_arg_matches(workspace)
                     .map_err(|error| safe_parse_message(error.kind()))?,
             ),
+            Some(("backup", backup)) => Command::Backup(
+                BackupCommand::from_arg_matches(backup)
+                    .map_err(|error| safe_parse_message(error.kind()))?,
+            ),
             Some(("label", label)) => Command::Label(
                 LabelCommand::from_arg_matches(label)
                     .map_err(|error| safe_parse_message(error.kind()))?,
@@ -1228,6 +1249,37 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             message: message.to_owned(),
         }),
     }
+}
+
+fn backup_parser(legacy: &clap::Command, args: &[OsString]) -> Option<clap::Command> {
+    if !args
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "backup" || arg == "--help" || arg == "-h")
+    {
+        return None;
+    }
+    let cli = legacy.clone().subcommand(
+        BackupCommand::augment_subcommands(
+            clap::Command::new("backup").about("Create a local v2 workspace backup."),
+        )
+        .subcommand_required(true)
+        .mut_subcommands(add_leaf_options),
+    );
+    let probe = extended_help_probe(cli.clone()).mut_subcommand("backup", |backup| {
+        backup
+            .disable_help_flag(true)
+            .mut_subcommands(extended_help_probe)
+    });
+    let matches = probe.ignore_errors(true).try_get_matches_from(args).ok()?;
+    if matches.subcommand_name() != Some("backup")
+        && !(matches.subcommand_name().is_none() && matches.get_flag("extended_help_probe"))
+    {
+        return None;
+    }
+    let leaf = matched_leaf(&cli, &matches);
+    (requested_contract(Some(&matches), leaf.as_ref().map(|(_, leaf)| *leaf)) == Contract::V2)
+        .then_some(cli)
 }
 
 fn workspace_parser(legacy: &clap::Command, args: &[OsString]) -> Option<clap::Command> {
@@ -2321,6 +2373,18 @@ impl Command {
                     }
                     Ok(())
                 }
+                Self::Backup(_) => {
+                    if common.workspace.is_none()
+                        || common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Backup create requires an explicit --workspace and working view.",
+                        );
+                    }
+                    Ok(())
+                }
                 Self::Workspace(WorkspaceAction::Runtime(
                     WorkspaceCommand::Start { .. } | WorkspaceCommand::Stop,
                 )) => {
@@ -2424,6 +2488,7 @@ impl Command {
             }
             Self::Area(_) => Err("Area commands require --contract 2."),
             Self::Issue(_) => Err("Issue commands require --contract 2."),
+            Self::Backup(_) => Err("Backup commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),
             Self::Conversation(_) => Err("Conversation commands require --contract 2."),
             Self::Bot(command) => command.validate(common),

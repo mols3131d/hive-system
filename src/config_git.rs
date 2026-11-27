@@ -358,6 +358,10 @@ impl<'a> PinnedAssets<'a> {
     }
 
     pub(crate) fn recheck(&self) -> Result<(), HiveError> {
+        self.check_status(false)
+    }
+
+    fn check_status(&self, include_ignored: bool) -> Result<(), HiveError> {
         self.repository.verify_selection(self.root)?;
         let command = || self.repository.status_command();
         let check_head = || {
@@ -393,9 +397,12 @@ impl<'a> PinnedAssets<'a> {
 
         let mut status = command()?;
         disable_status_filters(command()?, &mut status)?;
+        status.arg("status");
+        if include_ignored {
+            status.arg("--ignored=matching");
+        }
         let result = execute_asset(
             status.args([
-                "status",
                 "--porcelain=v1",
                 "-z",
                 "--untracked-files=normal",
@@ -419,6 +426,87 @@ impl<'a> PinnedAssets<'a> {
         check_head()?;
         self.repository.verify_selection(self.root)
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn with_asset_bundle<T>(
+    root: &crate::config_file::ScopedDirectory,
+    scratch: &Path,
+    bundle: &Path,
+    complete: impl FnOnce(&str, &dyn Fn() -> Result<(), HiveError>) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
+    let repository = AssetRepository::open(root)?;
+    let head = execute_asset(
+        repository
+            .status_command()?
+            .args(["rev-parse", "--verify", "HEAD^{commit}"]),
+        65,
+        None,
+    )?;
+    let revision = git_line(&head.stdout)
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .filter(|oid| head.status.success() && is_full_lowercase_oid(oid))
+        .ok_or_else(unavailable_blob)?;
+    let pinned = PinnedAssets {
+        root,
+        repository,
+        revision,
+    };
+    let recheck = || pinned.check_status(true);
+    recheck()?;
+
+    // Advertise only the selected commit and its ancestry. The isolated
+    // repository cannot inherit replace refs, shallow boundaries or remotes.
+    let config = pinned
+        .repository
+        .git_dir
+        .read(OsStr::new("config"))?
+        .unwrap_or_default();
+    let reader =
+        AssetObjectReader::new_in(&pinned.repository.objects, &config, revision.len(), scratch)?;
+    let head_ref = "refs/heads/inspection";
+    let check = |command: &mut Command| {
+        let result = execute_asset(command, 64 * 1024, None)?;
+        if !result.status.success() {
+            return Err(HiveError::new(
+                ErrorCode::ObjectUnavailable,
+                "Could not create or verify the full assets Git bundle.",
+            ));
+        }
+        Ok(result.stdout)
+    };
+    check(reader.command()?.args(["update-ref", head_ref, revision]))?;
+    check(
+        reader
+            .command()?
+            .args(["bundle", "create"])
+            .arg(bundle)
+            .arg(head_ref),
+    )?;
+
+    let verify = scratch.join("verify-assets.git");
+    let object_format = if revision.len() == 64 {
+        "sha256"
+    } else {
+        "sha1"
+    };
+    check(
+        isolated_git_command(scratch)
+            .args(["init", "--bare", "--template="])
+            .arg(format!("--object-format={object_format}"))
+            .arg(&verify),
+    )?;
+    let command = || isolated_git_command(&verify);
+    check(command().args(["bundle", "verify"]).arg(bundle))?;
+    let refs = check(command().args(["bundle", "unbundle"]).arg(bundle))?;
+    if refs != format!("{revision} {head_ref}\n").as_bytes() {
+        return Err(unavailable_blob());
+    }
+    check(command().args(["update-ref", head_ref, revision]))?;
+    check(command().args(["fsck", "--full", "--no-reflogs", revision]))?;
+    // The artifact contains only the verified bundle; Git's local metadata
+    // lives in scratch and will be removed with it.
+    complete(revision, &recheck)
 }
 
 #[cfg(target_os = "linux")]
@@ -526,6 +614,15 @@ impl<'a> AssetObjectReader<'a> {
         config: &[u8],
         oid_width: usize,
     ) -> Result<Self, HiveError> {
+        Self::new_in(objects, config, oid_width, Path::new("/tmp"))
+    }
+
+    fn new_in(
+        objects: &'a crate::config_file::ScopedDirectory,
+        config: &[u8],
+        oid_width: usize,
+        scratch: &Path,
+    ) -> Result<Self, HiveError> {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -557,7 +654,7 @@ impl<'a> AssetObjectReader<'a> {
         let repository = tempfile::Builder::new()
             .prefix("hive-soul-git-")
             .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir_in("/tmp")
+            .tempdir_in(scratch)
             .map_err(io_error)?;
         let path = repository.path();
         fs::create_dir(path.join("refs")).map_err(io_error)?;

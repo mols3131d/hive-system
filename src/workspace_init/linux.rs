@@ -15,6 +15,7 @@ use crate::{config_file, config_v2};
 
 mod registration;
 mod tools;
+pub(crate) use tools::Installed;
 
 const POLICY_REVISION: &str = "c66b3c50150e18426485d134de92c6b311dac125";
 // Assets init fixes the Git object format to SHA-1.
@@ -453,7 +454,7 @@ fn sync_directory(directory: &File) -> Result<(), HiveError> {
         .map_err(|_| io_error("Could not sync a workspace directory."))
 }
 
-fn sync_tree(directory: &File) -> Result<(), HiveError> {
+pub(crate) fn sync_tree(directory: &File) -> Result<(), HiveError> {
     let sync_error = |_| io_error("Could not sync the verified workspace payload.");
     for entry in fs::read_dir(fd_path(directory)).map_err(sync_error)? {
         let entry = entry.map_err(sync_error)?;
@@ -674,7 +675,7 @@ fn open_directory(path: &Path) -> Result<File, HiveError> {
         })
 }
 
-fn fd_path(directory: &File) -> PathBuf {
+pub(crate) fn fd_path(directory: &File) -> PathBuf {
     Path::new("/proc/self/fd").join(directory.as_raw_fd().to_string())
 }
 

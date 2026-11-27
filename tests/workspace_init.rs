@@ -1278,3 +1278,289 @@ exec {dolt} "$@"
     assert_eq!(stages.len(), 1);
     assert!(!stages[0].join("scratch").exists());
 }
+
+#[test]
+fn backup_help_and_conversation_flag_are_contract_two_only() {
+    let fixture = Fixture::new();
+    let run = |args: &[&str]| fixture.hive().args(args).output().unwrap();
+    for args in [
+        &["--help"][..],
+        &["backup", "--help"],
+        &["--contract", "1", "backup", "create", "--help"],
+    ] {
+        let result = run(args);
+        assert!(!String::from_utf8_lossy(&result.stdout).contains("Create a local"));
+    }
+    let v2_root = run(&["--contract", "2", "--help"]);
+    assert!(v2_root.status.success());
+    assert!(
+        String::from_utf8_lossy(&v2_root.stdout).contains("Create a local v2 workspace backup")
+    );
+    let help = run(&["backup", "create", "--help", "--contract", "2"]);
+    assert!(help.status.success(), "{help:?}");
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--include-conversations"));
+    let refused = response(
+        run(&[
+            "--contract",
+            "2",
+            "--json",
+            "--workspace",
+            "missing",
+            "backup",
+            "create",
+            "--destination",
+            "backup",
+            "--include-conversations",
+        ]),
+        7,
+    );
+    assert_eq!(refused["error"]["code"], "NOT_IMPLEMENTED");
+    assert!(!fixture.0.join("backup").exists());
+}
+
+#[test]
+#[ignore = "requires installed Dolt 2.7.6 and Git"]
+fn creates_exact_local_backup_and_refuses_unverified_sources() {
+    use sha2::{Digest, Sha256};
+
+    let fixture = Fixture::new();
+    let root = fixture.dir("workspace");
+    let xdg = fixture.dir("xdg");
+    let home = fixture.dir("offline home");
+    let bin = fixture.dir("bin");
+    let dolt = PathBuf::from(std::env::var_os("HIVE_DOLT_BIN").unwrap());
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    symlink(&dolt, bin.join("dolt")).unwrap();
+    symlink(&git, bin.join("git")).unwrap();
+    let initialized = response(
+        fixture
+            .init(&root)
+            .arg("--register-runtime")
+            .env("XDG_STATE_HOME", &xdg)
+            .output()
+            .unwrap(),
+        0,
+    );
+    let initial = &initialized["data"];
+    let execute = |command: &mut Command| {
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        output.stdout
+    };
+    let database = |path: &Path| {
+        let mut command = Command::new(&dolt);
+        command
+            .current_dir(path)
+            .env_clear()
+            .env("HOME", &home)
+            .env("DOLT_ROOT_PATH", &home)
+            .env("DOLT_DISABLE_VERSION_CHECKS", "true")
+            .env("DOLT_DISABLE_EVENT_FLUSH", "true");
+        command
+    };
+    let assets = |path: &Path| {
+        let mut command = Command::new(&git);
+        command
+            .current_dir(path)
+            .env_clear()
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Synthetic")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Synthetic")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid");
+        command
+    };
+    let db = root.join("db");
+    let asset_root = root.join("assets");
+    let source_soul = b"# Synthetic Soul
+
+Two lines.
+";
+    fs::write(asset_root.join("SOUL.md"), source_soul).unwrap();
+    execute(assets(&asset_root).args(["add", "SOUL.md"]));
+    execute(assets(&asset_root).args(["commit", "-m", "Add synthetic Soul"]));
+    let update = "UPDATE workspace_counters SET next_value = 42 WHERE name = 'issue_number'";
+    execute(database(&db).args(["sql", "-q", update]));
+    execute(database(&db).args(["add", "."]));
+    execute(database(&db).args([
+        "commit",
+        "--author",
+        "Synthetic <test@example.invalid>",
+        "-m",
+        "Advance counter",
+    ]));
+    fs::write(
+        root.join("conversations/private.md"),
+        "synthetic-private-marker",
+    )
+    .unwrap();
+
+    let run_backup = |destination: &str| {
+        fixture
+            .hive()
+            .env("XDG_STATE_HOME", &xdg)
+            .args(["--contract", "2", "--json", "--workspace"])
+            .arg(&root)
+            .args(["backup", "create", "--destination", destination])
+            .output()
+            .unwrap()
+    };
+    let expect_failure = |destination: &str, status, code| {
+        let result = response(run_backup(destination), status);
+        assert_eq!(result["error"]["code"], code, "{result}");
+        assert!(!fixture.0.join(destination).exists());
+        assert!(!fs::read_dir(&fixture.0).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".hive-backup-")
+        }));
+    };
+    let state = xdg
+        .join("hive/v2/workspaces")
+        .join(initial["workspace_id"].as_str().unwrap());
+    for marker in [
+        "pending-request.json",
+        "starting",
+        "server.json",
+        "run-unrecognized",
+    ] {
+        fs::write(state.join(marker), b"{}").unwrap();
+        expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
+        fs::remove_file(state.join(marker)).unwrap();
+    }
+    let native_server = db.join(".dolt/sql-server.info");
+    fs::write(&native_server, b"unknown").unwrap();
+    expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
+    fs::remove_file(native_server).unwrap();
+    let lock = fs::File::open(state.join("lock")).unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+    expect_failure("failed", 5, "LOCK_BUSY");
+    drop(lock);
+    let lock = fs::File::open(db.join(".dolt/noms/LOCK")).unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+    expect_failure("failed", 5, "LOCK_BUSY");
+    drop(lock);
+
+    fs::write(asset_root.join("SOUL.md"), "dirty").unwrap();
+    expect_failure("failed", 5, "DIRTY_CONFLICT");
+    fs::write(asset_root.join("SOUL.md"), source_soul).unwrap();
+    execute(database(&db).args(["sql", "-q", "UPDATE workspace_counters SET next_value = 43"]));
+    expect_failure("failed", 5, "DIRTY_CONFLICT");
+    execute(database(&db).args(["checkout", "--", "workspace_counters"]));
+    execute(database(&db).args(["branch", "unsupported"]));
+    expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
+    execute(database(&db).args(["branch", "-d", "unsupported"]));
+
+    // Inject failures at the native export boundary, after private staging is
+    // prepared. A competing destination must survive the final rename.
+    fs::remove_file(bin.join("dolt")).unwrap();
+    let wrapper = bin.join("dolt");
+    let fault = |body: &str| {
+        fs::write(&wrapper, format!(
+            "#!/bin/sh\nif [ \"$1\" = backup ] && [ \"$2\" = sync-url ]; then {body}; fi\nexec \"{}\" \"$@\"\n",
+            dolt.display()
+        )).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    fault("exit 17");
+    expect_failure("failed", 7, "IO_ERROR");
+    let competing = fixture.0.join("contended");
+    fault(&format!(
+        "/bin/mkdir '{}'; printf competing > '{}/sentinel'",
+        competing.display(),
+        competing.display()
+    ));
+    let raced = response(run_backup("contended"), 5);
+    assert_eq!(raced["error"]["code"], "ALREADY_EXISTS");
+    assert_eq!(fs::read(competing.join("sentinel")).unwrap(), b"competing");
+    fs::remove_file(&wrapper).unwrap();
+    symlink(&dolt, &wrapper).unwrap();
+
+    // Dolt can leave an empty native transfer directory in the source.
+    let native_tmp = db.join(".dolt/tmp");
+    fs::create_dir_all(&native_tmp).unwrap();
+    fs::write(native_tmp.join("unexpected"), b"unverified temporary state").unwrap();
+    expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
+    fs::remove_file(native_tmp.join("unexpected")).unwrap();
+
+    let result = response(run_backup("backup with spaces"), 0);
+    let backup = fixture.0.join("backup with spaces");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(backup.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(result["data"]["manifest"], manifest);
+    assert_eq!(manifest["format_version"], 1);
+    assert_eq!(manifest["conversations_included"], false);
+    assert_eq!(manifest["workspace_id"], initial["workspace_id"]);
+    assert_eq!(
+        backup.metadata().unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(fs::read_dir(&backup).unwrap().count(), 3);
+    let files = manifest["files"].as_array().unwrap();
+    for entry in files {
+        let bytes = fs::read(backup.join(entry["path"].as_str().unwrap())).unwrap();
+        assert_eq!(entry["bytes"], bytes.len());
+        assert_eq!(entry["sha256"], format!("{:x}", Sha256::digest(bytes)));
+    }
+    assert_eq!(
+        response(run_backup("backup with spaces"), 5)["error"]["code"],
+        "ALREADY_EXISTS"
+    );
+
+    execute(database(&home).args(["config", "--global", "--add", "user.name", "Synthetic"]));
+    execute(database(&home).args([
+        "config",
+        "--global",
+        "--add",
+        "user.email",
+        "test@example.invalid",
+    ]));
+    let restored = fixture.dir("restored");
+    execute(
+        database(&restored)
+            .args(["backup", "restore"])
+            .arg(format!("file://{}", backup.join("dolt").display()))
+            .arg("db"),
+    );
+    let verify = format!(
+        "SELECT DOLT_HASHOF('HEAD') AS revision,          (SELECT next_value FROM workspace_counters) AS current_value,          (SELECT next_value FROM workspace_counters AS OF '{}') AS prior_value",
+        initial["db_commit"].as_str().unwrap()
+    );
+    let rows: Value = serde_json::from_slice(&execute(
+        database(&restored.join("db")).args(["sql", "-r", "json", "-q", &verify]),
+    ))
+    .unwrap();
+    assert_eq!(rows["rows"][0]["revision"], manifest["dolt_commit"]);
+    assert_eq!(rows["rows"][0]["current_value"], 42);
+    assert_eq!(rows["rows"][0]["prior_value"], 1);
+
+    let checked = fixture.dir("checked-assets");
+    execute(assets(&checked).args(["init", "--template="]));
+    execute(
+        assets(&checked)
+            .args(["bundle", "unbundle"])
+            .arg(backup.join("assets.bundle")),
+    );
+    let revision = manifest["asset_git_commit"].as_str().unwrap();
+    assert_eq!(
+        execute(assets(&checked).args(["show", &format!("{revision}:SOUL.md")])),
+        source_soul
+    );
+    assert_eq!(
+        execute(assets(&checked).args(["rev-parse", &format!("{revision}^")])),
+        format!(
+            "{}
+",
+            initial["asset_commit"].as_str().unwrap()
+        )
+        .as_bytes()
+    );
+}
