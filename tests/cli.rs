@@ -1960,3 +1960,375 @@ fn duplicate_and_missing_config_scope_options_preserve_v2_parse_errors() {
         assert!(!output.stderr.is_empty(), "{args:?}");
     }
 }
+
+#[test]
+fn conversation_show_rejects_default_selection_and_preserves_late_v2_json() {
+    let sandbox = Sandbox::new();
+    let uuid = "01900000-0000-7000-8000-000000000001";
+    let target = [
+        "--workspace-id",
+        uuid,
+        "--database",
+        "fixture",
+        "--port",
+        "3306",
+    ];
+    let selectors = ["--bot", uuid, "--id", uuid];
+    let late = ["--contract", "2", "--json"];
+    let command = ["conversation", "show"];
+    let default = sandbox.0.join(".local/share/hive/v2/userdata");
+    fs::create_dir_all(&default).unwrap();
+    fs::write(
+        default.join("hive-workspace.yml"),
+        format!(
+            "version: 2\nworkspace_id: {uuid}\nschema_version: 1\npolicy_revision: {REVISION}\n"
+        ),
+    )
+    .unwrap();
+
+    for args in [
+        [&command[..], &target, &selectors, &late].concat(),
+        [&command[..], &["--workspace", "."], &selectors, &late].concat(),
+        [
+            &command[..],
+            &["--workspace", "."],
+            &target,
+            &["--bot", uuid],
+            &late,
+        ]
+        .concat(),
+        [
+            &command[..],
+            &["--workspace", "."],
+            &target,
+            &["--bot=--json", "--id", uuid],
+            &late,
+        ]
+        .concat(),
+        [
+            &command[..],
+            &["--workspace", "."],
+            &target,
+            &["--bot", uuid, "--id", "private-invalid-selector"],
+            &late,
+        ]
+        .concat(),
+    ] {
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?} {report}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "conversation show");
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(report.get("data").is_none());
+        assert!(
+            !String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("private-invalid-selector")
+        );
+    }
+
+    let literal = [
+        &command[..],
+        &["--workspace", "."],
+        &target,
+        &["--bot=--json", "--id", uuid, "--contract", "2"],
+    ]
+    .concat();
+    let output = sandbox.run(&literal);
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.status.code(), Some(2));
+
+    let legacy = [&command[..], &selectors, &["--json"]].concat();
+    let output = sandbox.run(&legacy);
+    assert_json_failure(&output, &legacy, "conversation show", "INVALID_ARGUMENT", 2);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+}
+
+#[test]
+fn conversation_show_recovers_v2_json_for_duplicate_and_hyphenated_selectors() {
+    let sandbox = Sandbox::new();
+    let uuid = "01900000-0000-7000-8000-000000000001";
+    let command = [
+        "conversation",
+        "show",
+        "--workspace",
+        ".",
+        "--workspace-id",
+        uuid,
+        "--database",
+        "fixture",
+        "--port",
+        "3306",
+    ];
+    let late = ["--contract", "2", "--json"];
+    for selectors in [
+        &["--bot", uuid, "--bot", uuid, "--id", uuid][..],
+        &[
+            "--bot",
+            uuid,
+            "--id",
+            uuid,
+            "--id",
+            "private-invalid-selector",
+        ],
+        &["--bot", "-invalid", "--id", uuid],
+        &["--bot", uuid, "--id", "-invalid"],
+        &["--bot", uuid, "--bot=--json", "--id", uuid],
+        &["--bot", uuid, "--id", uuid, "--id=--contract"],
+        &["--bot=-invalid", "--id", uuid],
+        &["--bot", uuid, "--id=-invalid"],
+        &["--bot", uuid, "--id"],
+        &["--id", uuid, "--bot"],
+    ] {
+        let args = [&command[..], selectors, &late].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], "conversation show");
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(report.get("data").is_none());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!stdout.contains("-invalid"));
+    }
+
+    for selectors in [
+        &[
+            "--bot",
+            uuid,
+            "--bot=--json",
+            "--id",
+            uuid,
+            "--contract",
+            "2",
+        ][..],
+        &[
+            "--bot",
+            "123",
+            "--id",
+            uuid,
+            "--id=--json",
+            "--contract",
+            "2",
+        ],
+        &[
+            "--bot",
+            "-invalid",
+            "--id",
+            uuid,
+            "--",
+            "--contract",
+            "2",
+            "--json",
+        ],
+        &[
+            "--bot",
+            uuid,
+            "--id",
+            uuid,
+            "--id",
+            uuid,
+            "--",
+            "--contract",
+            "2",
+            "--json",
+        ],
+        &[
+            "--bot",
+            uuid,
+            "--id",
+            uuid,
+            "--id",
+            "--",
+            "--contract",
+            "2",
+            "--json",
+        ],
+    ] {
+        let args = [&command[..], selectors].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("-invalid"));
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn conversation_show_recovers_output_for_target_and_scope_errors() {
+    let sandbox = Sandbox::new();
+    let uuid = "01900000-0000-7000-8000-000000000001";
+    fs::write(
+        sandbox.0.join("hive-workspace.yml"),
+        format!(
+            "version: 2\nworkspace_id: {uuid}\nschema_version: 1\npolicy_revision: {REVISION}\n"
+        ),
+    )
+    .unwrap();
+    let command = ["conversation", "show"];
+    let output_options = ["--contract", "2", "--json"];
+    let target = [
+        ["--workspace", "."],
+        ["--workspace-id", uuid],
+        ["--database", "fixture"],
+        ["--port", "3306"],
+        ["--bot", uuid],
+        ["--id", uuid],
+    ];
+    let check = |args: &[&str]| {
+        let output = sandbox.run(args);
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{args:?}: {error}\n{output:?}"));
+        assert!(output.status.code().is_some_and(|code| code != 0));
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], "conversation show", "{args:?}");
+        assert_eq!(report["ok"], false, "{args:?}");
+        assert!(report.get("data").is_none(), "{args:?}");
+        let message = report["error"]["message"].as_str().unwrap();
+        for private in ["INVALID", "-hidden", "private-selector", "other-copy"] {
+            assert!(!message.contains(private), "{report}");
+        }
+        (output.status.code(), report)
+    };
+
+    for (flag, valid, duplicate, invalid, root_allowed) in [
+        ("--port", "3306", "3306", "private-selector", false),
+        (
+            "--database",
+            "fixture",
+            "fixture",
+            "private-selector!",
+            false,
+        ),
+        ("--workspace-id", uuid, uuid, "private-selector", false),
+        ("--bot", uuid, uuid, "private-selector", false),
+        ("--id", uuid, uuid, "private-selector", false),
+        (
+            "--workspace",
+            ".",
+            "other-copy",
+            "https://private-selector",
+            true,
+        ),
+        (
+            "--project",
+            "example-project",
+            "other-project",
+            "INVALID",
+            true,
+        ),
+        (
+            "--project-root",
+            ".",
+            "other-copy",
+            "private-selector",
+            true,
+        ),
+        (
+            "--at",
+            REVISION,
+            "2222222222222222222222222222222222222222",
+            "INVALID",
+            true,
+        ),
+    ] {
+        let other = target
+            .iter()
+            .filter(|pair| pair[0] != flag)
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let empty = format!("{flag}=");
+        for (values, expected_message) in [
+            (
+                &[flag, valid, flag, duplicate][..],
+                (!root_allowed).then_some("Arguments conflict."),
+            ),
+            (&[flag, ""], None),
+            (&[empty.as_str()], None),
+            (&[flag, "-1"], None),
+            (
+                &[flag, "-hidden"],
+                Some("An argument has a missing or invalid value."),
+            ),
+            (
+                &[flag, invalid],
+                matches!(flag, "--project" | "--at")
+                    .then_some("An argument has a missing or invalid value."),
+            ),
+        ] {
+            for at_root in [false, true] {
+                if at_root && !root_allowed {
+                    continue;
+                }
+                let (root, leaf) = if at_root {
+                    (values, &[][..])
+                } else {
+                    (&[][..], values)
+                };
+                let early = [&output_options[..], root, &command, &other, leaf].concat();
+                let late = [root, &command, &other, leaf, &output_options].concat();
+                let early = check(&early);
+                let late = check(&late);
+                assert_eq!(early, late, "{flag} {values:?} at_root={at_root}");
+                if let Some(message) = expected_message {
+                    assert_eq!(late.0, Some(2));
+                    assert_eq!(late.1["error"]["code"], "INVALID_ARGUMENT");
+                    assert_eq!(late.1["error"]["message"], message, "{flag} {values:?}");
+                }
+            }
+        }
+
+        for at_root in [false, true] {
+            if at_root && !root_allowed {
+                continue;
+            }
+            let literal = format!("{flag}=--json");
+            let literal = [literal.as_str()];
+            let (root, leaf) = if at_root {
+                (&literal[..], &[][..])
+            } else {
+                (&[][..], &literal[..])
+            };
+            let args = [
+                root,
+                &command,
+                &other,
+                &["--port", "3306", "--port", "3306"],
+                leaf,
+                &["--contract", "2"],
+            ]
+            .concat();
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            assert!(!output.stderr.is_empty(), "{args:?}");
+        }
+    }
+
+    let full = target.into_iter().flatten().collect::<Vec<_>>();
+    for authority in [
+        "--authority",
+        "--authority=",
+        "--authority=INVALID",
+        "--authority=-1",
+    ] {
+        let early = [&output_options[..], &command, &full, &[authority]].concat();
+        let late = [&command[..], &full, &[authority], &output_options].concat();
+        assert_eq!(check(&early), check(&late), "{authority}");
+    }
+    let legacy = [&command[..], &full, &["--project", "INVALID", "--json"]].concat();
+    let explicit_v1 = [&["--contract", "1"][..], &legacy].concat();
+    let implicit = sandbox.run(&legacy);
+    let explicit = sandbox.run(&explicit_v1);
+    assert_eq!(implicit.status, explicit.status);
+    assert_eq!(implicit.stdout, explicit.stdout);
+    assert_eq!(implicit.stderr, explicit.stderr);
+}
