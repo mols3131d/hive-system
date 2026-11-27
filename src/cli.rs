@@ -264,6 +264,8 @@ pub(crate) enum Command {
     #[command(skip)]
     IssueNote(IssueNoteArgs),
     #[command(skip)]
+    IssueCreate(IssueCreateArgs),
+    #[command(skip)]
     Resource(ResourceCommand),
     #[command(skip)]
     Workspace(WorkspaceAction),
@@ -1053,6 +1055,33 @@ pub(crate) struct IssueNoteArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueCreateArgs {
+    /// Exact Area UUIDv7.
+    #[arg(long)]
+    pub(crate) area: String,
+    /// Issue type.
+    #[arg(long = "type", value_name = "TYPE", value_parser = ["epic", "feature", "task", "bug"])]
+    pub(crate) kind: String,
+    /// Title of the backlog Issue.
+    #[arg(long)]
+    pub(crate) title: String,
+    /// Operator-selected actor reference.
+    #[arg(long)]
+    pub(crate) actor: String,
+    /// Exact request UUID.
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Optional UTF-8 Issue body file.
+    #[arg(long)]
+    pub(crate) file: Option<PathBuf>,
+    /// Fresh, request-bound operator decision file.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueListArgs {
     /// Select Issues across the workspace.
     #[arg(long)]
@@ -1146,7 +1175,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     let mut config_error_matches = None;
     let extension = resource_parser(&cli, &args)
         .or_else(|| label_parser(&cli, &args))
-        .or_else(|| issue_note_parser(&cli, &args))
+        .or_else(|| issue_writer_parser(&cli, &args))
         .or_else(|| operation_parser(&cli, &args));
     let (parsed, extension_matches) = if let Some(extension) = extension {
         cli = extension.cli;
@@ -1264,6 +1293,12 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             Some(("issue", issue)) if issue.subcommand_name() == Some("note") => {
                 Command::IssueNote(
                     IssueNoteArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("create") => {
+                Command::IssueCreate(
+                    IssueCreateArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
             }
@@ -1773,21 +1808,29 @@ struct ExtendedParse {
     partial: Option<ArgMatches>,
 }
 
-fn issue_note_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedParse> {
+fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedParse> {
     if !args.iter().skip(1).any(|arg| arg == "issue") {
         return None;
     }
     let extended = cli.clone().mut_subcommand("issue", |issue| {
-        issue.subcommand(add_leaf_options(IssueNoteArgs::augment_args(
-            clap::Command::new("note")
-                .about("Append a scoped progress note with a current operator decision."),
-        )))
+        issue
+            .subcommand(add_leaf_options(IssueNoteArgs::augment_args(
+                clap::Command::new("note")
+                    .about("Append a scoped progress note with a current operator decision."),
+            )))
+            .subcommand(add_leaf_options(IssueCreateArgs::augment_args(
+                clap::Command::new("create").about(
+                    "Create a backlog Issue under an exact Area with a current operator decision.",
+                ),
+            )))
     });
     // Probe contract selection through Clap so a file name or an actor that
     // resembles a switch does not introduce the new leaf into the v1 grammar.
     let recovery = extended_error_options(extended.clone().disable_help_subcommand(true))
         .mut_subcommand("issue", |issue| {
-            extended_help_probe(issue).mut_subcommand("note", extended_error_options)
+            extended_help_probe(issue)
+                .mut_subcommand("note", extended_error_options)
+                .mut_subcommand("create", extended_error_options)
         });
     let partial = match recovery.clone().try_get_matches_from(args) {
         Ok(matches) => matches,
@@ -1802,7 +1845,7 @@ fn issue_note_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedP
     };
     let leaf = match partial.subcommand() {
         Some(("issue", issue)) => match issue.subcommand() {
-            Some(("note", leaf)) => Some(leaf),
+            Some(("note" | "create", leaf)) => Some(leaf),
             None => None,
             _ => return None,
         },
@@ -2613,6 +2656,20 @@ impl Command {
                     Ok(())
                 }
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
+                Self::IssueCreate(args) => {
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Issue create requires --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err("Issue create requires exact current Area scope.");
+                    }
+                    Ok(())
+                }
                 Self::IssueNote(args) => {
                     if args.kind != "progress" {
                         return Err("Issue note requires --kind progress.");
@@ -2706,7 +2763,9 @@ impl Command {
             }
             Self::Operation(_) => Err("Operation show requires --contract 2."),
             Self::Area(_) => Err("Area commands require --contract 2."),
-            Self::Issue(_) | Self::IssueNote(_) => Err("Issue commands require --contract 2."),
+            Self::Issue(_) | Self::IssueNote(_) | Self::IssueCreate(_) => {
+                Err("Issue commands require --contract 2.")
+            }
             Self::Backup(_) => Err("Backup commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),
             Self::Conversation(_) => Err("Conversation commands require --contract 2."),
