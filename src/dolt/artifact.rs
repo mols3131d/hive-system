@@ -7,12 +7,14 @@ use crate::error::{ErrorCode, HiveError};
 
 use super::{DoltFailure, DoltSuccess, Snapshot, is_uuid_v7};
 
+pub(super) const SUMMARY_COLUMNS: &str = "a.id, a.kind, a.title, a.revision";
+
 const MAX_LIMIT: u32 = 100;
 const MAX_SCOPES: usize = 100;
 const MAX_BODY_BYTES: u32 = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ScopeKind {
+pub(super) enum ScopeKind {
     Area,
     Project,
     Issue,
@@ -22,7 +24,7 @@ enum ScopeKind {
 impl ScopeKind {
     const ALL: [Self; 4] = [Self::Area, Self::Project, Self::Issue, Self::Resource];
 
-    fn tables(self) -> (&'static str, &'static str, &'static str) {
+    pub(super) fn tables(self) -> (&'static str, &'static str, &'static str) {
         match self {
             Self::Area => ("areas", "artifact_areas", "area_id"),
             Self::Project => ("projects", "artifact_projects", "project_id"),
@@ -79,7 +81,7 @@ impl<'a> Scope<'a> {
 }
 
 #[derive(Serialize)]
-struct Metadata {
+pub(super) struct Metadata {
     id: String,
     kind: String,
     title: String,
@@ -139,7 +141,7 @@ pub(crate) fn list(args: &ArtifactListArgs) -> Result<DoltSuccess, Box<DoltFailu
         let (_, links, column) = scope.kind.tables();
         let rows: Vec<MetadataRow> = snapshot.exec_rows(
             |commit| format!(
-                "SELECT a.id, a.kind, a.title, a.revision FROM artifacts AS OF '{commit}' AS a
+                "SELECT {SUMMARY_COLUMNS} FROM artifacts AS OF '{commit}' AS a
                  JOIN {links} AS OF '{commit}' AS link ON CAST(link.artifact_id AS BINARY) = CAST(a.id AS BINARY)
                  WHERE CAST(link.{column} AS BINARY) = ? AND CAST(a.id AS BINARY) > ?
                  ORDER BY CAST(a.id AS BINARY) LIMIT ?"

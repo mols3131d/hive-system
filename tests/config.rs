@@ -2370,10 +2370,14 @@ fn context_resolve_binds_the_committed_role_policy_to_the_descriptor() {
             .contains("Dolt port")
     );
     assert_eq!(snapshot(&fixture.0), before);
-    expect(
+    let limited = expect(
         &[common.as_slice(), &["--budget", "1"]].concat(),
         2,
         "CONTEXT_LIMIT",
+    );
+    assert_eq!(
+        limited["error"]["details"],
+        serde_json::json!({"kind": "role", "id": "Drone"})
     );
     expect(
         &[common.as_slice(), &["--bot", id]].concat(),

@@ -158,7 +158,8 @@ fn preflight(
             HiveError::new(
                 ErrorCode::ContextLimit,
                 "The required Role policy exceeds the inline context budget.",
-            ),
+            )
+            .context_limit_ref("role", role.policy_name()),
         ));
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]

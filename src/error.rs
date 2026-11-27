@@ -85,7 +85,7 @@ pub(crate) struct HiveError {
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 enum ErrorDetails {
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(any(test, unix))]
     ContextReference {
         kind: &'static str,
         id: String,
@@ -127,7 +127,7 @@ impl HiveError {
         }
     }
 
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(any(test, unix))]
     pub(crate) fn context_limit_ref(mut self, kind: &'static str, id: &str) -> Self {
         if matches!(self.code, ErrorCode::ContextLimit) && self.details.is_none() {
             self.details = Some(ErrorDetails::ContextReference {

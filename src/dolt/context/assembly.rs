@@ -5,11 +5,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use time::UtcOffset;
 
 use super::{
     DEFAULT_INLINE_BYTES, MAX_INLINE_BYTES, Scope, Snapshot, collect_work, directives, is_uuid_v7,
-    limit, resume, workflow,
+    limit, references, resume, workflow,
 };
 use crate::cli::ContextRole;
 use crate::dolt::DoltSuccess;
@@ -50,6 +51,8 @@ pub(super) struct Inputs<'a> {
     pub(super) activation_receipts: &'a BTreeMap<&'a str, &'a str>,
     pub(super) artifacts: &'a [SelectedArtifact<'a>],
     pub(super) budget: Option<usize>,
+    pub(super) cursor: Option<&'a str>,
+    pub(super) evidence_fingerprint: &'a str,
 }
 
 pub(super) fn assemble(
@@ -106,7 +109,8 @@ pub(super) fn assemble(
             .ok_or_else(workflow::unverified)?;
         let body = directives::read_approved(snapshot, &candidate, request_id, remaining)
             .map_err(|error| error.context_limit_ref("directive", &candidate.id))?;
-        charge(&mut remaining, body.len())?;
+        charge(&mut remaining, body.len())
+            .map_err(|error| error.context_limit_ref("directive", &candidate.id))?;
         directions.push(json!({
             "kind": "directive", "trust": "approved-direction", "id": candidate.id,
             "revision": candidate.revision, "body": body, "issuer_ref": candidate.issuer_ref,
@@ -123,30 +127,26 @@ pub(super) fn assemble(
         }
     })?;
     let mut data = json!({"identity": identity, "directives": directions});
-    let mut optional = json!({});
     if let Some(work) = &work {
         let handoff = resume::read_required(snapshot, scope, work, remaining, &inputs.request)
             .map_err(|error| error.context_limit_ref("issue", &work.issue.id))?;
-        charge(&mut remaining, work.inline_bytes)?;
+        charge(&mut remaining, work.inline_bytes)
+            .map_err(|error| error.context_limit_ref("issue", &work.issue.id))?;
         data["issue"] = json!({
             "kind": "issue", "trust": "data", "record": work.issue,
             "blockers": {"prerequisite": work.prerequisite_blocked, "archived_ancestry": work.archived_ancestry, "hold": work.issue.hold_reason.is_some()},
             "claimed": work.claimed
         });
-        optional = json!({
-            "prerequisites": work.prerequisites,
-            "updates": work.updates.iter().map(|entry| json!({
-                "id": entry.id, "kind": entry.kind, "trust": "data", "revision": snapshot.commit, "created_at": entry.created_at
-            })).collect::<Vec<_>>()
-        });
         if let Some(handoff) = &handoff {
-            charge(&mut remaining, handoff.inline_bytes)?;
+            let source_kind = match handoff.kind {
+                workflow::RecordKind::IssueUpdate => "issue_update",
+                workflow::RecordKind::Artifact => "artifact",
+            };
+            charge(&mut remaining, handoff.inline_bytes)
+                .map_err(|error| error.context_limit_ref(source_kind, &handoff.id))?;
             data["handoff"] = json!({
                 "kind": "handoff", "trust": "data", "id": handoff.id, "revision": handoff.revision,
-                "source_kind": match handoff.kind {
-                    workflow::RecordKind::IssueUpdate => "issue_update",
-                    workflow::RecordKind::Artifact => "artifact",
-                },
+                "source_kind": source_kind,
                 "body": handoff.body
             });
         }
@@ -165,7 +165,8 @@ pub(super) fn assemble(
             let body =
                 resume::read_artifact_body(snapshot, scope, work, entry.id, &revision, remaining)
                     .map_err(|error| error.context_limit_ref("artifact", entry.id))?;
-            charge(&mut remaining, body.len())?;
+            charge(&mut remaining, body.len())
+                .map_err(|error| error.context_limit_ref("artifact", entry.id))?;
             artifacts.push(json!({"kind": "artifact", "trust": "data", "id": entry.id, "revision": revision, "body": body}));
         }
         if !artifacts.is_empty() {
@@ -220,13 +221,40 @@ pub(super) fn assemble(
             "project_id": scope.project.as_ref().map(|project| &project.id)
         }
     });
+    if crate::output::context_json_bytes(&context, &data)? > MAX_JSON_BYTES {
+        return Err(serialized_limit(inputs.role));
+    }
+    // Required sections capture the current applicable Directive set as well
+    // as selected body revisions. The observation timestamp itself can advance.
+    let required = format!("{:x}", Sha256::digest(data.to_string()));
+    let binding = json!([
+        "context-references-v1",
+        snapshot.workspace_id,
+        snapshot.commit,
+        inputs.asset_commit,
+        inputs.policy_revision,
+        context["scope"],
+        inputs.request.actor_ref,
+        inputs.request.bot_id,
+        inputs.request.invocation_id,
+        inputs.role.policy_name(),
+        max,
+        required,
+        inputs
+            .artifacts
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        inputs.evidence_fingerprint,
+    ]);
+    let pages = references::collect(snapshot, scope, work.as_ref(), inputs.cursor, &binding)?;
     fit_output(
         context,
         data,
-        optional,
-        work.as_ref().map_or([0, 0], |work| {
-            [work.omitted_prerequisites as u64, work.omitted_updates]
-        }),
+        pages,
+        &binding,
+        inputs.role,
+        inputs.cursor.is_some(),
         MAX_JSON_BYTES,
     )
 }
@@ -311,51 +339,47 @@ fn charge(remaining: &mut usize, bytes: usize) -> Result<(), HiveError> {
     Ok(())
 }
 
+fn serialized_limit(role: ContextRole) -> HiveError {
+    limit("Required context JSON exceeds the serialized response budget.")
+        .context_limit_ref("role", role.policy_name())
+}
+
 fn fit_output(
     context: Value,
     mut data: Value,
-    mut optional: Value,
-    mut omitted: [u64; 2],
+    mut pages: Vec<references::Page>,
+    binding: &Value,
+    role: ContextRole,
+    continuing: bool,
     max: usize,
 ) -> Result<DoltSuccess, HiveError> {
-    let groups = ["prerequisites", "updates"];
     loop {
+        let mut omitted = json!({});
         let mut refs = json!({});
-        for (index, group) in groups.iter().enumerate() {
-            if omitted[index] != 0 {
-                let last = optional[*group].as_array().and_then(|items| items.last());
-                refs[*group] = json!({
-                    "count": omitted[index],
-                    "after_id": last.and_then(|entry| entry.as_str().or_else(|| entry["id"].as_str()))
+        for page in &pages {
+            refs[page.group] = json!(page.items);
+            if page.omitted != 0 {
+                omitted[page.group] = json!({
+                    "count": page.omitted,
+                    "next_cursor": page.next_cursor(binding)
                 });
             }
         }
-        data["omitted"] = refs;
-        data["refs"] = optional;
-        let bytes = crate::output::context_json_bytes(&context, &data)?;
-        if bytes <= max {
+        data["omitted"] = omitted;
+        data["refs"] = refs;
+        if crate::output::context_json_bytes(&context, &data)? <= max {
             return Ok(DoltSuccess { context, data });
         }
-        optional = data
-            .as_object_mut()
-            .expect("context object")
-            .remove("refs")
-            .expect("refs assigned");
-        let mut trimmed = false;
-        for (index, group) in groups.iter().enumerate().rev() {
-            if optional[*group]
-                .as_array_mut()
-                .is_some_and(|items| items.pop().is_some())
-            {
-                omitted[index] += 1;
-                trimmed = true;
-                break;
-            }
-        }
-        if !trimmed {
-            return Err(limit(
-                "Required context JSON exceeds the serialized response budget.",
-            ));
+        let Some(page) = pages.iter_mut().rev().find(|page| !page.items.is_empty()) else {
+            return Err(serialized_limit(role));
+        };
+        page.items.pop();
+        page.omitted += 1;
+        if continuing && page.items.is_empty() {
+            return Err(
+                limit("The response budget cannot fit the next context reference.")
+                    .context_limit_ref("role", role.policy_name()),
+            );
         }
     }
 }
@@ -368,29 +392,58 @@ mod tests {
     fn counts_the_full_envelope_and_omits_only_whole_optional_refs() {
         let context = json!({"scope": {"issue_id": "fixture"}});
         let required = json!({"identity": {"body": "é"}});
-        let optional = json!({"prerequisites": [], "updates": [{"id": "first"}, {"id": "second", "meta": "x".repeat(250)}]});
+        let pages = || {
+            vec![references::Page {
+                group: "updates",
+                offset: 0,
+                items: vec![
+                    json!({"id": "first"}),
+                    json!({"id": "second", "meta": "x".repeat(250)}),
+                ],
+                omitted: 0,
+            }]
+        };
+        let binding = json!("fixture");
+        let role = ContextRole::Queen;
         let full = fit_output(
             context.clone(),
             required.clone(),
-            optional.clone(),
-            [0, 0],
+            pages(),
+            &binding,
+            role,
+            false,
             MAX_JSON_BYTES,
         )
         .unwrap();
         let full_size = crate::output::context_json_bytes(&full.context, &full.data).unwrap();
-        let fitted =
-            fit_output(context.clone(), required, optional, [0, 0], full_size - 1).unwrap();
+        let fitted = fit_output(
+            context.clone(),
+            required,
+            pages(),
+            &binding,
+            role,
+            false,
+            full_size - 1,
+        )
+        .unwrap();
         assert_eq!(fitted.data["identity"]["body"], "é");
         assert_eq!(fitted.data["refs"]["updates"], json!([{"id": "first"}]));
+        assert_eq!(fitted.data["omitted"]["updates"]["count"], 1);
+        let cursor = fitted.data["omitted"]["updates"]["next_cursor"]
+            .as_str()
+            .unwrap();
+        assert!(cursor.starts_with("updates:1."));
+
+        let escaped = json!({"required": "\u{0001}".repeat(250)});
+        let error = fit_output(context, escaped, vec![], &binding, role, false, 1000)
+            .err()
+            .unwrap();
+        assert!(matches!(error.code, ErrorCode::ContextLimit));
         assert_eq!(
-            fitted.data["omitted"]["updates"],
-            json!({"count": 1, "after_id": "first"})
+            serde_json::to_value(error).unwrap()["details"],
+            json!({"kind": "role", "id": "Queen"})
         );
 
-        let too_big = json!({"required": "x".repeat(MAX_JSON_BYTES)});
-        assert!(
-            matches!(fit_output(context, too_big, json!({}), [0, 0], MAX_JSON_BYTES), Err(e) if matches!(e.code, ErrorCode::ContextLimit))
-        );
         let mut budget = MAX_INLINE_BYTES;
         assert!(charge(&mut budget, MAX_INLINE_BYTES).is_ok());
         assert!(matches!(

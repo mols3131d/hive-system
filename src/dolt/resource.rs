@@ -10,7 +10,7 @@ use super::{DoltFailure, DoltSuccess, Snapshot, is_uuid_v7};
 
 const MAX_LIMIT: u64 = 100;
 const SORT: &str = "CAST(r.id AS BINARY) ASC";
-const SUMMARY_COLUMNS: &str = "r.id, r.kind, r.name, r.revision";
+pub(super) const SUMMARY_COLUMNS: &str = "r.id, r.kind, r.name, r.revision";
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
@@ -196,7 +196,7 @@ fn list_page(
     }))
 }
 
-fn summary((id, kind, name, revision, _): &ResourceRow) -> Result<Value, HiveError> {
+pub(super) fn summary((id, kind, name, revision, _): &ResourceRow) -> Result<Value, HiveError> {
     if !is_uuid_v7(id) {
         return Err(HiveError::new(
             ErrorCode::InvalidRecord,
@@ -207,23 +207,25 @@ fn summary((id, kind, name, revision, _): &ResourceRow) -> Result<Value, HiveErr
 }
 
 // The immutable snapshot and bytewise ID sort make offsets stable.
-fn encode_cursor(offset: u64, binding: &Value) -> String {
+pub(super) fn encode_cursor(offset: u64, binding: &Value) -> String {
     let digest = Sha256::digest(json!([binding, offset]).to_string());
     format!("{offset}.{digest:x}")
 }
 
-fn cursor_offset(cursor: &str, binding: &Value) -> Result<u64, HiveError> {
-    if cursor.len() <= 85
-        && let Some((offset, _)) = cursor.split_once('.')
-        && let Ok(offset) = offset.parse::<u64>()
-        && offset > 0
-        && offset <= u64::MAX - MAX_LIMIT
-        && cursor == encode_cursor(offset, binding)
-    {
-        return Ok(offset);
+pub(super) fn decode_cursor(cursor: &str, binding: &Value) -> Option<u64> {
+    if cursor.len() > 85 {
+        return None;
     }
-    Err(HiveError::new(
-        ErrorCode::StaleCursor,
-        "The Resource list cursor is invalid for the selected workspace, commit, scope, or query.",
-    ))
+    let (offset, _) = cursor.split_once('.')?;
+    let offset = offset.parse::<u64>().ok()?;
+    (offset <= u64::MAX - MAX_LIMIT && cursor == encode_cursor(offset, binding)).then_some(offset)
+}
+
+fn cursor_offset(cursor: &str, binding: &Value) -> Result<u64, HiveError> {
+    decode_cursor(cursor, binding)
+        .filter(|offset| *offset > 0)
+        .ok_or_else(|| HiveError::new(
+            ErrorCode::StaleCursor,
+            "The Resource list cursor is invalid for the selected workspace, commit, scope, or query.",
+        ))
 }

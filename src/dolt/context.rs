@@ -7,6 +7,8 @@ use crate::dolt::directive_receipt as activation_receipt;
 mod assembly;
 #[path = "context/directives.rs"]
 mod directives;
+#[path = "context/references.rs"]
+mod references;
 #[path = "context/resume.rs"]
 mod resume;
 use crate::dolt::context_workflow as workflow;
@@ -209,13 +211,10 @@ struct Work {
     issue: IssueDetail,
     inline_bytes: usize,
     prerequisites: Vec<String>,
-    omitted_prerequisites: usize,
     prerequisite_blocked: bool,
     claimed: bool,
     archived_ancestry: bool,
     handoff: Option<UpdateRef>,
-    updates: Vec<UpdateRef>,
-    omitted_updates: u64,
 }
 
 // Budget is the remaining allowance after role, Soul and Directives.
@@ -250,8 +249,7 @@ fn collect_work(
         ));
     }
     let inline_bytes = issue.inline_bytes();
-    let (prerequisites, omitted_prerequisites, prerequisite_blocked) =
-        load_prerequisites(snapshot, &issue)?;
+    let (prerequisites, prerequisite_blocked) = load_prerequisites(snapshot, &issue)?;
     if let Some(id) = &issue.parent_id {
         let rows: Vec<(String,)> = snapshot.exec_rows(
             |commit| format!("SELECT area_id FROM issues AS OF '{commit}' WHERE id = ? AND CAST(id AS BINARY) = ? LIMIT 2"),
@@ -271,8 +269,7 @@ fn collect_work(
             issue.parent_id = None;
         }
     }
-    let (handoff, _) = load_updates(snapshot, &issue.id, true)?;
-    let (updates, omitted_updates) = load_updates(snapshot, &issue.id, false)?;
+    let (handoff, _) = load_updates(snapshot, &issue.id, true, 0)?;
     // Closure author is unnecessary for resume.
     issue.closed_by_ref = None;
     Ok(Some(Work {
@@ -280,13 +277,10 @@ fn collect_work(
         issue,
         inline_bytes,
         prerequisites,
-        omitted_prerequisites,
         prerequisite_blocked,
         claimed,
         archived_ancestry: scope.ancestry.iter().any(|area| area.archived),
         handoff: handoff.into_iter().next(),
-        updates,
-        omitted_updates,
     }))
 }
 
@@ -295,7 +289,7 @@ type PrerequisiteRow = (String, Option<String>, Option<String>, Option<String>, 
 fn load_prerequisites(
     snapshot: &mut Snapshot,
     issue: &IssueDetail,
-) -> Result<(Vec<String>, usize, bool), HiveError> {
+) -> Result<(Vec<String>, bool), HiveError> {
     let rows: Vec<PrerequisiteRow> = snapshot.exec_rows(
         |commit| {
             format!(
@@ -327,14 +321,13 @@ fn summarize_prerequisites(
     rows: Vec<PrerequisiteRow>,
     issue_id: &str,
     area_id: &str,
-) -> Result<(Vec<String>, usize, bool), HiveError> {
+) -> Result<(Vec<String>, bool), HiveError> {
     if rows.len() > PREREQUISITE_LIMIT {
         return Err(limit(
             "The selected Issue exceeds the prerequisite evaluation limit.",
         ));
     }
     let mut refs = Vec::new();
-    let mut omitted = 0;
     let mut blocked = false;
     for (id, area, kind, status, valid_closure) in rows {
         if id == issue_id
@@ -356,20 +349,17 @@ fn summarize_prerequisites(
             _ => blocked = true,
         }
         if area.as_deref() == Some(area_id) {
-            if refs.len() == REFERENCE_LIMIT {
-                omitted += 1;
-            } else {
-                refs.push(id);
-            }
+            refs.push(id);
         }
     }
-    Ok((refs, omitted, blocked))
+    Ok((refs, blocked))
 }
 
 fn load_updates(
     snapshot: &mut Snapshot,
     issue: &str,
     handoff: bool,
+    offset: u64,
 ) -> Result<(Vec<UpdateRef>, u64), HiveError> {
     // Select exact Issue-owned references. Case variants are included by the
     // predicate and rejected below so an invalid newer handoff cannot be missed.
@@ -385,13 +375,18 @@ fn load_updates(
                transition_json IS NULL, COUNT(*) OVER ()
              FROM issue_updates AS OF '{commit}'
              WHERE issue_id = ? AND CAST(issue_id AS BINARY) = ? AND kind IN ({kinds})
-             ORDER BY {UPDATE_ORDER} LIMIT ?"
+             ORDER BY {UPDATE_ORDER} LIMIT ? OFFSET ?"
             )
         },
-        (issue, issue, if handoff { 1 } else { REFERENCE_LIMIT }),
+        (
+            issue,
+            issue,
+            if handoff { 1 } else { REFERENCE_LIMIT },
+            offset,
+        ),
     )?;
     let count = rows.first().map_or(0, |row| row.4);
-    let omitted = count.saturating_sub(rows.len() as u64);
+    let omitted = count.saturating_sub(offset + rows.len() as u64);
     let refs = rows
         .into_iter()
         .map(|(id, kind, created_at, no_transition, _)| {
@@ -439,7 +434,8 @@ pub(in crate::dolt) fn resolve_snapshot(
         args.area.as_deref(),
         common.project.as_ref().map(|project| project.as_str()),
         args.issue.as_deref(),
-    )?;
+    )
+    .map_err(|error| error.context_limit_ref("role", verified.role.policy_name()))?;
     let soul = args
         .bot
         .as_deref()
@@ -488,8 +484,11 @@ pub(in crate::dolt) fn resolve_snapshot(
             activation_receipts: &verified.evidence.activation_receipts,
             artifacts: &artifacts,
             budget: Some(verified.budget),
+            cursor: args.cursor.as_deref(),
+            evidence_fingerprint: &verified.evidence.fingerprint(),
         },
-    )?;
+    )
+    .map_err(|error| error.context_limit_ref("role", verified.role.policy_name()))?;
     assets.recheck()?;
     Ok(result)
 }

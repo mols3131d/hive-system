@@ -67,6 +67,18 @@ pub(super) struct CheckedEvidence<'a> {
     pub(super) artifacts: BTreeMap<String, &'a [u8]>,
 }
 
+#[cfg(target_os = "linux")]
+impl CheckedEvidence<'_> {
+    pub(super) fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        // Include the exact current declarations, including their revisions
+        // and validity bounds. Only the digest enters the cursor binding.
+        let evidence = serde_json::json!([self.activation_receipts, self.handoff, self.artifacts]);
+        format!("{:x}", Sha256::digest(evidence.to_string()))
+    }
+}
+
 impl EvidenceFile {
     pub(super) fn read(path: &Path) -> Result<Self, HiveError> {
         let path = resolve_path(path, &current_dir()?, absolute_env("HOME").as_deref())?;

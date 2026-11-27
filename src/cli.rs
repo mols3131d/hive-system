@@ -326,6 +326,9 @@ pub(crate) struct ContextResolveArgs {
     /// Independent invocation UUID required for current body declarations.
     #[arg(long, value_name = "UUID")]
     pub(crate) invocation_id: Option<String>,
+    /// Continue one reference list using its previous next_cursor.
+    #[arg(long)]
+    pub(crate) cursor: Option<String>,
     /// Total inline body budget in UTF-8 bytes.
     #[arg(long, value_name = "BYTES", allow_negative_numbers = true)]
     pub(crate) budget: Option<String>,

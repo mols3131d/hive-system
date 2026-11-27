@@ -37,6 +37,8 @@ const INVOCATION: &str = "01900000-0000-7000-8000-000000000061";
 const DIRECTIVE: &str = "01900000-0000-7000-8000-000000000071";
 const RECEIPT: &str = "01900000-0000-7000-8000-000000000081";
 const MALFORMED_RECEIPT: &str = "01900000-0000-7000-8000-000000000082";
+const RESOURCE: &str = "01900000-0000-7000-8000-000000000055";
+const SIBLING_RESOURCE: &str = "01900000-0000-7000-8000-000000000056";
 const REPORT: &str = "01900000-0000-7000-8000-000000000053";
 const QUEEN: &str = "01900000-0000-7000-8000-000000000054";
 const GIT_PIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -139,6 +141,12 @@ fn committed_scope_and_resume() {
          INSERT INTO artifact_issues VALUES ('{ARTIFACT}', '{ARTIFACT_ISSUE}'), ('{MIXED_ARTIFACT}', '{OTHER}'), ('{REPORT}', '{ISSUE}'),
                 ('01900000-0000-7000-8000-000000000055', '{ARTIFACT_ISSUE}'), ('{THIRD_ARTIFACT}', '{ARTIFACT_ISSUE}');
          INSERT INTO artifact_projects VALUES ('{ARTIFACT}', '{PROJECT}');
+         INSERT INTO resources VALUES
+             ('{RESOURCE}', 'repository', 'Selected resource', 'synthetic-private-uri', 'resource-r1'),
+             ('{SIBLING_RESOURCE}', 'repository', 'Sibling resource', NULL, 'resource-r1');
+         INSERT INTO area_resources VALUES ('{AREA}', '{RESOURCE}'), ('{AREA}', '{SIBLING_RESOURCE}');
+         INSERT INTO issue_resources VALUES ('{ISSUE}', '{RESOURCE}'), ('{ARTIFACT_ISSUE}', '{SIBLING_RESOURCE}');
+         INSERT INTO artifact_resources VALUES ('01900000-0000-7000-8000-000000000052', '{RESOURCE}');
          INSERT INTO project_issues VALUES ('{PROJECT}', '{ARTIFACT_ISSUE}');
          INSERT INTO directives (id, scope_kind, area_id, project_id, include_descendants,
              title, body, status, issuer_ref, source_ref, approval_ref, revision, created_at, updated_at)
@@ -365,14 +373,14 @@ fn read_synthetic_snapshot() {
     assert_eq!(work.issue.acceptance_criteria.as_deref(), Some("OK"));
     assert!(work.issue.parent_id.is_none());
     assert!(work.prerequisites.is_empty());
-    assert_eq!(work.omitted_prerequisites, 0);
     assert!(work.prerequisite_blocked);
     assert!(!work.claimed);
     assert!(work.archived_ancestry);
     assert_eq!(work.handoff.as_ref().unwrap().id, HANDOFF);
-    assert_eq!(work.updates.len(), REFERENCE_LIMIT);
-    assert_eq!(work.updates[0].id, PROGRESS);
-    assert_eq!(work.omitted_updates, 1);
+    let (updates, omitted) = load_updates(&mut snapshot, &work.issue.id, false, 0).unwrap();
+    assert_eq!(updates.len(), REFERENCE_LIMIT);
+    assert_eq!(updates[0].id, PROGRESS);
+    assert_eq!(omitted, 1);
     let request = request(None);
     assert!(matches!(
         resume::read_required(&mut snapshot, &scope, &work, 100, &request),
@@ -566,7 +574,6 @@ fn read_synthetic_snapshot() {
     ));
     let again = collect_work(&mut snapshot, &scope, None).unwrap().unwrap();
     assert_eq!(again.handoff, work.handoff);
-    assert_eq!(again.updates, work.updates);
     assert_required_assembly(&mut snapshot, &scope);
 }
 
@@ -614,7 +621,7 @@ fn prerequisite_summaries_keep_cross_area_blockers_opaque() {
     ];
     assert_eq!(
         summarize_prerequisites(rows, ISSUE, AREA).unwrap(),
-        (vec![PROGRESS.to_owned()], 0, true)
+        (vec![PROGRESS.to_owned()], true)
     );
 
     let rows = vec![(
@@ -877,6 +884,8 @@ fn assert_required_assembly(snapshot: &mut Snapshot, scope: &Scope) {
         activation_receipts: &approvals,
         artifacts: &artifacts,
         budget: Some(4 + 4 + 4 * 7 + 8 + 15 + 15),
+        cursor: None,
+        evidence_fingerprint: "fixture-evidence",
     };
     let result = assemble(snapshot, scope, &inputs).unwrap();
     assert_eq!(result.context["db_commit"], commit);
@@ -904,9 +913,35 @@ fn assert_required_assembly(snapshot: &mut Snapshot, scope: &Scope) {
     assert_eq!(sections[4]["content"]["id"], HANDOFF);
     assert_eq!(sections[5]["content"][0]["body"], "selected report");
     assert_eq!(result.data["inline_bytes"], inputs.budget.unwrap());
-    assert_eq!(result.data["omitted"]["updates"]["count"], 1);
+    assert_eq!(
+        result.data["refs"]["resources"],
+        json!([{
+            "id": RESOURCE, "kind": "repository", "name": "Selected resource",
+            "revision": "resource-r1", "trust": "data"
+        }])
+    );
+    assert_eq!(
+        result.data["refs"]["artifacts"],
+        json!([{
+            "id": REPORT, "kind": "report", "title": "Report",
+            "revision": "report-r1", "trust": "data"
+        }])
+    );
     assert!(!result.data.to_string().contains(OTHER));
     assert!(!result.data.to_string().contains(ARTIFACT));
+    assert_eq!(result.data["omitted"]["updates"]["count"], 1);
+
+    inputs.cursor = result.data["omitted"]["updates"]["next_cursor"].as_str();
+    let next = assemble(snapshot, scope, &inputs).unwrap();
+    assert_eq!(next.data["sections"], result.data["sections"]);
+    assert_eq!(next.data["refs"]["updates"].as_array().unwrap().len(), 1);
+    assert!(next.data["refs"].get("resources").is_none());
+    assert!(next.data["omitted"]["updates"].is_null());
+    inputs.evidence_fingerprint = "changed-fixture-evidence";
+    assert!(
+        matches!(assemble(snapshot, scope, &inputs), Err(e) if matches!(e.code, ErrorCode::StaleCursor))
+    );
+    inputs.cursor = None;
 
     inputs.budget = Some(inputs.budget.unwrap() - 1);
     assert!(
