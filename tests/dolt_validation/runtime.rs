@@ -1566,12 +1566,13 @@ fn issue_create_writer_fixture(
            FROM operation_receipts WHERE request_id = ?", (&request,),
     ).unwrap().unwrap();
     let mut current = connect("writer");
-    let insert_tables: Vec<String> = current
+    let mut insert_tables: Vec<String> = current
         .query(
             "SELECT TABLE_NAME FROM information_schema.TABLE_PRIVILEGES
          WHERE TABLE_SCHEMA = 'db' AND PRIVILEGE_TYPE = 'INSERT' ORDER BY TABLE_NAME",
         )
         .unwrap();
+    insert_tables.sort_unstable();
     assert_eq!(
         insert_tables,
         ["issue_updates", "issues", "operation_receipts"]
