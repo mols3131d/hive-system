@@ -5,9 +5,7 @@ use time::OffsetDateTime;
 
 use crate::cli::{ArtifactCreateArgs, CommonOptions};
 use crate::dolt::{
-    DoltSuccess, DoltTarget, Snapshot,
-    context_evidence::read_evidence_bytes,
-    context_workflow as workflow, is_uuid, is_uuid_v7,
+    DoltSuccess, DoltTarget, Snapshot, context_workflow as workflow, is_uuid, is_uuid_v7,
     issue_writer::{
         self, Decision, Kind, Mutation, StagedMutation, WriteIdentity, digest, invalid,
         new_uuid_v7, valid_revision, valid_title,
@@ -19,7 +17,10 @@ use crate::dolt::{
 };
 use crate::error::{ErrorCode, HiveError};
 
-use super::{MAX_BODY_BYTES, ScopeKind};
+use super::{
+    MAX_BODY_BYTES, ScopeKind,
+    writes::{read_body, verify_delta, verify_links},
+};
 
 pub(in crate::dolt) const KIND: &str = "artifact.create";
 const ARCHIVED: &str = "Artifact linking requires active Area ancestry.";
@@ -154,15 +155,7 @@ pub(super) fn write(
             "Supply a documented lowercase Artifact kind and a nonblank title of up to 255 characters without control characters.",
         ));
     }
-    let bytes = read_evidence_bytes(&args.file, MAX_BODY_BYTES as usize).map_err(|error| {
-        let message = if matches!(error.code, ErrorCode::ContextLimit) {
-            "The Artifact body exceeds 64 KiB."
-        } else {
-            "Could not read the explicit regular Artifact body file."
-        };
-        HiveError::new(error.code, message)
-    })?;
-    let body = String::from_utf8(bytes).map_err(|_| invalid("The Artifact body must be UTF-8."))?;
+    let body = read_body(&args.file)?;
     let scope = Scope {
         workspace: workspace.workspace_id(),
         actor: &args.actor,
@@ -371,32 +364,6 @@ pub(in crate::dolt) fn check_current_scope(
     )
 }
 
-fn verify_links(
-    snapshot: &mut Snapshot,
-    commit: &str,
-    artifact_id: &str,
-    selected_area: Option<&str>,
-) -> Result<(), HiveError> {
-    for kind in ScopeKind::ALL {
-        let (_, links, column) = kind.tables();
-        let rows: Vec<(String, String)> = snapshot.exec_rows(
-            |_| format!(
-                "SELECT artifact_id, {column} FROM {links} AS OF '{commit}'
-                 WHERE artifact_id = CAST(? AS CHAR) OR CAST(LOWER(artifact_id) AS BINARY) = ? LIMIT 2"
-            ),
-            (artifact_id, artifact_id),
-        )?;
-        let area = selected_area.filter(|_| kind == ScopeKind::Area);
-        match (area, rows.as_slice()) {
-            (None, []) => {}
-            (Some(area), [(artifact, endpoint)]) if artifact == artifact_id && endpoint == area => {
-            }
-            _ => return Err(workflow::unverified()),
-        }
-    }
-    Ok(())
-}
-
 pub(in crate::dolt) fn verify_effect(
     snapshot: &mut Snapshot,
     introduced: &str,
@@ -460,12 +427,11 @@ pub(in crate::dolt) fn verify_effect(
         })?;
         verify_area_revision(snapshot, base, introduced, area, expected, revision)?;
     }
-    verify_delta(
-        &mut snapshot.connection,
-        base,
-        introduced,
-        result.area_id.is_some(),
-    )?;
+    let mut expected = vec![("artifacts", 1, 0, 0), ("operation_receipts", 1, 0, 0)];
+    if result.area_id.is_some() {
+        expected.splice(0..0, [("areas", 0, 0, 1), ("artifact_areas", 1, 0, 0)]);
+    }
+    verify_delta(&mut snapshot.connection, base, introduced, &expected)?;
     Ok(json!(result))
 }
 
@@ -494,58 +460,6 @@ fn verify_area_revision(
         (expected, revision, area),
     )?;
     if unchanged != [true] {
-        return Err(workflow::unverified());
-    }
-    Ok(())
-}
-
-fn verify_delta(
-    db: &mut impl Queryable,
-    base: &str,
-    introduced: &str,
-    linked: bool,
-) -> Result<(), HiveError> {
-    let mut expected = vec![("artifacts", 1, 0, 0), ("operation_receipts", 1, 0, 0)];
-    if linked {
-        expected.splice(0..0, [("areas", 0, 0, 1), ("artifact_areas", 1, 0, 0)]);
-    }
-    let tables: Vec<(String, String, String, bool, bool)> = db
-        .exec(
-            "SELECT from_table_name, to_table_name, diff_type, data_change, schema_change
-         FROM DOLT_DIFF_SUMMARY(?, ?) ORDER BY from_table_name LIMIT 5",
-            (base, introduced),
-        )
-        .map_err(read_error)?;
-    if tables.len() != expected.len()
-        || tables
-            .iter()
-            .zip(&expected)
-            .any(|((from, to, kind, data, schema), (name, ..))| {
-                from != name || to != name || kind != "modified" || !data || *schema
-            })
-        || db
-            .query_first::<mysql::Row, _>("SHOW WARNINGS LIMIT 1")
-            .map_err(read_error)?
-            .is_some()
-    {
-        return Err(workflow::unverified());
-    }
-    let rows: Vec<(String, u64, u64, u64)> = db
-        .exec(
-            "SELECT table_name, rows_added, rows_deleted, rows_modified
-         FROM DOLT_DIFF_STAT(?, ?) ORDER BY table_name LIMIT 5",
-            (base, introduced),
-        )
-        .map_err(read_error)?;
-    if !rows
-        .iter()
-        .map(|(table, added, deleted, modified)| (table.as_str(), *added, *deleted, *modified))
-        .eq(expected)
-        || db
-            .query_first::<mysql::Row, _>("SHOW WARNINGS LIMIT 1")
-            .map_err(read_error)?
-            .is_some()
-    {
         return Err(workflow::unverified());
     }
     Ok(())

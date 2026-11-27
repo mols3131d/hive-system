@@ -5,6 +5,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 #[path = "runtime/artifact_create.rs"]
 mod artifact_create;
+#[path = "runtime/artifact_update.rs"]
+mod artifact_update;
 #[path = "runtime/issue_update.rs"]
 mod issue_update;
 
