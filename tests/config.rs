@@ -872,3 +872,496 @@ fn remote_coordination_checks_local_metadata_without_contacting_the_remote() {
         "the invalid remote caused a transport invocation"
     );
 }
+
+const V2_DESCRIPTOR: &str = "version: 2
+workspace_id: 0195f1b2-3c4d-7e8f-9a0b-1c2d3e4f5a6b
+schema_version: 1
+policy_revision: c66b3c50150e18426485d134de92c6b311dac125
+";
+const V2_SHOW: &[&str] = &["--contract", "2", "config", "show", "--scope", "workspace"];
+
+fn show_v2(fixture: &Sandbox, extra: &[&str]) -> Command {
+    fixture.hive(&fixture.0.join("invocation"), &[V2_SHOW, extra].concat())
+}
+
+fn v2_json(output: Output, exit: i32) -> Value {
+    assert_eq!(
+        output.status.code(),
+        Some(exit),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schema_version"], 2);
+    assert_eq!(result["command"], "config show");
+    assert_eq!(result["ok"], exit == 0);
+    assert!(result.get("context").is_none());
+    result
+}
+
+fn v2_error(output: Output, exit: i32, code: &str) {
+    assert_redacted(&output, &["synthetic-private"]);
+    let result = v2_json(output, exit);
+    assert!(result.get("data").is_none());
+    assert_eq!(result["error"]["code"], code);
+}
+
+#[test]
+fn v2_descriptor_show_coexists_with_v1_and_keeps_targets_read_only() {
+    let fixture = Sandbox::new();
+    let v1 = fixture.workspace("workspace", PROJECT_URL);
+    fixture.user_config(USER_CONFIG);
+
+    let user = fixture.0.join("xdg/hive/v2/config.yml");
+    let default = fixture.0.join("user-default");
+    let explicit = fixture.0.join("explicit");
+    write(
+        &user,
+        "version: 2\nworkspace: ../../../user-default\noutput: {format: json}\n",
+    );
+    write(&default.join("hive-workspace.yml"), V2_DESCRIPTOR);
+    write(&explicit.join("hive-workspace.yml"), V2_DESCRIPTOR);
+    write(
+        &user.with_file_name("bindings.yml"),
+        "synthetic-private: [\n",
+    );
+    write(
+        &fixture.0.join("invocation/external.txt"),
+        "synthetic project file",
+    );
+    let before = snapshot(&fixture.0);
+
+    let legacy = json_result(
+        &fixture.run(&["config", "show", "--scope", "workspace"]),
+        "config show",
+        0,
+    );
+    assert_eq!(legacy["data"]["workspace_root"], v1.to_str().unwrap());
+
+    let state = fixture.0.join("state");
+    let runtime = fixture.0.join("runtime");
+    let selected = v2_json(
+        show_v2(&fixture, &[])
+            .env_remove("PATH")
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .output()
+            .unwrap(),
+        0,
+    );
+    assert!(!state.exists());
+    assert!(!runtime.exists());
+    assert!(!default.join("db").exists());
+    assert_eq!(
+        selected["data"]["workspace_root"],
+        default.to_str().unwrap()
+    );
+    assert_eq!(selected["data"]["user_config"], user.to_str().unwrap());
+    assert_eq!(
+        selected["data"]["sources"],
+        serde_json::json!({"workspace": "user", "output_format": "user"})
+    );
+
+    let selected = v2_json(
+        show_v2(&fixture, &["--workspace", "../explicit"])
+            .output()
+            .unwrap(),
+        0,
+    );
+    assert_eq!(
+        selected["data"]["workspace_root"],
+        explicit.to_str().unwrap()
+    );
+    assert_eq!(
+        selected["data"]["descriptor"],
+        explicit.join("hive-workspace.yml").to_str().unwrap()
+    );
+    assert_eq!(
+        selected["data"]["workspace_id"],
+        "0195f1b2-3c4d-7e8f-9a0b-1c2d3e4f5a6b"
+    );
+    assert_eq!(
+        selected["data"]["policy_revision"],
+        "c66b3c50150e18426485d134de92c6b311dac125"
+    );
+    assert_eq!(selected["data"]["storage_schema_version"], 1);
+    assert_eq!(
+        selected["data"]["sources"],
+        serde_json::json!({"workspace": "cli", "output_format": "user"})
+    );
+    assert_eq!(
+        selected["data"]["verification"],
+        serde_json::json!({
+            "descriptor": "verified", "committed_identity": "unverified", "runtime": "unverified"
+        })
+    );
+
+    for (target, exit, code) in [
+        ("../synthetic-private-absent", 3, "NOT_FOUND"),
+        ("../workspace", 4, "SCHEMA_INCOMPATIBLE"),
+        ("https://synthetic-private.example", 2, "INVALID_CONFIG"),
+        ("synthetic-private\n", 2, "INVALID_CONFIG"),
+    ] {
+        v2_error(
+            show_v2(&fixture, &["--json", "--workspace", target])
+                .output()
+                .unwrap(),
+            exit,
+            code,
+        );
+    }
+    v2_error(
+        show_v2(
+            &fixture,
+            &["--json", "--workspace", "../explicit", "--authority"],
+        )
+        .output()
+        .unwrap(),
+        2,
+        "INVALID_ARGUMENT",
+    );
+    assert_unchanged(&fixture.0, &before);
+
+    symlink("absent", explicit.join("hive.yml")).unwrap();
+    v2_error(
+        show_v2(&fixture, &["--json", "--workspace", "../explicit"])
+            .output()
+            .unwrap(),
+        4,
+        "SCHEMA_INCOMPATIBLE",
+    );
+}
+
+#[test]
+fn v2_uses_absolute_xdg_or_home_only_when_needed() {
+    let fixture = Sandbox::new();
+    let home_default = fixture.0.join("home/.local/share/hive/v2/userdata");
+    let xdg = fixture.0.join("xdg");
+    let data_default = xdg.join("hive/v2/userdata");
+    write(&home_default.join("hive-workspace.yml"), V2_DESCRIPTOR);
+    write(&data_default.join("hive-workspace.yml"), V2_DESCRIPTOR);
+    write(
+        &fixture.0.join("invocation/relative/hive/v2/config.yml"),
+        "bad: [",
+    );
+    write(
+        &fixture.0.join("home/.config/hive/v2/config.yml"),
+        "version: 2\n",
+    );
+    let before = snapshot(&fixture.0);
+    for value in [None, Some(""), Some("relative")] {
+        let mut command = show_v2(&fixture, &["--json"]);
+        if let Some(value) = value {
+            command
+                .env("XDG_CONFIG_HOME", value)
+                .env("XDG_DATA_HOME", value);
+        } else {
+            command
+                .env_remove("XDG_CONFIG_HOME")
+                .env_remove("XDG_DATA_HOME");
+        }
+        let report = v2_json(command.output().unwrap(), 0);
+        assert_eq!(
+            report["data"]["workspace_root"],
+            home_default.to_str().unwrap()
+        );
+        assert_eq!(report["data"]["sources"]["workspace"], "xdg-default");
+    }
+    let selected = v2_json(
+        show_v2(&fixture, &["--json"])
+            .env_remove("HOME")
+            .env("XDG_DATA_HOME", &xdg)
+            .output()
+            .unwrap(),
+        0,
+    );
+    assert_eq!(
+        selected["data"]["workspace_root"],
+        data_default.to_str().unwrap()
+    );
+
+    for home in [None, Some(""), Some("relative")] {
+        for config_home in ["relative", xdg.to_str().unwrap()] {
+            let mut command = show_v2(&fixture, &["--json"]);
+            command
+                .env("XDG_CONFIG_HOME", config_home)
+                .env("XDG_DATA_HOME", "relative");
+            if let Some(home) = home {
+                command.env("HOME", home);
+            } else {
+                command.env_remove("HOME");
+            }
+            v2_error(command.output().unwrap(), 2, "INVALID_CONFIG");
+        }
+    }
+    v2_json(
+        show_v2(
+            &fixture,
+            &["--json", "--workspace", "../xdg/hive/v2/userdata"],
+        )
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .unwrap(),
+        0,
+    );
+    v2_error(
+        show_v2(&fixture, &["--json", "--workspace", "~/synthetic-private"])
+            .env_remove("HOME")
+            .output()
+            .unwrap(),
+        2,
+        "INVALID_CONFIG",
+    );
+    v2_json(
+        show_v2(
+            &fixture,
+            &["--json", "--workspace", "~/.local/share/hive/v2/userdata"],
+        )
+        .output()
+        .unwrap(),
+        0,
+    );
+    assert_unchanged(&fixture.0, &before);
+}
+
+#[test]
+fn v2_rejects_unsafe_config_descriptor_and_workspace_paths() {
+    let fixture = Sandbox::new();
+    let target = fixture.0.join("candidate");
+    let marker = target.join("hive-workspace.yml");
+    let outside = fixture.0.join("outside");
+    write(&outside, V2_DESCRIPTOR);
+    fs::create_dir(&target).unwrap();
+    symlink(&outside, &marker).unwrap();
+    v2_error(
+        show_v2(&fixture, &["--json", "--workspace", "../candidate"])
+            .output()
+            .unwrap(),
+        2,
+        "INVALID_CONFIG",
+    );
+    fs::remove_file(&marker).unwrap();
+    // Nonblocking opens must refuse FIFOs without waiting for a peer.
+    assert!(
+        fixture
+            .command("mkfifo", &target)
+            .arg(&marker)
+            .status()
+            .unwrap()
+            .success()
+    );
+    v2_error(
+        show_v2(&fixture, &["--json", "--workspace", "../candidate"])
+            .output()
+            .unwrap(),
+        2,
+        "INVALID_CONFIG",
+    );
+    fs::remove_file(&marker).unwrap();
+    write(&marker, V2_DESCRIPTOR);
+    fs::create_dir_all(target.join("nested/child")).unwrap();
+    let report = v2_json(
+        show_v2(
+            &fixture,
+            &["--json", "--workspace", "../candidate/./nested/child/../.."],
+        )
+        .output()
+        .unwrap(),
+        0,
+    );
+    assert_eq!(report["data"]["workspace_root"], target.to_str().unwrap());
+    symlink(&target, fixture.0.join("synthetic-private-link")).unwrap();
+    for path in [
+        "../synthetic-private-link",
+        "../synthetic-private-link/../candidate",
+        "../outside/../candidate",
+    ] {
+        v2_error(
+            show_v2(&fixture, &["--json", "--workspace", path])
+                .output()
+                .unwrap(),
+            2,
+            "INVALID_CONFIG",
+        );
+    }
+
+    let user = fixture.0.join("xdg/hive/v2/config.yml");
+    fs::create_dir_all(user.parent().unwrap()).unwrap();
+    symlink(&outside, &user).unwrap();
+    v2_error(
+        show_v2(&fixture, &["--json"]).output().unwrap(),
+        2,
+        "INVALID_CONFIG",
+    );
+    v2_error(
+        show_v2(
+            &fixture,
+            &[
+                "--json",
+                "--workspace",
+                "../synthetic-private-absent/../candidate",
+            ],
+        )
+        .output()
+        .unwrap(),
+        3,
+        "NOT_FOUND",
+    );
+}
+
+#[test]
+fn v2_reports_strict_schema_errors_without_disclosing_inputs() {
+    let fixture = Sandbox::new();
+    let user = fixture.0.join("xdg/hive/v2/config.yml");
+    for input in [
+        "workspace: synthetic-private",
+        "version: '2'",
+        "version: 2.0",
+        "version: 2\nworkspace: null",
+        "version: 2\nworkspace: https://user:synthetic-private@example.invalid",
+        "version: 2\nworkspace: ''",
+        "version: 2\nworkspace: 123",
+        "version: 2\noutput: null",
+        "version: 2\noutput: {format: null}",
+        "version: 2\noutput: {format: synthetic-private}",
+        "version: 2\noutput: {synthetic-private: json}",
+        "version: 2\nworkspace: &synthetic-private path",
+        "version: 2\nworkspace: *synthetic-private",
+        "version: 2\nworkspace: !synthetic-private path",
+        "version: 2\nworkspace: !!str synthetic-private",
+        "version: 2\nversion: 2",
+        "version: 2\n<<: {workspace: synthetic-private}",
+        "version: 2\n---\nworkspace: synthetic-private",
+    ] {
+        write(&user, input);
+        v2_error(
+            show_v2(&fixture, &["--json"]).output().unwrap(),
+            2,
+            "INVALID_CONFIG",
+        );
+    }
+    write(&user, "version: -1");
+    v2_error(
+        show_v2(&fixture, &["--json"]).output().unwrap(),
+        4,
+        "SCHEMA_INCOMPATIBLE",
+    );
+
+    let marker = fixture.0.join("candidate/hive-workspace.yml");
+    for (input, exit, code) in [
+        (
+            V2_DESCRIPTOR.replace("version: 2", "version: '2'"),
+            2,
+            "INVALID_CONFIG",
+        ),
+        (
+            V2_DESCRIPTOR.replace("version: 2", "version: 1"),
+            4,
+            "SCHEMA_INCOMPATIBLE",
+        ),
+        (
+            V2_DESCRIPTOR.replace("schema_version: 1", "schema_version: 2"),
+            4,
+            "SCHEMA_INCOMPATIBLE",
+        ),
+        (
+            V2_DESCRIPTOR.replace("0195f1b2", "0195F1B2"),
+            2,
+            "INVALID_CONFIG",
+        ),
+        (
+            V2_DESCRIPTOR.replace(
+                "c66b3c50150e18426485d134de92c6b311dac125",
+                "synthetic-private",
+            ),
+            2,
+            "INVALID_CONFIG",
+        ),
+        (
+            format!("{V2_DESCRIPTOR}synthetic-private: credential\n"),
+            2,
+            "INVALID_CONFIG",
+        ),
+        (
+            format!("{V2_DESCRIPTOR}#{}", "x".repeat(64 * 1024)),
+            2,
+            "INVALID_CONFIG",
+        ),
+    ] {
+        write(&marker, input);
+        v2_error(
+            show_v2(&fixture, &["--json", "--workspace", "../candidate"])
+                .output()
+                .unwrap(),
+            exit,
+            code,
+        );
+    }
+    write(&marker, b"\xff");
+    v2_error(
+        show_v2(&fixture, &["--json", "--workspace", "../candidate"])
+            .output()
+            .unwrap(),
+        2,
+        "INVALID_CONFIG",
+    );
+}
+
+#[test]
+fn v2_rejects_tagged_field_names_and_accepts_quoted_tag_like_values() {
+    let fixture = Sandbox::new();
+    fixture.user_config("!!str output: {!!str format: json}\n");
+    let legacy = json_result(
+        &fixture.run(&["--json", "config", "show", "--scope", "user"]),
+        "config show",
+        0,
+    );
+    assert_eq!(legacy["data"]["output_format"], "json");
+
+    let candidate = fixture.0.join("xdg/hive/v2/!!str candidate");
+    let marker = candidate.join("hive-workspace.yml");
+    let user = fixture.0.join("xdg/hive/v2/config.yml");
+    write(&marker, V2_DESCRIPTOR);
+    let config = "version: 2\nworkspace: '!!str candidate'\noutput: {format: json}\n";
+    write(&user, config);
+    let report = v2_json(show_v2(&fixture, &[]).output().unwrap(), 0);
+    assert_eq!(
+        report["data"]["workspace_root"],
+        candidate.to_str().unwrap()
+    );
+
+    for (file, contents) in [
+        (
+            &marker,
+            V2_DESCRIPTOR.replacen("version:", "!!str version:", 1),
+        ),
+        (&user, config.replacen("version:", "!!str version:", 1)),
+        (&user, config.replacen("format:", "!!str format:", 1)),
+        (
+            &user,
+            config.replacen("format:", "!<tag:yaml.org,2002:str> format:", 1),
+        ),
+        (&user, config.replacen("format:", "! format:", 1)),
+    ] {
+        write(file, contents);
+        let output = show_v2(&fixture, &["--json"]).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "tagged key was accepted in {file:?}"
+        );
+        assert_redacted(&output, &["!!str", "tag:yaml.org"]);
+        v2_error(output, 2, "INVALID_CONFIG");
+        write(
+            file,
+            if file == &marker {
+                V2_DESCRIPTOR
+            } else {
+                config
+            },
+        );
+    }
+}

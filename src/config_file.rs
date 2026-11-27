@@ -9,8 +9,12 @@ use crate::cli::{Format, ProjectId};
 use crate::error::{ErrorCode, HiveError};
 
 pub(crate) use filesystem::read_scoped;
+#[cfg(unix)]
+pub(crate) use filesystem::{ScopedDirectory, read_regular};
 
 const MAX_FILE_BYTES: usize = 64 * 1024;
+const MAX_YAML_DEPTH: usize = 8;
+const MAX_YAML_NODES: usize = 128;
 
 #[derive(Debug)]
 pub(crate) struct UserConfig {
@@ -46,7 +50,7 @@ struct UserFields {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OutputFields {
+pub(crate) struct OutputFields {
     #[serde(default, deserialize_with = "present")]
     format: Option<String>,
 }
@@ -87,16 +91,19 @@ pub(crate) fn read_user(path: &Path) -> Result<Option<UserConfig>, HiveError> {
 
 fn parse_user(bytes: &[u8]) -> Result<UserConfig, HiveError> {
     let fields: UserFields = parse(bytes, "User configuration")?;
-    let format = match fields.output.and_then(|output| output.format).as_deref() {
-        None => None,
-        Some("text") => Some(Format::Text),
-        Some("json") => Some(Format::Json),
-        Some(_) => return Err(invalid("User output.format must be text or json")),
-    };
     Ok(UserConfig {
+        format: output_format(fields.output)?,
         workspace: workspace_path(fields.workspace)?,
-        format,
     })
+}
+
+pub(crate) fn output_format(output: Option<OutputFields>) -> Result<Option<Format>, HiveError> {
+    match output.and_then(|output| output.format).as_deref() {
+        None => Ok(None),
+        Some("text") => Ok(Some(Format::Text)),
+        Some("json") => Ok(Some(Format::Json)),
+        Some(_) => Err(invalid("User output.format must be text or json")),
+    }
 }
 
 pub(crate) fn parse_project(bytes: &[u8]) -> Result<ProjectConfig, HiveError> {
@@ -164,15 +171,71 @@ fn is_remote_alias(alias: &str) -> bool {
 }
 
 fn parse<T: de::DeserializeOwned>(bytes: &[u8], source: &str) -> Result<T, HiveError> {
+    deserialize_yaml(yaml_input(bytes, source)?, source)
+}
+
+#[cfg(unix)]
+pub(crate) fn parse_v2<T: de::DeserializeOwned>(
+    bytes: &[u8],
+    source: &str,
+) -> Result<T, HiveError> {
+    use serde_saphyr::granit_parser::{self, Event, Parser};
+
+    enum Collection {
+        Mapping { next_is_key: bool },
+        Sequence,
+    }
+
+    let input = yaml_input(bytes, source)?;
+    // serde-saphyr 2.2.0 allows explicit string tags on struct fields even
+    // with reject_tagged_field_names. Check the original node events for v2.
+    let options = granit_parser::options! {
+        strict_indentation: true,
+        flow_nesting_limit: MAX_YAML_DEPTH,
+        block_nesting_limit: MAX_YAML_DEPTH,
+    };
+    let malformed = || invalid(format!("{source} contains invalid YAML or fields"));
+    let mut collections = Vec::new();
+    let mut nodes = 0;
+    for result in Parser::new_from_str_with_options(input, options) {
+        let (event, _) = result.map_err(|_| malformed())?;
+        if event.is_node() {
+            nodes += 1;
+            if nodes > MAX_YAML_NODES || collections.len() > MAX_YAML_DEPTH {
+                return Err(malformed());
+            }
+            if let Some(Collection::Mapping { next_is_key }) = collections.last_mut() {
+                if *next_is_key && event.tag().is_some() {
+                    return Err(invalid(format!("{source} contains a tagged field name")));
+                }
+                *next_is_key = !*next_is_key;
+            }
+        }
+        match event {
+            Event::MappingStart(..) => collections.push(Collection::Mapping { next_is_key: true }),
+            Event::SequenceStart(..) => collections.push(Collection::Sequence),
+            Event::MappingEnd | Event::SequenceEnd => {
+                collections.pop();
+            }
+            _ => {}
+        }
+    }
+    deserialize_yaml(input, source)
+}
+
+fn yaml_input<'a>(bytes: &'a [u8], source: &str) -> Result<&'a str, HiveError> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err(invalid(format!("{source} exceeds the 64 KiB size limit")));
     }
-    let input = str::from_utf8(bytes).map_err(|_| invalid(format!("{source} must be UTF-8")))?;
+    str::from_utf8(bytes).map_err(|_| invalid(format!("{source} must be UTF-8")))
+}
+
+fn deserialize_yaml<T: de::DeserializeOwned>(input: &str, source: &str) -> Result<T, HiveError> {
     let options = serde_saphyr::options! {
         budget: serde_saphyr::budget! {
             max_documents: 1,
-            max_depth: 8,
-            max_nodes: 128,
+            max_depth: MAX_YAML_DEPTH,
+            max_nodes: MAX_YAML_NODES,
             max_anchors: 0,
             max_aliases: 0,
         },
@@ -190,7 +253,7 @@ fn parse<T: de::DeserializeOwned>(bytes: &[u8], source: &str) -> Result<T, HiveE
         .map_err(|_| invalid(format!("{source} contains invalid YAML or fields")))
 }
 
-fn untagged<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+pub(crate) fn untagged<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> Result<T, D::Error> {
     let Tagged(value, tag) = Tagged::deserialize(deserializer)?;
@@ -200,7 +263,7 @@ fn untagged<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     Ok(value)
 }
 
-fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+pub(crate) fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> Result<Option<T>, D::Error> {
     // Missing fields use the defaults. Present fields must have the declared type.
@@ -218,12 +281,12 @@ mod filesystem {
     use std::io::{Error, ErrorKind, Read};
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
-    use std::path::{Component, Path};
+    use std::path::{Component, Path, PathBuf};
 
     use super::{MAX_FILE_BYTES, invalid};
     use crate::error::{ErrorCode, HiveError};
 
-    pub(super) fn read_regular(path: &Path) -> Result<Option<Vec<u8>>, HiveError> {
+    pub(crate) fn read_regular(path: &Path) -> Result<Option<Vec<u8>>, HiveError> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -273,6 +336,86 @@ mod filesystem {
             return Ok(None);
         };
         read_file(file).map(Some)
+    }
+
+    pub(crate) struct ScopedDirectory {
+        file: File,
+        pub(crate) path: PathBuf,
+    }
+
+    impl ScopedDirectory {
+        pub(crate) fn open_absolute(path: &Path) -> Result<Self, HiveError> {
+            let mut components = path.components();
+            if components.next() != Some(Component::RootDir) {
+                return Err(invalid("Workspace root must be absolute"));
+            }
+            let mut resolved = PathBuf::from("/");
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY)
+                .open(&resolved)
+                .map_err(read_error)?;
+            let mut ancestors = Vec::new();
+            // Open each component before processing any following ".." so
+            // missing directories and symlinks cannot be hidden by normalization.
+            for component in components {
+                match component {
+                    Component::CurDir => {}
+                    Component::Normal(name) => {
+                        let child =
+                            open_child(&file, name, libc::O_DIRECTORY)?.ok_or_else(|| {
+                                HiveError::new(
+                                    ErrorCode::NotFound,
+                                    "Workspace directory does not exist",
+                                )
+                            })?;
+                        ancestors.push(std::mem::replace(&mut file, child));
+                        resolved.push(name);
+                    }
+                    Component::ParentDir => {
+                        // A directory moved after open may have a different OS
+                        // parent. Return to the ancestor we already traversed.
+                        if let Some(parent) = ancestors.pop() {
+                            file = parent;
+                            resolved.pop();
+                        }
+                    }
+                    _ => return Err(invalid("Workspace root has an invalid path component")),
+                }
+            }
+            Ok(Self {
+                file,
+                path: resolved,
+            })
+        }
+
+        pub(crate) fn contains(&self, name: &std::ffi::CStr) -> Result<bool, HiveError> {
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: The directory descriptor, name, and output buffer are valid.
+            let result = unsafe {
+                libc::fstatat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    metadata.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result == 0 {
+                return Ok(true);
+            }
+            let error = Error::last_os_error();
+            if error.kind() == ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(read_error(error))
+            }
+        }
+
+        pub(crate) fn read(&self, name: &OsStr) -> Result<Option<Vec<u8>>, HiveError> {
+            open_child(&self.file, name, libc::O_NONBLOCK)?
+                .map(read_file)
+                .transpose()
+        }
     }
 
     fn open_child(
@@ -333,7 +476,7 @@ mod filesystem {
 
     use crate::error::{ErrorCode, HiveError};
 
-    pub(super) fn read_regular(_path: &Path) -> Result<Option<Vec<u8>>, HiveError> {
+    pub(crate) fn read_regular(_path: &Path) -> Result<Option<Vec<u8>>, HiveError> {
         Err(HiveError::new(
             ErrorCode::IoError,
             "Configuration file access is unsupported on this platform",
