@@ -264,6 +264,29 @@ pub(crate) fn committed_identity(target: DoltTarget<'_>) -> Result<Value, HiveEr
     Ok(identity_report(&snapshot, workspace_id))
 }
 
+#[cfg(unix)]
+pub(crate) fn inspect_workspace_db(target: DoltTarget<'_>) -> Result<(Value, Value), HiveError> {
+    let (mut snapshot, workspace_id) = Snapshot::open_target(target)?;
+    // Observe only whether each class of change exists. Never return table names.
+    let status: Result<Option<(String, bool, bool)>, _> = first_row(
+        &mut snapshot.connection,
+        concat!(
+            "SELECT DOLT_HASHOF('HEAD'), ",
+            "EXISTS(SELECT 1 FROM dolt_status WHERE staged = TRUE), ",
+            "EXISTS(SELECT 1 FROM dolt_status WHERE staged = FALSE)"
+        ),
+    );
+    let working_set = match status {
+        Ok(Some((head, staged, working))) if head == snapshot.commit => json!({
+            "staged": if staged { "dirty" } else { "clean" },
+            "working": if working { "dirty" } else { "clean" },
+        }),
+        Ok(Some(_)) => json!({"unavailable": "head_changed"}),
+        _ => json!({"unavailable": "status_query_unavailable"}),
+    };
+    Ok((identity_report(&snapshot, workspace_id), working_set))
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn runtime_identity(
     target: &DoltTargetArgs,

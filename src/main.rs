@@ -6,6 +6,7 @@ mod config_v2;
 mod dolt;
 mod error;
 mod output;
+mod workspace_doctor;
 mod workspace_init;
 mod workspace_status;
 
@@ -100,6 +101,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
                 target,
                 register_runtime,
             } => (format, workspace_init::run(target, *register_runtime)),
+            WorkspaceAction::Doctor { target, endpoint } => {
+                workspace_doctor::observe(&invocation.common, target.as_deref(), endpoint)
+            }
             WorkspaceAction::Runtime(command) => workspace_status::run(&invocation.common, command),
         };
         return match result {

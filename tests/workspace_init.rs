@@ -45,6 +45,21 @@ impl Fixture {
         command
     }
 
+    fn doctor_target(&self, target: &Path) -> Command {
+        let mut command = self.hive();
+        command
+            .args([
+                "--contract",
+                "2",
+                "--json",
+                "workspace",
+                "doctor",
+                "--target",
+            ])
+            .arg(target);
+        command
+    }
+
     fn stages(&self) -> Vec<PathBuf> {
         fs::read_dir(&self.0)
             .unwrap()
@@ -86,6 +101,307 @@ fn response(output: Output, status: i32) -> Value {
     assert_eq!(output.status.code(), Some(status), "{body}");
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
     serde_json::from_str(&body).unwrap()
+}
+
+#[test]
+fn doctor_checks_an_explicit_empty_target_and_leaves_it_empty() {
+    let fixture = Fixture::new();
+    let target = fixture.dir("empty");
+    let xdg = fixture.0.join("state");
+    fixture.fake_dolt(
+        "[ \"$(/usr/bin/stat -Lc %a \"$HOME\")\" = 700 ] && \
+         [ \"$#\" = 1 ] && [ \"$1\" = version ] && [ \"$DOLT_ROOT_PATH\" = \"$HOME\" ] && \
+         [ \"$DOLT_DISABLE_EVENT_FLUSH\" = true ] && echo 'dolt version 2.7.6'",
+    );
+    fixture.fake_git_version();
+    let doctor = || {
+        let mut command = fixture.doctor_target(&target);
+        command.env("XDG_STATE_HOME", &xdg);
+        command
+    };
+    let mut permissive = doctor();
+    // SAFETY: umask is async-signal-safe and runs only in the forked child.
+    unsafe {
+        permissive.pre_exec(|| {
+            libc::umask(0);
+            Ok(())
+        });
+    }
+    let result = response(permissive.output().unwrap(), 0);
+    assert_eq!(result["command"], "workspace doctor");
+    let data = &result["data"];
+    assert_eq!(data["versions"]["hive"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(data["versions"]["git"], "2.56.1");
+    assert_eq!(data["versions"]["dolt"], "2.7.6");
+    assert_eq!(data["sources"]["output_format"], "cli");
+    assert_eq!(data["directory_lock"], "acquired");
+    assert!(data["available_blocks"].as_u64().unwrap() > 0);
+    assert_eq!(
+        data["deferred"]["committed_identity"],
+        "workspace_uninitialized"
+    );
+    assert!(fs::read_dir(&target).unwrap().next().is_none());
+    assert!(fixture.stages().is_empty());
+    assert!(!xdg.exists());
+
+    let mut restrictive = doctor();
+    // SAFETY: umask is async-signal-safe and runs only in the forked child.
+    unsafe {
+        restrictive.pre_exec(|| {
+            libc::umask(0o777);
+            Ok(())
+        });
+    }
+    response(restrictive.output().unwrap(), 0);
+
+    let held = fs::File::open(&target).unwrap();
+    // SAFETY: held owns the live directory descriptor for the duration of this check.
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let result = response(doctor().output().unwrap(), 5);
+    assert_eq!(result["error"]["code"], "LOCK_BUSY");
+    drop(held);
+
+    fs::write(
+        fixture.0.join("bin/dolt"),
+        "#!/bin/sh\necho 'dolt version 2.7.60'\n",
+    )
+    .unwrap();
+    let result = response(doctor().output().unwrap(), 4);
+    assert_eq!(result["error"]["code"], "SCHEMA_INCOMPATIBLE");
+    assert!(fs::read_dir(&target).unwrap().next().is_none());
+
+    fs::write(target.join(".keep"), "untouched").unwrap();
+    let result = response(doctor().output().unwrap(), 5);
+    assert_eq!(result["error"]["code"], "ALREADY_EXISTS");
+    assert_eq!(
+        fs::read_to_string(target.join(".keep")).unwrap(),
+        "untouched"
+    );
+}
+
+#[test]
+fn doctor_bounds_version_output_and_exit_time() {
+    let fixture = Fixture::new();
+    let target = fixture.dir("empty");
+    let bin = fixture.0.join("bin");
+    fixture.fake_dolt("exec /usr/bin/head -c 65536 /dev/zero");
+    fixture.fake_git_version();
+    let report = response(fixture.doctor_target(&target).output().unwrap(), 7);
+    assert_eq!(report["error"]["code"], "RUNTIME_UNAVAILABLE");
+    assert_eq!(
+        report["error"]["message"],
+        "Dolt version probe exceeded its output limit."
+    );
+
+    fs::write(bin.join("dolt"), "#!/bin/sh\necho 'dolt version 2.7.6'\n").unwrap();
+    fs::write(
+        bin.join("git"),
+        "#!/bin/sh\nexec 1>&-\nexec /bin/sleep 30\n",
+    )
+    .unwrap();
+    let started = Instant::now();
+    let report = response(fixture.doctor_target(&target).output().unwrap(), 7);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(report["error"]["code"], "RUNTIME_UNAVAILABLE");
+    assert_eq!(report["error"]["message"], "Git version probe timed out.");
+    assert!(fs::read_dir(&target).unwrap().next().is_none());
+}
+
+#[test]
+fn doctor_terminates_version_helpers_before_reaping_the_wrapper() {
+    for (tail, reason) in [
+        ("exit 0", "timed out"),
+        (
+            "/usr/bin/head -c 65536 /dev/zero",
+            "exceeded its output limit",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let target = fixture.dir("empty");
+        fixture.fake_dolt(&format!(
+            r#"
+            marker="${{0%/*}}/../helper"
+            (
+                [ -d "$HOME" ] || exit 1
+                printf '%s\n' "${{HOME##*/}}" > "$marker.fd"
+                exec /bin/sleep 8
+            ) &
+            printf '%s\n' "$!" > "$marker.pid"
+            while [ ! -s "$marker.fd" ]; do :; done
+            {tail}
+            "#
+        ));
+        fixture.fake_git_version();
+        let report = response(fixture.doctor_target(&target).output().unwrap(), 7);
+        assert_eq!(report["error"]["code"], "RUNTIME_UNAVAILABLE");
+        assert_eq!(
+            report["error"]["message"],
+            format!("Dolt version probe {reason}.")
+        );
+        let helper: u32 = fs::read_to_string(fixture.0.join("helper.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let fd: u32 = fs::read_to_string(fixture.0.join("helper.fd"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let scratch_fd = PathBuf::from(format!("/proc/{helper}/fd/{fd}"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match fs::symlink_metadata(&scratch_fd) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => panic!("could not inspect the version helper's descriptor: {error}"),
+                Ok(_) => assert!(
+                    Instant::now() < deadline,
+                    "version helper still holds scratch"
+                ),
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+fn doctor_refuses_version_probes_when_children_are_auto_reaped() {
+    let fixture = Fixture::new();
+    let target = fixture.dir("empty");
+    fixture.fake_dolt("exit 42");
+    fixture.fake_git_version();
+    let mut doctor = fixture.doctor_target(&target);
+    // SAFETY: signal sets a disposition only in the forked child, before exec.
+    unsafe {
+        doctor.pre_exec(|| {
+            if libc::signal(libc::SIGCHLD, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let report = response(doctor.output().unwrap(), 7);
+    assert_eq!(
+        report["error"]["message"],
+        "Dolt version probe requires waitable children."
+    );
+}
+
+#[test]
+fn doctor_uses_status_for_initialized_inspection_and_requires_explicit_selection() {
+    let fixture = Fixture::new();
+    let target = fixture.dir("initialized");
+    let state = fixture.0.join("state");
+    let config = fixture.0.join("config");
+    let descriptor = "version: 2\nworkspace_id: 01900000-0000-7000-8000-000000000001\nschema_version: 1\npolicy_revision: c66b3c50150e18426485d134de92c6b311dac125\n";
+    fs::write(target.join("hive-workspace.yml"), descriptor).unwrap();
+    fixture.fake_dolt("[ \"$1\" = version ] && echo 'dolt version 2.7.6'");
+    fixture.fake_git_version();
+    let doctor = || {
+        let mut command = fixture.hive();
+        command
+            .args(["--contract", "2", "--json", "workspace", "doctor"])
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_CONFIG_HOME", &config);
+        command
+    };
+    let result = response(doctor().output().unwrap(), 2);
+    assert_eq!(result["error"]["code"], "INVALID_ARGUMENT");
+    let result = response(
+        doctor().arg("--workspace").arg(&target).output().unwrap(),
+        0,
+    );
+    let data = &result["data"];
+    assert_eq!(data["initialized"], true);
+    assert_eq!(data["sources"]["workspace"], "cli");
+    assert_eq!(data["sources"]["output_format"], "cli");
+    assert_eq!(
+        data["descriptor"],
+        target.join("hive-workspace.yml").to_str().unwrap()
+    );
+    assert!(data.get("user_config").is_none());
+    assert_eq!(
+        data["state_directory"]["unavailable"],
+        "state_directory_missing"
+    );
+    assert_eq!(
+        data["working_set"]["unavailable"],
+        "authenticated_endpoint_not_supplied"
+    );
+    assert_eq!(data["workspace_id"], "01900000-0000-7000-8000-000000000001");
+    assert_eq!(data["runtime"]["endpoint_ownership"], "unverified");
+    assert_eq!(
+        data["deferred"]["committed_identity"],
+        "authenticated_endpoint_not_supplied"
+    );
+    let wrong_identity = response(
+        doctor()
+            .arg("--workspace")
+            .arg(&target)
+            .args([
+                "--workspace-id",
+                "01900000-0000-7000-8000-000000000002",
+                "--database",
+                "fixture_db",
+                "--port",
+                "3307",
+            ])
+            .output()
+            .unwrap(),
+        7,
+    );
+    assert_eq!(wrong_identity["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert!(!state.exists());
+    let private_state = state.join("hive/v2/workspaces/01900000-0000-7000-8000-000000000001");
+    fs::create_dir_all(&private_state).unwrap();
+    fs::set_permissions(&private_state, fs::Permissions::from_mode(0o755)).unwrap();
+    let insecure = response(
+        doctor().arg("--workspace").arg(&target).output().unwrap(),
+        0,
+    );
+    assert_eq!(
+        insecure["data"]["state_directory"],
+        serde_json::json!({
+            "owned_by_caller": true, "mode": "0755", "private": false,
+        })
+    );
+    fs::set_permissions(&private_state, fs::Permissions::from_mode(0o700)).unwrap();
+    let user_path = config.join("hive/v2/config.yml");
+    fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+    let configured_doctor = || {
+        let mut command = fixture.hive();
+        command
+            .args(["--contract", "2", "workspace", "doctor", "--workspace"])
+            .arg(&target)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_STATE_HOME", &state);
+        command
+    };
+    let default_output = configured_doctor().output().unwrap();
+    assert!(default_output.status.success());
+    let text = String::from_utf8(default_output.stdout).unwrap();
+    let report: Value =
+        serde_json::from_str(text.strip_prefix("workspace doctor\n").unwrap()).unwrap();
+    assert_eq!(report["sources"]["output_format"], "default");
+    assert!(report.get("user_config").is_none());
+    let user_config = "version: 2\noutput: {format: json}\n";
+    fs::write(&user_path, user_config).unwrap();
+    let from_user = response(configured_doctor().output().unwrap(), 0);
+    assert_eq!(from_user["data"]["sources"]["output_format"], "user");
+    assert_eq!(
+        from_user["data"]["user_config"],
+        user_path.to_str().unwrap()
+    );
+    assert_eq!(from_user["data"]["state_directory"]["private"], true);
+    assert_eq!(fs::read_dir(&private_state).unwrap().count(), 0);
+    assert_eq!(fs::read_to_string(user_path).unwrap(), user_config);
+    assert_eq!(
+        fs::read_to_string(target.join("hive-workspace.yml")).unwrap(),
+        descriptor
+    );
 }
 
 #[test]

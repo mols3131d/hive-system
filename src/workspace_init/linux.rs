@@ -2,7 +2,7 @@ use std::ffi::{CString, OsStr};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -58,16 +58,106 @@ impl Prepared {
     }
 }
 
-pub(super) fn run(target: &Path, register_runtime: bool) -> Result<Value, HiveError> {
+fn absolute_target(target: &Path) -> Result<PathBuf, HiveError> {
     let input = json_path(target)?;
     if input.trim().is_empty() || input.contains("://") || input.chars().any(char::is_control) {
         return Err(invalid_target("Supply an explicit local directory path."));
     }
-    let target = if target.is_absolute() {
+    Ok(if target.is_absolute() {
         target.to_path_buf()
     } else {
         current_dir()?.join(target)
+    })
+}
+
+pub(crate) fn inspect_empty_target(target: &Path) -> Result<Value, HiveError> {
+    let target = absolute_target(target)?;
+    let (parent, original) = inspect(&target)?;
+    lock_target(&original).map_err(|error| {
+        if matches!(error.code, ErrorCode::ConcurrentChange) {
+            HiveError::new(ErrorCode::LockBusy, error.to_string())
+        } else {
+            error
+        }
+    })?;
+    require_entries(&original, &[])?;
+
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: The parent directory descriptor and output buffer are valid.
+    if unsafe { libc::fstatvfs(parent.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(io_error(
+            "Could not determine available workspace filesystem blocks.",
+        ));
+    }
+    // SAFETY: fstatvfs succeeded.
+    let stat = unsafe { stat.assume_init() };
+    if stat.f_flag & libc::ST_RDONLY != 0 || stat.f_bavail == 0 {
+        return Err(invalid_target(
+            "Workspace initialization requires a writable filesystem with available blocks.",
+        ));
+    }
+    for directory in [&parent, &original] {
+        if rustix::fs::accessat(
+            directory,
+            ".",
+            rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )
+        .is_err()
+        {
+            return Err(invalid_target(
+                "Workspace initialization requires write and search access to the target and its parent.",
+            ));
+        }
+    }
+    let filesystem = if filesystem_kind(&parent)? == libc::TMPFS_MAGIC {
+        "tmpfs"
+    } else {
+        "ext-family"
     };
+    check_target_path(&target, &parent, &original)?;
+    Ok(json!({
+        "workspace_root": json_path(&target)?,
+        "filesystem": filesystem,
+        "available_blocks": stat.f_bavail,
+        "block_size_bytes": stat.f_frsize,
+        "directory_lock": "acquired",
+    }))
+}
+
+pub(crate) fn probe_versions() -> Result<Value, HiveError> {
+    // Dolt's version command initializes its global config and event
+    // directory. Keep them outside any workspace and the user's home/XDG.
+    let scratch = tempfile::Builder::new()
+        .prefix("hive-doctor-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+        .map_err(|_| io_error("Could not isolate the local version probes."))?;
+    // O_PATH works even if a restrictive umask removed owner access.
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(scratch.path())
+        .map_err(|_| io_error("Could not open the isolated version probe directory."))?;
+    let original = dir_metadata(&directory)?;
+    let versions = (|| {
+        fs::set_permissions(fd_path(&directory), fs::Permissions::from_mode(0o700))
+            .map_err(|_| io_error("Could not secure the isolated version probe directory."))?;
+        tools::Installed::locate(&directory)?.doctor_versions()
+    })();
+    if !fs::symlink_metadata(scratch.path()).is_ok_and(|current| same_inode(&original, &current)) {
+        let _ = scratch.keep();
+        return Err(io_error("The isolated version probe directory changed."));
+    }
+    scratch
+        .close()
+        .map_err(|_| io_error("Could not remove the isolated version probe directory."))?;
+    let (git, dolt) = versions?;
+    Ok(json!({"hive": env!("CARGO_PKG_VERSION"), "git": git, "dolt": dolt}))
+}
+
+pub(super) fn run(target: &Path, register_runtime: bool) -> Result<Value, HiveError> {
+    let target = absolute_target(target)?;
     let target_json = json_path(&target)?;
     let (parent, original) = inspect(&target)?;
     lock_target(&original)?;

@@ -17,12 +17,28 @@ mod unix {
 
     mod bindings;
 
-    struct Selection {
-        candidate: Candidate,
-        workspace_source: &'static str,
-        output_source: &'static str,
+    pub(crate) struct Selection {
+        pub(crate) candidate: Candidate,
+        pub(crate) workspace_source: &'static str,
+        pub(crate) output_source: &'static str,
         user: Option<UserSource>,
         binding: Option<bindings::Selected>,
+    }
+
+    impl Selection {
+        pub(crate) fn user_config(&self) -> Option<&Path> {
+            self.user
+                .as_ref()
+                .filter(|_| {
+                    self.workspace_source == "user"
+                        || self.output_source == "user"
+                        || self
+                            .binding
+                            .as_ref()
+                            .is_some_and(|selected| selected.binding.workspace.is_none())
+                })
+                .map(|source| source.path.as_path())
+        }
     }
 
     #[derive(Deserialize)]
@@ -113,13 +129,15 @@ mod unix {
             ));
         }
 
+        let selection = select(options, args, format)?;
+        let user_config = selection.user_config().map(json_path).transpose()?;
         let Selection {
             candidate,
             workspace_source,
             output_source,
-            user,
             binding,
-        } = select(options, args, format)?;
+            ..
+        } = &selection;
         let binding = binding.as_ref();
         let area = args.area.as_deref();
         let project = options.project.as_ref().map(|id| id.as_str());
@@ -128,7 +146,7 @@ mod unix {
         let bound_project = resource.and_then(|binding| binding.project_id.as_deref());
         let effective_area = area.or(bound_area);
         let effective_project = project.or(bound_project);
-        let descriptor = candidate.descriptor;
+        let descriptor = &candidate.descriptor;
         let mut report = json!({
             "scope": if resolved { "resolved" } else { "workspace" },
             "workspace_root": json_path(&candidate.root.path)?,
@@ -144,12 +162,8 @@ mod unix {
                 "runtime": "unverified"
             }
         });
-        if let Some(source) = user
-            && (workspace_source == "user"
-                || output_source == "user"
-                || binding.is_some_and(|selected| selected.binding.workspace.is_none()))
-        {
-            report["user_config"] = json!(json_path(&source.path)?);
+        if let Some(path) = user_config {
+            report["user_config"] = json!(path);
         }
         if resolved {
             report["verification"]["scope_membership"] = json!("unverified");
@@ -196,7 +210,7 @@ mod unix {
     pub(crate) fn select_workspace(
         options: &CommonOptions,
         format: &mut Format,
-    ) -> Result<(Candidate, &'static str), HiveError> {
+    ) -> Result<Selection, HiveError> {
         let args = ConfigShowArgs {
             target: crate::cli::ConfigScopeArgs {
                 scope: if options.workspace.is_some() {
@@ -210,8 +224,7 @@ mod unix {
             resource: None,
             dolt_target: Default::default(),
         };
-        let selected = select(options, &args, format)?;
-        Ok((selected.candidate, selected.workspace_source))
+        select(options, &args, format)
     }
 
     fn select(
