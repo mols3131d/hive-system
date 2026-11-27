@@ -1175,6 +1175,25 @@ fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
         check(&args, leaf, code, exit);
     }
 
+    let report = check(
+        &[
+            "bot",
+            "show",
+            "01900000-0000-7000-8000-00000000000a",
+            "--asset-commit",
+            REVISION,
+            "--asset-commit",
+            REVISION,
+            "--contract",
+            "2",
+            "--json",
+        ],
+        "show",
+        "INVALID_ARGUMENT",
+        2,
+    );
+    assert_eq!(report["error"]["message"], "Arguments conflict.");
+
     let command = ["bot", "list"];
     let trailing = ["--contract", "2", "--json"];
     for (flag, value) in [

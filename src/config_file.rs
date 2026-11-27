@@ -459,24 +459,6 @@ mod filesystem {
             Ok(())
         }
 
-        /// The caller must keep this directory open until the command is spawned.
-        #[cfg(target_os = "linux")]
-        pub(crate) unsafe fn set_command_directory(&self, command: &mut std::process::Command) {
-            use std::os::unix::process::CommandExt;
-
-            let fd = self.file.as_raw_fd();
-            // SAFETY: Callers execute the command while this directory is open.
-            // fchdir only changes the child process before exec.
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::fchdir(fd) == -1 {
-                        return Err(Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-
         #[cfg(target_os = "linux")]
         pub(crate) fn same_directory(&self, other: &Self) -> Result<bool, HiveError> {
             Ok(Self::same_inode(

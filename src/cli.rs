@@ -1548,7 +1548,9 @@ fn retry_scoped_read_failure(
     let retry = recover_scope(cli.clone().mut_subcommand(domain, |command| {
         command.mut_subcommands(|leaf| {
             recover_scope(leaf).mut_args(|arg| match arg.get_id().as_str() {
-                "database" | "workspace_id" | "port" | "cursor" | "area" => recover_value(arg),
+                "database" | "workspace_id" | "port" | "cursor" | "area" | "asset_commit" => {
+                    recover_value(arg)
+                }
                 "status" | "limit" | "after" => {
                     recover_value(arg.value_parser(StringValueParser::new()))
                 }

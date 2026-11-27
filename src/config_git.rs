@@ -377,21 +377,7 @@ impl AssetRepository {
         Ok(())
     }
 
-    fn command(&self) -> Result<Command, HiveError> {
-        let mut command = git_command(Path::new("."));
-        command.arg("--git-dir=.").env("GIT_COMMON_DIR", ".");
-        // SAFETY: Callers spawn and reap each command while the repository is open.
-        let objects = unsafe {
-            self.git_dir.set_command_directory(&mut command);
-            self.objects.inherit_directory(&mut command)?
-        };
-        command.env("GIT_OBJECT_DIRECTORY", objects);
-        Ok(command)
-    }
-
     fn read(&self, revision: &str, relative: &Path) -> Result<Option<Vec<u8>>, HiveError> {
-        const MAX_METADATA_BYTES: usize = 1024 * 1024;
-
         if !is_full_oid(revision) {
             return Err(HiveError::new(
                 ErrorCode::InvalidArgument,
@@ -399,6 +385,84 @@ impl AssetRepository {
             ));
         }
         relative_git_path(relative)?;
+        let config = self.git_dir.read(OsStr::new("config"))?.unwrap_or_default();
+        let reader = AssetObjectReader::new(&self.objects, &config, revision.len())?;
+        reader.read(revision, relative)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct AssetObjectReader<'a> {
+    objects: &'a crate::config_file::ScopedDirectory,
+    repository: tempfile::TempDir,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> AssetObjectReader<'a> {
+    fn new(
+        objects: &'a crate::config_file::ScopedDirectory,
+        config: &[u8],
+        oid_width: usize,
+    ) -> Result<Self, HiveError> {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let invalid_format = || {
+            HiveError::new(
+                ErrorCode::InvalidConfig,
+                "The assets Git repository has an unsupported object format.",
+            )
+        };
+        let version = asset_config_value(config, "core.repositoryformatversion", Some("int"))?;
+        let format = asset_config_value(config, "extensions.objectformat", None)?;
+        let format = match (version.as_deref(), format.as_deref()) {
+            (None | Some(b"0" | b"1"), None | Some(b"sha1")) => "sha1",
+            (Some(b"1"), Some(b"sha256")) => "sha256",
+            _ => return Err(invalid_format()),
+        };
+        if oid_width != if format == "sha256" { 64 } else { 40 } {
+            return Err(unavailable_blob());
+        }
+
+        // Git's object commands require repository metadata. Only the selected
+        // object directory is shared with the source repository.
+        let io_error = |_| {
+            HiveError::new(
+                ErrorCode::IoError,
+                "Could not create isolated Git reader metadata.",
+            )
+        };
+        let repository = tempfile::Builder::new()
+            .prefix("hive-soul-git-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .map_err(io_error)?;
+        let path = repository.path();
+        fs::create_dir(path.join("refs")).map_err(io_error)?;
+        fs::write(path.join("HEAD"), b"ref: refs/heads/inspection\n").map_err(io_error)?;
+        fs::write(
+            path.join("config"),
+            format!("[core]\nrepositoryformatversion = 1\nbare = true\n[extensions]\nobjectformat = {format}\n"),
+        ).map_err(io_error)?;
+        Ok(Self {
+            objects,
+            repository,
+        })
+    }
+
+    fn command(&self) -> Result<Command, HiveError> {
+        let path = self.repository.path();
+        let mut command = isolated_git_command(path);
+        command.arg("--git-dir=.");
+        // SAFETY: The object directory remains open until all children are reaped.
+        let objects = unsafe { self.objects.inherit_directory(&mut command)? };
+        command.env("GIT_OBJECT_DIRECTORY", objects);
+        Ok(command)
+    }
+
+    fn read(&self, revision: &str, relative: &Path) -> Result<Option<Vec<u8>>, HiveError> {
+        const MAX_METADATA_BYTES: usize = 1024 * 1024;
+
         let commit =
             self.verified_object("commit", &revision.to_ascii_lowercase(), MAX_METADATA_BYTES)?;
         let mut oid = commit
@@ -442,6 +506,39 @@ impl AssetRepository {
             return Err(unavailable_blob());
         }
         Ok(result.stdout)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn isolated_git_command(root: &Path) -> Command {
+    let mut command = git_command(root);
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn asset_config_value(
+    config: &[u8],
+    key: &str,
+    value_type: Option<&str>,
+) -> Result<Option<Vec<u8>>, HiveError> {
+    let mut command = isolated_git_command(Path::new("/"));
+    command.args(["--git-dir=/dev/null", "config", "--file=-", "--no-includes"]);
+    if let Some(value_type) = value_type {
+        command.args(["--type", value_type]);
+    }
+    let output = execute_asset(command.args(["--get", key]), 32, Some(config))?;
+    match output.status.code() {
+        Some(0) if git_line(&output.stdout).is_some() => {
+            Ok(git_line(&output.stdout).map(<[u8]>::to_vec))
+        }
+        Some(1) if output.stdout.is_empty() => Ok(None),
+        _ => Err(HiveError::new(
+            ErrorCode::InvalidConfig,
+            "Could not determine the assets Git repository format.",
+        )),
     }
 }
 
@@ -835,6 +932,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_object_format("sha1")
+        }
+
+        fn with_object_format(format: &str) -> Self {
             let nonce = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
@@ -844,7 +945,8 @@ mod tests {
             );
             fs::create_dir(fixture.assets().parent().unwrap()).unwrap();
             fs::create_dir(fixture.assets()).unwrap();
-            fixture.git(&["init", "--initial-branch=main"]);
+            let format = format!("--object-format={format}");
+            fixture.git(&["init", "--initial-branch=main", &format]);
             fixture
         }
 
@@ -876,6 +978,44 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn asset_reads_use_the_declared_format_without_repository_config_includes() {
+        for format in ["sha1", "sha256"] {
+            let fixture = Fixture::with_object_format(format);
+            let assets = fixture.assets();
+            let relative = Path::new("bots/queen/SOUL.md");
+            let soul = assets.join(relative);
+            fs::create_dir_all(soul.parent().unwrap()).unwrap();
+            fs::write(&soul, "synthetic").unwrap();
+            fixture.git(&["add", "--all"]);
+            fixture.git(&["commit", "-m", "Synthetic Soul"]);
+            let commit = fixture.git(&["rev-parse", "HEAD"]);
+            fixture.git(&["repack", "-ad"]);
+
+            let git_dir = assets.join(".git");
+            let config = git_dir.join("config");
+            let mut original = fs::read(&config).unwrap();
+            original.extend_from_slice(b"\n[include]\npath = broken-include\n");
+            fs::write(&config, &original).unwrap();
+            fs::write(git_dir.join("broken-include"), b"[invalid\n").unwrap();
+
+            let ordinary = git_command(&assets)
+                .args(["cat-file", "commit", &commit])
+                .output()
+                .unwrap();
+            assert!(!ordinary.status.success());
+            let directory = ScopedDirectory::open_absolute(&fixture.0).unwrap();
+            assert_eq!(
+                read_asset_blob(&directory, &commit, relative)
+                    .unwrap()
+                    .unwrap(),
+                b"synthetic",
+                "{format}"
+            );
+            assert_eq!(fs::read(&config).unwrap(), original);
         }
     }
 
