@@ -2332,3 +2332,31 @@ fn conversation_show_recovers_output_for_target_and_scope_errors() {
     assert_eq!(implicit.stdout, explicit.stdout);
     assert_eq!(implicit.stderr, explicit.stderr);
 }
+
+#[test]
+fn soul_inspection_requires_contract_two_and_an_explicit_root() {
+    let sandbox = Sandbox::new();
+    for (contract, expected) in [
+        ("1", "Dolt Bot options require --contract 2."),
+        ("2", "Soul inspection requires an explicit --workspace."),
+    ] {
+        let args = [
+            "--contract",
+            contract,
+            "--json",
+            "bot",
+            "show",
+            "01900000-0000-7000-8000-00000000000a",
+            "--asset-commit",
+            REVISION,
+        ];
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{report}");
+        assert_eq!(report["schema_version"], contract.parse::<u32>().unwrap());
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(report["error"]["message"], expected);
+        assert!(output.stderr.is_empty());
+    }
+    sandbox.assert_empty();
+}

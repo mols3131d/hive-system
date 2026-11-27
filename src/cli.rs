@@ -629,6 +629,9 @@ pub(crate) enum BotCommand {
     Show {
         #[arg(value_name = "BOT-ID", value_parser = parse_slug)]
         bot_id: String,
+        /// Inspect the Soul at this full asset Git commit (contract 2, requires --workspace).
+        #[arg(long, hide = true)]
+        asset_commit: Option<String>,
         #[command(flatten)]
         target: DoltTargetArgs,
     },
@@ -1561,6 +1564,9 @@ impl BotCommand {
                     } | Self::List {
                         cursor: Some(_),
                         ..
+                    } | Self::Show {
+                        asset_commit: Some(_),
+                        ..
                     }
                 )
             {
@@ -1568,10 +1574,28 @@ impl BotCommand {
             }
             return Ok(());
         }
-        target.validate_common(
-            common,
-            "Dolt Bot inspection accepts only an explicit local database and workspace ID.",
-        )?;
+        if matches!(
+            self,
+            Self::Show {
+                asset_commit: Some(_),
+                ..
+            }
+        ) {
+            if common.workspace.is_none() {
+                return Err("Soul inspection requires an explicit --workspace.");
+            }
+            if common.project.is_some()
+                || common.project_root.is_some()
+                || !matches!(common.view, View::WorkingTree)
+            {
+                return Err("Soul inspection accepts only explicit workspace and Bot selection.");
+            }
+        } else {
+            target.validate_common(
+                common,
+                "Dolt Bot inspection accepts only an explicit local database and workspace ID.",
+            )?;
+        }
         if !target.has_all() {
             return Err("Dolt Bot inspection requires --workspace-id, --database, and --port.");
         }

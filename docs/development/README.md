@@ -158,7 +158,19 @@ hive --contract 2 --json bot show 01900000-0000-7000-8000-00000000000a \
 
 `bot list` defaults to `--status active` and accepts `retired` or `all`. It orders entries by ascending Bot UUID, with 25 results per page by default and a maximum of 100. Pass `next_cursor` as `--cursor` with the same target, status and page size. Changes to the committed snapshot or query return `STALE_CURSOR`.
 
-`bot show` takes an exact lowercase UUIDv7 and can inspect retired Queens. Both commands return registry metadata and the verified Dolt commit. Registry status describes retirement. Committed Soul inspection requires the workspace and asset repository pairing from [#18](https://github.com/mols3131d/hive-system/issues/18).
+`bot show` takes an exact lowercase UUIDv7 and can inspect retired Queens. Both commands return registry metadata and the verified Dolt commit. Registry status describes retirement.
+
+For read-only Soul inspection of an explicitly selected workspace copy, add the descriptor root and the full Git commit object ID from its dedicated `assets/.git` repository.
+
+```sh
+hive --contract 2 --json bot show 01900000-0000-7000-8000-00000000000a \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001 \
+  --workspace ./fixture-copy --asset-commit "$asset_commit"
+```
+
+Select the copy's Dolt endpoint explicitly. Hive checks the workspace UUID against the descriptor and the endpoint's committed `main` snapshot. The committed Queen's slug selects exactly `assets/bots/<slug>/SOUL.md` at the supplied Git commit. The output includes the Soul path and UTF-8 body, Queen metadata, workspace UUID, Dolt commit, asset commit, and descriptor policy pin. Optional YAML frontmatter is omitted from the body. When present, `workspace_id`, `id` or `bot_id`, `slug` or `bot_slug`, `display_name`, and `role` must match the selected identity.
+
+Inspection establishes portable identity agreement for the selected revisions. Physical endpoint pairing, an active-root decision, and host loading require separate evidence.
 
 ## Committed Resource reads
 

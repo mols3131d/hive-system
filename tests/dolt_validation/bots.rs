@@ -238,3 +238,155 @@ fn inspects_committed_bot_metadata_and_pins_page_continuations() {
     assert_eq!(run(&continuation, 5)["error"]["code"], "STALE_CURSOR");
     assert_eq!(run(&["show", &staged], 0)["data"]["bot"]["id"], staged);
 }
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
+fn inspects_only_the_explicit_committed_soul() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+
+    use serde_json::Value;
+
+    let fixture = Fixture::start_empty();
+    let mut admin = fixture.connect(ADMIN);
+    let queen = id(0x90);
+    let workspace = id(1);
+    let policy = "c66b3c50150e18426485d134de92c6b311dac125";
+    insert_bot(&mut admin, &queen, "queen-alpha", "Queen Alpha", true);
+    commit(&mut admin);
+    admin.query_drop("UPDATE bots SET slug = 'staged'").unwrap();
+    admin.query_drop("CALL DOLT_ADD('bots')").unwrap();
+    admin.query_drop("UPDATE bots SET slug = 'dirty'").unwrap();
+    let db_before = storage_state(&mut admin);
+
+    let root = fixture.root.join("copy");
+    let assets = root.join("assets");
+    let directory = assets.join("bots/queen-alpha");
+    let soul = directory.join("SOUL.md");
+    fs::create_dir_all(&directory).unwrap();
+    let descriptor = |id: &str| {
+        format!("version: 2\nworkspace_id: {id}\nschema_version: 1\npolicy_revision: {policy}\n")
+    };
+    let marker = root.join("hive-workspace.yml");
+    fs::write(&marker, descriptor(&workspace)).unwrap();
+    // The conversation root need not even be readable for Soul inspection.
+    symlink("missing-conversations", root.join("conversations")).unwrap();
+
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", fixture.root.join("home"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(&assets)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let save = || {
+        git(&["add", "--all"]);
+        git(&["commit", "-m", "Synthetic assets"]);
+        git(&["rev-parse", "HEAD"])
+    };
+    git(&["init", "--initial-branch=main"]);
+    fs::write(directory.join("README.md"), "management-only-readme").unwrap();
+    fs::write(directory.join("AGENTS.md"), "management-only-agents").unwrap();
+    let missing = save();
+    let body = "# Synthetic Queen 기록\r\nKeep exact bytes.";
+    fs::write(
+        &soul,
+        format!(
+            "---\r\nworkspace_id: {workspace}\r\nbot_id: {queen}\r\nslug: queen-alpha\r\nrole: queen\r\n---\r\n{body}"
+        ),
+    )
+    .unwrap();
+    let selected = save();
+    fs::write(&soul, "later-commit").unwrap();
+    let other = save();
+    fs::write(&soul, "staged-only").unwrap();
+    git(&["add", "--all"]);
+    fs::write(&soul, "dirty-only").unwrap();
+    let index = fs::read(assets.join(".git/index")).unwrap();
+    let head = git(&["rev-parse", "HEAD"]);
+
+    let run = |contract: &str, expected_workspace: &str, id: &str, revision: &str| {
+        let port = fixture.port.to_string();
+        let output = fixture.run_hive(
+            &[
+                "--contract",
+                contract,
+                "--json",
+                "bot",
+                "show",
+                id,
+                "--workspace",
+                "copy",
+                "--workspace-id",
+                expected_workspace,
+                "--database",
+                super::DATABASE,
+                "--port",
+                &port,
+                "--asset-commit",
+                revision,
+            ],
+            &fixture.password,
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.success(), report["ok"] == true, "{report}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(storage_state(&mut fixture.connect(ADMIN)), db_before);
+        report
+    };
+    let inspect = |revision: &str| run("2", &workspace, &queen, revision);
+    let report = inspect(&selected);
+    assert_eq!(report["data"]["soul"]["body"], body);
+    assert_eq!(
+        report["data"]["soul"]["path"],
+        "assets/bots/queen-alpha/SOUL.md"
+    );
+    assert_eq!(report["data"]["bot"]["id"], queen);
+    assert_eq!(report["data"]["bot"]["status"], "retired");
+    assert_eq!(report["context"]["db_commit"], db_before.0);
+    assert_eq!(report["context"]["asset_commit"], selected);
+    assert_eq!(report["context"]["policy_revision"], policy);
+    assert_eq!(report["context"]["workspace_id"], workspace);
+    assert_eq!(inspect(&other)["data"]["soul"]["body"], "later-commit");
+    assert_eq!(inspect(&missing)["error"]["code"], "NOT_FOUND");
+    assert_eq!(
+        run("1", &workspace, &queen, &selected)["error"]["code"],
+        "INVALID_ARGUMENT"
+    );
+    assert_eq!(
+        run("2", &workspace, &id(0x91), &selected)["error"]["code"],
+        "NOT_FOUND"
+    );
+    assert_eq!(fs::read_to_string(&marker).unwrap(), descriptor(&workspace));
+    assert_eq!(
+        run("2", &id(2), &queen, &selected)["error"]["code"],
+        "AUTHORITY_UNVERIFIED"
+    );
+    fs::write(&marker, descriptor(&id(2))).unwrap();
+    assert_eq!(
+        run("2", &id(2), &queen, &selected)["error"]["code"],
+        "AUTHORITY_UNVERIFIED"
+    );
+    fs::write(&marker, descriptor(&workspace)).unwrap();
+    fs::write(root.join("hive.yml"), "version: 1\n").unwrap();
+    assert_eq!(inspect(&selected)["error"]["code"], "SCHEMA_INCOMPATIBLE");
+    fs::remove_file(root.join("hive.yml")).unwrap();
+
+    assert_eq!(fs::read(assets.join(".git/index")).unwrap(), index);
+    assert_eq!(git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(fs::read_to_string(&soul).unwrap(), "dirty-only");
+}

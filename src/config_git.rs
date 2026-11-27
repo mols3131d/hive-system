@@ -96,17 +96,18 @@ pub(crate) fn is_full_oid(oid: &str) -> bool {
 }
 
 fn resolve_commit(root: &Path, revision: &str) -> Result<Option<String>, HiveError> {
+    resolve_commit_with(&mut git_command(root), revision)
+}
+
+fn resolve_commit_with(command: &mut Command, revision: &str) -> Result<Option<String>, HiveError> {
     let expression = format!("{revision}^{{commit}}");
-    let result = git(
-        root,
-        [
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            "--end-of-options",
-            &expression,
-        ],
-    )?;
+    let result = execute(command.args([
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        &expression,
+    ]))?;
     if !result.status.success() {
         return Ok(None);
     }
@@ -277,13 +278,49 @@ pub(crate) fn read_blob(
     revision: &str,
     relative: &Path,
 ) -> Result<Option<Vec<u8>>, HiveError> {
+    read_blob_with(|| git_command(root), revision, relative)
+}
+
+#[cfg(unix)]
+pub(crate) fn read_asset_blob(
+    root: &crate::config_file::ScopedDirectory,
+    revision: &str,
+    relative: &Path,
+) -> Result<Option<Vec<u8>>, HiveError> {
+    let git_dir = root
+        .open_directory(OsStr::new("assets"))?
+        .open_directory(OsStr::new(".git"))?;
+    if git_dir.contains(c"commondir")? {
+        return Err(HiveError::new(
+            ErrorCode::InvalidConfig,
+            "The assets directory must have a dedicated Git repository.",
+        ));
+    }
+    read_blob_with(
+        || {
+            let mut command = git_command(Path::new("."));
+            command.arg("--git-dir=.");
+            // SAFETY: read_blob_with runs the commands before git_dir is dropped.
+            unsafe { git_dir.set_command_directory(&mut command) };
+            command
+        },
+        revision,
+        relative,
+    )
+}
+
+fn read_blob_with(
+    command: impl Fn() -> Command,
+    revision: &str,
+    relative: &Path,
+) -> Result<Option<Vec<u8>>, HiveError> {
     if !is_full_oid(revision) {
         return Err(HiveError::new(
             ErrorCode::InvalidArgument,
             "A snapshot requires a full Git commit object ID",
         ));
     }
-    let Some(commit) = resolve_commit(root, revision)? else {
+    let Some(commit) = resolve_commit_with(&mut command(), revision)? else {
         return Err(unavailable_blob());
     };
     if !commit.eq_ignore_ascii_case(revision) {
@@ -292,7 +329,7 @@ pub(crate) fn read_blob(
 
     let path = relative_git_path(relative)?;
     let result = execute(
-        git_command(root)
+        command()
             .args([
                 "--literal-pathspecs",
                 "ls-tree",
@@ -310,7 +347,7 @@ pub(crate) fn read_blob(
         return Ok(None);
     }
     let object = tree_blob_oid(&result.stdout, path)?;
-    let size = git(root, ["cat-file", "-s", object])?;
+    let size = execute(command().args(["cat-file", "-s", object]))?;
     let size = size
         .status
         .success()
@@ -326,7 +363,7 @@ pub(crate) fn read_blob(
         ));
     }
 
-    let result = git(root, ["cat-file", "blob", object])?;
+    let result = execute(command().args(["cat-file", "blob", object]))?;
     if !result.status.success() || result.stdout.len() != size {
         return Err(unavailable_blob());
     }
@@ -574,4 +611,116 @@ fn execute(command: &mut Command) -> Result<Output, HiveError> {
         ));
     }
     Ok(output)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{fs, os::unix::fs::symlink, time::SystemTime};
+
+    use super::*;
+    use crate::config_file::ScopedDirectory;
+
+    #[test]
+    fn asset_blob_reads_only_a_bounded_regular_entry_at_the_selected_commit() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = Fixture(
+            env::temp_dir().join(format!("hive-asset-test-{}-{nonce}", std::process::id())),
+        );
+        let assets = root.0.join("assets");
+        let relative = Path::new("bots/queen/SOUL.md");
+        let soul = assets.join(relative);
+        fs::create_dir_all(soul.parent().unwrap()).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .env_clear()
+                .env("HOME", &root.0)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("PATH", env::var_os("PATH").unwrap())
+                .current_dir(&assets)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{:?}", output.stderr);
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let save = || {
+            git(&["add", "--all"]);
+            git(&["commit", "-m", "Synthetic asset snapshot"]);
+            git(&["rev-parse", "HEAD"])
+        };
+        git(&["init", "--initial-branch=main"]);
+        fs::write(soul.with_file_name("README.md"), "management").unwrap();
+        let missing = save();
+        fs::write(&soul, "committed").unwrap();
+        let committed = save();
+        let blob = git(&["rev-parse", "HEAD:bots/queen/SOUL.md"]);
+        fs::write(&soul, vec![b'x'; MAX_BLOB_BYTES + 1]).unwrap();
+        let oversized = save();
+        fs::remove_file(&soul).unwrap();
+        symlink("README.md", &soul).unwrap();
+        let linked = save();
+        fs::remove_file(&soul).unwrap();
+        fs::write(&soul, "staged").unwrap();
+        git(&["add", "--all"]);
+        fs::write(&soul, "dirty").unwrap();
+        let index = fs::read(assets.join(".git/index")).unwrap();
+
+        let directory = ScopedDirectory::open_absolute(&root.0).unwrap();
+        let read = |revision| read_asset_blob(&directory, revision, relative);
+        assert_eq!(read(&committed).unwrap().unwrap(), b"committed");
+        assert!(read(&missing).unwrap().is_none());
+        for (revision, expected) in [
+            (&linked[..], ErrorCode::InvalidConfig),
+            (&oversized, ErrorCode::InvalidConfig),
+            (&blob, ErrorCode::ObjectUnavailable),
+            (
+                "0000000000000000000000000000000000000000",
+                ErrorCode::ObjectUnavailable,
+            ),
+            ("HEAD", ErrorCode::InvalidArgument),
+            (&committed[..12], ErrorCode::InvalidArgument),
+        ] {
+            assert_eq!(
+                std::mem::discriminant(&read(revision).unwrap_err().code),
+                std::mem::discriminant(&expected)
+            );
+        }
+        assert_eq!(fs::read(assets.join(".git/index")).unwrap(), index);
+        assert_eq!(git(&["rev-parse", "HEAD"]), linked);
+        assert_eq!(fs::read_to_string(&soul).unwrap(), "dirty");
+
+        fs::rename(&assets, root.0.join("elsewhere")).unwrap();
+        symlink("elsewhere", &assets).unwrap();
+        assert!(matches!(
+            read(&committed).unwrap_err().code,
+            ErrorCode::InvalidConfig
+        ));
+        fs::remove_file(&assets).unwrap();
+        fs::create_dir(&assets).unwrap();
+        symlink("../elsewhere/.git", assets.join(".git")).unwrap();
+        assert!(matches!(
+            read(&committed).unwrap_err().code,
+            ErrorCode::InvalidConfig
+        ));
+        fs::remove_file(assets.join(".git")).unwrap();
+        assert!(matches!(
+            read(&committed).unwrap_err().code,
+            ErrorCode::NotFound
+        ));
+    }
 }

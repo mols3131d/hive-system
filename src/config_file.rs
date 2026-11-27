@@ -395,6 +395,36 @@ mod filesystem {
             })
         }
 
+        pub(crate) fn open_directory(&self, name: &OsStr) -> Result<Self, HiveError> {
+            let file = open_child(&self.file, name, libc::O_DIRECTORY)?.ok_or_else(|| {
+                HiveError::new(
+                    ErrorCode::NotFound,
+                    "A required scoped directory is missing",
+                )
+            })?;
+            Ok(Self {
+                file,
+                path: self.path.join(name),
+            })
+        }
+
+        /// The caller must keep this directory open until the command is spawned.
+        pub(crate) unsafe fn set_command_directory(&self, command: &mut std::process::Command) {
+            use std::os::unix::process::CommandExt;
+
+            let fd = self.file.as_raw_fd();
+            // SAFETY: Callers execute the command while this directory is open.
+            // fchdir only changes the child process before exec.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fchdir(fd) == -1 {
+                        return Err(Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+
         pub(crate) fn contains(&self, name: &std::ffi::CStr) -> Result<bool, HiveError> {
             let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
             // SAFETY: The directory descriptor, name, and output buffer are valid.
