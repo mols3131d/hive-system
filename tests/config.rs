@@ -1365,3 +1365,506 @@ fn v2_rejects_tagged_field_names_and_accepts_quoted_tag_like_values() {
         );
     }
 }
+
+const V2_RESOLVED: &[&str] = &["--contract", "2", "config", "show", "--json"];
+const RESOURCE: &str = "0195f1b2-4000-7000-8000-000000000010";
+const AREA: &str = "0195f1b2-4000-7000-8000-000000000001";
+const PROJECT_V2: &str = "0195f1b2-4000-7000-8000-000000000020";
+const OVERRIDE: &str = "0195f1b2-4000-7000-8000-000000000021";
+
+fn v2_binding(path: &str, workspace: &str) -> String {
+    format!("  - path: {path}\n    workspace: {workspace}\n    resource_id: {RESOURCE}\n")
+}
+
+#[test]
+fn v2_resolved_selects_canonical_roots_and_reports_sources_offline() {
+    let fixture = Sandbox::new();
+    let external = fixture.project("external", PROJECT_URL);
+    write(&external.join("src/untracked.txt"), "synthetic local file");
+    write(&external.join(".git/hooks/pre-commit"), "synthetic hook");
+    write(
+        &fixture.0.join("invocation/notes/deep/example"),
+        "non-Git resource",
+    );
+    write(
+        &fixture.0.join("invocation/notes-other/example"),
+        "sibling resource",
+    );
+    write(
+        &fixture.0.join("invocation/notes/bindings.yml"),
+        "synthetic-project-input: [",
+    );
+    for workspace in ["parent", "child", "user", "xdg/hive/v2/userdata"] {
+        write(
+            &fixture.0.join(workspace).join("hive-workspace.yml"),
+            V2_DESCRIPTOR,
+        );
+    }
+    let user = fixture.0.join("xdg/hive/v2/config.yml");
+    let bindings = user.with_file_name("bindings.yml");
+    write(
+        &user,
+        "version: 2\nworkspace: ../../../user\noutput: {format: json}\n",
+    );
+    let mut yaml = String::from("version: 2\nbindings:\n");
+    yaml.push_str(&v2_binding("../../../invocation", "../../../parent"));
+    yaml.push_str(&v2_binding(
+        "../../../invocation/notes/./deep/..",
+        "../../../child",
+    ));
+    yaml.push_str(&format!(
+        "    area_id: {AREA}\n    project_id: {PROJECT_V2}\n"
+    ));
+    yaml.push_str(&v2_binding("../../../external", "../../../child"));
+    write(&bindings, yaml);
+    let before = snapshot(&fixture.0);
+    let inspect = |cwd: &Path, extra: &[&str]| {
+        let output = fixture
+            .hive(
+                cwd,
+                &[&["--contract", "2", "config", "show"][..], extra].concat(),
+            )
+            .env("PATH", fixture.0.join("no-executables"))
+            .env("XDG_DATA_HOME", fixture.0.join("xdg"))
+            .env("XDG_STATE_HOME", fixture.0.join("state"))
+            .env("XDG_RUNTIME_DIR", fixture.0.join("runtime"))
+            .output()
+            .unwrap();
+        v2_json(output, 0)["data"].clone()
+    };
+    let deep = fixture.0.join("invocation/notes/deep");
+    let report = inspect(&deep, &[]);
+    assert_eq!(report["scope"], "resolved");
+    assert_eq!(
+        report["workspace_root"],
+        fixture.0.join("child").to_str().unwrap()
+    );
+    assert_eq!(
+        report["resource_root"],
+        deep.parent().unwrap().to_str().unwrap()
+    );
+    assert_eq!(report["resource_id"], RESOURCE);
+    assert_eq!(report["area_id"], AREA);
+    assert_eq!(report["project_id"], PROJECT_V2);
+    assert_eq!(report["binding"], bindings.to_str().unwrap());
+    assert_eq!(report["user_config"], user.to_str().unwrap());
+    assert_eq!(
+        report["sources"],
+        serde_json::json!({
+            "workspace": "binding", "area": "binding", "project": "binding",
+            "resource": "binding", "output_format": "user",
+        })
+    );
+    assert_eq!(
+        report["verification"],
+        serde_json::json!({
+            "descriptor": "verified", "committed_identity": "unverified",
+            "runtime": "unverified", "scope_membership": "unverified",
+        })
+    );
+
+    let sibling = fixture.0.join("invocation/notes-other");
+    for report in [
+        inspect(&sibling, &[]),
+        inspect(&deep, &["--resource", "../.."]),
+    ] {
+        assert_eq!(
+            report["workspace_root"],
+            fixture.0.join("parent").to_str().unwrap()
+        );
+        assert!(report.get("area_id").is_none());
+    }
+    assert_eq!(
+        inspect(&external.join("src"), &[])["sources"]["workspace"],
+        "binding"
+    );
+    assert_eq!(inspect(&fixture.0, &[])["sources"]["workspace"], "user");
+
+    let report = inspect(
+        &deep,
+        &[
+            "--json",
+            "--workspace",
+            "../../../child",
+            "--area",
+            OVERRIDE,
+            "--project",
+            OVERRIDE,
+        ],
+    );
+    assert_eq!(report["area_id"], OVERRIDE);
+    assert_eq!(report["project_id"], OVERRIDE);
+    assert_eq!(
+        report["sources"],
+        serde_json::json!({
+            "workspace": "cli", "area": "cli", "project": "cli",
+            "resource": "binding", "output_format": "cli",
+        })
+    );
+    assert!(report.get("user_config").is_none());
+
+    let report = inspect(
+        &deep,
+        &["--json", "--workspace", "../../../user", "--area", OVERRIDE],
+    );
+    assert_eq!(
+        report["workspace_root"],
+        fixture.0.join("user").to_str().unwrap()
+    );
+    assert_eq!(report["area_id"], OVERRIDE);
+    assert_eq!(
+        report["sources"],
+        serde_json::json!({
+            "workspace": "cli", "area": "cli", "output_format": "cli",
+        })
+    );
+    for field in ["binding", "resource_id", "resource_root", "project_id"] {
+        assert!(report.get(field).is_none(), "{field}");
+    }
+    assert!(!fixture.0.join("state").exists());
+    assert!(!fixture.0.join("runtime").exists());
+    assert_unchanged(&fixture.0, &before);
+
+    // A foreign workspace's descriptor and scope are irrelevant to --workspace.
+    write(
+        &fixture.0.join("child/hive-workspace.yml"),
+        "synthetic-private: [",
+    );
+    let report = inspect(&deep, &["--json", "--workspace", "../../../user"]);
+    assert!(report.get("binding").is_none());
+
+    write(&user, "version: 2\n");
+    assert_eq!(
+        inspect(&fixture.0, &["--json"])["sources"]["workspace"],
+        "xdg-default"
+    );
+
+    // A supplied root is exact, even if an ancestor would apply implicitly.
+    v2_error(
+        fixture.run_in(&deep, &[V2_RESOLVED, &["--resource", "."]].concat()),
+        3,
+        "NOT_FOUND",
+    );
+}
+
+#[test]
+fn v2_binding_without_workspace_uses_only_the_user_default() {
+    let fixture = Sandbox::new();
+    let user = fixture.0.join("xdg/hive/v2/config.yml");
+    write(
+        &fixture.0.join("workspace/hive-workspace.yml"),
+        V2_DESCRIPTOR,
+    );
+    write(
+        &fixture.0.join("xdg/hive/v2/userdata/hive-workspace.yml"),
+        V2_DESCRIPTOR,
+    );
+    write(
+        &user.with_file_name("bindings.yml"),
+        format!(
+            "version: 2\nbindings:\n  - path: ../../../invocation\n    resource_id: {RESOURCE}\n"
+        ),
+    );
+    write(&user, "version: 2\nworkspace: ../../../workspace\n");
+    let report = v2_json(fixture.run(V2_RESOLVED), 0);
+    assert_eq!(report["data"]["sources"]["workspace"], "binding");
+    assert_eq!(report["data"]["user_config"], user.to_str().unwrap());
+    assert_eq!(
+        report["data"]["workspace_root"],
+        fixture.0.join("workspace").to_str().unwrap()
+    );
+    write(&user, "version: 2\n");
+    let output = fixture
+        .hive(&fixture.0.join("invocation"), V2_RESOLVED)
+        .env("XDG_DATA_HOME", fixture.0.join("xdg"))
+        .output()
+        .unwrap();
+    v2_error(output, 2, "INVALID_CONFIG");
+}
+
+#[test]
+fn v2_bindings_use_only_an_absolute_xdg_config_home_or_the_home_fallback() {
+    let fixture = Sandbox::new();
+    write(
+        &fixture.0.join("workspace/hive-workspace.yml"),
+        V2_DESCRIPTOR,
+    );
+    let home_bindings = fixture.0.join("home/.config/hive/v2/bindings.yml");
+    write(
+        &home_bindings,
+        format!(
+            "version: 2\nbindings:\n{}",
+            v2_binding("../../../../invocation", "../../../../workspace")
+        ),
+    );
+    write(
+        &fixture.0.join("invocation/relative/hive/v2/bindings.yml"),
+        "synthetic-private: [",
+    );
+    let before = snapshot(&fixture.0);
+    for override_value in [None, Some(""), Some("relative")] {
+        let mut command = fixture.hive(&fixture.0.join("invocation"), V2_RESOLVED);
+        if let Some(value) = override_value {
+            command.env("XDG_CONFIG_HOME", value);
+        } else {
+            command.env_remove("XDG_CONFIG_HOME");
+        }
+        let report = v2_json(command.output().unwrap(), 0);
+        assert_eq!(report["data"]["binding"], home_bindings.to_str().unwrap());
+    }
+    assert_unchanged(&fixture.0, &before);
+}
+
+#[test]
+fn v2_bindings_refuse_invalid_selected_inputs_and_unsafe_files() {
+    let fixture = Sandbox::new();
+    let user = fixture.0.join("xdg/hive/v2/config.yml");
+    let bindings = user.with_file_name("bindings.yml");
+    let workspace = fixture.0.join("workspace");
+    write(&workspace.join("hive-workspace.yml"), V2_DESCRIPTOR);
+    write(
+        &user,
+        "version: 2\nworkspace: ../../../workspace\noutput: {format: json}\n",
+    );
+    write(
+        &fixture.0.join("invocation/child/example"),
+        "synthetic resource file",
+    );
+    let binding = v2_binding("../../../invocation", "../../../workspace");
+    let valid = format!("version: 2\nbindings:\n{binding}");
+    let duplicate = v2_binding("../../../invocation/child/..", "../../../workspace");
+    for (yaml, exit, code) in [
+        (format!("{valid}{duplicate}"), 2, "INVALID_CONFIG"),
+        (
+            format!("{valid}    synthetic-private: forbidden\n"),
+            2,
+            "INVALID_CONFIG",
+        ),
+        (
+            format!("{valid}    resource_id: {RESOURCE}\n"),
+            2,
+            "INVALID_CONFIG",
+        ),
+        (format!("{valid}    area_id: null\n"), 2, "INVALID_CONFIG"),
+        (
+            format!("{valid}    area_id: synthetic-private\n"),
+            2,
+            "INVALID_CONFIG",
+        ),
+        (
+            valid.replace("version: 2", "version: 1"),
+            4,
+            "SCHEMA_INCOMPATIBLE",
+        ),
+        (
+            valid.replace("- path:", "- &synthetic-private path:"),
+            2,
+            "INVALID_CONFIG",
+        ),
+        (
+            valid.replace("- path:", "- !!map\n    path:"),
+            2,
+            "INVALID_CONFIG",
+        ),
+        (
+            valid.replace("../../../workspace", "../../../absent"),
+            3,
+            "NOT_FOUND",
+        ),
+        (
+            format!("{valid}    workspace_id: {OVERRIDE}\n"),
+            7,
+            "AUTHORITY_UNVERIFIED",
+        ),
+        (format!("{valid}---\n{{}}\n"), 2, "INVALID_CONFIG"),
+    ] {
+        write(&bindings, yaml);
+        let output = fixture.run(&["--contract", "2", "config", "show"]);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("binding"));
+        v2_error(output, exit, code);
+    }
+
+    let broken_child = v2_binding("../../../invocation/child", "../../../absent");
+    write(&bindings, format!("{valid}{broken_child}"));
+    v2_error(
+        fixture.run_in(&fixture.0.join("invocation/child"), V2_RESOLVED),
+        3,
+        "NOT_FOUND",
+    );
+    for bytes in [vec![0xff], vec![b' '; 64 * 1024 + 1]] {
+        write(&bindings, bytes);
+        v2_error(fixture.run(V2_RESOLVED), 2, "INVALID_CONFIG");
+    }
+    fs::remove_file(&bindings).unwrap();
+    symlink(&user, &bindings).unwrap();
+    v2_error(fixture.run(V2_RESOLVED), 2, "INVALID_CONFIG");
+
+    // Invalid explicit inputs win even with a malformed binding file.
+    for (extra, exit, code) in [
+        (&["--workspace", "../absent"][..], 3, "NOT_FOUND"),
+        (&["--area", "synthetic-private"][..], 2, "INVALID_ARGUMENT"),
+        (
+            &["--project", "SYNTHETIC-PRIVATE"][..],
+            2,
+            "INVALID_ARGUMENT",
+        ),
+    ] {
+        v2_error(fixture.run(&[V2_RESOLVED, extra].concat()), exit, code);
+    }
+}
+
+#[test]
+fn v2_binding_selection_opens_only_the_winning_resource_path() {
+    let fixture = Sandbox::new();
+    let invocation = fixture.0.join("invocation");
+    let child = invocation.join("child");
+    fs::create_dir(&child).unwrap();
+    symlink(&child, invocation.join("shortcut")).unwrap();
+    write(
+        &fixture.0.join("workspace/hive-workspace.yml"),
+        V2_DESCRIPTOR,
+    );
+    let yaml = fixture.0.join("xdg/hive/v2/bindings.yml");
+    let binding = |path: &str| v2_binding(path, "../../../workspace");
+    let parent = binding("../../../invocation");
+    let unrelated = binding("../../../unrelated-missing");
+    write(&yaml, format!("version: 2\nbindings:\n{unrelated}{parent}"));
+    for scope in [&[][..], &["--resource", ".."]] {
+        let report = v2_json(fixture.run_in(&child, &[V2_RESOLVED, scope].concat()), 0);
+        assert_eq!(
+            report["data"]["resource_root"],
+            invocation.to_str().unwrap()
+        );
+    }
+
+    let duplicate = binding("../../../unrelated-missing/another/..");
+    write(
+        &yaml,
+        format!("version: 2\nbindings:\n{parent}{unrelated}{duplicate}"),
+    );
+    v2_error(fixture.run(V2_RESOLVED), 2, "INVALID_CONFIG");
+
+    for (component, exit, code) in [
+        ("missing", 3, "NOT_FOUND"),
+        ("shortcut", 2, "INVALID_CONFIG"),
+    ] {
+        let winner = binding(&format!("../../../invocation/{component}/../child"));
+        write(&yaml, format!("version: 2\nbindings:\n{parent}{winner}"));
+        for scope in [&[][..], &["--resource", "."]] {
+            let output = fixture.run_in(&child, &[V2_RESOLVED, scope].concat());
+            v2_error(output, exit, code);
+        }
+    }
+}
+
+#[test]
+fn v2_explicit_unbound_resource_precedes_malformed_user_config() {
+    let fixture = Sandbox::new();
+    write(
+        &fixture.0.join("xdg/hive/v2/config.yml"),
+        "synthetic-private: [",
+    );
+    let message = "The CLI Resource directory has no exact machine-local binding.";
+    let output = fixture.run(&["--contract", "2", "config", "show", "--resource", "."]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, format!("error: {message}\n").as_bytes());
+
+    let output = fixture.run(&[V2_RESOLVED, &["--resource", "."]].concat());
+    let report = v2_json(output, 3);
+    assert_eq!(report["error"]["code"], "NOT_FOUND");
+    assert_eq!(report["error"]["message"], message);
+}
+
+#[test]
+fn v2_exact_resource_validates_its_workspace_before_output_preferences() {
+    let fixture = Sandbox::new();
+    let user = fixture.0.join("xdg/hive/v2/config.yml");
+    let bindings = user.with_file_name("bindings.yml");
+    for name in ["workspace", "foreign"] {
+        write(
+            &fixture.0.join(name).join("hive-workspace.yml"),
+            V2_DESCRIPTOR,
+        );
+    }
+    let exact = ["--contract", "2", "config", "show", "--resource", "."];
+    let pair = [&exact[..], &["--workspace", "../workspace"]].concat();
+    let header = "version: 2\nbindings:\n";
+    let same_path = v2_binding("../../../invocation", "../../../workspace");
+    let wrong_id = format!("{same_path}    workspace_id: {OVERRIDE}\n");
+    let malformed = "synthetic-private: [";
+    for (binding, args, exit, code) in [
+        (
+            v2_binding("../../../invocation", "../../../foreign"),
+            pair.as_slice(),
+            3,
+            "NOT_FOUND",
+        ),
+        (wrong_id.clone(), pair.as_slice(), 7, "AUTHORITY_UNVERIFIED"),
+        (wrong_id, exact.as_slice(), 7, "AUTHORITY_UNVERIFIED"),
+    ] {
+        write(&bindings, format!("{header}{binding}"));
+        write(&user, "version: 2\n");
+        let baseline = fixture.run(args);
+        assert_eq!(baseline.status.code(), Some(exit));
+        assert!(baseline.stdout.is_empty());
+        write(&user, malformed);
+        let output = fixture.run(args);
+        assert_eq!(output.status.code(), baseline.status.code());
+        assert_eq!(output.stdout, baseline.stdout);
+        assert_eq!(output.stderr, baseline.stderr);
+        let output = fixture.run(&[args, &["--json"]].concat());
+        v2_error(output, exit, code);
+    }
+
+    // A matching workspace ID alone still needs the configured workspace path.
+    let id = "0195f1b2-3c4d-7e8f-9a0b-1c2d3e4f5a6b";
+    write(
+        &bindings,
+        format!(
+            "{header}  - path: ../../../invocation\n    resource_id: {RESOURCE}\n    workspace_id: {id}\n"
+        ),
+    );
+    let json_pair = [&pair[..], &["--json"]].concat();
+    v2_error(fixture.run(&json_pair), 2, "INVALID_CONFIG");
+    write(
+        &user,
+        "version: 2\nworkspace: ../../../workspace\noutput: {format: json}\n",
+    );
+    let report = v2_json(fixture.run(&pair), 0);
+    assert_eq!(report["data"]["user_config"], user.to_str().unwrap());
+    assert_eq!(report["data"]["sources"]["output_format"], "user");
+    write(&bindings, format!("{header}{same_path}"));
+    let report = v2_json(fixture.run(&pair), 0);
+    assert_eq!(report["data"]["sources"]["output_format"], "user");
+}
+
+#[test]
+fn v2_workspace_scope_preserves_descriptor_failure_diagnostics() {
+    let fixture = Sandbox::new();
+    for (selection, exit, code, message) in [
+        (
+            &["--workspace", "../absent"][..],
+            3,
+            "NOT_FOUND",
+            "Workspace directory does not exist",
+        ),
+        (
+            &["--authority"][..],
+            2,
+            "INVALID_ARGUMENT",
+            "Workspace descriptor inspection accepts only workspace and output selection.",
+        ),
+    ] {
+        let output = show_v2(&fixture, selection).output().unwrap();
+        assert_eq!(output.status.code(), Some(exit));
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, format!("error: {message}\n").as_bytes());
+        let output = show_v2(&fixture, &[selection, &["--json"]].concat())
+            .output()
+            .unwrap();
+        let report = v2_json(output, exit);
+        assert_eq!(report["error"]["code"], code);
+        assert_eq!(report["error"]["message"], message);
+    }
+}
