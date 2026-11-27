@@ -247,6 +247,9 @@ pub(crate) enum Command {
     /// Inspect Issues under contract 2.
     #[command(subcommand, hide = true)]
     Issue(IssueCommand),
+    /// Inspect preserved Queen conversations under contract 2.
+    #[command(subcommand, hide = true)]
+    Conversation(ConversationCommand),
     /// Validate workspace records.
     Validate(ValidateArgs),
     /// Check the local environment and workspace.
@@ -631,6 +634,24 @@ pub(crate) struct DoltTargetArgs {
     /// Explicit local Dolt SQL Server port.
     #[arg(long, value_name = "PORT", allow_negative_numbers = true)]
     pub(crate) port: Option<OsString>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ConversationCommand {
+    /// Show one preserved Queen conversation.
+    Show(ConversationShowArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ConversationShowArgs {
+    /// Canonical lowercase UUIDv7 of the registered Queen.
+    #[arg(long, value_name = "UUID", allow_negative_numbers = true)]
+    pub(crate) bot: Option<OsString>,
+    /// Canonical lowercase UUIDv7 of the preserved conversation.
+    #[arg(long, value_name = "UUID", allow_negative_numbers = true)]
+    pub(crate) id: Option<OsString>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Subcommand)]
@@ -1043,6 +1064,22 @@ impl Command {
                 Self::Validate(args) => args.validate_dolt_selection(common),
                 Self::Area(command) => command.validate_dolt_selection(common),
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
+                Self::Conversation(ConversationCommand::Show(args)) => {
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Conversation show requires --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Conversation show accepts only explicit workspace and conversation selection.",
+                        );
+                    }
+                    Ok(())
+                }
                 Self::Issue(
                     IssueCommand::List(args)
                     | IssueCommand::Ready(args)
@@ -1067,6 +1104,7 @@ impl Command {
             }
             Self::Area(_) => Err("Area commands require --contract 2."),
             Self::Issue(_) => Err("Issue commands require --contract 2."),
+            Self::Conversation(_) => Err("Conversation commands require --contract 2."),
             Self::Validate(args) => {
                 if args.all || args.target.has_any() {
                     return Err("Dolt validation requires --contract 2.");

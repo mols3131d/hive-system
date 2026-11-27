@@ -1120,3 +1120,90 @@ fn dolt_area_option_recovery_preserves_literals_and_v1_errors() {
     }
     sandbox.assert_empty();
 }
+
+#[test]
+fn conversation_show_rejects_default_selection_and_preserves_late_v2_json() {
+    let sandbox = Sandbox::new();
+    let uuid = "01900000-0000-7000-8000-000000000001";
+    let target = [
+        "--workspace-id",
+        uuid,
+        "--database",
+        "fixture",
+        "--port",
+        "3306",
+    ];
+    let selectors = ["--bot", uuid, "--id", uuid];
+    let late = ["--contract", "2", "--json"];
+    let command = ["conversation", "show"];
+    let default = sandbox.0.join(".local/share/hive/v2/userdata");
+    fs::create_dir_all(&default).unwrap();
+    fs::write(
+        default.join("hive-workspace.yml"),
+        format!(
+            "version: 2\nworkspace_id: {uuid}\nschema_version: 1\npolicy_revision: {REVISION}\n"
+        ),
+    )
+    .unwrap();
+
+    for args in [
+        [&command[..], &target, &selectors, &late].concat(),
+        [&command[..], &["--workspace", "."], &selectors, &late].concat(),
+        [
+            &command[..],
+            &["--workspace", "."],
+            &target,
+            &["--bot", uuid],
+            &late,
+        ]
+        .concat(),
+        [
+            &command[..],
+            &["--workspace", "."],
+            &target,
+            &["--bot=--json", "--id", uuid],
+            &late,
+        ]
+        .concat(),
+        [
+            &command[..],
+            &["--workspace", "."],
+            &target,
+            &["--bot", uuid, "--id", "private-invalid-selector"],
+            &late,
+        ]
+        .concat(),
+    ] {
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?} {report}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "conversation show");
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(report.get("data").is_none());
+        assert!(
+            !String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("private-invalid-selector")
+        );
+    }
+
+    let literal = [
+        &command[..],
+        &["--workspace", "."],
+        &target,
+        &["--bot=--json", "--id", uuid, "--contract", "2"],
+    ]
+    .concat();
+    let output = sandbox.run(&literal);
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.status.code(), Some(2));
+
+    let legacy = [&command[..], &selectors, &["--json"]].concat();
+    let output = sandbox.run(&legacy);
+    assert_json_failure(&output, &legacy, "conversation show", "INVALID_ARGUMENT", 2);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+}

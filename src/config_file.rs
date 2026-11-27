@@ -12,7 +12,7 @@ pub(crate) use filesystem::read_scoped;
 #[cfg(unix)]
 pub(crate) use filesystem::{ScopedDirectory, read_regular};
 
-const MAX_FILE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_FILE_BYTES: usize = 64 * 1024;
 const MAX_YAML_DEPTH: usize = 8;
 const MAX_YAML_NODES: usize = 128;
 
@@ -302,7 +302,7 @@ mod filesystem {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(read_error)?;
-        read_file(file).map(Some)
+        read_file(file, MAX_FILE_BYTES).map(Some)
     }
 
     pub(crate) fn read_scoped(root: &Path, relative: &Path) -> Result<Option<Vec<u8>>, HiveError> {
@@ -319,23 +319,40 @@ mod filesystem {
             return Err(invalid("Configuration source requires a file path"));
         };
 
-        let mut directory = OpenOptions::new()
+        let directory = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(root)
             .map_err(read_error)?;
+        open_scoped_file(&directory, name, directories)?
+            .map(|file| read_file(file, MAX_FILE_BYTES))
+            .transpose()
+    }
+
+    fn open_scoped_file(
+        directory: &File,
+        name: &OsStr,
+        directories: &[&OsStr],
+    ) -> Result<Option<File>, HiveError> {
         // Open each child relative to the descriptor so replacing a path component
         // cannot redirect a subsequent open through a symlink.
-        for name in directories {
-            let Some(child) = open_child(&directory, name, libc::O_DIRECTORY)? else {
+        let mut child_directory = None;
+        for component in directories {
+            let Some(child) = open_child(
+                child_directory.as_ref().unwrap_or(directory),
+                component,
+                libc::O_DIRECTORY,
+            )?
+            else {
                 return Ok(None);
             };
-            directory = child;
+            child_directory = Some(child);
         }
-        let Some(file) = open_child(&directory, name, libc::O_NONBLOCK)? else {
-            return Ok(None);
-        };
-        read_file(file).map(Some)
+        open_child(
+            child_directory.as_ref().unwrap_or(directory),
+            name,
+            libc::O_NONBLOCK,
+        )
     }
 
     pub(crate) struct ScopedDirectory {
@@ -413,7 +430,20 @@ mod filesystem {
 
         pub(crate) fn read(&self, name: &OsStr) -> Result<Option<Vec<u8>>, HiveError> {
             open_child(&self.file, name, libc::O_NONBLOCK)?
-                .map(read_file)
+                .map(|file| read_file(file, MAX_FILE_BYTES))
+                .transpose()
+        }
+
+        pub(crate) fn read_bounded(
+            &self,
+            components: &[&OsStr],
+            limit: usize,
+        ) -> Result<Option<Vec<u8>>, HiveError> {
+            let (name, directories) = components
+                .split_last()
+                .ok_or_else(|| invalid("Scoped source requires a file path"))?;
+            open_scoped_file(&self.file, name, directories)?
+                .map(|file| read_file(file, limit))
                 .transpose()
         }
     }
@@ -423,6 +453,12 @@ mod filesystem {
         name: &OsStr,
         flags: libc::c_int,
     ) -> Result<Option<File>, HiveError> {
+        if name.is_empty()
+            || matches!(name.as_bytes(), b"." | b"..")
+            || name.as_bytes().contains(&b'/')
+        {
+            return Err(invalid("Scoped source has an invalid path component"));
+        }
         let name = CString::new(name.as_bytes())
             .map_err(|_| invalid("Configuration source has an invalid path component"))?;
         // SAFETY: The descriptor and NUL-terminated component remain valid for this call.
@@ -445,19 +481,21 @@ mod filesystem {
         Ok(Some(unsafe { File::from_raw_fd(descriptor) }))
     }
 
-    fn read_file(file: File) -> Result<Vec<u8>, HiveError> {
+    fn read_file(file: File, limit: usize) -> Result<Vec<u8>, HiveError> {
         if !file.metadata().map_err(read_error)?.is_file() {
             return Err(invalid("Configuration source must be a regular file"));
         }
 
         let mut bytes = Vec::new();
-        file.take(MAX_FILE_BYTES as u64 + 1)
+        file.take(limit as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(read_error)?;
-        if bytes.len() > MAX_FILE_BYTES {
-            return Err(invalid(
-                "Configuration source exceeds the 64 KiB size limit",
-            ));
+        if bytes.len() > limit {
+            return Err(invalid(if limit == MAX_FILE_BYTES {
+                "Configuration source exceeds the 64 KiB size limit"
+            } else {
+                "Scoped source exceeds its size limit"
+            }));
         }
         Ok(bytes)
     }

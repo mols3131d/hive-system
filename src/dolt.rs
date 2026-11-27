@@ -1,4 +1,22 @@
 pub(crate) mod area;
+#[cfg(unix)]
+pub(crate) mod conversation;
+#[cfg(not(unix))]
+pub(crate) mod conversation {
+    use super::{DoltFailure, DoltSuccess, ErrorCode, HiveError};
+    use crate::cli::{CommonOptions, ConversationShowArgs};
+
+    pub(crate) fn show(
+        _: &CommonOptions,
+        args: &ConversationShowArgs,
+    ) -> Result<DoltSuccess, Box<DoltFailure>> {
+        let _ = (&args.bot, &args.id);
+        Err(DoltFailure::without_context(HiveError::new(
+            ErrorCode::NotImplemented,
+            "Conversation inspection is unavailable on this platform.",
+        )))
+    }
+}
 mod graph;
 mod issue;
 mod issue_list;
