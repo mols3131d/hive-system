@@ -15,7 +15,7 @@ type FileId = (u64, u64);
 pub(super) struct Store {
     root: FileId,
     pub(super) db: ScopedDirectory,
-    dolt: ScopedDirectory,
+    pub(super) dolt: ScopedDirectory,
     pub(super) noms: ScopedDirectory,
 }
 
@@ -239,7 +239,7 @@ pub(super) fn recover(
     id: &str,
     root: &str,
     executable: &Path,
-    check_selection: &impl Fn() -> Result<(), HiveError>,
+    check_selection: &dyn Fn() -> Result<(), HiveError>,
 ) -> Result<Value, HiveError> {
     if !executable.is_absolute() {
         return Err(HiveError::new(

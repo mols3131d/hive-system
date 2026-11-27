@@ -35,6 +35,71 @@ pub(super) fn run(
     command: &WorkspaceCommand,
     format: &mut Format,
 ) -> Result<Value, HiveError> {
+    with_registered(
+        options,
+        format,
+        !matches!(command, WorkspaceCommand::Start { .. }),
+        |workspace, state, check_selection| {
+            let id = workspace.workspace_id();
+            let root = json_path(&workspace.root.path)?;
+            if let WorkspaceCommand::Recover { dolt_bin } = command {
+                return recovery::recover(
+                    state,
+                    &workspace.root,
+                    id,
+                    root,
+                    dolt_bin,
+                    check_selection,
+                );
+            }
+
+            require_no_launch_intent(state)?;
+            let store = recovery::Store::open(&workspace.root)?;
+            let server: Option<Server> = read_json(Some(state), "server.json")?;
+            match command {
+                WorkspaceCommand::Start { dolt_bin, port } => {
+                    if server.is_some() {
+                        return Err(unverified(
+                            "A server record already exists for this workspace.",
+                        ));
+                    }
+                    if state.contains(c"pending-request.json")? {
+                        return Err(unverified(
+                            "A pending request requires recovery before start.",
+                        ));
+                    }
+                    start(
+                        state,
+                        &store.db,
+                        &store.noms,
+                        id,
+                        root,
+                        dolt_bin,
+                        parse_port(port)?,
+                    )
+                }
+                WorkspaceCommand::Stop => {
+                    let server =
+                        server.ok_or_else(|| unverified("No owned server is recorded."))?;
+                    check_server(&server, id, root)?;
+                    stop(state, &store, &server, check_selection)
+                }
+                WorkspaceCommand::Recover { .. } | WorkspaceCommand::Status(_) => unreachable!(),
+            }
+        },
+    )
+}
+
+fn with_registered<T>(
+    options: &CommonOptions,
+    format: &mut Format,
+    existing_lock: bool,
+    operation: impl FnOnce(
+        &Candidate,
+        &ScopedDirectory,
+        &dyn Fn() -> Result<(), HiveError>,
+    ) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
     let workspace = select_workspace(options, format)?.candidate;
     let id = workspace.workspace_id();
     let root = json_path(&workspace.root.path)?;
@@ -42,10 +107,10 @@ pub(super) fn run(
         .ok_or_else(|| unverified("No active-root registration exists for this workspace."))?;
     require_private_dir(&state)?;
     require_local_filesystem(&state)?;
-    let held = if matches!(command, WorkspaceCommand::Start { .. }) {
-        lock(&state)?
-    } else {
+    let held = if existing_lock {
         lock_file(regular(&state, "lock")?, libc::LOCK_EX)?
+    } else {
+        lock(&state)?
     };
 
     // Resolve again after taking the lock. A moved path or replaced descriptor
@@ -70,52 +135,69 @@ pub(super) fn run(
             &registration.workspace_root,
             id,
             root,
-        )?;
-        Ok(())
+        )
     };
     check_selection()?;
-    if let WorkspaceCommand::Recover { dolt_bin } = command {
-        return recovery::recover(
-            &state,
-            &workspace.root,
-            id,
-            root,
-            dolt_bin,
-            &check_selection,
-        );
-    }
-    require_no_launch_intent(&state)?;
-    let store = recovery::Store::open(&workspace.root)?;
-    let server: Option<Server> = read_json(Some(&state), "server.json")?;
-    match command {
-        WorkspaceCommand::Start { dolt_bin, port } => {
-            if server.is_some() {
-                return Err(unverified(
-                    "A server record already exists for this workspace.",
-                ));
-            }
-            if state.contains(c"pending-request.json")? {
-                return Err(unverified(
-                    "A pending request requires recovery before start.",
-                ));
-            }
-            start(
-                &state,
-                &store.db,
-                &store.noms,
-                id,
-                root,
-                dolt_bin,
-                parse_port(port)?,
+    operation(&workspace, &state, &check_selection)
+}
+
+pub(super) fn backup(
+    options: &CommonOptions,
+    destination: &Path,
+    format: &mut Format,
+) -> Result<Value, HiveError> {
+    with_registered(
+        options,
+        format,
+        true,
+        |workspace, state, check_selection| {
+            let store = recovery::Store::open(&workspace.root)?;
+            let (db, native, noms) = (&store.db, &store.dolt, &store.noms);
+            let check_stopped = || {
+                check_selection()?;
+                for dir in [&workspace.root, state, db, native, noms] {
+                    require_current_directory(dir)?;
+                }
+                let selected = read_explicit(&workspace.root.path)?;
+                if selected.workspace_id() != workspace.workspace_id()
+                    || selected.policy_revision() != workspace.policy_revision()
+                    || state.contains(c"pending-request.json")?
+                    || state.contains(c"starting")?
+                    || state.contains(c"server.json")?
+                    || native.contains(c"sql-server.info")?
+                {
+                    return Err(unverified(
+                        "Backup requires a stopped and unchanged workspace with no pending request.",
+                    ));
+                }
+                for entry in fs::read_dir(at(state, "")).map_err(io_error)? {
+                    let entry = entry.map_err(io_error)?;
+                    if !matches!(
+                        entry.file_name().to_str(),
+                        Some("lock" | "active-root.json")
+                    ) {
+                        return Err(unverified(
+                            "Unrecognized workspace runtime state requires inspection.",
+                        ));
+                    }
+                }
+                // Dolt takes its native lock when opening the store. Probe it
+                // before running offline commands, which acquire it independently.
+                lock_file(regular(noms, "LOCK")?, libc::LOCK_EX)?;
+                Ok(())
+            };
+            check_stopped()?;
+            crate::workspace_backup::create(
+                workspace,
+                state,
+                db,
+                native,
+                noms,
+                destination,
+                check_stopped,
             )
-        }
-        WorkspaceCommand::Stop => {
-            let server = server.ok_or_else(|| unverified("No owned server is recorded."))?;
-            check_server(&server, id, root)?;
-            stop(&state, &store, &server, &check_selection)
-        }
-        WorkspaceCommand::Recover { .. } | WorkspaceCommand::Status(_) => unreachable!(),
-    }
+        },
+    )
 }
 
 fn start(
@@ -269,7 +351,7 @@ fn stop(
     state: &ScopedDirectory,
     store: &recovery::Store,
     server: &Server,
-    check_selection: &impl Fn() -> Result<(), HiveError>,
+    check_selection: &dyn Fn() -> Result<(), HiveError>,
 ) -> Result<Value, HiveError> {
     if server.endpoint.database != DATABASE {
         return Err(unverified(
@@ -1054,7 +1136,7 @@ fn require_private_dir(dir: &ScopedDirectory) -> Result<(), HiveError> {
     Ok(())
 }
 
-fn require_local_filesystem(dir: &ScopedDirectory) -> Result<(), HiveError> {
+pub(crate) fn require_local_filesystem(dir: &ScopedDirectory) -> Result<(), HiveError> {
     let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: the directory descriptor and output buffer remain valid.
     if unsafe { libc::fstatfs(dir.directory_file().as_raw_fd(), stat.as_mut_ptr()) } != 0 {
