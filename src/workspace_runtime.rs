@@ -71,12 +71,20 @@ pub(super) fn run(
             id,
             root,
         )?;
-        if state.contains(c"starting")? {
-            return Err(unverified("An interrupted launch requires inspection."));
-        }
         Ok(())
     };
     check_selection()?;
+    if let WorkspaceCommand::Recover { dolt_bin } = command {
+        return recovery::recover(
+            &state,
+            &workspace.root,
+            id,
+            root,
+            dolt_bin,
+            &check_selection,
+        );
+    }
+    require_no_launch_intent(&state)?;
     let store = recovery::Store::open(&workspace.root)?;
     let server: Option<Server> = read_json(Some(&state), "server.json")?;
     match command {
@@ -106,16 +114,7 @@ pub(super) fn run(
             check_server(&server, id, root)?;
             stop(&state, &store, &server, &check_selection)
         }
-        WorkspaceCommand::Recover { dolt_bin } => recovery::recover(
-            &state,
-            &store,
-            id,
-            root,
-            server.as_ref(),
-            dolt_bin,
-            &check_selection,
-        ),
-        WorkspaceCommand::Status(_) => unreachable!(),
+        WorkspaceCommand::Recover { .. } | WorkspaceCommand::Status(_) => unreachable!(),
     }
 }
 
@@ -284,6 +283,7 @@ fn stop(
     let capture = verify_with(server, state, &run, &store.noms, &handle, |_, check| {
         let capture = recovery::capture(state, store, server, &run)?;
         check_selection()?;
+        require_no_launch_intent(state)?;
         check()?;
         Ok(capture)
     })?;
@@ -294,6 +294,7 @@ fn stop(
         ));
     }
     check_selection()?;
+    require_no_launch_intent(state)?;
     if read_json::<Server>(Some(state), "server.json")?.as_ref() != Some(server) {
         return Err(unverified(
             "The owned Dolt server record changed during stop.",
@@ -302,9 +303,7 @@ fn stop(
     if let Some(capture) = capture {
         capture.record_exit(state, store, server)?;
     }
-    remove_run(&run)?;
-    fs::remove_file(at(state, "server.json")).map_err(io_error)?;
-    sync(state)?;
+    finish_owned_stop(state, &run)?;
     Ok(json!({
         "state": "stopped",
         "workspace_id": server.workspace_id,
@@ -312,6 +311,21 @@ fn stop(
         "process_exit": "pidfd_verified",
         "pending_request": if state.contains(c"pending-request.json")? { "recorded" } else { "unrecorded" },
     }))
+}
+
+fn finish_owned_stop(state: &ScopedDirectory, run: &ScopedDirectory) -> Result<(), HiveError> {
+    // A failed credential-directory cleanup must not leave a dead server
+    // recorded as active. Any pending exit proof has already been synced.
+    fs::remove_file(at(state, "server.json")).map_err(io_error)?;
+    sync(state)?;
+    remove_run(run)
+}
+
+fn require_no_launch_intent(state: &ScopedDirectory) -> Result<(), HiveError> {
+    if state.contains(c"starting")? {
+        return Err(unverified("An interrupted launch requires inspection."));
+    }
+    Ok(())
 }
 
 /// Hold the existing lifecycle lock and process handle around one authenticated read.
@@ -1089,6 +1103,24 @@ fn io_error(error: io::Error) -> HiveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_server_record_is_removed_even_when_run_cleanup_refuses() {
+        let scratch = tempfile::tempdir().unwrap();
+        let state = ScopedDirectory::open_absolute(scratch.path()).unwrap();
+        let run = create_run(&state, "fixture").unwrap();
+        write_new(&state, "server.json", b"synthetic exited server").unwrap();
+        let retained = scratch.path().join("retained-run");
+        fs::rename(&run.path, &retained).unwrap();
+        let replacement = create_run(&state, "fixture").unwrap();
+
+        let error = finish_owned_stop(&state, &run).unwrap_err();
+
+        assert!(matches!(error.code, ErrorCode::AuthorityUnverified));
+        assert!(!state.contains(c"server.json").unwrap());
+        assert!(retained.is_dir());
+        require_current_directory(&replacement).unwrap();
+    }
 
     #[test]
     fn pidfd_requires_one_matching_positive_procfs_pid() {

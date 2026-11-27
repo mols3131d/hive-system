@@ -235,10 +235,9 @@ impl StopCapture {
 
 pub(super) fn recover(
     state: &ScopedDirectory,
-    store: &Store,
+    workspace_root: &ScopedDirectory,
     id: &str,
     root: &str,
-    server: Option<&Server>,
     executable: &Path,
     check_selection: &impl Fn() -> Result<(), HiveError>,
 ) -> Result<Value, HiveError> {
@@ -249,13 +248,18 @@ pub(super) fn recover(
         ));
     }
     let resolve = || -> Result<Value, HiveError> {
+        require_no_launch_intent(state)?;
+        let store = Store::open(workspace_root)?;
+        let server: Option<Server> = read_json(Some(state), "server.json")?;
         let proof: StoppedRequest = read_proof(state)?;
         check_server(&proof.server, id, root)?;
         if proof.version != 1
             || proof.server.endpoint.database != DATABASE
             || proof.state != state.file_identity()?
             || proof.lifecycle_lock != file_id(&regular(state, "lock")?)?
-            || server.is_some_and(|server| *server != proof.server)
+            || server
+                .as_ref()
+                .is_some_and(|server| *server != proof.server)
         {
             return Err(uncertain());
         }
@@ -282,11 +286,12 @@ pub(super) fn recover(
         }
         // Execute the checked inode even if the supplied path is replaced.
         let binary = PathBuf::from(format!("/proc/self/fd/{}", engine.as_raw_fd()));
-        let outcome = inspect_copy(state, store, id, &binary, &marker)?;
+        let outcome = inspect_copy(state, &store, id, &binary, &marker)?;
 
         check_selection()?;
+        require_no_launch_intent(state)?;
         let current = read_json::<Server>(Some(state), "server.json")?;
-        if current.as_ref() != server
+        if current != server
             || proof.store != store.identity(&store_lock)?
             || proof.engine.file != stamp(&engine)?
             || proof.marker != Fingerprint::pending(&entry)?

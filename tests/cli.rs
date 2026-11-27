@@ -3155,6 +3155,91 @@ fn workspace_recover_is_v2_only() {
     sandbox.assert_empty();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn workspace_recover_keeps_the_marker_on_unavailable_evidence() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let sandbox = Sandbox::new();
+    let workspace = sandbox.0.join("workspace");
+    let copy = sandbox.0.join("workspace-copy");
+    let uuid = "01900000-0000-7000-8000-000000000001";
+    let descriptor = format!(
+        "version: 2\nworkspace_id: {uuid}\nschema_version: 1\npolicy_revision: {}\n",
+        "a".repeat(40)
+    );
+    for target in [&workspace, &copy] {
+        fs::create_dir(target).unwrap();
+        fs::write(target.join("hive-workspace.yml"), &descriptor).unwrap();
+    }
+    let state = sandbox.0.join(".local/state/hive/v2/workspaces").join(uuid);
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&state)
+        .unwrap();
+    fs::write(
+        state.join("active-root.json"),
+        serde_json::json!({"version": 2, "workspace_id": uuid, "workspace_root": workspace.canonicalize().unwrap()}).to_string(),
+    ).unwrap();
+    let marker = state.join("pending-request.json");
+    let marker_bytes = b"synthetic pending bytes\r\n";
+    let private = |path: &std::path::Path, bytes: &[u8]| {
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    private(&state.join("lock"), b"");
+    private(&marker, marker_bytes);
+
+    let check = |target, command: &[&str], code, exit| {
+        let base = [
+            "--contract",
+            "2",
+            "--json",
+            "--workspace",
+            target,
+            "workspace",
+        ];
+        let output = sandbox.run(&[&base[..], command].concat());
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(exit), "{report}");
+        assert_eq!(report["error"]["code"], code, "{report}");
+        assert!(!report.to_string().contains("synthetic pending bytes"));
+        assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+    };
+    let recover = ["recover", "--dolt-bin", "/fixture-dolt"];
+    let uncertain = || check("workspace", &recover, "COMMIT_UNCERTAIN", 8);
+    check("workspace-copy", &recover, "AUTHORITY_UNVERIFIED", 7);
+    uncertain(); // Missing database directory.
+
+    let manifest = workspace.join("db/.dolt/noms/manifest");
+    fs::create_dir_all(&manifest).unwrap();
+    uncertain(); // The manifest has an invalid file type.
+    fs::remove_dir(&manifest).unwrap();
+    fs::write(&manifest, b"synthetic manifest").unwrap();
+
+    let starting = state.join("starting");
+    private(&starting, b"synthetic interrupted launch");
+    uncertain();
+    fs::remove_file(starting).unwrap();
+
+    let server = state.join("server.json");
+    private(&server, b"{");
+    uncertain();
+    check("workspace", &["stop"], "INVALID_CONFIG", 2);
+    check(
+        "workspace",
+        &["start", "--dolt-bin", "/fixture-dolt", "--port", "3307"],
+        "INVALID_CONFIG",
+        2,
+    );
+    fs::remove_file(server).unwrap();
+
+    uncertain(); // Missing stop proof.
+    private(&state.join("stopped-request.json"), b"{");
+    uncertain(); // Corrupt stop proof.
+}
+
 #[test]
 fn conversation_export_preserves_v2_error_and_literal_boundaries() {
     let sandbox = Sandbox::new();
