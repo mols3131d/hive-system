@@ -201,7 +201,7 @@ $XDG_RUNTIME_DIR/hive/v2/         # Used only when XDG_RUNTIME_DIR is absolute a
 ```
 
 - **Active-root verification:** Under the `workspace_id`-keyed lock, writers verify that the target canonical `workspace_root` matches `active-root.json` and `db/` `workspace_meta.workspace_id`. A restored copy at a different path remains inactive until explicitly promoted after verifying the old authority stopped and preserving final history.
-- **Pending-request marker:** Records the format version, exact workspace, request, base commit, Area and Issue IDs, bounded launch and session identity, payload fingerprint and receipt digest. Version 1 denotes an Issue note. Version 2 includes a kind for Issue create or update. Reconcile before any replay or new write.
+- **Pending-request marker:** Records the format version, exact workspace, request, base commit, bounded launch and session identity, payload fingerprint and receipt digest. Version 1 denotes an Issue note and records `area_id` and `issue_id`. Version 2 also records a kind for Issue create or update. Version 3 uses `artifact_id` for Artifact creation and includes `area_id` only for an Area-linked Artifact. Reconcile before any replay or new write.
 - Keep runtime state and local config outside `db/`, `assets/` and backup manifests. Obtain credentials through the explicitly selected machine-local runtime mechanism. Preserve the existing environment-based reader credentials for validation.
 
 #### Workspace status
