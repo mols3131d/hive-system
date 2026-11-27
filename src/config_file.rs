@@ -417,16 +417,12 @@ mod filesystem {
         }
 
         #[cfg(target_os = "linux")]
-        pub(crate) fn open_child_directory(&self, name: &OsStr) -> Result<Self, HiveError> {
-            let file = open_child(&self.file, name, libc::O_DIRECTORY)?.ok_or_else(|| {
+        pub(crate) fn require_child_directory(&self, name: &OsStr) -> Result<Self, HiveError> {
+            self.open_child_directory(name)?.ok_or_else(|| {
                 HiveError::new(
                     ErrorCode::NotFound,
                     "A required scoped directory is missing",
                 )
-            })?;
-            Ok(Self {
-                file,
-                path: self.path.join(name),
             })
         }
 
@@ -460,7 +456,7 @@ mod filesystem {
                 match FileType::from_raw_mode(metadata.st_mode) {
                     FileType::RegularFile => {}
                     FileType::Directory => self
-                        .open_child_directory(OsStr::from_bytes(name.to_bytes()))?
+                        .require_child_directory(OsStr::from_bytes(name.to_bytes()))?
                         .check_object_entries(depth + 1)?,
                     _ => return Err(unsafe_store()),
                 }
