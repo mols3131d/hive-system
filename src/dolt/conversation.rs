@@ -228,7 +228,7 @@ fn publish_export(workspace: &Path, destination: &Path, body: &[u8]) -> Result<(
             "The export destination must be outside the selected conversation storage.",
         ));
     }
-    publish_private(directory.handle(), &name, &[body], || Ok(()))
+    publish_private(directory.handle(), &name, &[body], || Ok(())).map(drop)
 }
 
 #[cfg(target_os = "linux")]
@@ -237,7 +237,7 @@ fn publish_private(
     name: &std::ffi::CStr,
     chunks: &[&[u8]],
     check_destination: impl FnOnce() -> Result<(), HiveError>,
-) -> Result<(), HiveError> {
+) -> Result<std::fs::File, HiveError> {
     use std::ffi::CString;
     use std::fs::File;
     use std::io::{Error, ErrorKind, Write};
@@ -310,7 +310,8 @@ fn publish_private(
             ErrorCode::UnknownWriteOutcome,
             "The conversation file was published, but its directory could not be synchronized.",
         )
-    })
+    })?;
+    Ok(temporary)
 }
 
 #[cfg(not(target_os = "linux"))]

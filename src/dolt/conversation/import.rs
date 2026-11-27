@@ -1,11 +1,12 @@
 use std::ffi::{CString, OsStr};
-use std::fs::File;
+use std::fs::{self, File, Permissions};
 use std::io::{self, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path};
 
-use rustix::fs::{Mode, mkdirat};
+use rustix::fs::{AtFlags, Mode, OFlags, mkdirat, openat, statat};
 use rustix::io::Errno;
 
 use super::{
@@ -205,6 +206,15 @@ fn conversation_id(now: OffsetDateTime) -> Result<String, HiveError> {
 }
 
 fn publish(root: &ScopedDirectory, metadata: &Metadata, body: &[u8]) -> Result<(), HiveError> {
+    publish_with(root, metadata, body, || {})
+}
+
+fn publish_with(
+    root: &ScopedDirectory,
+    metadata: &Metadata,
+    body: &[u8],
+    before_link: impl FnOnce(),
+) -> Result<(), HiveError> {
     // JSON string quoting also gives YAML-safe scalars for user-provided fields.
     let header = serde_json::to_string(metadata)
         .map_err(|_| io_error("Could not encode conversation metadata."))?;
@@ -222,31 +232,68 @@ fn publish(root: &ScopedDirectory, metadata: &Metadata, body: &[u8]) -> Result<(
     let queen = private_child(&bots, &metadata.bot_id)?;
     let name = CString::new(format!("{}.md", metadata.conversation_id))
         .expect("a generated UUID filename contains no NUL");
-    publish_private(queen.handle(), &name, &[header.as_bytes(), body], || {
-        for directory in [root, &conversations, &bots, &queen] {
-            let current = ScopedDirectory::open_absolute(&directory.path)?;
-            if !current.same_directory(directory)? {
-                return Err(HiveError::new(
-                    ErrorCode::ConcurrentChange,
-                    "A conversation directory changed during import.",
-                ));
-            }
-            outside_git(&current)?;
-        }
+    let ancestors = [root, &conversations, &bots];
+    let published = publish_private(queen.handle(), &name, &[header.as_bytes(), body], || {
+        check_destination(&ancestors, &queen)?;
+        before_link();
         Ok(())
-    }).map_err(|error| {
+    })
+    .map_err(|error| {
         if matches!(error.code, ErrorCode::UnknownWriteOutcome) {
-            HiveError::new(
-                error.code,
-                format!(
-                    "Conversation {} for Queen {} was published, but its directory could not be synchronized.",
-                    metadata.conversation_id, metadata.bot_id,
-                ),
-            )
+            uncertain(metadata, "its directory could not be synchronized")
         } else {
             error
         }
-    })
+    })?;
+
+    let check_publication = || -> Result<bool, HiveError> {
+        let current = check_destination(&ancestors, &queen)?;
+        let entry = statat(current.handle(), name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| io_error("Could not inspect the published conversation entry."))?;
+        let file = published
+            .metadata()
+            .map_err(|_| io_error("Could not identify the published conversation inode."))?;
+        Ok((entry.st_dev, entry.st_ino) == (file.dev(), file.ino()))
+    };
+    if !check_publication().unwrap_or(false) {
+        return Err(uncertain(
+            metadata,
+            "its identity at the canonical destination could not be verified",
+        ));
+    }
+    Ok(())
+}
+
+fn check_destination(
+    ancestors: &[&ScopedDirectory],
+    destination: &ScopedDirectory,
+) -> Result<ScopedDirectory, HiveError> {
+    for directory in ancestors {
+        check_directory(directory)?;
+    }
+    check_directory(destination)
+}
+
+fn check_directory(directory: &ScopedDirectory) -> Result<ScopedDirectory, HiveError> {
+    let current = ScopedDirectory::open_absolute(&directory.path)?;
+    if !current.same_directory(directory)? {
+        return Err(HiveError::new(
+            ErrorCode::ConcurrentChange,
+            "A conversation directory changed during import.",
+        ));
+    }
+    outside_git(&current)?;
+    Ok(current)
+}
+
+fn uncertain(metadata: &Metadata, reason: &'static str) -> HiveError {
+    HiveError::new(
+        ErrorCode::UnknownWriteOutcome,
+        format!(
+            "Conversation {} for Queen {} was published, but {reason}.",
+            metadata.conversation_id, metadata.bot_id,
+        ),
+    )
 }
 
 fn outside_git(directory: &ScopedDirectory) -> Result<(), HiveError> {
@@ -263,25 +310,49 @@ fn outside_git(directory: &ScopedDirectory) -> Result<(), HiveError> {
 
 fn private_child(parent: &ScopedDirectory, name: &str) -> Result<ScopedDirectory, HiveError> {
     let name = OsStr::new(name);
-    match mkdirat(parent.handle(), name, Mode::RWXU) {
-        Ok(()) | Err(Errno::EXIST) => {}
+    let created = match mkdirat(parent.handle(), name, Mode::RWXU) {
+        Ok(()) => {
+            // O_PATH pins the new directory even when umask removed all access.
+            let pinned = openat(
+                parent.handle(),
+                name,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|_| io_error("Could not open the new private conversation directory."))?;
+            let info = directory_metadata(&pinned)?;
+            // SAFETY: geteuid takes no pointers and has no preconditions.
+            if info.uid() != unsafe { libc::geteuid() } {
+                return Err(unsafe_directory());
+            }
+            // As in workspace initialization, chmod the kernel link to our descriptor.
+            let fd_path = format!("/proc/self/fd/{}", pinned.as_raw_fd());
+            fs::set_permissions(fd_path, Permissions::from_mode(0o700)).map_err(|_| {
+                io_error("Could not secure the new private conversation directory.")
+            })?;
+            Some((pinned, info))
+        }
+        Err(Errno::EXIST) => None,
         Err(_) => {
             return Err(io_error(
                 "Could not create a private conversation directory.",
             ));
         }
-    }
+    };
     let directory = parent.require_child_directory(name)?;
-    let info = directory
-        .handle()
-        .metadata()
-        .map_err(|_| io_error("Could not inspect a conversation directory."))?;
+    let info = directory_metadata(directory.handle())?;
+    if created.is_some_and(|(_pinned, created)| {
+        (created.dev(), created.ino()) != (info.dev(), info.ino())
+    }) {
+        return Err(HiveError::new(
+            ErrorCode::ConcurrentChange,
+            "The new private conversation directory changed during import.",
+        ));
+    }
     // SAFETY: geteuid takes no pointers and has no preconditions.
     if info.uid() != unsafe { libc::geteuid() } || info.mode() & 0o7777 != 0o700 {
-        return Err(HiveError::new(
-            ErrorCode::InvalidConfig,
-            "Conversation directories must be owned by the caller with mode 0700.",
-        ));
+        return Err(unsafe_directory());
     }
     outside_git(&directory)?;
     parent
@@ -289,6 +360,19 @@ fn private_child(parent: &ScopedDirectory, name: &str) -> Result<ScopedDirectory
         .sync_all()
         .map_err(|_| io_error("Could not synchronize the conversation directory hierarchy."))?;
     Ok(directory)
+}
+
+fn directory_metadata(directory: &File) -> Result<fs::Metadata, HiveError> {
+    directory
+        .metadata()
+        .map_err(|_| io_error("Could not inspect a conversation directory."))
+}
+
+fn unsafe_directory() -> HiveError {
+    HiveError::new(
+        ErrorCode::InvalidConfig,
+        "Conversation directories must be owned by the caller with mode 0700.",
+    )
 }
 
 fn io_error(message: &'static str) -> HiveError {
@@ -300,8 +384,100 @@ mod tests {
     use super::*;
     use crate::dolt::conversation::validate_file;
     use crate::dolt::is_uuid_v7;
-    use std::fs;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::symlink;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    fn fixture_metadata(source: Source, body: &[u8]) -> Metadata {
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        Metadata {
+            version: json!(1),
+            workspace_id: "01900000-0000-7000-8000-000000000001".to_owned(),
+            bot_id: "01900000-0000-7000-8000-000000000002".to_owned(),
+            bot_slug: "queen-fixture".to_owned(),
+            conversation_id: conversation_id(now).unwrap(),
+            imported_at: "2027-01-15T08:00:00Z".to_owned(),
+            title: Some("Fixture: \"quoted\" *title*".to_owned()),
+            provenance: Provenance {
+                source,
+                session_ref: Some("---".to_owned()),
+                body_sha256: format!("{:x}", Sha256::digest(body)),
+            },
+        }
+    }
+
+    #[test]
+    fn import_reports_uncertainty_when_the_parent_moves_at_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = ScopedDirectory::open_absolute(temp.path()).unwrap();
+        let body = b"synthetic conversation";
+        let metadata = fixture_metadata(Source::Stdin, body);
+        let canonical = temp
+            .path()
+            .join("conversations/bots")
+            .join(&metadata.bot_id);
+        let relocated = temp.path().join("relocated");
+        let error = publish_with(&root, &metadata, body, || {
+            fs::rename(&canonical, &relocated).unwrap();
+            fs::create_dir(&canonical).unwrap();
+        })
+        .unwrap_err();
+
+        assert!(matches!(error.code, ErrorCode::UnknownWriteOutcome));
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains(&metadata.conversation_id));
+        assert!(!diagnostic.contains(temp.path().to_str().unwrap()));
+        let name = format!("{}.md", metadata.conversation_id);
+        assert!(!canonical.join(&name).exists());
+        assert!(fs::read(relocated.join(&name)).unwrap().ends_with(body));
+    }
+
+    #[test]
+    fn first_import_sets_private_modes_under_restrictive_umask() {
+        const FIXTURE: &str = "HIVE_IMPORT_UMASK_FIXTURE";
+        if let Some(path) = std::env::var_os(FIXTURE) {
+            let root = ScopedDirectory::open_absolute(Path::new(&path)).unwrap();
+            let body = b"synthetic conversation";
+            let metadata = fixture_metadata(Source::Stdin, body);
+            publish(&root, &metadata, body).unwrap();
+
+            let storage = root.path.join("conversations");
+            let bots = storage.join("bots");
+            let queen = bots.join(&metadata.bot_id);
+            for directory in [&storage, &bots, &queen] {
+                assert_eq!(fs::metadata(directory).unwrap().mode() & 0o7777, 0o700);
+            }
+            let file = queen.join(format!("{}.md", metadata.conversation_id));
+            assert_eq!(fs::metadata(&file).unwrap().mode() & 0o7777, 0o600);
+            assert!(fs::read(file).unwrap().ends_with(body));
+
+            fs::set_permissions(&bots, Permissions::from_mode(0o755)).unwrap();
+            let replacement = fixture_metadata(Source::Stdin, body);
+            let error = publish(&root, &replacement, body).unwrap_err();
+            assert!(matches!(error.code, ErrorCode::InvalidConfig));
+            assert_eq!(fs::metadata(&bots).unwrap().mode() & 0o7777, 0o755);
+            assert_eq!(fs::read_dir(&queen).unwrap().count(), 1);
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.env(FIXTURE, temp.path()).args([
+            "--exact",
+            "dolt::conversation::import::tests::first_import_sets_private_modes_under_restrictive_umask",
+        ]);
+        // SAFETY: umask is async-signal-safe and changes only the child process.
+        unsafe {
+            child.pre_exec(|| {
+                libc::umask(0o777);
+                Ok(())
+            });
+        }
+        let output = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
+    }
 
     #[test]
     fn imports_preserve_bytes_and_refuse_unsafe_paths() {
@@ -323,20 +499,7 @@ mod tests {
 
         let (source, body) = read_input(Some(&input)).unwrap();
         let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
-        let mut metadata = Metadata {
-            version: json!(1),
-            workspace_id: "01900000-0000-7000-8000-000000000001".to_owned(),
-            bot_id: "01900000-0000-7000-8000-000000000002".to_owned(),
-            bot_slug: "queen-fixture".to_owned(),
-            conversation_id: conversation_id(now).unwrap(),
-            imported_at: "2027-01-15T08:00:00Z".to_owned(),
-            title: Some("Fixture: \"quoted\" *title*".to_owned()),
-            provenance: Provenance {
-                source,
-                session_ref: Some("---".to_owned()),
-                body_sha256: format!("{:x}", Sha256::digest(&body)),
-            },
-        };
+        let mut metadata = fixture_metadata(source, &body);
         let storage = temp.path().join("conversations");
         let elsewhere = temp.path().join("elsewhere");
         fs::create_dir(&elsewhere).unwrap();

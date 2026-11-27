@@ -669,6 +669,9 @@ fn conversation_import_requires_explicit_input_and_an_unblocked_runtime_lock() {
 #[test]
 #[ignore = "requires pinned Dolt at HIVE_DOLT_BIN, local TCP and Linux pidfds"]
 fn conversation_import_uses_the_committed_registry_of_the_owned_runtime() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+
     let workspace_id = id(1);
     let active = id(15);
     let retired = id(16);
@@ -696,7 +699,6 @@ fn conversation_import_uses_the_committed_registry_of_the_owned_runtime() {
     let state_home = fixture.root.join("state");
     let state = state_home.join("hive/v2/workspaces").join(&workspace_id);
     fs::create_dir_all(&state).unwrap();
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(
         state.join("active-root.json"),
@@ -760,13 +762,16 @@ fn conversation_import_uses_the_committed_registry_of_the_owned_runtime() {
         );
         let input = fixture.root.join("fixture.md");
         fs::write(&input, BODY).unwrap();
-        let first = report(
-            import(&active)
-                .args(["--file", "fixture.md"])
-                .output()
-                .unwrap(),
-            true,
-        );
+        let mut first = import(&active);
+        first.args(["--file", "fixture.md"]);
+        // SAFETY: umask is async-signal-safe and changes only the child process.
+        unsafe {
+            first.pre_exec(|| {
+                libc::umask(0o200);
+                Ok(())
+            });
+        }
+        let first = report(first.output().unwrap(), true);
         let mut second = import(&active)
             .arg("--stdin")
             .stdin(Stdio::piped())
@@ -783,9 +788,22 @@ fn conversation_import_uses_the_committed_registry_of_the_owned_runtime() {
         let first_id = first["data"]["conversation_id"].as_str().unwrap();
         let second_id = second["data"]["conversation_id"].as_str().unwrap();
         assert_ne!(first_id, second_id);
-        let directory = workspace.join("conversations/bots").join(&active);
+        let storage = workspace.join("conversations");
+        let bots = storage.join("bots");
+        let directory = bots.join(&active);
+        for path in [&storage, &bots, &directory] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                0o700
+            );
+        }
         for (result, id, source) in [(&first, first_id, "file"), (&second, second_id, "stdin")] {
-            let stored = fs::read_to_string(directory.join(format!("{id}.md"))).unwrap();
+            let file = directory.join(format!("{id}.md"));
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o7777,
+                0o600
+            );
+            let stored = fs::read_to_string(file).unwrap();
             let (header, body) = stored
                 .strip_prefix("---\n")
                 .unwrap()
