@@ -397,9 +397,8 @@ mod unix {
             })?;
         let descriptor = parse_descriptor(&bytes)?;
         if descriptor.bootstrap_layout.is_some() {
-            // Init holds the exclusive lock through its post-publication check.
-            // Re-read under the shared lock in case it invalidated the descriptor
-            // between the initial read and lock acquisition.
+            // Init holds the exclusive lock through the descriptor move and
+            // directory sync. Re-read under the shared lock.
             root.try_lock_shared()?;
             if root.read(OsStr::new(MARKER))?.as_deref() != Some(bytes.as_slice()) {
                 return Err(HiveError::new(
@@ -433,6 +432,20 @@ mod unix {
                 .map_err(|_| invalid_layout())?
         {
             return Err(invalid_layout());
+        }
+        let invalid_git =
+            || invalid("The bootstrap Git asset repository layout is missing or unsafe.");
+        let git =
+            config_file::open_scoped_directory(root, OsStr::new("assets"), &[OsStr::new(".git")])
+                .map_err(|_| invalid_git())?
+                .ok_or_else(invalid_git)?;
+        if !config_file::has_nonempty_regular(&git, c"HEAD").map_err(|_| invalid_git())? {
+            return Err(invalid_git());
+        }
+        for name in ["objects", "refs"] {
+            config_file::open_scoped_directory(&git, OsStr::new(name), &[])
+                .map_err(|_| invalid_git())?
+                .ok_or_else(invalid_git)?;
         }
         Ok(())
     }

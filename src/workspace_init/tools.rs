@@ -61,7 +61,11 @@ impl<'a> Installed<'a> {
         Ok(installed)
     }
 
-    pub(super) fn initialize_db(&self, db: &Path, workspace_id: &str) -> Result<String, HiveError> {
+    pub(super) fn initialize_db(
+        &self,
+        db: &Path,
+        workspace_id: &str,
+    ) -> Result<(String, File), HiveError> {
         self.dolt(
             db,
             &[
@@ -76,6 +80,7 @@ impl<'a> Installed<'a> {
             None,
         )?;
 
+        let native = super::open_directory(&db.join(".dolt"))?;
         let digest = format!("{:x}", Sha256::digest(INITIAL_SCHEMA));
         let mut sql = INITIAL_SCHEMA.to_vec();
         // These interpolations are an internally generated UUID, integer and digest.
@@ -163,11 +168,12 @@ impl<'a> Installed<'a> {
             }
         }
         restrict_db_modes(db)?;
-        Ok(commit.to_owned())
+        Ok((commit.to_owned(), native))
     }
 
-    pub(super) fn initialize_assets(&self, assets: &Path) -> Result<String, HiveError> {
+    pub(super) fn initialize_assets(&self, assets: &Path) -> Result<(String, File), HiveError> {
         self.git(assets, &["init", "--initial-branch=main", "--template="])?;
+        let native = super::open_directory(&assets.join(".git"))?;
         self.git(
             assets,
             &[
@@ -198,7 +204,7 @@ impl<'a> Installed<'a> {
                 "Could not verify the initial Git asset repository and commit.",
             ));
         }
-        Ok(commit.to_owned())
+        Ok((commit.to_owned(), native))
     }
 
     fn query(&self, db: &Path, query: &str) -> Result<Vec<Value>, HiveError> {
@@ -232,6 +238,7 @@ impl<'a> Installed<'a> {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_DEFAULT_HASH", "sha1")
+            .env("GIT_DEFAULT_REF_FORMAT", "files")
             .env("GIT_AUTHOR_NAME", "Hive")
             .env("GIT_AUTHOR_EMAIL", "bootstrap@hive.invalid")
             .env("GIT_COMMITTER_NAME", "Hive")

@@ -344,6 +344,26 @@ fn bootstrap_layout_refuses_missing_empty_and_symlinked_native_markers() {
     assert_missing_layout();
     fs::remove_file(&manifest).unwrap();
     fs::rename(&other, &manifest).unwrap();
+    let assert_missing_assets = || {
+        let error = response(show(), 2);
+        assert_eq!(error["error"]["code"], "INVALID_CONFIG");
+        assert_eq!(
+            error["error"]["message"],
+            "The bootstrap Git asset repository layout is missing or unsafe."
+        );
+    };
+    assert_missing_assets();
+    let assets = target.join("assets");
+    let git = assets.join(".git");
+    fs::create_dir(&assets).unwrap();
+    let elsewhere = fixture.dir("external-git");
+    fs::write(elsewhere.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::create_dir(elsewhere.join("objects")).unwrap();
+    fs::create_dir(elsewhere.join("refs")).unwrap();
+    symlink(&elsewhere, &git).unwrap();
+    assert_missing_assets();
+    fs::remove_file(&git).unwrap();
+    fs::rename(elsewhere, git).unwrap();
     assert_eq!(
         response(show(), 0)["data"]["verification"]["descriptor"],
         "verified"

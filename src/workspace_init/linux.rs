@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::os::fd::AsRawFd;
@@ -6,16 +6,47 @@ use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::config::{current_dir, json_path};
-use crate::config_v2;
 use crate::dolt::{DOLT_VERSION, STORAGE_SCHEMA_VERSION};
 use crate::error::{ErrorCode, HiveError};
+use crate::{config_file, config_v2};
 
 mod tools;
 
 const POLICY_REVISION: &str = "c66b3c50150e18426485d134de92c6b311dac125";
 const PAYLOAD_ENTRIES: [&str; 3] = ["db", "assets", "conversations"];
+
+struct Prepared {
+    db: File,
+    dolt: File,
+    assets: File,
+    git: File,
+    conversations: File,
+    asset_commit: String,
+    asset_object_digest: [u8; 32],
+}
+
+impl Prepared {
+    fn entries(&self) -> [(&'static str, &File); 3] {
+        [
+            ("db", &self.db),
+            ("assets", &self.assets),
+            ("conversations", &self.conversations),
+        ]
+    }
+
+    fn verify(&self, target: &File) -> Result<(), HiveError> {
+        for (name, directory) in self.entries() {
+            verify_entry(target, name, directory)?;
+        }
+        verify_entry(&self.db, ".dolt", &self.dolt)?;
+        verify_entry(&self.assets, ".git", &self.git)?;
+        config_v2::verify_bootstrap_layout(target)?;
+        verify_git_revision(&self.git, &self.asset_commit, &self.asset_object_digest)
+    }
+}
 
 pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
     let input = json_path(target)?;
@@ -52,9 +83,24 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
         for name in PAYLOAD_ENTRIES {
             private_dir(&payload.join(name))?;
         }
-        let db_commit = tools.initialize_db(&payload.join("db"), &workspace_id)?;
-        let asset_commit = tools.initialize_assets(&payload.join("assets"))?;
-        Ok((db_commit, asset_commit))
+        let db = open_directory(&payload.join("db"))?;
+        let assets = open_directory(&payload.join("assets"))?;
+        let conversations = open_directory(&payload.join("conversations"))?;
+        let (db_commit, dolt) = tools.initialize_db(&fd_path(&db), &workspace_id)?;
+        let (asset_commit, git) = tools.initialize_assets(&fd_path(&assets))?;
+        let asset_object_digest = git_object_digest(&git, &asset_commit)?;
+        Ok((
+            db_commit,
+            Prepared {
+                db,
+                dolt,
+                assets,
+                git,
+                conversations,
+                asset_commit,
+                asset_object_digest,
+            },
+        ))
     })();
 
     // Keep verified or partial payloads identifiable on refusal. Clean up
@@ -66,7 +112,7 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
         )
     };
     let cleanup = fs::remove_dir_all(&scratch);
-    let (db_commit, asset_commit) = match result {
+    let (db_commit, prepared) = match result {
         Ok(commits) => {
             cleanup.map_err(|_| with_stage(io_error("Could not remove isolated tool state.")))?;
             commits
@@ -108,7 +154,16 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
     config_v2::verify_descriptor(&bytes).map_err(with_stage)?;
 
     let payload_fd = open_directory(&payload).map_err(with_stage)?;
-    publish(&payload_fd, &original, &marker, &bytes, check_path).map_err(|error| {
+    sync_directory(&parent).map_err(with_stage)?;
+    publish(
+        &payload_fd,
+        &original,
+        &prepared,
+        &marker,
+        &bytes,
+        check_path,
+    )
+    .map_err(|error| {
         with_stage(HiveError::new(
             error.code,
             format!("{error} Any moved entries remain in the original target directory."),
@@ -122,7 +177,7 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
         "storage_schema_version": STORAGE_SCHEMA_VERSION,
         "dolt_version": DOLT_VERSION,
         "db_commit": db_commit,
-        "asset_commit": asset_commit,
+        "asset_commit": prepared.asset_commit,
     });
     if fs::remove_dir(&payload)
         .and_then(|()| fs::remove_dir(&stage_entry))
@@ -211,85 +266,130 @@ fn require_entries(target: &File, expected: &[&str]) -> Result<(), HiveError> {
 fn publish(
     payload: &File,
     target: &File,
+    prepared: &Prepared,
     descriptor: &File,
     descriptor_bytes: &[u8],
     mut check_path: impl FnMut() -> Result<(), HiveError>,
 ) -> Result<(), HiveError> {
     check_path()?;
     require_entries(target, &[])?;
-    let entries = PAYLOAD_ENTRIES
-        .into_iter()
-        .map(|name| {
-            let directory = open_directory(&fd_path(payload).join(name))?;
-            Ok((name, directory))
-        })
-        .collect::<Result<Vec<_>, HiveError>>()?;
     let pending_name = config_v2::INIT_PENDING
         .to_str()
         .expect("ASCII publication sentinel name");
     let pending = create_publication_sentinel(target, pending_name)?;
-    for (name, _) in &entries {
+    for (name, directory) in prepared.entries() {
+        verify_entry(payload, name, directory)?;
         move_entry(payload, target, name)?;
     }
-    let verify_payload = || {
-        for (name, directory) in &entries {
-            verify_entry(target, name, directory)?;
-        }
-        Ok(())
-    };
 
     let [db, assets, conversations] = PAYLOAD_ENTRIES;
     require_entries(target, &[db, assets, conversations, pending_name])?;
-    verify_payload()?;
     check_path()?;
     verify_entry(target, pending_name, &pending)?;
-    move_entry(payload, target, config_v2::MARKER)?;
-    let mut sentinel_removed = false;
-    let verified = (|| {
-        check_path()?;
-        require_entries(
-            target,
-            &[db, assets, conversations, config_v2::MARKER, pending_name],
-        )?;
-        verify_payload()?;
-        config_v2::verify_bootstrap_layout(target)?;
-        verify_entry(target, config_v2::MARKER, descriptor)?;
-        check_path()?;
-        verify_entry(target, pending_name, &pending)?;
-        // SAFETY: The target FD is pinned and the sentinel name is a single component.
-        if unsafe { libc::unlinkat(target.as_raw_fd(), config_v2::INIT_PENDING.as_ptr(), 0) } != 0 {
-            return Err(io_error(
-                "Could not clear the incomplete workspace publication sentinel.",
-            ));
-        }
-        sentinel_removed = true;
+    // SAFETY: The target FD is pinned and the sentinel name is a single component.
+    if unsafe { libc::unlinkat(target.as_raw_fd(), config_v2::INIT_PENDING.as_ptr(), 0) } != 0 {
+        return Err(io_error(
+            "Could not clear the incomplete workspace publication sentinel.",
+        ));
+    }
 
-        // Bootstrap readers take a shared lock, so removing the sentinel
-        // does not expose the target until this check finishes under our lock.
-        check_path()?;
-        require_entries(target, &[db, assets, conversations, config_v2::MARKER])?;
-        verify_payload()?;
-        config_v2::verify_bootstrap_layout(target)?;
-        verify_entry(target, config_v2::MARKER, descriptor)?;
-        verify_descriptor_bytes(descriptor, descriptor_bytes)?;
-        check_path()?;
-        Ok(())
-    })();
-    if let Err(error) = verified {
-        if sentinel_removed {
-            // Preserve any intervening entry. Even if we cannot restore our
-            // sentinel, invalidate the exact descriptor before unlocking.
-            let _ = create_publication_sentinel(target, pending_name);
+    check_path()?;
+    prepared.verify(target)?;
+    for (_, directory) in prepared.entries() {
+        sync_tree(directory)?;
+    }
+    sync_directory(target)?;
+    descriptor
+        .sync_all()
+        .map_err(|_| io_error("Could not sync the staged workspace descriptor."))?;
+    sync_directory(payload)?;
+
+    // The canonical descriptor remains absent through every verification.
+    // The no-clobber move is the readiness event and is never rolled back.
+    check_path()?;
+    prepared.verify(target)?;
+    require_entries(target, &PAYLOAD_ENTRIES)?;
+    verify_entry(payload, config_v2::MARKER, descriptor)?;
+    verify_descriptor_bytes(descriptor, descriptor_bytes)?;
+    check_path()?;
+    move_entry(payload, target, config_v2::MARKER)?;
+    target.sync_all().map_err(|_| {
+        HiveError::new(
+            ErrorCode::UnknownWriteOutcome,
+            "The workspace descriptor was published, but its durability could not be confirmed.",
+        )
+    })
+}
+
+fn sync_directory(directory: &File) -> Result<(), HiveError> {
+    directory
+        .sync_all()
+        .map_err(|_| io_error("Could not sync a workspace directory."))
+}
+
+fn sync_tree(directory: &File) -> Result<(), HiveError> {
+    let sync_error = |_| io_error("Could not sync the verified workspace payload.");
+    for entry in fs::read_dir(fd_path(directory)).map_err(sync_error)? {
+        let entry = entry.map_err(sync_error)?;
+        if entry.file_type().map_err(sync_error)?.is_dir() {
+            let child = open_directory(&entry.path())?;
+            sync_tree(&child)?;
+        } else {
+            let file = config_file::open_regular_child(directory, &entry.file_name())?.ok_or_else(
+                || {
+                    HiveError::new(
+                        ErrorCode::ConcurrentChange,
+                        "A prepared workspace file disappeared.",
+                    )
+                },
+            )?;
+            file.sync_all().map_err(sync_error)?;
         }
-        descriptor.set_len(0).map_err(|_| {
-            HiveError::new(
-                ErrorCode::UnknownWriteOutcome,
-                "The published workspace could not be verified and its descriptor could not be invalidated.",
-            )
-        })?;
-        return Err(error);
+    }
+    sync_directory(directory)
+}
+
+fn verify_git_revision(git: &File, commit: &str, digest: &[u8; 32]) -> Result<(), HiveError> {
+    // The bootstrap commit is installed as a loose object and a loose main
+    // reference. Read only these anchored Git files after moving the tree.
+    let refs = config_file::open_scoped_directory(git, OsStr::new("refs"), &[OsStr::new("heads")])?
+        .ok_or_else(unverified_asset_commit)?;
+    if read_git_file(git, "HEAD", 128)? != b"ref: refs/heads/main\n"
+        || read_git_file(&refs, "main", 128)? != format!("{commit}\n").as_bytes()
+        || git_object_digest(git, commit)? != *digest
+    {
+        return Err(unverified_asset_commit());
     }
     Ok(())
+}
+
+fn git_object_digest(git: &File, commit: &str) -> Result<[u8; 32], HiveError> {
+    let (fanout, object) = commit.split_at(2);
+    let objects =
+        config_file::open_scoped_directory(git, OsStr::new("objects"), &[OsStr::new(fanout)])?
+            .ok_or_else(unverified_asset_commit)?;
+    let bytes = read_git_file(&objects, object, 16 * 1024)?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+fn read_git_file(directory: &File, name: &str, limit: u64) -> Result<Vec<u8>, HiveError> {
+    let mut bytes = Vec::new();
+    config_file::open_regular_child(directory, OsStr::new(name))?
+        .ok_or_else(unverified_asset_commit)?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| unverified_asset_commit())?;
+    if bytes.is_empty() || bytes.len() as u64 > limit {
+        return Err(unverified_asset_commit());
+    }
+    Ok(bytes)
+}
+
+fn unverified_asset_commit() -> HiveError {
+    HiveError::new(
+        ErrorCode::AuthorityUnverified,
+        "The prepared Git asset repository no longer matches its verified initial commit.",
+    )
 }
 
 fn verify_descriptor_bytes(descriptor: &File, expected: &[u8]) -> Result<(), HiveError> {
@@ -606,6 +706,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    const FIXTURE_COMMIT: &str = "0123456789012345678901234567890123456789";
     const FIXTURE_DESCRIPTOR: &str = concat!(
         "version: 2\n",
         "workspace_id: 01900000-0000-7000-8000-000000000001\n",
@@ -637,6 +738,16 @@ mod tests {
             fs::create_dir_all(payload.join("db/.dolt/noms")).unwrap();
             fs::write(payload.join("db/.dolt/repo_state.json"), b"fixture state").unwrap();
             fs::write(payload.join("db/.dolt/noms/manifest"), b"fixture manifest").unwrap();
+            let git = payload.join("assets/.git");
+            fs::create_dir_all(git.join("refs/heads")).unwrap();
+            fs::create_dir_all(git.join("objects/01")).unwrap();
+            fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+            fs::write(git.join("refs/heads/main"), format!("{FIXTURE_COMMIT}\n")).unwrap();
+            fs::write(
+                git.join("objects/01").join(&FIXTURE_COMMIT[2..]),
+                b"fixture object",
+            )
+            .unwrap();
             fs::write(payload.join(config_v2::MARKER), FIXTURE_DESCRIPTOR).unwrap();
             Self {
                 root,
@@ -664,10 +775,20 @@ mod tests {
             .write(true)
             .open(source.join(config_v2::MARKER))
             .unwrap();
+        let prepared = Prepared {
+            db: open_directory(&source.join("db"))?,
+            dolt: open_directory(&source.join("db/.dolt"))?,
+            assets: open_directory(&source.join("assets"))?,
+            git: open_directory(&source.join("assets/.git"))?,
+            conversations: open_directory(&source.join("conversations"))?,
+            asset_commit: FIXTURE_COMMIT.to_owned(),
+            asset_object_digest: Sha256::digest(b"fixture object").into(),
+        };
         let mut checks = 0;
         publish(
             &payload,
             &target,
+            &prepared,
             &descriptor,
             FIXTURE_DESCRIPTOR.as_bytes(),
             || {
@@ -705,7 +826,7 @@ mod tests {
         );
         assert_eq!(fs::read_dir(&fixture.target).unwrap().count(), 1);
         assert!(moved.join("db").is_dir());
-        assert_eq!(fs::read(moved.join(config_v2::MARKER)).unwrap(), b"");
+        assert_unpublished(&moved);
     }
 
     #[test]
@@ -746,10 +867,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error.code, ErrorCode::ConcurrentChange));
         assert!(fs::read_dir(&fixture.target).unwrap().next().is_none());
-        assert_eq!(
-            fs::read(moved.join("target").join(config_v2::MARKER)).unwrap(),
-            b""
-        );
+        assert_unpublished(&moved.join("target"));
     }
 
     #[test]
@@ -757,7 +875,7 @@ mod tests {
         let fixture = Publication::new();
         let error = fixture
             .publish_with(|check| {
-                if check == 2 {
+                if check == 5 {
                     fs::write(fixture.target.join(config_v2::MARKER), b"competing").unwrap();
                 }
             })
@@ -790,57 +908,79 @@ mod tests {
     }
 
     #[test]
-    fn post_publication_check_catches_changes_at_sentinel_removal() {
-        for move_parent in [true, false] {
+    fn changed_prepared_directory_is_not_published() {
+        let fixture = Publication::new();
+        let staged_assets = fixture.payload.join("assets");
+        let error = fixture
+            .publish_with(|check| {
+                if check == 1 {
+                    fs::rename(&staged_assets, fixture.root.join("original-assets")).unwrap();
+                    private_dir(&staged_assets).unwrap();
+                    fs::write(staged_assets.join("keep"), b"replacement").unwrap();
+                }
+            })
+            .unwrap_err();
+        assert!(matches!(error.code, ErrorCode::ConcurrentChange));
+        assert_eq!(
+            fs::read(staged_assets.join("keep")).unwrap(),
+            b"replacement"
+        );
+        assert!(!fixture.target.join("assets").exists());
+        assert!(!fixture.target.join(config_v2::MARKER).exists());
+    }
+
+    #[test]
+    fn missing_replaced_or_changed_git_repo_keeps_descriptor_unpublished() {
+        for mode in ["missing", "replaced", "revision", "object"] {
             let fixture = Publication::new();
-            let moved = fixture.root.join("moved");
-            let pending_name = config_v2::INIT_PENDING.to_str().unwrap();
-            let mut original_sentinel = None;
+            let git = fixture.target.join("assets/.git");
             let error = fixture
                 .publish_with(|check| {
-                    if check == 4 {
-                        original_sentinel =
-                            Some(fixture.target.join(pending_name).metadata().unwrap().ino());
-                        if move_parent {
-                            fs::rename(&fixture.parent, &moved).unwrap();
-                            private_dir(&fixture.parent).unwrap();
-                            private_dir(&fixture.target).unwrap();
-                            fs::write(fixture.target.join("keep"), b"keep").unwrap();
+                    if check == 3 {
+                        if mode == "revision" {
+                            fs::write(git.join("refs/heads/main"), b"unexpected revision").unwrap();
+                        } else if mode == "object" {
+                            fs::write(
+                                git.join("objects/01").join(&FIXTURE_COMMIT[2..]),
+                                b"replacement object",
+                            )
+                            .unwrap();
                         } else {
-                            fs::rename(fixture.target.join("db"), &moved).unwrap();
-                            private_dir(&fixture.target.join("db")).unwrap();
-                            fs::write(fixture.target.join("db/keep"), b"keep").unwrap();
+                            let original = fixture.root.join("original-git");
+                            fs::rename(&git, &original).unwrap();
+                            if mode == "replaced" {
+                                private_dir(&git).unwrap();
+                                fs::write(git.join("keep"), b"replacement").unwrap();
+                            }
                         }
                     }
                 })
                 .unwrap_err();
-            assert!(matches!(error.code, ErrorCode::ConcurrentChange));
-            let original = if move_parent {
-                assert_eq!(fs::read(fixture.target.join("keep")).unwrap(), b"keep");
-                assert_eq!(fs::read_dir(&fixture.target).unwrap().count(), 1);
-                moved.join("target")
+            if matches!(mode, "revision" | "object") {
+                assert!(matches!(error.code, ErrorCode::AuthorityUnverified));
             } else {
-                assert_eq!(fs::read(fixture.target.join("db/keep")).unwrap(), b"keep");
-                fixture.target.clone()
-            };
-            // The reopened sentinel has a new inode while the old sentinel FD
-            // was still pinned, proving the check ran after actual removal.
-            let restored_sentinel = original.join(pending_name).metadata().unwrap().ino();
-            assert_ne!(Some(restored_sentinel), original_sentinel);
-            assert_incomplete(&original);
+                assert!(matches!(error.code, ErrorCode::ConcurrentChange));
+            }
+            assert_unpublished(&fixture.target);
+            assert_eq!(
+                fs::read(fixture.payload.join(config_v2::MARKER)).unwrap(),
+                FIXTURE_DESCRIPTOR.as_bytes()
+            );
+            if mode == "replaced" {
+                assert_eq!(fs::read(git.join("keep")).unwrap(), b"replacement");
+            }
         }
     }
 
     #[test]
     fn readers_refuse_paused_and_killed_publications() {
         for (pause, mode) in [
+            (2, "complete"),
+            (2, "killed"),
             (3, "complete"),
             (3, "moved"),
             (3, "replaced"),
             (3, "killed"),
-            (5, "complete"),
-            (5, "moved"),
-            (5, "replaced"),
             (5, "killed"),
         ] {
             let fixture = Publication::new();
@@ -874,22 +1014,14 @@ mod tests {
             } else {
                 &fixture.target
             };
-            assert_eq!(
-                fs::read(observed.join(config_v2::MARKER)).unwrap(),
-                FIXTURE_DESCRIPTOR.as_bytes()
-            );
+            assert!(!observed.join(config_v2::MARKER).exists());
             let pending = observed.join(config_v2::INIT_PENDING.to_str().unwrap());
-            if pause == 3 {
+            if pause == 2 {
                 assert!(pending.is_file());
                 assert_incomplete(observed);
             } else {
                 assert!(!pending.exists());
-                let error = selection_error(observed);
-                assert!(matches!(error.code, ErrorCode::ConcurrentChange));
-                assert_eq!(
-                    error.to_string(),
-                    "Workspace initialization is still being verified."
-                );
+                assert_unpublished(observed);
             }
 
             if matches!(mode, "replaced" | "killed") {
@@ -900,10 +1032,7 @@ mod tests {
             if mode == "killed" {
                 writer.kill().unwrap();
                 assert!(!writer.wait().unwrap().success());
-                assert_eq!(
-                    fs::read(observed.join(config_v2::MARKER)).unwrap(),
-                    FIXTURE_DESCRIPTOR.as_bytes()
-                );
+                assert!(!observed.join(config_v2::MARKER).exists());
                 assert_eq!(fs::read(observed.join("db/keep")).unwrap(), b"replacement");
             } else {
                 fs::write(fixture.root.join("release"), b"go").unwrap();
@@ -916,17 +1045,12 @@ mod tests {
                     candidate.workspace_id(),
                     "01900000-0000-7000-8000-000000000001"
                 );
-            } else if pause == 5 && mode == "killed" {
-                assert!(!pending.exists());
-                let error = selection_error(observed);
-                assert!(matches!(error.code, ErrorCode::InvalidConfig));
-                assert_eq!(
-                    error.to_string(),
-                    "The bootstrap Dolt repository layout is missing or unsafe."
-                );
-            } else {
+            } else if pause == 2 {
                 assert!(pending.is_file());
                 assert_incomplete(observed);
+            } else {
+                assert!(!pending.exists());
+                assert_unpublished(observed);
             }
             if mode == "moved" {
                 assert_eq!(
@@ -945,6 +1069,11 @@ mod tests {
         config_v2::read_explicit(path)
             .err()
             .expect("workspace must be hidden")
+    }
+
+    fn assert_unpublished(path: &Path) {
+        assert!(!path.join(config_v2::MARKER).exists());
+        assert!(matches!(selection_error(path).code, ErrorCode::NotFound));
     }
 
     fn assert_incomplete(path: &Path) {
