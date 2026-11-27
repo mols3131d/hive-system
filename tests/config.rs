@@ -2272,6 +2272,48 @@ fn context_inspect_binds_the_committed_role_policy_to_the_descriptor() {
     let report = expect(&common, 7, "AUTHORITY_UNVERIFIED");
     assert_eq!(report["context"]["policy_revision"], pin);
     assert!(!report.to_string().contains("synthetic-private"));
+    let before = snapshot(&fixture.0);
+    for candidate in [pin.as_str(), &"a".repeat(64)] {
+        let report = expect(
+            &[common.as_slice(), &["--asset-commit", candidate]].concat(),
+            7,
+            "AUTHORITY_UNVERIFIED",
+        );
+        assert!(report["context"].get("asset_commit").is_none());
+    }
+    for candidate in ["a123", &"A".repeat(40), &"z".repeat(40), &"a".repeat(65)] {
+        expect(
+            &[common.as_slice(), &["--asset-commit", candidate]].concat(),
+            2,
+            "INVALID_ARGUMENT",
+        );
+    }
+    expect(
+        &[
+            "context",
+            "inspect",
+            "--asset-commit",
+            "--contract",
+            "2",
+            "--json",
+        ],
+        2,
+        "INVALID_ARGUMENT",
+    );
+    let mut invalid_target = common;
+    let port = invalid_target
+        .iter()
+        .position(|arg| *arg == "--port")
+        .unwrap();
+    invalid_target[port + 1] = "0";
+    let report = expect(&invalid_target, 2, "INVALID_ARGUMENT");
+    assert!(
+        report["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Dolt port")
+    );
+    assert_eq!(snapshot(&fixture.0), before);
     expect(
         &[common.as_slice(), &["--budget", "1"]].concat(),
         2,

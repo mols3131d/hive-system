@@ -95,6 +95,10 @@ pub(crate) fn is_full_oid(oid: &str) -> bool {
     matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+pub(crate) fn is_full_lowercase_oid(oid: &str) -> bool {
+    is_full_oid(oid) && !oid.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
 fn resolve_commit(root: &Path, revision: &str) -> Result<Option<String>, HiveError> {
     let expression = format!("{revision}^{{commit}}");
     let result = git(

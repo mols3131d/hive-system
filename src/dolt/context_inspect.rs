@@ -4,7 +4,7 @@
 use crate::cli::{CommonOptions, ContextInspectArgs, ContextRole};
 use crate::error::{ErrorCode, HiveError};
 
-use super::{DoltFailure, DoltSuccess, is_uuid_v7};
+use super::{DoltFailure, DoltSuccess, DoltTarget, is_uuid_v7};
 
 const DEFAULT_BUDGET: usize = 32 * 1024;
 const MAX_BUDGET: usize = 64 * 1024;
@@ -24,7 +24,8 @@ pub(crate) fn inspect(
     args: &ContextInspectArgs,
 ) -> Result<DoltSuccess, Box<DoltFailure>> {
     let (role, budget) = selection(common, args).map_err(DoltFailure::without_context)?;
-    preflight(common, args, role, budget)
+    let target = DoltTarget::parse(&args.target).map_err(DoltFailure::without_context)?;
+    preflight(common, args, target, role, budget)
 }
 
 fn selection(
@@ -55,6 +56,15 @@ fn selection(
     if let Some(issue) = &args.issue {
         super::issue::parse_selector(issue)?;
     }
+    if args
+        .asset_commit
+        .as_deref()
+        .is_some_and(|commit| !crate::config_git::is_full_lowercase_oid(commit))
+    {
+        return Err(invalid(
+            "Supply a full lowercase Git asset commit object ID.",
+        ));
+    }
     if args.area.is_none() && project.is_none() && args.issue.is_none() {
         return Err(HiveError::new(
             ErrorCode::AmbiguousScope,
@@ -84,6 +94,7 @@ fn selection(
 fn preflight(
     common: &CommonOptions,
     args: &ContextInspectArgs,
+    target: DoltTarget<'_>,
     role: ContextRole,
     budget: usize,
 ) -> Result<DoltSuccess, Box<DoltFailure>> {
@@ -93,7 +104,7 @@ fn preflight(
     let workspace =
         config_v2::read_explicit(common.workspace.as_deref().expect("validated workspace"))
             .map_err(DoltFailure::without_context)?;
-    if args.target.workspace_id.as_deref() != Some(workspace.workspace_id()) {
+    if target.workspace_id != workspace.workspace_id() {
         return Err(DoltFailure::without_context(HiveError::new(
             ErrorCode::AuthorityUnverified,
             "The descriptor identity differs from the explicit workspace ID.",
@@ -132,6 +143,7 @@ fn preflight(
 fn preflight(
     _common: &CommonOptions,
     _args: &ContextInspectArgs,
+    _target: DoltTarget<'_>,
     _role: ContextRole,
     _budget: usize,
 ) -> Result<DoltSuccess, Box<DoltFailure>> {

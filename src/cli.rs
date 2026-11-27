@@ -303,6 +303,9 @@ pub(crate) struct ContextInspectArgs {
     /// Reviewed local Hive system checkout at the workspace's policy pin.
     #[arg(long, value_name = "PATH")]
     pub(crate) policy_root: Option<PathBuf>,
+    /// Exact commit of the selected workspace asset tree.
+    #[arg(long, value_name = "OID")]
+    pub(crate) asset_commit: Option<String>,
     /// Exact workflow participant reference.
     #[arg(long, value_name = "REF")]
     pub(crate) actor: Option<String>,
@@ -1720,7 +1723,9 @@ fn retry_scoped_read_failure(
     let retry = recover_scope(cli.clone().mut_subcommand(domain, |command| {
         command.mut_subcommands(|leaf| {
             recover_scope(leaf).mut_args(|arg| match arg.get_id().as_str() {
-                "database" | "workspace_id" | "port" | "cursor" | "area" => recover_value(arg),
+                "database" | "workspace_id" | "port" | "cursor" | "area" | "asset_commit" => {
+                    recover_value(arg)
+                }
                 "status" | "limit" | "after" | "role" | "actor" | "issue" | "bot" | "budget"
                 | "policy_root" => recover_value(arg.value_parser(StringValueParser::new())),
                 "bot_id" | "id" => arg
