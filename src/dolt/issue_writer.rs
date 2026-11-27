@@ -15,7 +15,7 @@ use super::{
     context_evidence::read_evidence_bytes,
     context_resolve::observe_time,
     context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7, issue_create,
-    issue_note_receipt, issue_update,
+    issue_dependency, issue_note_receipt, issue_update,
     project::planning,
     read_error,
     receipt_history::{
@@ -44,6 +44,10 @@ pub(super) enum Kind {
     ProjectCreate,
     #[serde(rename = "project.add-issue")]
     ProjectAddIssue,
+    #[serde(rename = "issue.add-dependency")]
+    DependencyAdd,
+    #[serde(rename = "issue.remove-dependency")]
+    DependencyRemove,
 }
 
 impl Kind {
@@ -57,6 +61,8 @@ impl Kind {
             Self::AreaCreate => area_create::KIND,
             Self::ProjectCreate => planning::CREATE,
             Self::ProjectAddIssue => planning::ADD_ISSUE,
+            Self::DependencyAdd => "issue.add-dependency",
+            Self::DependencyRemove => "issue.remove-dependency",
         }
     }
 
@@ -70,7 +76,12 @@ impl Kind {
             Self::AreaCreate => "Area create",
             Self::ProjectCreate => "Project create",
             Self::ProjectAddIssue => "Project add-issue",
+            Self::DependencyAdd | Self::DependencyRemove => "Issue dependency",
         }
+    }
+
+    fn is_dependency(self) -> bool {
+        matches!(self, Self::DependencyAdd | Self::DependencyRemove)
     }
 
     fn grants(self, area: Option<&str>) -> &'static [(&'static str, &'static str)] {
@@ -81,6 +92,16 @@ impl Kind {
                 ("operation_receipts", "INSERT"),
             ],
             Self::Update => &[("issues", "UPDATE"), ("operation_receipts", "INSERT")],
+            Self::DependencyAdd => &[
+                ("issues", "UPDATE"),
+                ("operation_receipts", "INSERT"),
+                ("issue_dependencies", "INSERT"),
+            ],
+            Self::DependencyRemove => &[
+                ("issues", "UPDATE"),
+                ("operation_receipts", "INSERT"),
+                ("issue_dependencies", "DELETE"),
+            ],
             Self::Create => &[
                 ("issues", "INSERT"),
                 ("workspace_counters", "UPDATE"),
@@ -276,9 +297,20 @@ impl Pending {
             &self.project_id,
         ) {
             (1, None, Some(_), Some(_), None, None, None) => Ok(Kind::Note),
-            (2, Some(kind @ (Kind::Create | Kind::Update)), Some(_), Some(_), None, None, None) => {
-                Ok(kind)
-            }
+            (
+                2,
+                Some(
+                    kind @ (Kind::Create
+                    | Kind::Update
+                    | Kind::DependencyAdd
+                    | Kind::DependencyRemove),
+                ),
+                Some(_),
+                Some(_),
+                None,
+                None,
+                None,
+            ) => Ok(kind),
             (
                 3,
                 Some(kind @ (Kind::ArtifactCreate | Kind::ArtifactUpdate)),
@@ -365,7 +397,7 @@ pub(super) fn execute(
             receipt_at(snapshot, request.request_id, &commit, None).map_err(|_| uncertain())?;
         mutation.verify_decision(observe_time()?)?;
         let (outcome, base, introduced, result) = if let Some(receipt) = existing {
-            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate | Kind::AreaCreate) || request.kind.is_project() {
+            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate | Kind::AreaCreate) || request.kind.is_project() || request.kind.is_dependency() {
                 check_fingerprint(&receipt.fingerprint, request.fingerprint, request.kind)?;
             }
             let scoped = ScopedReceipt::read(
@@ -419,6 +451,11 @@ pub(super) fn execute(
                     Kind::ArtifactCreate | Kind::ArtifactUpdate => json!({"area_id": request.area_id, "artifact_id": result["artifact_id"]}),
                     Kind::ProjectCreate | Kind::ProjectAddIssue => json!({"project_id": result["project_id"], "area_id": request.area_id,
                            "issue_id": result["membership"]["issue_id"]}),
+                    Kind::DependencyAdd | Kind::DependencyRemove => json!({
+                        "area_id": request.area_id, "issue_id": result["issue_id"],
+                        "prerequisite_area_id": result["prerequisite_area_id"],
+                        "prerequisite_id": result["prerequisite_id"],
+                    }),
                     _ => json!({"area_id": request.area_id, "issue_id": result["issue_id"]}),
                 },
             }),
@@ -499,7 +536,9 @@ fn apply(
 
     let (version, kind) = match request.kind {
         Kind::Note => (1, None),
-        kind @ (Kind::Create | Kind::Update) => (2, Some(kind)),
+        kind @ (Kind::Create | Kind::Update | Kind::DependencyAdd | Kind::DependencyRemove) => {
+            (2, Some(kind))
+        }
         kind @ (Kind::ArtifactCreate | Kind::ArtifactUpdate) => (3, Some(kind)),
         kind @ (Kind::AreaCreate | Kind::ProjectCreate | Kind::ProjectAddIssue) => (4, Some(kind)),
     };
@@ -580,7 +619,7 @@ fn open_verified_writer(
             "SELECT GRANTEE, TABLE_NAME, PRIVILEGE_TYPE FROM information_schema.TABLE_PRIVILEGES
          WHERE TABLE_SCHEMA = 'db' AND GRANTEE = ?
          AND TABLE_NAME IN ('issues', 'issue_updates', 'workspace_counters', 'operation_receipts',
-                            'artifacts', 'artifact_areas', 'areas', 'projects', 'project_issues')",
+                            'artifacts', 'artifact_areas', 'areas', 'projects', 'project_issues', 'issue_dependencies')",
             (&grantee,),
         )
         .map_err(read_error)?;
@@ -588,7 +627,11 @@ fn open_verified_writer(
         grants
             .iter()
             .any(|row| row.0 == grantee && row.1 == table && row.2 == privilege)
-    }) {
+    }) && (!kind.is_dependency()
+        || grants.iter().all(|(_, table, privilege)| {
+            table != "issue_dependencies" || matches!(privilege.as_str(), "INSERT" | "DELETE")
+        }))
+    {
         return Ok(writer);
     }
     let guidance = if pending {
@@ -647,6 +690,7 @@ enum ScopedReceipt {
     ArtifactUpdate(artifact_update::ScopedUpdate),
     AreaCreate(area_create::ScopedCreate),
     Project(Box<planning::ScopedProject>),
+    Dependency(Box<issue_dependency::ScopedDependency>),
 }
 
 impl ScopedReceipt {
@@ -696,6 +740,22 @@ impl ScopedReceipt {
                     receipt,
                 )
                 .map(Self::Create)
+            }
+            Kind::DependencyAdd | Kind::DependencyRemove => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                issue_dependency::check_receipt(
+                    snapshot,
+                    kind,
+                    request,
+                    area.ok_or_else(uncertain)?,
+                    record.ok_or_else(uncertain)?,
+                    actor,
+                    receipt,
+                )
+                .map(|dependency| Self::Dependency(Box::new(dependency)))
+                .map_err(|_| uncertain())
             }
             Kind::ArtifactCreate => {
                 if receipt.kind != kind.name() {
@@ -756,6 +816,7 @@ impl ScopedReceipt {
                 Ok(json!(note.result))
             }
             Self::Update(update) => issue_update::verify_effect(snapshot, commit, receipt, &update),
+            Self::Dependency(dependency) => dependency.verify_effect(snapshot, commit, receipt),
             Self::ArtifactCreate(scoped) => {
                 artifact_create::verify_effect(snapshot, commit, receipt, &scoped)
             }
