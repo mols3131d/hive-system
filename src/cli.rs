@@ -16,7 +16,7 @@ use clap::{
     value_parser,
 };
 
-pub(crate) use conversation_v2::ConversationListArgs;
+pub(crate) use conversation_v2::{ConversationImportArgs, ConversationListArgs};
 pub(crate) use project_v2::ProjectRead;
 
 pub(crate) struct Invocation {
@@ -272,6 +272,8 @@ pub(crate) enum Command {
     Conversation(ConversationCommand),
     #[command(skip)]
     ConversationList(ConversationListArgs),
+    #[command(skip)]
+    ConversationImport(ConversationImportArgs),
     /// Inspect a committed operation under contract 2.
     #[command(subcommand, hide = true)]
     Operation(OperationCommand),
@@ -1995,6 +1997,15 @@ fn retry_conversation_failure(
     const SCOPED_VALUES: &[&str] = &["workspace", "project", "project-root", "at"];
     let leaf_values: &[&str] = match action {
         "list" => &["bot", "limit", "cursor", "workspace-id", "database", "port"],
+        "import" => &[
+            "bot",
+            "file",
+            "title",
+            "session-ref",
+            "workspace-id",
+            "database",
+            "port",
+        ],
         "export" => &[
             "bot",
             "id",

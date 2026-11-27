@@ -39,8 +39,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::cli::{
-    CommonOptions, ConversationListArgs, ConversationSelectionArgs, DoltTargetArgs, IssueShowArgs,
-    ValidateArgs,
+    CommonOptions, ConversationImportArgs, ConversationListArgs, ConversationSelectionArgs,
+    DoltTargetArgs, IssueShowArgs, ValidateArgs,
 };
 use crate::error::{ErrorCode, HiveError};
 
@@ -79,6 +79,25 @@ impl DoltFailure {
             context: Some(context),
             error,
         })
+    }
+}
+
+pub(crate) fn conversation_import(
+    common: &CommonOptions,
+    args: &ConversationImportArgs,
+) -> Result<DoltSuccess, Box<DoltFailure>> {
+    let bot_id = conversation_selector(args.bot.as_deref(), "--bot")?;
+    #[cfg(target_os = "linux")]
+    {
+        conversation::import(common, args, bot_id).map_err(DoltFailure::without_context)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (common, bot_id, &args.title, &args.session_ref);
+        Err(DoltFailure::without_context(HiveError::new(
+            ErrorCode::NotImplemented,
+            "Conversation import is unavailable on this platform.",
+        )))
     }
 }
 

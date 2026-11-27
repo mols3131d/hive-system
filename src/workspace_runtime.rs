@@ -298,7 +298,14 @@ pub(crate) fn with_owned_snapshot<T>(
     target: DoltTarget<'_>,
     read: impl FnOnce(&mut Snapshot) -> Result<T, HiveError>,
 ) -> Result<T, HiveError> {
-    with_owned_snapshot_inner(workspace, target, false, |snapshot, _| read(snapshot))
+    with_owned_snapshot_inner(
+        workspace,
+        target,
+        libc::LOCK_SH,
+        false,
+        |snapshot, _| read(snapshot),
+        Ok,
+    )
 }
 
 /// Inspection reads committed history even while a pending marker is retained.
@@ -307,15 +314,35 @@ pub(crate) fn with_operation_snapshot<T>(
     target: DoltTarget<'_>,
     read: impl FnOnce(&mut Snapshot, bool) -> Result<T, HiveError>,
 ) -> Result<T, HiveError> {
-    with_owned_snapshot_inner(workspace, target, true, read)
+    with_owned_snapshot_inner(workspace, target, libc::LOCK_SH, true, read, Ok)
 }
 
-fn with_owned_snapshot_inner<T>(
+/// Validate at a committed snapshot, then publish while still holding the
+/// lifecycle lock. All runtime and selection checks precede publication.
+pub(crate) fn with_exclusive_owned_snapshot<T, U>(
     workspace: &Candidate,
     target: DoltTarget<'_>,
+    read: impl FnOnce(&mut Snapshot) -> Result<T, HiveError>,
+    publish: impl FnOnce(T) -> Result<U, HiveError>,
+) -> Result<U, HiveError> {
+    with_owned_snapshot_inner(
+        workspace,
+        target,
+        libc::LOCK_EX,
+        false,
+        |snapshot, _| read(snapshot),
+        publish,
+    )
+}
+
+fn with_owned_snapshot_inner<T, U>(
+    workspace: &Candidate,
+    target: DoltTarget<'_>,
+    lock_mode: libc::c_int,
     inspect_pending: bool,
     read: impl FnOnce(&mut Snapshot, bool) -> Result<T, HiveError>,
-) -> Result<T, HiveError> {
+    finish: impl FnOnce(T) -> Result<U, HiveError>,
+) -> Result<U, HiveError> {
     let id = workspace.workspace_id();
     let root = json_path(&workspace.root.path)?;
     let state = find_state(id, &workspace.root.path)?
@@ -327,7 +354,7 @@ fn with_owned_snapshot_inner<T>(
             "The existing workspace lifecycle lock is unavailable.",
         ));
     }
-    let lock = lock_file(regular(&state, "lock")?, libc::LOCK_SH)?;
+    let lock = lock_file(regular(&state, "lock")?, lock_mode)?;
     let check_selection = || -> Result<bool, HiveError> {
         let selected = read_explicit(&workspace.root.path)?;
         let lock_now = regular(&state, "lock")?.metadata().map_err(io_error)?;
@@ -388,7 +415,7 @@ fn with_owned_snapshot_inner<T>(
             "The pending request state changed during inspection.",
         ));
     }
-    result
+    finish(result?)
 }
 
 fn verify(

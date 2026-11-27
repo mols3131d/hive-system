@@ -1,6 +1,12 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod list;
 
+#[cfg(target_os = "linux")]
+mod import;
+
+#[cfg(target_os = "linux")]
+pub(super) use import::run as import;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) use list::run as list;
 
@@ -183,9 +189,6 @@ pub(super) fn read(
 #[cfg(target_os = "linux")]
 fn publish_export(workspace: &Path, destination: &Path, body: &[u8]) -> Result<(), HiveError> {
     use std::ffi::CString;
-    use std::fs::File;
-    use std::io::{Error, ErrorKind, Write};
-    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
 
     use crate::config_file::ScopedDirectory;
@@ -225,7 +228,22 @@ fn publish_export(workspace: &Path, destination: &Path, body: &[u8]) -> Result<(
             "The export destination must be outside the selected conversation storage.",
         ));
     }
-    let parent = directory.handle();
+    publish_private(directory.handle(), &name, &[body], || Ok(()))
+}
+
+#[cfg(target_os = "linux")]
+fn publish_private(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+    chunks: &[&[u8]],
+    check_destination: impl FnOnce() -> Result<(), HiveError>,
+) -> Result<(), HiveError> {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::PermissionsExt;
+
     let parent_fd = parent.as_raw_fd();
 
     // An unnamed inode belongs to this descriptor until publication. Closing it
@@ -242,20 +260,21 @@ fn publish_export(workspace: &Path, destination: &Path, body: &[u8]) -> Result<(
     if fd == -1 {
         return Err(HiveError::new(
             ErrorCode::IoError,
-            "Could not create a private temporary file in the export directory.",
+            "Could not create a private temporary file in the conversation destination directory.",
         ));
     }
     // SAFETY: openat returned a newly owned descriptor.
     let mut temporary = unsafe { File::from_raw_fd(fd) };
+    let write_error =
+        |_| HiveError::new(ErrorCode::IoError, "Could not write the conversation file.");
     temporary
-        .write_all(body)
-        .and_then(|()| temporary.sync_all())
-        .map_err(|_| {
-            HiveError::new(
-                ErrorCode::IoError,
-                "Could not write the conversation export.",
-            )
-        })?;
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(write_error)?;
+    for chunk in chunks {
+        temporary.write_all(chunk).map_err(write_error)?;
+    }
+    temporary.sync_all().map_err(write_error)?;
+    check_destination()?;
 
     // The source is the kernel's link to our open descriptor. The destination
     // is a single component under the pinned directory and linkat never replaces it.
@@ -276,12 +295,12 @@ fn publish_export(workspace: &Path, destination: &Path, body: &[u8]) -> Result<(
             if Error::last_os_error().kind() == ErrorKind::AlreadyExists {
                 HiveError::new(
                     ErrorCode::AlreadyExists,
-                    "The export destination already exists.",
+                    "The conversation destination already exists.",
                 )
             } else {
                 HiveError::new(
                     ErrorCode::IoError,
-                    "Could not publish the conversation export.",
+                    "Could not publish the conversation file.",
                 )
             },
         );
@@ -289,7 +308,7 @@ fn publish_export(workspace: &Path, destination: &Path, body: &[u8]) -> Result<(
     parent.sync_all().map_err(|_| {
         HiveError::new(
             ErrorCode::UnknownWriteOutcome,
-            "The export was published, but its directory could not be synchronized.",
+            "The conversation file was published, but its directory could not be synchronized.",
         )
     })
 }
@@ -357,9 +376,10 @@ fn validate_metadata(
         || !OffsetDateTime::parse(&metadata.imported_at, &Rfc3339)
             .is_ok_and(|time| time.offset().is_utc())
         || metadata.imported_at.ends_with("-00:00")
-        || metadata.title.as_deref().is_some_and(|title| {
-            title.is_empty() || !valid_label(title) || title.contains(['\u{2028}', '\u{2029}'])
-        })
+        || metadata
+            .title
+            .as_deref()
+            .is_some_and(|title| !valid_title(title))
         || metadata
             .provenance
             .session_ref
@@ -392,6 +412,10 @@ fn split_frontmatter(input: &str) -> Result<(&str, &str), HiveError> {
     Err(invalid(
         "The conversation frontmatter delimiters are invalid.",
     ))
+}
+
+fn valid_title(title: &str) -> bool {
+    !title.is_empty() && valid_label(title) && !title.contains(['\u{2028}', '\u{2029}'])
 }
 
 fn valid_label(value: &str) -> bool {
