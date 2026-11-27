@@ -737,11 +737,19 @@ pub(crate) struct DoltTargetArgs {
 #[derive(Subcommand)]
 pub(crate) enum ConversationCommand {
     /// Show one preserved Queen conversation.
-    Show(ConversationShowArgs),
+    Show(ConversationSelectionArgs),
+    /// Export one preserved Queen conversation to a new Markdown file.
+    Export {
+        #[command(flatten)]
+        selection: ConversationSelectionArgs,
+        /// Explicit path to a new Markdown file.
+        #[arg(long, value_name = "PATH")]
+        destination: Option<PathBuf>,
+    },
 }
 
 #[derive(Args)]
-pub(crate) struct ConversationShowArgs {
+pub(crate) struct ConversationSelectionArgs {
     /// Canonical lowercase UUIDv7 of the registered Queen.
     #[arg(long, value_name = "UUID", allow_negative_numbers = true)]
     pub(crate) bot: Option<OsString>,
@@ -997,6 +1005,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
                 .or_else(|| retry_conversation_failure(&cli, &args, error.kind(), "show"))
+                .or_else(|| retry_conversation_failure(&cli, &args, error.kind(), "export"))
                 .or_else(|| {
                     cli.clone()
                         .ignore_errors(true)
@@ -1609,10 +1618,17 @@ fn retry_conversation_failure(
         return None;
     }
     const SCOPED_VALUES: &[&str] = &["workspace", "project", "project-root", "at"];
-    let leaf_values: &[&str] = if action == "list" {
-        &["bot", "limit", "cursor", "workspace-id", "database", "port"]
-    } else {
-        &["bot", "id", "workspace-id", "database", "port"]
+    let leaf_values: &[&str] = match action {
+        "list" => &["bot", "limit", "cursor", "workspace-id", "database", "port"],
+        "export" => &[
+            "bot",
+            "id",
+            "workspace-id",
+            "database",
+            "port",
+            "destination",
+        ],
+        _ => &["bot", "id", "workspace-id", "database", "port"],
     };
     let recover_metadata = |command: clap::Command, leaf: bool| {
         command.mut_args(|arg| {
@@ -1889,8 +1905,25 @@ impl Command {
                     Ok(())
                 }
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
-                Self::Conversation(ConversationCommand::Show(args)) => {
-                    if common.workspace.is_none() || !args.target.has_all() {
+                Self::Conversation(command) => {
+                    let (selection, destination) = match command {
+                        ConversationCommand::Show(selection) => (selection, None),
+                        ConversationCommand::Export {
+                            selection,
+                            destination,
+                        } => {
+                            if destination.is_none() {
+                                return Err("Conversation export requires --destination.");
+                            }
+                            (selection, destination.as_ref())
+                        }
+                    };
+                    if common.workspace.is_none() || !selection.target.has_all() {
+                        if destination.is_some() {
+                            return Err(
+                                "Conversation export requires --workspace, --workspace-id, --database, and --port.",
+                            );
+                        }
                         return Err(
                             "Conversation show requires --workspace, --workspace-id, --database, and --port.",
                         );
@@ -1899,9 +1932,11 @@ impl Command {
                         || common.project_root.is_some()
                         || !matches!(common.view, View::WorkingTree)
                     {
-                        return Err(
-                            "Conversation show accepts only explicit workspace and conversation selection.",
-                        );
+                        return Err(if destination.is_some() {
+                            "Conversation export accepts only explicit workspace and conversation selection."
+                        } else {
+                            "Conversation show accepts only explicit workspace and conversation selection."
+                        });
                     }
                     Ok(())
                 }

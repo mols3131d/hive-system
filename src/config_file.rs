@@ -412,6 +412,11 @@ mod filesystem {
             })
         }
 
+        #[cfg(target_os = "linux")]
+        pub(crate) fn handle(&self) -> &File {
+            &self.file
+        }
+
         pub(crate) fn contains(&self, name: &std::ffi::CStr) -> Result<bool, HiveError> {
             Ok(scoped_metadata(&self.file, name)?.is_some())
         }
