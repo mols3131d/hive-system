@@ -35,6 +35,57 @@ pub(super) fn run(
     command: &WorkspaceCommand,
     format: &mut Format,
 ) -> Result<Value, HiveError> {
+    with_registered(
+        options,
+        format,
+        false,
+        |workspace, state, db, _, noms, _| {
+            let id = workspace.workspace_id();
+            let root = json_path(&workspace.root.path)?;
+
+            if state.contains(c"starting")? {
+                return Err(unverified("An interrupted launch requires inspection."));
+            }
+            let server: Option<Server> = read_json(Some(state), "server.json")?;
+            match command {
+                WorkspaceCommand::Start { dolt_bin, port } => {
+                    if server.is_some() {
+                        return Err(unverified(
+                            "A server record already exists for this workspace.",
+                        ));
+                    }
+                    if state.contains(c"pending-request.json")? {
+                        return Err(unverified(
+                            "A pending request requires recovery before start.",
+                        ));
+                    }
+                    start(state, db, noms, id, root, dolt_bin, parse_port(port)?)
+                }
+                WorkspaceCommand::Stop => {
+                    let server =
+                        server.ok_or_else(|| unverified("No owned server is recorded."))?;
+                    check_server(&server, id, root)?;
+                    stop(state, noms, &server)
+                }
+                WorkspaceCommand::Status(_) => unreachable!(),
+            }
+        },
+    )
+}
+
+fn with_registered<T>(
+    options: &CommonOptions,
+    format: &mut Format,
+    existing_lock: bool,
+    operation: impl FnOnce(
+        &Candidate,
+        &ScopedDirectory,
+        &ScopedDirectory,
+        &ScopedDirectory,
+        &ScopedDirectory,
+        &File,
+    ) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
     let workspace = select_workspace(options, format)?.candidate;
     let id = workspace.workspace_id();
     let root = json_path(&workspace.root.path)?;
@@ -42,7 +93,11 @@ pub(super) fn run(
         .ok_or_else(|| unverified("No active-root registration exists for this workspace."))?;
     require_private_dir(&state)?;
     require_local_filesystem(&state)?;
-    let _lock = lock(&state)?;
+    let held_lock = if existing_lock {
+        lock_file(regular(&state, "lock")?, libc::LOCK_EX)?
+    } else {
+        lock(&state)?
+    };
 
     // Resolve again after taking the lock. A moved path or replaced descriptor
     // must not give a different root or UUID access to this state.
@@ -66,36 +121,82 @@ pub(super) fn run(
         root,
     )?;
     let db = child_dir(&workspace.root, DATABASE)?;
-    let noms = child_dir(&child_dir(&db, ".dolt")?, "noms")?;
+    let native = child_dir(&db, ".dolt")?;
+    let noms = child_dir(&native, "noms")?;
     require_local_filesystem(&noms)?;
-    let manifest = regular(&noms, "manifest")?;
-    drop(manifest);
+    regular(&noms, "manifest")?;
 
-    if state.contains(c"starting")? {
-        return Err(unverified("An interrupted launch requires inspection."));
-    }
-    let server: Option<Server> = read_json(Some(&state), "server.json")?;
-    match command {
-        WorkspaceCommand::Start { dolt_bin, port } => {
-            if server.is_some() {
-                return Err(unverified(
-                    "A server record already exists for this workspace.",
-                ));
-            }
-            if state.contains(c"pending-request.json")? {
-                return Err(unverified(
-                    "A pending request requires recovery before start.",
-                ));
-            }
-            start(&state, &db, &noms, id, root, dolt_bin, parse_port(port)?)
-        }
-        WorkspaceCommand::Stop => {
-            let server = server.ok_or_else(|| unverified("No owned server is recorded."))?;
-            check_server(&server, id, root)?;
-            stop(&state, &noms, &server)
-        }
-        WorkspaceCommand::Status(_) => unreachable!(),
-    }
+    operation(&workspace, &state, &db, &native, &noms, &held_lock)
+}
+
+pub(super) fn backup(
+    options: &CommonOptions,
+    destination: &Path,
+    format: &mut Format,
+) -> Result<Value, HiveError> {
+    with_registered(
+        options,
+        format,
+        true,
+        |workspace, state, db, native, noms, held_lock| {
+            let check_stopped = || {
+                for dir in [&workspace.root, state, db, native, noms] {
+                    require_current_directory(dir)?;
+                }
+                let expected = held_lock.metadata().map_err(io_error)?;
+                let current = regular(state, "lock")?.metadata().map_err(io_error)?;
+                if (expected.dev(), expected.ino()) != (current.dev(), current.ino()) {
+                    return Err(unverified("The workspace lock file changed."));
+                }
+                let selected = read_explicit(&workspace.root.path)?;
+                let registration: Registration = read_json(Some(state), "active-root.json")?
+                    .ok_or_else(|| unverified("The active-root registration disappeared."))?;
+                check_identity(
+                    registration.version,
+                    &registration.workspace_id,
+                    &registration.workspace_root,
+                    workspace.workspace_id(),
+                    json_path(&workspace.root.path)?,
+                )?;
+                if selected.workspace_id() != workspace.workspace_id()
+                    || selected.policy_revision() != workspace.policy_revision()
+                    || state.contains(c"pending-request.json")?
+                    || state.contains(c"starting")?
+                    || state.contains(c"server.json")?
+                    || native.contains(c"sql-server.info")?
+                {
+                    return Err(unverified(
+                        "Backup requires a stopped and unchanged workspace with no pending request.",
+                    ));
+                }
+                for entry in fs::read_dir(at(state, "")).map_err(io_error)? {
+                    let entry = entry.map_err(io_error)?;
+                    if !matches!(
+                        entry.file_name().to_str(),
+                        Some("lock" | "active-root.json")
+                    ) {
+                        return Err(unverified(
+                            "Unrecognized workspace runtime state requires inspection.",
+                        ));
+                    }
+                }
+                // Dolt takes its native lock when opening the store. Probe it
+                // before running offline commands, which acquire it independently.
+                lock_file(regular(noms, "LOCK")?, libc::LOCK_EX)?;
+                Ok(())
+            };
+            check_stopped()?;
+            crate::workspace_backup::create(
+                workspace,
+                state,
+                db,
+                native,
+                noms,
+                destination,
+                check_stopped,
+            )
+        },
+    )
 }
 
 fn start(
@@ -992,7 +1093,7 @@ fn require_private_dir(dir: &ScopedDirectory) -> Result<(), HiveError> {
     Ok(())
 }
 
-fn require_local_filesystem(dir: &ScopedDirectory) -> Result<(), HiveError> {
+pub(crate) fn require_local_filesystem(dir: &ScopedDirectory) -> Result<(), HiveError> {
     let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: the directory descriptor and output buffer remain valid.
     if unsafe { libc::fstatfs(dir.directory_file().as_raw_fd(), stat.as_mut_ptr()) } != 0 {

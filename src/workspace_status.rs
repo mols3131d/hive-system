@@ -18,8 +18,8 @@ mod runtime;
 
 #[cfg(target_os = "linux")]
 pub(crate) use runtime::{
-    WriterRuntime, token, with_exclusive_owned_snapshot, with_operation_snapshot,
-    with_owned_snapshot, with_writer_runtime,
+    WriterRuntime, require_local_filesystem, token, with_exclusive_owned_snapshot,
+    with_operation_snapshot, with_owned_snapshot, with_writer_runtime,
 };
 
 pub(crate) fn run(
@@ -38,6 +38,45 @@ pub(crate) fn run(
         "Workspace lifecycle is available only on Linux.",
     ));
     (format, result)
+}
+
+pub(crate) fn backup(
+    options: &CommonOptions,
+    command: &crate::cli::BackupCommand,
+) -> (Format, Result<Value, HiveError>) {
+    use crate::error::ErrorCode;
+
+    let crate::cli::BackupCommand::Create {
+        destination,
+        include_conversations,
+    } = command;
+    let format = options.format.unwrap_or_default();
+    if *include_conversations {
+        return (
+            format,
+            Err(HiveError::new(
+                ErrorCode::NotImplemented,
+                "Backup conversation inclusion requires a later contract-2 implementation.",
+            )),
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut format = format;
+        let result = runtime::backup(options, destination, &mut format);
+        (format, result)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = destination;
+        (
+            format,
+            Err(HiveError::new(
+                ErrorCode::NotImplemented,
+                "Backup creation is supported only on Linux.",
+            )),
+        )
+    }
 }
 
 pub(crate) fn observe(
