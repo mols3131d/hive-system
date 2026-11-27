@@ -2081,6 +2081,62 @@ fn workspace_status_checks_registration_and_scopes_state_to_its_uuid() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn workspace_commands_reject_state_at_or_below_the_selected_root() {
+    let fixture = Sandbox::new();
+    let xdg_state = fixture.0.join("state");
+    let workspaces = xdg_state.join("hive/v2/workspaces");
+    let uuid_state = workspaces.join(STATUS_WORKSPACE_ID);
+    let unused_dolt = fixture.0.join("unused-dolt");
+    fs::create_dir_all(&uuid_state).unwrap();
+    fs::set_permissions(&uuid_state, fs::Permissions::from_mode(0o700)).unwrap();
+    for root in [&workspaces, &uuid_state] {
+        write(&root.join("hive-workspace.yml"), V2_DESCRIPTOR);
+        let before = snapshot(&fixture.0);
+        for args in [
+            &["status"][..],
+            &["stop"][..],
+            &[
+                "start",
+                "--dolt-bin",
+                unused_dolt.to_str().unwrap(),
+                "--port",
+                "3307",
+            ][..],
+        ] {
+            let mut command = fixture.hive(
+                &fixture.0.join("invocation"),
+                &[
+                    "--contract",
+                    "2",
+                    "--json",
+                    "--workspace",
+                    root.to_str().unwrap(),
+                    "workspace",
+                ],
+            );
+            let output = command
+                .env("XDG_STATE_HOME", &xdg_state)
+                .args(args)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stderr.is_empty());
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["command"], format!("workspace {}", args[0]));
+            assert_eq!(report["error"]["code"], "INVALID_CONFIG");
+            assert!(
+                report["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("outside the selected workspace")
+            );
+            assert_eq!(snapshot(&fixture.0), before);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn workspace_status_checks_process_start_and_endpoint_independently() {
     let fixture = Sandbox::new();
     let root = fixture.0.join("workspace");
