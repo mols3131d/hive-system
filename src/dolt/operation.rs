@@ -161,7 +161,22 @@ fn inspect(
             )
         });
     };
-    let (introduced, result) = if receipt.kind == super::issue_create::KIND {
+    let (introduced, result) = if receipt.kind == super::issue_update::KIND {
+        let scoped = super::issue_update::check_scope(
+            snapshot,
+            selected.request,
+            selected.area,
+            selected.issue,
+            selected.actor,
+            &receipt,
+        )?;
+        let introduced =
+            receipt_history::receipt_introduction(snapshot, selected.request, &receipt)
+                .map_err(|_| uncertain())?;
+        let result = super::issue_update::verify_effect(snapshot, &introduced, &receipt, &scoped)
+            .map_err(|_| uncertain())?;
+        (introduced, result)
+    } else if receipt.kind == super::issue_create::KIND {
         let result = super::issue_create::check_scope(
             snapshot,
             selected.request,

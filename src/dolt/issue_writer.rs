@@ -13,7 +13,7 @@ use super::{
     context_evidence::read_evidence_bytes,
     context_resolve::observe_time,
     context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7, issue_create,
-    issue_note_receipt, read_error,
+    issue_note_receipt, issue_update, read_error,
     receipt_history::{
         HistoricalReceipt, has_receipt_history, receipt_at, receipt_introduction, valid_sha256,
     },
@@ -28,6 +28,8 @@ pub(super) enum Kind {
     Note,
     #[serde(rename = "issue.create")]
     Create,
+    #[serde(rename = "issue.update")]
+    Update,
 }
 
 impl Kind {
@@ -35,6 +37,7 @@ impl Kind {
         match self {
             Self::Note => super::issue_note_fingerprint::KIND,
             Self::Create => issue_create::KIND,
+            Self::Update => issue_update::KIND,
         }
     }
 
@@ -42,6 +45,7 @@ impl Kind {
         match self {
             Self::Note => "Issue note",
             Self::Create => "Issue create",
+            Self::Update => "Issue update",
         }
     }
 
@@ -52,6 +56,7 @@ impl Kind {
                 ("issue_updates", "INSERT"),
                 ("operation_receipts", "INSERT"),
             ],
+            Self::Update => &[("issues", "UPDATE"), ("operation_receipts", "INSERT")],
             Self::Create => &[
                 ("issues", "INSERT"),
                 ("workspace_counters", "UPDATE"),
@@ -179,7 +184,7 @@ impl Pending {
     fn operation(&self) -> Result<Kind, HiveError> {
         match (self.version, self.kind) {
             (1, None) => Ok(Kind::Note),
-            (2, Some(Kind::Create)) => Ok(Kind::Create),
+            (2, Some(kind @ (Kind::Create | Kind::Update))) => Ok(kind),
             _ => Err(uncertain()),
         }
     }
@@ -341,7 +346,7 @@ fn apply(
 
     let (version, kind) = match request.kind {
         Kind::Note => (1, None),
-        Kind::Create => (2, Some(Kind::Create)),
+        kind @ (Kind::Create | Kind::Update) => (2, Some(kind)),
     };
     let marker = Pending {
         version,
@@ -464,6 +469,7 @@ fn confirm(
 enum ScopedReceipt {
     Note(Box<issue_note_receipt::ScopedNote>),
     Create(issue_create::CreateResult),
+    Update(Box<issue_update::ScopedUpdate>),
 }
 
 impl ScopedReceipt {
@@ -486,6 +492,20 @@ impl ScopedReceipt {
                 receipt,
             )
             .map(|note| Self::Note(Box::new(note))),
+            Kind::Update => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                issue_update::check_scope(
+                    snapshot,
+                    request,
+                    area,
+                    issue.ok_or_else(uncertain)?,
+                    actor,
+                    receipt,
+                )
+                .map(|update| Self::Update(Box::new(update)))
+            }
             Kind::Create => {
                 if receipt.kind != kind.name() {
                     return Err(conflict(kind));
@@ -516,6 +536,7 @@ impl ScopedReceipt {
                 )?;
                 Ok(json!(note.result))
             }
+            Self::Update(update) => issue_update::verify_effect(snapshot, commit, receipt, &update),
             Self::Create(result) => {
                 issue_create::verify_effect(snapshot, commit, receipt, &result)?;
                 Ok(json!(result))
@@ -647,6 +668,10 @@ mod tests {
         let create = read(&value).unwrap();
         assert!(matches!(create.operation(), Ok(Kind::Create)));
         assert_eq!(json!(create), value);
+        value["kind"] = json!("issue.update");
+        let update = read(&value).unwrap();
+        assert!(matches!(update.operation(), Ok(Kind::Update)));
+        assert_eq!(json!(update), value);
         value["extra"] = json!(true);
         assert!(read(&value).is_err());
         value.as_object_mut().unwrap().remove("extra");
