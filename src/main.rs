@@ -11,7 +11,7 @@ use std::process::ExitCode;
 
 use cli::{
     AreaCommand, BotCommand, Command, ConfigCommand, Contract, ConversationCommand, Invocation,
-    IssueCommand, ParseFailure,
+    IssueCommand, ParseFailure, ResourceCommand,
 };
 use error::{ErrorCode, HiveError};
 
@@ -107,6 +107,8 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
+        Command::Resource(ResourceCommand::List(args)) => dolt::resource::list(&args),
+        Command::Resource(ResourceCommand::Show(args)) => dolt::resource::show(&args),
         Command::ProjectRead(args) => dolt::project_read(&args),
         Command::Bot(BotCommand::List {
             target,

@@ -1422,6 +1422,195 @@ fn malformed_dolt_area_options_preserve_v2_json_at_root_and_leaf() {
 }
 
 #[test]
+fn dolt_resource_reads_preserve_json_errors_and_option_literals() {
+    let sandbox = Sandbox::new();
+    let id = "01900000-0000-7000-8000-000000000001";
+    let target = [
+        "--workspace-id",
+        id,
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+    ];
+    let selectors = ["--contract", "2", "--json"];
+    let help = sandbox.run(&["--contract", "2", "resource", "show", "--help"]);
+    assert!(help.status.success(), "{help:?}");
+    assert!(String::from_utf8_lossy(&help.stdout).contains("hive resource show"));
+    for (command, invalid, at_root, code) in [
+        (
+            &["list", "--all"][..],
+            &["--project", "BAD!"][..],
+            true,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list", "--all"][..],
+            &["--at", "BAD!"][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list", "--all"][..],
+            &["--cursor", "-1"][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list", "--all"][..],
+            &["--limit", "-1"][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list", "--all"][..],
+            &["--workspace", "-1"][..],
+            true,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list", "--all"][..],
+            &["--all"][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list"][..],
+            &["--all=false"][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["show", id][..],
+            &["--area", id][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list", "--all"][..],
+            &["--issue", id][..],
+            false,
+            "AMBIGUOUS_SCOPE",
+        ),
+        (&["list"][..], &[][..], false, "INVALID_ARGUMENT"),
+        (
+            &["list", "--issue", "#1"][..],
+            &[][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (&["show", "BAD!"][..], &[][..], false, "INVALID_ARGUMENT"),
+        (
+            &["show", id][..],
+            &["--at=--json"][..],
+            true,
+            "INVALID_ARGUMENT",
+        ),
+    ] {
+        let name = format!("resource {}", command[0]);
+        let command = [&["resource"][..], command, &target].concat();
+        let invalid_command = if at_root {
+            [invalid, &command].concat()
+        } else {
+            [&command[..], invalid].concat()
+        };
+        let early = sandbox.run(&[&selectors[..], &invalid_command].concat());
+        let late = sandbox.run(&[&invalid_command[..], &selectors].concat());
+        let report: Value = serde_json::from_slice(&early.stdout)
+            .unwrap_or_else(|error| panic!("{invalid_command:?}: {error}: {early:?}"));
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], name);
+        assert_eq!(report["error"]["code"], code);
+        assert!(!report.to_string().contains("BAD!"));
+        assert!(early.stderr.is_empty());
+        assert_eq!(late.status, early.status, "{invalid_command:?}");
+        assert_eq!(late.stdout, early.stdout, "{invalid_command:?}: {late:?}");
+        assert!(late.stderr.is_empty());
+    }
+
+    for args in [
+        &["--project=--json", "resource", "list", "--contract", "2"][..],
+        &[
+            "resource",
+            "list",
+            "--cursor=--json",
+            "--at",
+            "BAD!",
+            "--contract",
+            "2",
+        ],
+        &["--contract", "2", "resource", "show", "--", "--json"],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+
+    let v1 = sandbox.run(&["--json", "resource", "list"]);
+    let unknown = sandbox.run(&["--json", "unrecognized", "list"]);
+    assert_eq!(v1.status, unknown.status);
+    assert_eq!(v1.stdout, unknown.stdout);
+    assert_eq!(v1.stderr, unknown.stderr);
+    sandbox.assert_empty();
+}
+
+#[test]
+fn malformed_resource_json_switch_preserves_independent_output_selection() {
+    let sandbox = Sandbox::new();
+    let command = ["--contract", "2", "resource", "list"];
+    let early = sandbox.run(&[&command[..], &["--format", "json", "--json=false"]].concat());
+    assert_eq!(early.status.code(), Some(2), "{early:?}");
+    assert!(early.stderr.is_empty(), "{early:?}");
+    let report: Value = serde_json::from_slice(&early.stdout).unwrap();
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["command"], "resource list");
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    assert_eq!(
+        report["error"]["message"],
+        "An argument has a missing or invalid value."
+    );
+
+    for options in [
+        &["--json=false", "--format", "json"][..],
+        &["--json=false", "--json"],
+        &["--json", "--json=false"],
+    ] {
+        let output = sandbox.run(&[&command[..], options].concat());
+        assert_eq!(output.status, early.status, "{options:?}");
+        assert_eq!(output.stdout, early.stdout, "{options:?}");
+        assert!(output.stderr.is_empty(), "{options:?}");
+    }
+
+    for args in [
+        [&command[..], &["--json=false"]].concat(),
+        [&command[..], &["--json=true"]].concat(),
+        [&command[..], &["--json="]].concat(),
+        [&command[..], &["--json=--json"]].concat(),
+        [&command[..], &["--json=--format=json"]].concat(),
+        [&command[..], &["--json=false", "--cursor=--json"]].concat(),
+        vec![
+            "--contract",
+            "2",
+            "resource",
+            "show",
+            "--json=false",
+            "--",
+            "--json",
+        ],
+    ] {
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Usage: hive resource"),
+            "{args:?}"
+        );
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn dolt_area_option_recovery_preserves_literals_and_v1_errors() {
     let sandbox = Sandbox::new();
     for args in [

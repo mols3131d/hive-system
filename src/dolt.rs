@@ -8,6 +8,7 @@ mod issue_list;
 mod issue_readiness;
 mod project;
 mod records;
+pub(crate) mod resource;
 
 use std::ffi::OsStr;
 use std::num::NonZeroU16;

@@ -160,6 +160,21 @@ hive --contract 2 --json bot show 01900000-0000-7000-8000-00000000000a \
 
 `bot show` takes an exact lowercase UUIDv7 and can inspect retired Queens. Both commands return registry metadata and the verified Dolt commit. Registry status describes retirement. Committed Soul inspection requires the workspace and asset repository pairing from [#18](https://github.com/mols3131d/hive-system/issues/18).
 
+## Committed Resource reads
+
+Use the same explicit Dolt target and SELECT-only account for contract 2 Resource reads.
+
+```sh
+hive --contract 2 --json resource list --area 01900000-0000-7000-8000-000000000002 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+hive --contract 2 --json resource show 01900000-0000-7000-8000-000000000014 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+`resource list` requires exactly one of `--all`, `--area UUID`, or `--issue UUID`. Scope and Resource selectors use canonical lowercase UUIDv7 IDs. Area and Issue scopes include only directly linked Resources. A known scope with no links returns an empty page, and an unknown scope returns `NOT_FOUND`.
+
+List pages contain Resource IDs, kinds, names, and revisions in ascending bytewise ID order, with 25 items by default and a maximum of 100. Pass `next_cursor` as `--cursor` with the same target, scope, and page size. A changed snapshot or query returns `STALE_CURSOR`. Exact-ID `resource show` adds the stored URI to the selected record. Both commands report the verified Dolt commit and leave URIs unopened.
+
 ## Historical Queen conversations
 
 Use contract 2 with an explicit workspace root, the same authenticated Dolt reader and target options, and exact lowercase UUIDv7 selectors for the Queen and conversation.
