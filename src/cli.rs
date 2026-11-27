@@ -1347,6 +1347,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             let partial = extension_matches
                 .or(config_error_matches)
                 .or(area_matches)
+                .or_else(|| retry_area_create_failure(&cli, &args, error.kind()))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "context"))
@@ -2513,6 +2514,31 @@ fn retry_conversation_failure(
     let (command, leaf) = matched_leaf(cli, &matches)?;
     (command == format!("conversation {action}")
         && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+        .then_some(matches)
+}
+
+fn retry_area_create_failure(
+    cli: &clap::Command,
+    args: &[OsString],
+    kind: ErrorKind,
+) -> Option<ArgMatches> {
+    if !matches!(
+        kind,
+        ErrorKind::ValueValidation
+            | ErrorKind::InvalidValue
+            | ErrorKind::ArgumentConflict
+            | ErrorKind::TooManyValues
+            | ErrorKind::InvalidUtf8
+    ) {
+        return None;
+    }
+    let retry = extended_error_options(cli.clone().disable_help_subcommand(true))
+        .mut_subcommand("area", |area| {
+            extended_help_probe(area).mut_subcommand("create", extended_error_options)
+        });
+    let matches = retry.try_get_matches_from(args).ok()?;
+    let (command, leaf) = matched_leaf(cli, &matches)?;
+    (command == "area create" && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }
 
