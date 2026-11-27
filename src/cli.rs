@@ -270,6 +270,10 @@ pub(crate) enum Command {
     #[command(skip)]
     IssueUpdate(IssueUpdateArgs),
     #[command(skip)]
+    IssueSelect(IssueTransitionArgs),
+    #[command(skip)]
+    IssueClaim(IssueClaimArgs),
+    #[command(skip)]
     IssueDependency(IssueDependencyArgs, bool),
     #[command(skip)]
     Resource(ResourceCommand),
@@ -1259,6 +1263,29 @@ pub(crate) struct IssueUpdateArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueTransitionArgs {
+    /// Exact Issue UUIDv7.
+    pub(crate) issue: String,
+    /// Exact owning Area UUIDv7.
+    #[arg(long)]
+    pub(crate) area: String,
+    /// Operator-selected actor reference.
+    #[arg(long)]
+    pub(crate) actor: String,
+    /// Expected Issue revision as ISSUE=REV.
+    #[arg(long)]
+    pub(crate) if_match: String,
+    /// Exact request UUID.
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision file.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueDependencyArgs {
     /// Exact dependent Issue UUIDv7.
     pub(crate) issue: String,
@@ -1282,6 +1309,15 @@ pub(crate) struct IssueDependencyArgs {
     pub(crate) evidence_file: PathBuf,
     #[command(flatten)]
     pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct IssueClaimArgs {
+    #[command(flatten)]
+    pub(crate) transition: IssueTransitionArgs,
+    /// Exact execution holder reference.
+    #[arg(long)]
+    pub(crate) holder: String,
 }
 
 #[derive(Args)]
@@ -1523,6 +1559,18 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             Some(("issue", issue)) if issue.subcommand_name() == Some("update") => {
                 Command::IssueUpdate(
                     IssueUpdateArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("select") => {
+                Command::IssueSelect(
+                    IssueTransitionArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("claim") => {
+                Command::IssueClaim(
+                    IssueClaimArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
             }
@@ -2039,7 +2087,10 @@ fn recover_unknown_long(
     let positional_write = matches!(
         (domain, action),
         ("project", "add-issue")
-            | ("issue", "add-dependency" | "remove-dependency")
+            | (
+                "issue",
+                "add-dependency" | "remove-dependency" | "select" | "claim"
+            )
             | ("bot", "retire")
     );
     if !(named_write
@@ -2155,6 +2206,12 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 clap::Command::new("update")
                     .about("Edit an Issue with a current operator decision."),
             )))
+            .subcommand(add_leaf_options(IssueTransitionArgs::augment_args(
+                clap::Command::new("select").about("Select a backlog Issue for planning."),
+            )))
+            .subcommand(add_leaf_options(IssueClaimArgs::augment_args(
+                clap::Command::new("claim").about("Record an exclusive Claim for a ready Issue."),
+            )))
             .subcommand(add_leaf_options(IssueDependencyArgs::augment_args(
                 clap::Command::new("add-dependency").about("Add an exact Issue prerequisite."),
             )))
@@ -2171,6 +2228,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .mut_subcommand("note", extended_error_options)
                 .mut_subcommand("create", extended_error_options)
                 .mut_subcommand("update", extended_error_options)
+                .mut_subcommand("select", extended_error_options)
+                .mut_subcommand("claim", extended_error_options)
                 .mut_subcommand("add-dependency", extended_error_options)
                 .mut_subcommand("remove-dependency", extended_error_options)
         });
@@ -2187,7 +2246,7 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 args,
                 error.kind(),
                 "issue",
-                &["add-dependency", "remove-dependency"],
+                &["add-dependency", "remove-dependency", "select", "claim"],
             )
             .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "issue"))
             .unwrap_or(partial)
@@ -2195,9 +2254,11 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
     };
     let leaf = match partial.subcommand() {
         Some(("issue", issue)) => match issue.subcommand() {
-            Some(("note" | "create" | "update" | "add-dependency" | "remove-dependency", leaf)) => {
-                Some(leaf)
-            }
+            Some((
+                "note" | "create" | "update" | "select" | "claim" | "add-dependency"
+                | "remove-dependency",
+                leaf,
+            )) => Some(leaf),
             None => None,
             _ => return None,
         },
@@ -3197,6 +3258,25 @@ impl Command {
                     }
                     Ok(())
                 }
+                Self::IssueSelect(args)
+                | Self::IssueClaim(IssueClaimArgs {
+                    transition: args, ..
+                }) => {
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Issue transitions require --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Issue transitions require exact current Area and Issue scope.",
+                        );
+                    }
+                    Ok(())
+                }
                 Self::IssueDependency(args, _) => {
                     if common.workspace.is_none() || !args.target.has_all() {
                         return Err(
@@ -3310,6 +3390,8 @@ impl Command {
             | Self::IssueNote(_)
             | Self::IssueCreate(_)
             | Self::IssueUpdate(_)
+            | Self::IssueSelect(_)
+            | Self::IssueClaim(_)
             | Self::IssueDependency(_, _) => Err("Issue commands require --contract 2."),
             Self::Backup(_) => Err("Backup commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),

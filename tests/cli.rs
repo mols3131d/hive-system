@@ -4081,6 +4081,49 @@ fn issue_create_is_registered_only_in_v2_grammar() {
 }
 
 #[test]
+fn issue_transitions_are_scoped_to_v2_issue_commands() {
+    let sandbox = Sandbox::new();
+    for (action, holder) in [("select", false), ("claim", true)] {
+        for selection in [&[][..], &["--contract", "1"][..]] {
+            let help = sandbox.run(&[selection, &["issue", action, "--help"]].concat());
+            let unknown = sandbox.run(&[selection, &["issue", "unknown-leaf", "--help"]].concat());
+            assert_eq!(help.status.code(), Some(2));
+            assert_eq!(help.stdout, unknown.stdout);
+            assert_eq!(help.stderr, unknown.stderr);
+        }
+        let help = sandbox.run(&["issue", action, "--help", "--contract", "2"]);
+        assert!(help.status.success(), "{help:?}");
+        let text = String::from_utf8(help.stdout).unwrap();
+        assert!(text.contains("--if-match") && text.contains("--evidence-file"));
+        assert_eq!(text.contains("--holder"), holder);
+
+        for invalid in ["unexpected-position", "--unknown=--json"] {
+            let args = [
+                "issue",
+                action,
+                "01900000-0000-7000-8000-000000000001",
+                invalid,
+                "--contract",
+                "2",
+                "--json",
+            ];
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+            assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], format!("issue {action}"));
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        }
+
+        let root_help = sandbox.run(&["--contract", "2", "--help"]);
+        let text = String::from_utf8(root_help.stdout).unwrap();
+        assert!(!text.contains(&format!("issue-{action}")));
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn dolt_artifact_update_requires_one_explicit_body_and_revision() {
     let sandbox = Sandbox::new();
     let target = "01900000-0000-7000-8000-000000000001";

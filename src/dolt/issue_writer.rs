@@ -16,7 +16,7 @@ use super::{
     context_evidence::read_evidence_bytes,
     context_resolve::observe_time,
     context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7, issue_create,
-    issue_dependency, issue_note_receipt, issue_update,
+    issue_dependency, issue_note_receipt, issue_transition, issue_update,
     project::planning,
     read_error,
     receipt_history::{
@@ -53,6 +53,8 @@ pub(super) enum Kind {
     BotRegister,
     #[serde(rename = "bot.retire")]
     BotRetire,
+    #[serde(untagged)]
+    Transition(issue_transition::Operation),
 }
 
 impl Kind {
@@ -70,6 +72,7 @@ impl Kind {
             Self::DependencyRemove => "issue.remove-dependency",
             Self::BotRegister => bot_register::KIND,
             Self::BotRetire => bot_retire::KIND,
+            Self::Transition(operation) => operation.name(),
         }
     }
 
@@ -86,6 +89,8 @@ impl Kind {
             Self::DependencyAdd | Self::DependencyRemove => "Issue dependency",
             Self::BotRegister => "Bot register",
             Self::BotRetire => "Bot retire",
+            Self::Transition(issue_transition::Operation::Select) => "Issue select",
+            Self::Transition(issue_transition::Operation::Claim) => "Issue claim",
         }
     }
 
@@ -95,7 +100,13 @@ impl Kind {
 
     fn grants(self, area: Option<&str>) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Note => &[
+            Self::Transition(issue_transition::Operation::Claim) => &[
+                ("issues", "UPDATE"),
+                ("issue_updates", "INSERT"),
+                ("issue_claims", "INSERT"),
+                ("operation_receipts", "INSERT"),
+            ],
+            Self::Note | Self::Transition(issue_transition::Operation::Select) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
                 ("operation_receipts", "INSERT"),
@@ -212,7 +223,7 @@ pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
 
 // Version 1 has no kind field and always denotes a progress note. Version 2
 // carries an Issue kind. Version 3 carries an Artifact ID and optional Area.
-// Version 4 carries the typed Area, Project or Bot identifiers.
+// Version 4 carries a typed transition or the Area, Project or Bot identifiers.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Pending {
@@ -361,6 +372,9 @@ impl Pending {
                 None,
                 Some(_),
             ) => Ok(kind),
+            (4, Some(kind @ Kind::Transition(_)), Some(_), Some(_), None, None, None, None) => {
+                Ok(kind)
+            }
             _ => Err(uncertain()),
         }
     }
@@ -429,7 +443,7 @@ pub(super) fn execute(
             receipt_at(snapshot, request.request_id, &commit, None).map_err(|_| uncertain())?;
         mutation.verify_decision(observe_time()?)?;
         let (outcome, base, introduced, result) = if let Some(receipt) = existing {
-            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate | Kind::AreaCreate | Kind::BotRegister | Kind::BotRetire) || request.kind.is_project() || request.kind.is_dependency() {
+            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate | Kind::AreaCreate | Kind::BotRegister | Kind::BotRetire | Kind::Transition(_)) || request.kind.is_project() || request.kind.is_dependency() {
                 check_fingerprint(&receipt.fingerprint, request.fingerprint, request.kind)?;
             }
             let scoped = ScopedReceipt::read(
@@ -578,6 +592,7 @@ fn apply(
         | Kind::ProjectAddIssue
         | Kind::BotRegister
         | Kind::BotRetire) => (4, Some(kind)),
+        kind @ Kind::Transition(_) => (4, Some(kind)),
     };
     let area_scope = request.area_id.map(str::to_owned);
     let (area_id, parent_id, issue_id, artifact_id, project_id, bot_id) = match request.kind {
@@ -660,7 +675,7 @@ fn open_verified_writer(
             "SELECT GRANTEE, TABLE_NAME, PRIVILEGE_TYPE FROM information_schema.TABLE_PRIVILEGES
          WHERE TABLE_SCHEMA = 'db' AND GRANTEE = ?
          AND TABLE_NAME IN ('issues', 'issue_updates', 'workspace_counters', 'operation_receipts',
-                            'artifacts', 'artifact_areas', 'areas', 'projects', 'project_issues', 'issue_dependencies', 'bots')",
+                            'artifacts', 'artifact_areas', 'areas', 'projects', 'project_issues', 'issue_dependencies', 'bots', 'issue_claims')",
             (&grantee,),
         )
         .map_err(read_error)?;
@@ -734,6 +749,7 @@ enum ScopedReceipt {
     Dependency(Box<issue_dependency::ScopedDependency>),
     BotRegister(bot_register::RegisterResult),
     BotRetire(bot_retire::RetireResult),
+    Transition(Box<issue_transition::Record>),
 }
 
 impl ScopedReceipt {
@@ -747,6 +763,21 @@ impl ScopedReceipt {
         receipt: &HistoricalReceipt,
     ) -> Result<Self, HiveError> {
         match kind {
+            Kind::Transition(operation) => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                issue_transition::check_scope(
+                    snapshot,
+                    operation,
+                    request,
+                    area.ok_or_else(uncertain)?,
+                    record.ok_or_else(uncertain)?,
+                    actor,
+                    receipt,
+                )
+                .map(|record| Self::Transition(Box::new(record)))
+            }
             Kind::Note => issue_note_receipt::check_scope(
                 snapshot,
                 request,
@@ -880,6 +911,9 @@ impl ScopedReceipt {
             }
             Self::Update(update) => issue_update::verify_effect(snapshot, commit, receipt, &update),
             Self::Dependency(dependency) => dependency.verify_effect(snapshot, commit, receipt),
+            Self::Transition(record) => {
+                issue_transition::verify_effect(snapshot, commit, receipt, &record)
+            }
             Self::ArtifactCreate(scoped) => {
                 artifact_create::verify_effect(snapshot, commit, receipt, &scoped)
             }
@@ -1094,6 +1128,22 @@ mod tests {
         assert!(read(&value).is_err());
         value["kind"] = Value::Null;
         assert!(read(&value).is_err());
+        let mut transition = value.clone();
+        transition.as_object_mut().unwrap().remove("artifact_id");
+        transition["issue_id"] = json!("01900000-0000-7000-8000-000000000003");
+        transition["version"] = json!(4);
+        for (name, operation) in [
+            ("issue.select", issue_transition::Operation::Select),
+            ("issue.claim", issue_transition::Operation::Claim),
+        ] {
+            transition["kind"] = json!(name);
+            let marker = read(&transition).unwrap();
+            assert!(matches!(marker.operation(), Ok(Kind::Transition(kind)) if kind == operation));
+            assert_eq!(json!(marker), transition);
+        }
+        transition["kind"] = json!("issue.release");
+        assert!(read(&transition).is_err());
+
         let legacy_bytes = serde_json::to_string(&legacy).unwrap();
         let duplicate = legacy_bytes.replacen(r#""version":1"#, r#""version":1,"version":1"#, 1);
         assert!(Pending::read(duplicate.as_bytes(), "workspace", "launch").is_err());
