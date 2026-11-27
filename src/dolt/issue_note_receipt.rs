@@ -114,6 +114,7 @@ pub(super) fn verify_effect(
     introduced: &str,
     receipt: &HistoricalReceipt,
     note: &ScopedNote,
+    expected_kind: Option<&str>,
 ) -> Result<(), HiveError> {
     let result = &note.result;
     // Both literals have been validated by receipt_introduction.
@@ -159,6 +160,7 @@ pub(super) fn verify_effect(
             kind.as_str(),
             "progress" | "review" | "handoff" | "evidence" | "comment"
         )
+        || expected_kind.is_some_and(|expected| expected != kind)
         || !valid_sha256(body_sha256)
     {
         return Err(workflow::unverified());

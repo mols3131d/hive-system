@@ -78,7 +78,8 @@ pub(super) fn write(
         }
         require_clean(&mut snapshot.connection, &snapshot.commit)?;
         let commit = snapshot.commit.clone();
-        let existing = receipt_at(snapshot, &args.request_id, &commit).map_err(|_| uncertain())?;
+        let existing =
+            receipt_at(snapshot, &args.request_id, &commit, None).map_err(|_| uncertain())?;
         request.verify_decision(&decision, observe_time()?)?;
         let (outcome, base, introduced, result) = if let Some(receipt) = existing {
             let note = issue_note_receipt::check_scope(
@@ -480,7 +481,7 @@ fn confirm(
 ) -> Result<Option<(String, NoteResult)>, HiveError> {
     let head = snapshot.commit.clone();
     require_clean(&mut snapshot.connection, &head)?;
-    let Some(receipt) = receipt_at(snapshot, &marker.request_id, &head)? else {
+    let Some(receipt) = receipt_at(snapshot, &marker.request_id, &head, None)? else {
         return Ok(None);
     };
     if receipt.base_commit != marker.base_commit
@@ -512,36 +513,10 @@ fn verify_progress(
     receipt: &HistoricalReceipt,
     note: &ScopedNote,
 ) -> Result<(), HiveError> {
-    issue_note_receipt::verify_effect(snapshot, commit, receipt, note)?;
-    let notes: Vec<(String, Option<Vec<u8>>)> = snapshot.exec_rows(
-        |_| {
-            format!(
-                "SELECT kind, CASE WHEN OCTET_LENGTH(body) <= ? THEN CAST(body AS BINARY) END
-             FROM issue_updates AS OF '{commit}' WHERE CAST(id AS BINARY) = ? LIMIT 2"
-            )
-        },
-        (MAX_BODY_BYTES, &note.result.note_id),
-    )?;
-    let [(kind, Some(body))] = notes.as_slice() else {
-        return Err(uncertain());
-    };
-    let evidence = &note.evidence;
-    if kind != "progress" || evidence.claim_id.is_none() || evidence.bot_id.is_some() {
+    if note.evidence.claim_id.is_none() || note.evidence.bot_id.is_some() {
         return Err(uncertain());
     }
-    let confirmed = NoteFingerprint {
-        workspace_id: &snapshot.workspace_id,
-        area_id: &note.result.area_id,
-        issue_id: &note.result.issue_id,
-        actor_ref: &receipt.actor_ref,
-        claim_id: evidence.claim_id.as_deref(),
-        expected_issue_revision: &evidence.expected_issue_revision,
-        note_kind: kind,
-    };
-    if confirmed.with_body_digest(&digest(body)) != receipt.fingerprint {
-        return Err(uncertain());
-    }
-    Ok(())
+    issue_note_receipt::verify_effect(snapshot, commit, receipt, note, Some("progress"))
 }
 
 fn receipt_digest(receipt: &HistoricalReceipt) -> String {
