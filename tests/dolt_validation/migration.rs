@@ -987,6 +987,7 @@ fn cli_preflights_only_a_clean_pinned_v1_source() {
     fs::create_dir(source.join(".rulesync")).unwrap();
     fs::write(source.join(".rulesync/rule.md"), "Synthetic rule").unwrap();
     fs::write(source.join("rulesync.jsonc"), "{}").unwrap();
+    fs::create_dir_all(source.join(".git/info")).unwrap();
     fs::write(source.join(".git/info/exclude"), "/ignored-scratch\n").unwrap();
     fs::write(source.join("ignored-scratch"), "Ignored local bytes").unwrap();
     let current = commit_all();
