@@ -4,7 +4,9 @@ description: "Use when implementing or verifying Dolt v2 workspace layout, descr
 
 # Dolt v2 Workspace Layout and Local File Contract
 
-**Status: partially implemented.** This document specifies the Dolt v2 local filesystem layout, workspace descriptor, XDG configuration, local Area/resource bindings, canonical asset root, runtime state, and private Queen conversation storage for `#22`, `#18`, and `#20` against approved baseline `c66b3c50150e18426485d134de92c6b311dac125`. The Rust CLI supports [descriptor inspection and inactive workspace initialization](../development/README.md#dolt-workspace-descriptor-inspection). The remaining layout and lifecycle rules guide later implementation. Existing workspaces continue under their [pinned v1 contracts](README.md#v1-compatibility). Migration mapping, live migration, and an authority switch are out of scope and require separate explicit approval.
+This document specifies the Dolt v2 local filesystem layout, workspace descriptor, XDG configuration, local Area/resource bindings, canonical asset root, runtime state, and private Queen conversation storage for `#22`, `#18`, and `#20` against approved baseline `c66b3c50150e18426485d134de92c6b311dac125`. Existing workspaces continue under their [pinned v1 contracts](README.md#v1-compatibility). Migration mapping, live migration, and an authority switch are out of scope and require separate explicit approval.
+
+The Rust CLI supports [descriptor inspection](../development/README.md#dolt-workspace-descriptor-inspection), [inactive workspace initialization](../development/README.md#dolt-workspace-initialization), and [offline workspace status](#workspace-status).
 
 Read this with the [Dolt v2 architecture](dolt-redesign.md), [MVP contract](dolt-mvp-contract.md), and [relational schema](dolt-schema.md).
 
@@ -199,6 +201,23 @@ $XDG_RUNTIME_DIR/hive/v2/         # Used only when XDG_RUNTIME_DIR is absolute a
 - **Active-root verification:** Under the `workspace_id`-keyed lock, writers verify that the target canonical `workspace_root` matches `active-root.json` and `db/` `workspace_meta.workspace_id`. A restored copy at a different path remains inactive until explicitly promoted after verifying the old authority stopped and preserving final history.
 - **Pending-request marker:** Contains only `workspace_id`, `request_id`, `base_commit`, payload `fingerprint`, and bounded server/connection identity. Reconcile before any replay or new write.
 - Keep runtime state and local config outside `db/`, `assets/` and backup manifests. Obtain credentials through the explicitly selected machine-local runtime mechanism. Preserve the existing environment-based reader credentials for validation.
+
+#### Workspace status
+
+`hive --contract 2 --json workspace status [--workspace PATH]` uses the descriptor selector with explicit workspace, applicable local binding, user configuration, and XDG candidate precedence. It opens the versioned state directory and selected UUID directory without following symlinks. Missing state is valid. Status reports the descriptor UUID, canonical root, selection source, policy pin, and storage schema version. It makes no network connection by default.
+
+Status consumes two strict UTF-8 JSON records, each bounded to 64 KiB, with integer `version: 2` and no extra or duplicate fields. Future lifecycle commands can share this representation.
+
+| Record | Required fields in addition to `version` |
+| --- | --- |
+| `active-root.json` | `workspace_id` (canonical lowercase UUID used for both descriptor and committed DB identity), `workspace_root` (exact canonical absolute path string) |
+| `server.json` | The same `workspace_id` and `workspace_root`, positive integer `pid`, Linux boot UUID `boot_id`, positive integer `start_ticks` (field 22 of `/proc/<pid>/stat`), per-launch canonical lowercase UUID `nonce`, and `endpoint` with an integer TCP `port` (1–65535) and explicit Dolt `database` name |
+
+The server record requires a matching registration. Its endpoint denotes TCP on `127.0.0.1`. Registration matching establishes agreement with local configuration. On Linux, `pid_start_verified` establishes matching boot, PID and process start ticks for a live process in the caller's procfs view. Without readable process evidence the process remains `recorded`. A different root or UUID, stale boot or process start, or a dead or missing recorded PID fails closed. The nonce is a launch record identifier.
+
+Supply all of `--workspace-id UUID --database NAME --port PORT` to inspect committed identity using the existing SELECT-only reader and `HIVE_DOLT_USER` and `HIVE_DOLT_PASSWORD`. The expected UUID must match the descriptor, and the target must match the recorded endpoint when one exists. A successful read verifies the selected database, Dolt version, committed main snapshot, supported schema, and workspace UUID. With a server record it upgrades the endpoint observation to `committed_identity_verified`. This verifies the SQL identity returned through the endpoint. Binding that endpoint to the recorded process and on-disk root requires further evidence. Status reports endpoint ownership as `unverified` and operational state as `unknown`.
+
+A safely readable `pending-request.json` is enough to report `recovery_required`, even if its contents are incomplete. Status does not interpret its payload. Status observes files without taking the writer lock, so lifecycle commands must reverify under that lock. These observations grant no mutation authority and provide no evidence about worker execution, claims or stop.
 
 ## Private Queen conversation file contract
 

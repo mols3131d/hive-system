@@ -7,6 +7,7 @@ mod dolt;
 mod error;
 mod output;
 mod workspace_init;
+mod workspace_status;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -95,6 +96,13 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let format = invocation.common.format.unwrap_or_default();
     if let Command::Workspace(WorkspaceCommand::Init { target }) = &invocation.command {
         return match workspace_init::run(target) {
+            Ok(data) => output::success(Contract::V2, format, name, None, &data),
+            Err(error) => output::failure(Contract::V2, format, Some(name), None, error),
+        };
+    }
+    if let Command::Workspace(WorkspaceCommand::Status(target)) = &invocation.command {
+        let (format, result) = workspace_status::observe(&invocation.common, target);
+        return match result {
             Ok(data) => output::success(Contract::V2, format, name, None, &data),
             Err(error) => output::failure(Contract::V2, format, Some(name), None, error),
         };
