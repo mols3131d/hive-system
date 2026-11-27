@@ -195,7 +195,14 @@ mod unix {
             Err(error) if matches!(error.code, ErrorCode::NotFound) => return Ok(None),
             Err(error) => return Err(error),
         };
-        if state.path.starts_with(root) {
+        // The XDG base can be an ancestor of the selected workspace while
+        // the directory that holds this UUID's lock is inside the workspace.
+        if state
+            .path
+            .join("workspaces")
+            .join(workspace_id)
+            .starts_with(root)
+        {
             return Err(invalid(
                 "The v2 state directory must be outside the selected workspace.",
             ));

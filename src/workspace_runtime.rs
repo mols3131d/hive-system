@@ -167,15 +167,7 @@ fn start(
             .sync_all()
             .map_err(io_error)?;
         sync(&run)?;
-        // Install a durable refusal before spawning. A killed CLI must never
-        // leave a launch that a subsequent CLI interprets as stopped.
-        write_new(state, "starting", nonce.as_bytes())?;
-        sync(state)?;
-        let actual = ScopedDirectory::open_absolute(&db.path)?;
-        if actual.file_identity()? != db.file_identity()? {
-            return Err(unverified("The selected database path changed."));
-        }
-        Ok(())
+        record_launch_intent(state, &run, db, &nonce)
     };
     if let Err(error) = prepare() {
         if !state.contains(c"starting")? {
@@ -229,7 +221,7 @@ fn start(
             }
             thread::sleep(RETRY);
         }
-        let identity = verify(&server, &run, noms, &handle)?;
+        let identity = verify(&server, state, &run, noms, &handle)?;
         let bytes = serde_json::to_vec(&server)
             .map_err(|_| unavailable("Could not encode the server record."))?;
         write_new(&run, "server.json", &bytes)?;
@@ -280,7 +272,7 @@ fn stop(
     require_private_dir(&run)?;
     // Acquire a kernel process handle before checking mutable procfs entries.
     let handle = pidfd(server.pid)?;
-    verify(server, &run, noms, &handle)?;
+    verify(server, state, &run, noms, &handle)?;
     send_signal(&handle, libc::SIGTERM)?;
     if !exited(&handle, WAIT)? {
         return Err(unavailable(
@@ -301,6 +293,7 @@ fn stop(
 
 fn verify(
     server: &Server,
+    state: &ScopedDirectory,
     run: &ScopedDirectory,
     noms: &ScopedDirectory,
     handle: &OwnedFd,
@@ -308,6 +301,7 @@ fn verify(
     let proc = proc_dir(server.pid);
     let root = Path::new(&server.workspace_root).join(DATABASE);
     let check = || -> Result<(), HiveError> {
+        verify_pidfd(handle, server.pid)?;
         if exited(handle, Duration::ZERO)? || process_evidence(server)? != "pid_start_verified" {
             return Err(unverified(
                 "The recorded Dolt process identity is unavailable.",
@@ -318,11 +312,12 @@ fn verify(
         let binary_id = read_private(run, "binary-id")?;
         let cmdline = fs::read(proc.join("cmdline")).map_err(io_error)?;
         let args = server_args(&root, &run.path, server.endpoint.port);
-        let selected_store = ScopedDirectory::open_absolute(&noms.path)?;
+        for dir in [state, run, noms] {
+            require_current_directory(dir)?;
+        }
         let actual = cmdline.strip_suffix(&[0]).unwrap_or(&cmdline);
         if (cwd.dev(), cwd.ino()) != run.file_identity()?
             || binary_id != format!("{}:{}", exe.dev(), exe.ino())
-            || selected_store.file_identity()? != noms.file_identity()?
             || !actual
                 .split(|byte| *byte == 0)
                 .skip(1)
@@ -427,7 +422,32 @@ fn pidfd(pid: i32) -> Result<OwnedFd, HiveError> {
         return Err(unavailable("Could not acquire a Linux process handle."));
     }
     // SAFETY: successful pidfd_open returned a new owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+    let handle = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    verify_pidfd(&handle, pid)?;
+    Ok(handle)
+}
+
+fn verify_pidfd(handle: &OwnedFd, pid: i32) -> Result<(), HiveError> {
+    // The kernel translates Pid to this procfs mount's PID namespace.
+    // Match that view before trusting evidence from /proc/<pid>.
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", handle.as_raw_fd()))
+        .map_err(|_| unverified("The pidfd's procfs identity is unavailable."))?;
+    if !pidfd_matches(&info, pid) {
+        return Err(unverified(
+            "The pidfd does not identify the selected PID in procfs.",
+        ));
+    }
+    Ok(())
+}
+
+fn pidfd_matches(info: &str, pid: i32) -> bool {
+    let mut fields = info.lines().filter_map(|line| line.strip_prefix("Pid:"));
+    pid > 0
+        && fields
+            .next()
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            == Some(pid)
+        && fields.next().is_none()
 }
 
 fn send_signal(handle: &OwnedFd, signal: i32) -> Result<(), HiveError> {
@@ -677,11 +697,31 @@ fn sync(directory: &ScopedDirectory) -> Result<(), HiveError> {
 
 fn remove_run(run: &ScopedDirectory) -> Result<(), HiveError> {
     // Only remove the exact child we opened beneath the private state directory.
-    let current = ScopedDirectory::open_absolute(&run.path)?;
-    if current.file_identity()? != run.file_identity()? {
-        return Err(unverified("The private launch directory changed."));
-    }
+    require_current_directory(run)?;
     fs::remove_dir_all(&run.path).map_err(io_error)
+}
+
+fn require_current_directory(directory: &ScopedDirectory) -> Result<(), HiveError> {
+    let current = ScopedDirectory::open_absolute(&directory.path)
+        .map_err(|_| unverified("A canonical runtime directory is unavailable."))?;
+    if current.file_identity()? != directory.file_identity()? {
+        return Err(unverified("A canonical runtime directory changed."));
+    }
+    Ok(())
+}
+
+fn record_launch_intent(
+    state: &ScopedDirectory,
+    run: &ScopedDirectory,
+    db: &ScopedDirectory,
+    nonce: &str,
+) -> Result<(), HiveError> {
+    for directory in [state, run, db] {
+        require_current_directory(directory)?;
+    }
+    // A killed CLI must leave durable evidence before it can spawn Dolt.
+    write_new(state, "starting", nonce.as_bytes())?;
+    sync(state)
 }
 
 fn clear_intent(state: &ScopedDirectory, run: &ScopedDirectory) -> Result<(), HiveError> {
@@ -745,4 +785,57 @@ fn io_error(error: io::Error) -> HiveError {
         ErrorCode::IoError,
         format!("Workspace runtime I/O failed ({:?}).", error.kind()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pidfd_requires_one_matching_positive_procfs_pid() {
+        assert!(pidfd_matches("pos:\t0\nPid:\t123\nNSpid:\t123\t45\n", 123));
+        for info in [
+            "Pid:\t45\nNSpid:\t45\t123\n",
+            "NSpid:\t123\n",
+            "Pid:\t0\n",
+            "Pid:\t-1\n",
+            "Pid:\tabc\n",
+            "Pid:\t123\nPid:\t123\n",
+        ] {
+            assert!(!pidfd_matches(info, 123), "{info:?}");
+        }
+        assert!(!pidfd_matches("Pid:\t0\n", 0));
+    }
+
+    #[test]
+    fn replaced_database_directory_refuses_launch_before_recording_intent() {
+        let nonce = token().unwrap();
+        let root = std::env::temp_dir().join(format!("hive-runtime-{nonce}"));
+        let db_path = root.join("db");
+        let state_path = root.join("state");
+        fs::create_dir_all(&db_path).unwrap();
+        fs::create_dir(&state_path).unwrap();
+        let db = ScopedDirectory::open_absolute(&db_path).unwrap();
+        let state = ScopedDirectory::open_absolute(&state_path).unwrap();
+        let run = create_run(&state, &nonce).unwrap();
+
+        fs::rename(&db_path, root.join("moved")).unwrap();
+        fs::create_dir(&db_path).unwrap();
+        let refused = record_launch_intent(&state, &run, &db, &nonce);
+        let marker_exists = state.contains(c"starting").unwrap();
+
+        fs::remove_dir(&db_path).unwrap();
+        fs::rename(root.join("moved"), &db_path).unwrap();
+        let accepted = record_launch_intent(&state, &run, &db, &nonce);
+        let intent = state.read(OsStr::new("starting")).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(matches!(
+            refused.unwrap_err().code,
+            ErrorCode::AuthorityUnverified
+        ));
+        assert!(!marker_exists);
+        accepted.unwrap();
+        assert_eq!(intent.as_deref(), Some(nonce.as_bytes()));
+    }
 }
