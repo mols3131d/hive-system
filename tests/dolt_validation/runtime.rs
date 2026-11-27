@@ -1413,6 +1413,43 @@ fn issue_note_writer_fixture(
         fs::remove_file(&marker).unwrap();
         run(&start, 0);
     }
+
+    let receipt_ddl = include_str!("../../assets/schema/dolt/0001_initial.sql")
+        .split("CREATE TABLE operation_receipts")
+        .nth(1)
+        .unwrap()
+        .split_once(';')
+        .unwrap()
+        .0;
+    restart(
+        Some(&format!(
+            "DROP TABLE operation_receipts;
+             CALL DOLT_ADD('.');
+             CALL DOLT_COMMIT('-m', 'Synthetic receipt table removal');
+             CREATE TABLE operation_receipts{receipt_ddl};"
+        )),
+        None,
+    );
+    let mut reader = connect("reader");
+    let new_base = storage_state(&mut reader);
+    let introduced = written["data"]["confirmed_commit"].as_str().unwrap();
+    let old_count: u64 = reader
+        .exec_first(
+            format!(
+                "SELECT COUNT(*) FROM operation_receipts AS OF '{introduced}' WHERE request_id = ?"
+            ),
+            (id(60),),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(old_count, 1);
+    let before = effect(&mut reader);
+    assert_eq!(before.0, 0);
+    let incomplete = note(&id(60), "fixture-holder", current_revision, body, 8);
+    assert_eq!(incomplete["error"]["code"], "COMMIT_UNCERTAIN");
+    assert_eq!(storage_state(&mut reader), new_base);
+    assert_eq!(effect(&mut reader), before);
+    assert!(!marker.exists());
 }
 
 #[cfg(target_os = "linux")]

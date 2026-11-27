@@ -146,7 +146,7 @@ fn receipt_changes(snapshot: &mut Snapshot, request_id: &str) -> Result<Vec<Delt
     if !is_uuid(request_id) {
         return Err(invalid_record("The receipt request ID is malformed."));
     }
-    snapshot.exec_rows(
+    let changes = snapshot.exec_rows(
         |commit| {
             format!(
                 "SELECT from_commit, to_commit, diff_type, from_request_id, to_request_id
@@ -155,7 +155,20 @@ fn receipt_changes(snapshot: &mut Snapshot, request_id: &str) -> Result<Vec<Delt
             )
         },
         (request_id, request_id),
-    )
+    )?;
+    // Dolt can end an otherwise successful diff at a historical schema
+    // boundary. Check diagnostics before another query changes the session.
+    if snapshot
+        .connection
+        .query_first::<mysql::Row, _>("SHOW WARNINGS LIMIT 1")
+        .map_err(super::read_error)?
+        .is_some()
+    {
+        return Err(invalid_record(
+            "Retained receipt history could not be verified.",
+        ));
+    }
+    Ok(changes)
 }
 
 pub(super) fn valid_sha256(value: &str) -> bool {
