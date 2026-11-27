@@ -139,7 +139,19 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
             cursor,
             ..
         }) => dolt::bot::list(&target, status.as_deref(), page.limit, cursor.as_deref()),
-        Command::Bot(BotCommand::Show { target, bot_id }) => dolt::bot::show(&target, &bot_id),
+        Command::Bot(BotCommand::Show {
+            target,
+            bot_id,
+            asset_commit,
+        }) => dolt::bot::show(
+            &target,
+            &bot_id,
+            invocation
+                .common
+                .workspace
+                .as_deref()
+                .zip(asset_commit.as_deref()),
+        ),
         Command::Directive(DirectiveCommand::List {
             selection,
             status,
