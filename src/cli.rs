@@ -2009,7 +2009,10 @@ fn requested_format(root: Option<&ArgMatches>, leaf: Option<&ArgMatches>) -> For
                 .flatten()
                 .is_some_and(|mut values| values.any(|value| *value == Format::Json))
     };
-    if root.into_iter().chain(leaf).any(requested_json) {
+    if root.into_iter().chain(leaf).any(requested_json)
+        || (context_resolve_parent(root).is_some_and(requested_json)
+            && requested_contract(root, leaf) == Contract::V2)
+    {
         Format::Json
     } else {
         Format::Text
@@ -2019,11 +2022,20 @@ fn requested_format(root: Option<&ArgMatches>, leaf: Option<&ArgMatches>) -> For
 fn requested_contract(root: Option<&ArgMatches>, leaf: Option<&ArgMatches>) -> Contract {
     root.into_iter()
         .chain(leaf)
+        .chain(context_resolve_parent(root))
         .filter_map(|args| args.try_get_many::<Contract>("contract").ok().flatten())
         .flatten()
         .copied()
         .next()
         .unwrap_or_default()
+}
+
+// These options are still forbidden here. Read them for the v2 error envelope.
+fn context_resolve_parent(root: Option<&ArgMatches>) -> Option<&ArgMatches> {
+    let ("context", parent) = root?.subcommand()? else {
+        return None;
+    };
+    matches!(parent.subcommand(), Some(("resolve", _))).then_some(parent)
 }
 
 fn safe_parse_message(kind: ErrorKind) -> &'static str {

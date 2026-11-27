@@ -184,6 +184,60 @@ fn explicit_dolt_validation_refuses_ambiguous_selection_without_touching_config(
 }
 
 #[test]
+fn context_resolve_rejects_parent_options_with_the_requested_v2_envelope() {
+    let sandbox = Sandbox::new();
+    for args in [
+        &["context", "--contract", "2", "resolve", "--json"][..],
+        &["--contract", "2", "context", "--json", "resolve"],
+        &["context", "--contract=2", "--format=json", "resolve"],
+        &[
+            "--json",
+            "context",
+            "--workspace=fixture",
+            "resolve",
+            "--contract=2",
+        ],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            serde_json::json!({
+                "schema_version": 2,
+                "ok": false,
+                "command": "context resolve",
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "Supply common options before context or after resolve.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+
+    for args in [
+        &["--contract=2", "context", "--workspace=--json", "resolve"][..],
+        &["--contract=2", "context", "resolve", "--", "--json"],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+
+    for args in [
+        &["--json", "context", "--workspace=--contract=2", "resolve"][..],
+        &["--json", "context", "resolve", "--", "--contract=2"],
+        &["--json", "context", "--contract=1", "resolve"],
+    ] {
+        assert_json_failure(&sandbox.run(args), args, "context", "INVALID_ARGUMENT", 2);
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn malformed_dolt_port_preserves_the_explicit_contract_and_format() {
     let sandbox = Sandbox::new();
     let target = [

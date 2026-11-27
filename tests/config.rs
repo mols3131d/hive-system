@@ -2443,6 +2443,7 @@ fn context_resolve_accepts_only_bounded_exact_evidence_inputs() {
         let report: Value = serde_json::from_slice(&output.stdout)
             .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&output.stderr)));
         assert_eq!(output.status.code(), Some(exit), "{report}");
+        assert!(output.stderr.is_empty(), "{args:?}");
         assert_eq!(report["command"], "context resolve");
         assert_eq!(report["schema_version"], 2);
         assert_eq!(report["error"]["code"], code);
@@ -2550,14 +2551,53 @@ fn context_resolve_accepts_only_bounded_exact_evidence_inputs() {
         let report = expect(&selected, exit, code);
         assert!(!report.to_string().contains("synthetic-private"));
     }
-    write(
-        &path,
-        valid.to_string().replace(
-            "\"kind\":\"artifact\"",
-            "\"kind\":\"artifact\",\"kind\":\"artifact\"",
+    for (object, replacements, message) in [
+        (
+            &receipt,
+            [
+                serde_json::json!([area, invocation]).to_string(),
+                format!(
+                    r#"{{"directive_id":"{area}","directive_id":"{area}","request_id":"{invocation}"}}"#
+                ),
+                format!(
+                    r#"{{"directive_id":"{area}","request_id":"{invocation}","synthetic-private":true}}"#
+                ),
+            ],
+            "The context evidence file is not a valid versioned JSON object.",
         ),
-    );
-    expect(&selected, 2, "INVALID_ARGUMENT");
+        (
+            &declaration["record"],
+            [
+                serde_json::json!(["artifact", artifact, "artifact-r1"]).to_string(),
+                format!(
+                    r#"{{"kind":"artifact","kind":"artifact","id":"{artifact}","revision":"artifact-r1"}}"#
+                ),
+                format!(
+                    r#"{{"kind":"artifact","id":"{artifact}","revision":"artifact-r1","synthetic-private":true}}"#
+                ),
+            ],
+            "The workflow read declaration is malformed.",
+        ),
+    ] {
+        for replacement in replacements {
+            write(
+                &path,
+                valid.to_string().replace(&object.to_string(), &replacement),
+            );
+            let report = expect(&selected, 2, "INVALID_ARGUMENT");
+            assert_eq!(
+                report,
+                serde_json::json!({
+                    "schema_version": 2,
+                    "ok": false,
+                    "command": "context resolve",
+                    "context": {"policy_revision": pin},
+                    "error": {"code": "INVALID_ARGUMENT", "message": message},
+                    "warnings": [],
+                })
+            );
+        }
+    }
 
     for content in [
         "{\"version\":1,\"version\":1}",

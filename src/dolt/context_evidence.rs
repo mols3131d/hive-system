@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Component, Path};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 
 use super::context_workflow::{
@@ -23,7 +23,7 @@ pub(super) const MAX_DIRECTIVE_RECEIPTS: usize = 100;
 #[serde(deny_unknown_fields)]
 pub(super) struct EvidenceFile {
     version: u8,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_receipts")]
     directive_receipts: Vec<DirectiveReceipt>,
     handoff: Option<Box<RawValue>>,
     #[serde(default)]
@@ -35,6 +35,15 @@ pub(super) struct EvidenceFile {
 struct DirectiveReceipt {
     directive_id: String,
     request_id: String,
+}
+
+fn deserialize_receipts<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<DirectiveReceipt>, D::Error> {
+    Vec::<&RawValue>::deserialize(deserializer)?
+        .into_iter()
+        .map(workflow::parse_json_object)
+        .collect()
 }
 
 pub(super) struct Selection<'a> {

@@ -2,7 +2,8 @@
 //! identify a fresh operator request or re-resolve the selected host source on
 //! each invocation. Receipt JSON and cached sources are historical inputs.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
+use serde_json::value::RawValue;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::dolt::{is_commit_hash, is_uuid, is_uuid_v7};
@@ -48,12 +49,27 @@ pub(super) struct Declaration {
     pub(super) area_id: String,
     pub(super) issue_id: String,
     operations: Vec<Operation>,
+    #[serde(deserialize_with = "deserialize_record")]
     pub(super) record: ExactRecord,
     invocation_id: String,
     db_commit: String,
     valid_from: String,
     expires_at: String,
     withdrawn: bool,
+}
+
+fn deserialize_record<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ExactRecord, D::Error> {
+    parse_json_object(<&RawValue>::deserialize(deserializer)?)
+}
+
+pub(super) fn parse_json_object<'de, T: Deserialize<'de>, E: de::Error>(
+    value: &'de RawValue,
+) -> Result<T, E> {
+    if !value.get().trim_start().starts_with('{') {
+        return Err(E::custom("Expected a JSON object."));
+    }
+    // Parse the original JSON so the derived types still reject duplicate and unknown keys.
+    serde_json::from_str(value.get()).map_err(E::custom)
 }
 
 #[cfg(test)]
