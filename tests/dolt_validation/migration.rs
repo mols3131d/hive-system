@@ -5,7 +5,8 @@ use std::process::{Command, Stdio};
 
 use mysql::Conn;
 use mysql::prelude::Queryable;
-use serde_json::Value;
+use serde::Serialize;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{ADMIN, Fixture, id, storage_state};
@@ -22,12 +23,52 @@ const DIRECTIVE_V2: u32 = 0x402;
 const ARTIFACT_REPORT: u32 = 0x501;
 const BOT_QUEEN: u32 = 0x601;
 
-// Explicit synthetic manifest mapping supplying reviewed author_ref for positive artifacts only.
-// Artifacts absent from this map (even if prose mentions a name) are held as incomplete_historical_provenance.
-const REVIEWED_ARTIFACT_AUTHORS: &[(&str, &str)] = &[(
-    "tasks/synth-app/backlog/implement-widget/artifacts/design-note.md",
-    "synthetic-author",
-)];
+// The synthetic operator's reviewed selection for the pinned fixture snapshot.
+struct FixtureManifest<'a> {
+    source_commit: &'a str,
+    external_scope: &'static str,
+    external_backend: &'static str,
+    scopes: BTreeMap<&'static str, (u32, &'static str, &'static str)>,
+    area_resource: (u32, u32),
+    project_issue: (u32, u32),
+    issue_resource: (u32, u32),
+    artifact_issue: (u32, u32),
+    artifact_area: (u32, u32),
+    artifact_authors: &'static [(&'static str, &'static str)],
+}
+
+impl<'a> FixtureManifest<'a> {
+    fn reviewed(source_commit: &'a str) -> Self {
+        Self {
+            source_commit,
+            external_scope: "tasks/external-team/README.md",
+            external_backend: "notion",
+            scopes: BTreeMap::from([
+                ("_general", (AREA_GENERAL, "general", "General")),
+                (
+                    "_hive-userdata",
+                    (AREA_USERDATA, "hive-userdata", "Workspace Operations"),
+                ),
+                ("synth-app", (AREA_APP, "synth-app", "Synthetic App")),
+            ]),
+            area_resource: (AREA_APP, RESOURCE_REPO),
+            project_issue: (PROJECT_RELEASE, 0x112),
+            issue_resource: (0x112, RESOURCE_REPO),
+            artifact_issue: (ARTIFACT_REPORT, 0x112),
+            artifact_area: (ARTIFACT_REPORT, AREA_APP),
+            artifact_authors: &[(
+                "tasks/synth-app/backlog/implement-widget/artifacts/design-note.md",
+                "synthetic-author",
+            )],
+        }
+    }
+
+    fn artifact_author(&self, path: &str) -> Option<&'static str> {
+        self.artifact_authors
+            .iter()
+            .find_map(|(entry_path, author)| (*entry_path == path).then_some(*author))
+    }
+}
 
 // Compact synthetic v1 workspace fixture conforming to pinned frontmatter (0e58483).
 // Intentionally deficient records are marked in comments and descriptions.
@@ -128,6 +169,129 @@ const SYNTHETIC_V1_FILES: &[(&str, &str)] = &[
     ),
 ];
 
+#[derive(Clone, Copy)]
+enum Disposition {
+    Imported,
+    Held,
+    Excluded,
+}
+
+use Disposition::{Excluded, Held, Imported};
+
+// Declare every path in the fixed source tree, including non-record files.
+const FIXTURE_INVENTORY: &[(&str, &str, Disposition)] = &[
+    ("AGENTS.md", "policy_metadata", Excluded),
+    ("hive.yml", "policy_metadata", Excluded),
+    ("tasks/_general/README.md", "scopes", Imported),
+    ("tasks/_hive-userdata/README.md", "scopes", Imported),
+    ("tasks/synth-app/README.md", "scopes", Imported),
+    ("tasks/_hive/README.md", "scopes", Held),
+    (
+        "tasks/synth-app/backlog/implement-widget/README.md",
+        "tasks",
+        Imported,
+    ),
+    (
+        "tasks/_general/archive/close-checklist/README.md",
+        "tasks",
+        Imported,
+    ),
+    (
+        "tasks/_hive-userdata/active/unproven-done/README.md",
+        "tasks",
+        Held,
+    ),
+    ("directives/README.md", "directives", Excluded),
+    ("directives/synth-app/README.md", "directives", Excluded),
+    ("directives/synth-app/v1-rule.md", "directives", Imported),
+    ("directives/synth-app/v2-rule.md", "directives", Imported),
+    (
+        "directives/_hive-userdata/unapproved-active.md",
+        "directives",
+        Held,
+    ),
+    (
+        "tasks/synth-app/backlog/implement-widget/artifacts/design-note.md",
+        "artifacts_work_scoped",
+        Imported,
+    ),
+    (
+        "artifacts/unclassified-note.md",
+        "artifacts_standalone",
+        Held,
+    ),
+    ("artifacts/no-author-note.md", "artifacts_standalone", Held),
+    ("bots/queen-synth/SOUL.md", "bots_soul", Imported),
+    ("bots/queen-synth/README.md", "bots_soul", Excluded),
+    ("bots/queen-synth/MEMORY.md", "navigation_only", Excluded),
+    (
+        "bots/queen-synth/memory/_general/MEMORY.md",
+        "bot_memories_historical",
+        Held,
+    ),
+    (
+        "bots/queen-synth/memory/synth-app/architecture.md",
+        "bot_memories_historical",
+        Held,
+    ),
+];
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+struct SurfaceCounts {
+    inventoried: usize,
+    imported: usize,
+    held: usize,
+    excluded_non_record: usize,
+}
+
+fn inventory_counts(
+    tree: &[u8],
+    manifest: &FixtureManifest<'_>,
+    holds: &BTreeMap<&str, &str>,
+) -> Result<BTreeMap<&'static str, SurfaceCounts>, String> {
+    let mut remaining: BTreeMap<_, _> = FIXTURE_INVENTORY
+        .iter()
+        .map(|&(path, surface, disposition)| (path, (surface, disposition)))
+        .collect();
+    assert_eq!(remaining.len(), FIXTURE_INVENTORY.len());
+    assert_eq!(manifest.external_backend, "notion");
+    assert!(
+        remaining
+            .insert(manifest.external_scope, ("scopes", Excluded))
+            .is_none()
+    );
+
+    let mut counts = BTreeMap::<_, SurfaceCounts>::new();
+    let mut held_paths = 0;
+    for path in tree
+        .split(|&byte| byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = std::str::from_utf8(path).unwrap();
+        let (surface, disposition) = remaining
+            .remove(path)
+            .ok_or_else(|| format!("unexpected fixture path: {path}"))?;
+        if holds.contains_key(path) != matches!(disposition, Held) {
+            return Err(format!("fixture hold disposition changed: {path}"));
+        }
+        let surface = counts.entry(surface).or_default();
+        surface.inventoried += 1;
+        match disposition {
+            Imported => surface.imported += 1,
+            Held => {
+                surface.held += 1;
+                held_paths += 1;
+            }
+            Excluded => surface.excluded_non_record += 1,
+        }
+    }
+    if !remaining.is_empty() {
+        return Err(format!("missing fixture paths: {:?}", remaining.keys()));
+    }
+    assert_eq!(held_paths, holds.len());
+    Ok(counts)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct FixtureProjection {
     source_commit: String,
@@ -135,8 +299,7 @@ struct FixtureProjection {
     hive_yml_version: String,
     hive_yml_mode: String,
     issue_number_next_value: u64,
-    // (inventoried, imported, held, excluded_non_record) per surface.
-    counts: BTreeMap<&'static str, (usize, usize, usize, usize)>,
+    counts: BTreeMap<&'static str, SurfaceCounts>,
     // (source_path, reason_code) sorted deterministically.
     holds: BTreeMap<&'static str, &'static str>,
     // target_id -> (source_raw_sha256, target_body_sha256)
@@ -147,6 +310,18 @@ struct FixtureProjection {
     artifact_author: String,
     soul_bytes: Vec<u8>,
     reversed_supersedes_id: String,
+}
+
+impl FixtureProjection {
+    fn redacted_evidence(&self) -> Value {
+        json!({
+            "source_commit": self.source_commit,
+            "policy_pin": self.policy_pin,
+            "counts": self.counts,
+            "holds": self.holds,
+            "hashes": self.hashes,
+        })
+    }
 }
 
 fn git(repo: &Path, home: &Path, args: &[&str]) -> Vec<u8> {
@@ -213,18 +388,18 @@ fn field<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
         .find_map(|line| line.trim_start().strip_prefix(prefix).map(str::trim))
 }
 
-fn reviewed_artifact_author(path: &str) -> Option<&'static str> {
-    REVIEWED_ARTIFACT_AUTHORS
-        .iter()
-        .find_map(|(entry_path, author)| (*entry_path == path).then_some(*author))
-}
-
-// Fixture-only projection over one pinned v1 commit; not a general importer.
+// Fixture-only projection over one pinned v1 commit.
 fn project_fixture_snapshot(
     source_repo: &Path,
     home: &Path,
-    source_commit: &str,
+    manifest: &FixtureManifest<'_>,
 ) -> FixtureProjection {
+    let source_commit = manifest.source_commit;
+    let tree = git(
+        source_repo,
+        home,
+        &["ls-tree", "-r", "-z", "--name-only", source_commit],
+    );
     assert!(
         git(
             source_repo,
@@ -256,10 +431,9 @@ fn project_fixture_snapshot(
     let mut holds = BTreeMap::new();
     let mut hashes = BTreeMap::new();
 
-    // Chosen fixture/manifest dispositions: unsplit _hive held, external Notion excluded.
+    // The unsplit legacy scope requires reconciliation.
     let _ = show("tasks/_hive/README.md");
     holds.insert("tasks/_hive/README.md", "unsplit_legacy_scope");
-    let _ = show("tasks/external-team/README.md");
 
     // Tasks sorted deterministically by qualified (scope, work_id):
     // 1: (_general, close-checklist), 2: (synth-app, implement-widget); held task consumes no number.
@@ -296,8 +470,6 @@ fn project_fixture_snapshot(
     }
 
     // Directives: navigation READMEs excluded; replacement and approval derived from body fields.
-    let _ = show("directives/README.md");
-    let _ = show("directives/synth-app/README.md");
     let d1_raw = show("directives/synth-app/v1-rule.md");
     let (d1_fm, d1_body) = split_doc(&d1_raw);
     let d2_raw = show("directives/synth-app/v2-rule.md");
@@ -336,7 +508,8 @@ fn project_fixture_snapshot(
     let art_raw = show(art_path);
     let (art_fm, art_body) = split_doc(&art_raw);
     assert_eq!(field(art_fm, "kind:"), Some("report"));
-    let artifact_author = reviewed_artifact_author(art_path)
+    let artifact_author = manifest
+        .artifact_author(art_path)
         .expect("positive artifact must have reviewed manifest author_ref")
         .to_owned();
     hashes.insert(
@@ -358,7 +531,7 @@ fn project_fixture_snapshot(
         field(split_doc(&no_author_raw).0, "kind:"),
         Some("research")
     );
-    if reviewed_artifact_author(no_author_path).is_none() {
+    if manifest.artifact_author(no_author_path).is_none() {
         holds.insert(no_author_path, "incomplete_historical_provenance");
     }
 
@@ -366,8 +539,6 @@ fn project_fixture_snapshot(
     let soul_bytes = show("bots/queen-synth/SOUL.md");
     let soul_sha = sha256_hex(&soul_bytes);
     hashes.insert(id(BOT_QUEEN), (soul_sha.clone(), soul_sha));
-    let _ = show("bots/queen-synth/README.md");
-    let _ = show("bots/queen-synth/MEMORY.md");
     for memory_path in [
         "bots/queen-synth/memory/_general/MEMORY.md",
         "bots/queen-synth/memory/synth-app/architecture.md",
@@ -376,15 +547,7 @@ fn project_fixture_snapshot(
         holds.insert(memory_path, "curated_memory_deferred");
     }
 
-    let counts = BTreeMap::from([
-        ("scopes", (5, 3, 1, 1)),
-        ("tasks", (3, 2, 1, 0)),
-        ("directives", (5, 2, 1, 2)),
-        ("artifacts_work_scoped", (1, 1, 0, 0)),
-        ("artifacts_standalone", (2, 0, 2, 0)),
-        ("bots_soul", (2, 1, 0, 1)),
-        ("bot_memories_historical", (3, 0, 2, 1)),
-    ]);
+    let counts = inventory_counts(&tree, manifest, &holds).unwrap();
 
     FixtureProjection {
         source_commit: source_commit.to_owned(),
@@ -404,37 +567,36 @@ fn project_fixture_snapshot(
     }
 }
 
-fn apply_fixture_sql(admin: &mut Conn, p: &FixtureProjection) {
+fn apply_fixture_sql(admin: &mut Conn, p: &FixtureProjection, manifest: &FixtureManifest<'_>) {
     let rev = id(REVISION);
-    for (area_id, slug, name) in [
-        (id(AREA_GENERAL), "general", "General"),
-        (id(AREA_USERDATA), "hive-userdata", "Workspace Operations"),
-        (id(AREA_APP), "synth-app", "Synthetic App"),
-    ] {
+    assert_eq!(p.source_commit, manifest.source_commit);
+    let app_area = manifest.scopes["synth-app"].0;
+    let general_area = manifest.scopes["_general"].0;
+    for &(area_id, slug, name) in manifest.scopes.values() {
         admin
             .exec_drop(
                 "INSERT INTO areas (id, slug, name, revision) VALUES (?, ?, ?, ?)",
-                (area_id, slug, name, &rev),
+                (id(area_id), slug, name, &rev),
             )
             .unwrap();
     }
     admin
         .exec_drop(
             "INSERT INTO projects (id, name, status, revision) VALUES (?, 'Synthetic Release', 'active', ?)",
-            (id(PROJECT_RELEASE), &rev),
+            (id(manifest.project_issue.0), &rev),
         )
         .unwrap();
     admin
         .exec_drop(
             "INSERT INTO resources (id, kind, name, uri, revision)
              VALUES (?, 'git-repo', 'Synthetic App Repo', 'https://forge.example/synthetic/app', ?)",
-            (id(RESOURCE_REPO), &rev),
+            (id(manifest.area_resource.1), &rev),
         )
         .unwrap();
     admin
         .exec_drop(
             "INSERT INTO area_resources (area_id, resource_id) VALUES (?, ?)",
-            (id(AREA_APP), id(RESOURCE_REPO)),
+            (id(manifest.area_resource.0), id(manifest.area_resource.1)),
         )
         .unwrap();
     admin
@@ -450,11 +612,11 @@ fn apply_fixture_sql(admin: &mut Conn, p: &FixtureProjection) {
               '2026-01-02 00:00:00', '2026-01-02 01:00:00', NULL, NULL, NULL)",
             (
                 id(0x111),
-                id(AREA_GENERAL),
+                id(general_area),
                 &p.task_bodies[&id(0x111)],
                 &rev,
                 id(0x112),
-                id(AREA_APP),
+                id(app_area),
                 &p.task_bodies[&id(0x112)],
                 &rev,
             ),
@@ -463,13 +625,13 @@ fn apply_fixture_sql(admin: &mut Conn, p: &FixtureProjection) {
     admin
         .exec_drop(
             "INSERT INTO project_issues (project_id, issue_id) VALUES (?, ?)",
-            (id(PROJECT_RELEASE), id(0x112)),
+            (id(manifest.project_issue.0), id(manifest.project_issue.1)),
         )
         .unwrap();
     admin
         .exec_drop(
             "INSERT INTO issue_resources (issue_id, resource_id) VALUES (?, ?)",
-            (id(0x112), id(RESOURCE_REPO)),
+            (id(manifest.issue_resource.0), id(manifest.issue_resource.1)),
         )
         .unwrap();
     admin
@@ -492,11 +654,11 @@ fn apply_fixture_sql(admin: &mut Conn, p: &FixtureProjection) {
               '2026-01-02 00:00:00', '2026-01-02 00:00:00')",
             (
                 id(DIRECTIVE_V1),
-                id(AREA_APP),
+                id(app_area),
                 &p.directive_bodies[&id(DIRECTIVE_V1)],
                 &rev,
                 id(DIRECTIVE_V2),
-                id(AREA_APP),
+                id(app_area),
                 &p.directive_bodies[&id(DIRECTIVE_V2)],
                 &p.reversed_supersedes_id,
                 &rev,
@@ -509,19 +671,19 @@ fn apply_fixture_sql(admin: &mut Conn, p: &FixtureProjection) {
              (id, kind, title, body, author_ref, source_ref, revision, created_at, substantive_updated_at)
              VALUES (?, 'report', 'Widget synthetic report', ?, ?, 'synthetic-run-1', ?,
                      '2026-01-02 00:30:00', '2026-01-02 01:00:00')",
-            (id(ARTIFACT_REPORT), &p.artifact_body, &p.artifact_author, &rev),
+            (id(manifest.artifact_issue.0), &p.artifact_body, &p.artifact_author, &rev),
         )
         .unwrap();
     admin
         .exec_drop(
             "INSERT INTO artifact_issues (artifact_id, issue_id) VALUES (?, ?)",
-            (id(ARTIFACT_REPORT), id(0x112)),
+            (id(manifest.artifact_issue.0), id(manifest.artifact_issue.1)),
         )
         .unwrap();
     admin
         .exec_drop(
             "INSERT INTO artifact_areas (artifact_id, area_id) VALUES (?, ?)",
-            (id(ARTIFACT_REPORT), id(AREA_APP)),
+            (id(manifest.artifact_area.0), id(manifest.artifact_area.1)),
         )
         .unwrap();
     admin
@@ -530,6 +692,134 @@ fn apply_fixture_sql(admin: &mut Conn, p: &FixtureProjection) {
             (id(BOT_QUEEN), &rev),
         )
         .unwrap();
+}
+
+fn init_source(source_repo: &Path, home: &Path) -> String {
+    init_git(
+        source_repo,
+        home,
+        "Synthetic Fixture",
+        "synthetic@example.invalid",
+    );
+    for (rel, content) in SYNTHETIC_V1_FILES {
+        let path = source_repo.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+    }
+    git(source_repo, home, &["add", "."]);
+    git(source_repo, home, &["commit", "-qm", "Synthetic v1"]);
+    git_text(source_repo, home, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn reconciles_pinned_fixture_inventory_and_redacts_evidence() {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempRoot(PathBuf);
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("hive-migration-{}-{nonce}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let root = TempRoot(root);
+    let root = &root.0;
+    let home = root.join("home");
+    fs::create_dir(&home).unwrap();
+    let source_repo = root.join("legacy-v1");
+    let source_commit = init_source(&source_repo, &home);
+    let manifest = FixtureManifest::reviewed(&source_commit);
+
+    // Repeatability: projecting twice from the same pinned Git commit yields identical hashes/counts/holds.
+    let projection = project_fixture_snapshot(&source_repo, &home, &manifest);
+    assert_eq!(
+        projection,
+        project_fixture_snapshot(&source_repo, &home, &manifest)
+    );
+    for (surface, counts) in &projection.counts {
+        assert_eq!(
+            counts.inventoried,
+            counts.imported + counts.held + counts.excluded_non_record,
+            "unbalanced counts for {surface}"
+        );
+    }
+    assert_eq!(
+        projection.holds,
+        BTreeMap::from([
+            (
+                "artifacts/no-author-note.md",
+                "incomplete_historical_provenance",
+            ),
+            (
+                "artifacts/unclassified-note.md",
+                "unclassified_artifact_kind",
+            ),
+            (
+                "bots/queen-synth/memory/_general/MEMORY.md",
+                "curated_memory_deferred",
+            ),
+            (
+                "bots/queen-synth/memory/synth-app/architecture.md",
+                "curated_memory_deferred",
+            ),
+            (
+                "directives/_hive-userdata/unapproved-active.md",
+                "missing_directive_approval",
+            ),
+            (
+                "tasks/_hive-userdata/active/unproven-done/README.md",
+                "incomplete_historical_provenance",
+            ),
+            ("tasks/_hive/README.md", "unsplit_legacy_scope"),
+        ])
+    );
+
+    let evidence = serde_json::to_string(&projection.redacted_evidence()).unwrap();
+    let decoded: Value = serde_json::from_str(&evidence).unwrap();
+    assert_eq!(
+        decoded,
+        json!({
+            "source_commit": source_commit,
+            "policy_pin": POLICY_PIN,
+            "counts": projection.counts,
+            "holds": projection.holds,
+            "hashes": projection.hashes,
+        })
+    );
+    for sentinel in [
+        "Synthetic work-scoped report body.",
+        "Missing approval reference.",
+        "Synthetic persona bytes.",
+        root.to_str().unwrap(),
+        source_repo.to_str().unwrap(),
+    ] {
+        assert!(!evidence.contains(sentinel), "evidence leaked {sentinel}");
+    }
+
+    // Exercise drift against the same NUL-delimited inventory used for projection.
+    let mut tree = git(
+        &source_repo,
+        &home,
+        &["ls-tree", "-r", "-z", "--name-only", &source_commit],
+    );
+    let missing = tree.strip_prefix(b"AGENTS.md\0").unwrap();
+    assert_eq!(
+        inventory_counts(missing, &manifest, &projection.holds).unwrap_err(),
+        "missing fixture paths: [\"AGENTS.md\"]"
+    );
+    tree.extend_from_slice(b"unexpected\npath.md\0");
+    assert_eq!(
+        inventory_counts(&tree, &manifest, &projection.holds).unwrap_err(),
+        "unexpected fixture path: unexpected\npath.md"
+    );
 }
 
 fn row_count(admin: &mut Conn, table: &str) -> u64 {
@@ -545,20 +835,8 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
     let fixture = Fixture::start_empty();
     let home = fixture.root.join("home");
     let source_repo = fixture.root.join("legacy-v1");
-    init_git(
-        &source_repo,
-        &home,
-        "Synthetic Fixture",
-        "synthetic@example.invalid",
-    );
-    for (rel, content) in SYNTHETIC_V1_FILES {
-        let path = source_repo.join(rel);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, content).unwrap();
-    }
-    git(&source_repo, &home, &["add", "."]);
-    git(&source_repo, &home, &["commit", "-qm", "Synthetic v1"]);
-    let source_commit = git_text(&source_repo, &home, &["rev-parse", "HEAD"]);
+    let source_commit = init_source(&source_repo, &home);
+    let manifest = FixtureManifest::reviewed(&source_commit);
     let source_hashes_before: BTreeMap<&str, String> = SYNTHETIC_V1_FILES
         .iter()
         .map(|(rel, _)| (*rel, sha256_hex(&fs::read(source_repo.join(rel)).unwrap())))
@@ -599,45 +877,7 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
     assert_eq!(v1_config["data"]["present"], true);
     assert_eq!(v1_config["data"]["coordination"]["mode"], "local");
 
-    // Repeatability: projecting twice from the same pinned Git commit yields identical hashes/counts/holds.
-    let projection = project_fixture_snapshot(&source_repo, &home, &source_commit);
-    assert_eq!(
-        projection,
-        project_fixture_snapshot(&source_repo, &home, &source_commit)
-    );
-    for (surface, (inv, imp, held, excl)) in &projection.counts {
-        assert_eq!(*inv, imp + held + excl, "unbalanced counts for {surface}");
-    }
-    assert_eq!(
-        projection.holds,
-        BTreeMap::from([
-            (
-                "artifacts/no-author-note.md",
-                "incomplete_historical_provenance",
-            ),
-            (
-                "artifacts/unclassified-note.md",
-                "unclassified_artifact_kind",
-            ),
-            (
-                "bots/queen-synth/memory/_general/MEMORY.md",
-                "curated_memory_deferred",
-            ),
-            (
-                "bots/queen-synth/memory/synth-app/architecture.md",
-                "curated_memory_deferred",
-            ),
-            (
-                "directives/_hive-userdata/unapproved-active.md",
-                "missing_directive_approval",
-            ),
-            (
-                "tasks/_hive-userdata/active/unproven-done/README.md",
-                "incomplete_historical_provenance",
-            ),
-            ("tasks/_hive/README.md", "unsplit_legacy_scope"),
-        ])
-    );
+    let projection = project_fixture_snapshot(&source_repo, &home, &manifest);
 
     // SQL rollback leaves zero domain rows, counter == 1, and unchanged HEAD/work/stage.
     let mut admin = fixture.connect(ADMIN);
@@ -648,7 +888,7 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
         .query_drop("SET @@SESSION.dolt_transaction_commit = 1")
         .unwrap();
     admin.query_drop("START TRANSACTION").unwrap();
-    apply_fixture_sql(&mut admin, &projection);
+    apply_fixture_sql(&mut admin, &projection, &manifest);
     admin.query_drop("ROLLBACK").unwrap();
 
     assert_eq!(storage_state(&mut admin), base_state);
@@ -718,7 +958,7 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
 
     // Commit isolated v2 Dolt target and verify with the actual compiled Rust v2 validator.
     admin.query_drop("START TRANSACTION").unwrap();
-    apply_fixture_sql(&mut admin, &projection);
+    apply_fixture_sql(&mut admin, &projection, &manifest);
     admin.query_drop("COMMIT").unwrap();
 
     let committed = storage_state(&mut admin);
@@ -793,10 +1033,13 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
         .unwrap();
     assert_eq!(replaced_supersedes, None);
 
-    let artifact_link: (String, String, String, String) = admin
+    let artifact_link: (String, String, String, String, String) = admin
         .exec_first(
-            "SELECT a.kind, DATE_FORMAT(a.substantive_updated_at, '%Y-%m-%d %H:%i:%s'), ai.issue_id, a.author_ref
-             FROM artifacts a JOIN artifact_issues ai ON ai.artifact_id = a.id WHERE a.id = ?",
+            "SELECT a.kind, DATE_FORMAT(a.substantive_updated_at, '%Y-%m-%d %H:%i:%s'), ai.issue_id, a.author_ref, aa.area_id
+             FROM artifacts a
+             JOIN artifact_issues ai ON ai.artifact_id = a.id
+             JOIN artifact_areas aa ON aa.artifact_id = a.id
+             WHERE a.id = ?",
             (id(ARTIFACT_REPORT),),
         )
         .unwrap()
@@ -808,6 +1051,7 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
             "2026-01-02 01:00:00".to_owned(),
             id(0x112),
             "synthetic-author".to_owned(),
+            id(AREA_APP),
         )
     );
 
