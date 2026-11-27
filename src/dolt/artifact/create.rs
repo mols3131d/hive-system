@@ -5,9 +5,7 @@ use time::OffsetDateTime;
 
 use crate::cli::{ArtifactCreateArgs, CommonOptions};
 use crate::dolt::{
-    DoltSuccess, DoltTarget, Snapshot,
-    context_evidence::read_evidence_bytes,
-    context_workflow as workflow, is_uuid, is_uuid_v7,
+    DoltSuccess, DoltTarget, Snapshot, context_workflow as workflow, is_uuid, is_uuid_v7,
     issue_writer::{
         self, Decision, Kind, Mutation, StagedMutation, WriteIdentity, digest, invalid,
         new_uuid_v7, valid_revision, valid_title,
@@ -19,7 +17,10 @@ use crate::dolt::{
 };
 use crate::error::{ErrorCode, HiveError};
 
-use super::{MAX_BODY_BYTES, ScopeKind};
+use super::{
+    MAX_BODY_BYTES, ScopeKind,
+    writes::{read_body, verify_links},
+};
 
 pub(in crate::dolt) const KIND: &str = "artifact.create";
 const ARCHIVED: &str = "Artifact linking requires active Area ancestry.";
@@ -154,15 +155,7 @@ pub(super) fn write(
             "Supply a documented lowercase Artifact kind and a nonblank title of up to 255 characters without control characters.",
         ));
     }
-    let bytes = read_evidence_bytes(&args.file, MAX_BODY_BYTES as usize).map_err(|error| {
-        let message = if matches!(error.code, ErrorCode::ContextLimit) {
-            "The Artifact body exceeds 64 KiB."
-        } else {
-            "Could not read the explicit regular Artifact body file."
-        };
-        HiveError::new(error.code, message)
-    })?;
-    let body = String::from_utf8(bytes).map_err(|_| invalid("The Artifact body must be UTF-8."))?;
+    let body = read_body(&args.file)?;
     let scope = Scope {
         workspace: workspace.workspace_id(),
         actor: &args.actor,
@@ -369,32 +362,6 @@ pub(in crate::dolt) fn check_current_scope(
         &result.artifact_id,
         result.area_id.as_deref(),
     )
-}
-
-fn verify_links(
-    snapshot: &mut Snapshot,
-    commit: &str,
-    artifact_id: &str,
-    selected_area: Option<&str>,
-) -> Result<(), HiveError> {
-    for kind in ScopeKind::ALL {
-        let (_, links, column) = kind.tables();
-        let rows: Vec<(String, String)> = snapshot.exec_rows(
-            |_| format!(
-                "SELECT artifact_id, {column} FROM {links} AS OF '{commit}'
-                 WHERE artifact_id = CAST(? AS CHAR) OR CAST(LOWER(artifact_id) AS BINARY) = ? LIMIT 2"
-            ),
-            (artifact_id, artifact_id),
-        )?;
-        let area = selected_area.filter(|_| kind == ScopeKind::Area);
-        match (area, rows.as_slice()) {
-            (None, []) => {}
-            (Some(area), [(artifact, endpoint)]) if artifact == artifact_id && endpoint == area => {
-            }
-            _ => return Err(workflow::unverified()),
-        }
-    }
-    Ok(())
 }
 
 pub(in crate::dolt) fn verify_effect(

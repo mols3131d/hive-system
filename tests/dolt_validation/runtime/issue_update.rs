@@ -577,7 +577,7 @@ pub(super) fn exercise(
     );
 }
 
-type Receipt = (
+pub(super) type Receipt = (
     String,
     String,
     String,
@@ -588,7 +588,7 @@ type Receipt = (
     String,
 );
 
-fn stored_receipt(connection: &mut Conn, request: &str) -> Receipt {
+pub(super) fn stored_receipt(connection: &mut Conn, request: &str) -> Receipt {
     connection.exec_first(
         "SELECT kind, actor_ref, fingerprint, authorization_ref, base_commit,
                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'), workflow_evidence_json, result_json
@@ -597,7 +597,7 @@ fn stored_receipt(connection: &mut Conn, request: &str) -> Receipt {
     ).unwrap().unwrap()
 }
 
-fn record_intent(state: &Path, intent: &Value) {
+pub(super) fn record_intent(state: &Path, intent: &Value) {
     let marker = state.join("pending-request.json");
     fs::write(&marker, intent.to_string()).unwrap();
     fs::set_permissions(&marker, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();

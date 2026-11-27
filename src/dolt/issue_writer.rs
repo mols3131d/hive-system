@@ -10,12 +10,15 @@ use time::OffsetDateTime;
 
 use super::{
     DoltSuccess, DoltTarget, Snapshot,
-    artifact::create as artifact_create,
+    area::create as area_create,
+    artifact::{create as artifact_create, update as artifact_update},
     bot::register as bot_register,
     context_evidence::read_evidence_bytes,
     context_resolve::observe_time,
     context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7, issue_create,
-    issue_note_receipt, issue_update, read_error,
+    issue_dependency, issue_note_receipt, issue_update,
+    project::planning,
+    read_error,
     receipt_history::{
         HistoricalReceipt, has_receipt_history, receipt_at, receipt_introduction, valid_sha256,
     },
@@ -34,17 +37,35 @@ pub(super) enum Kind {
     Update,
     #[serde(rename = "artifact.create")]
     ArtifactCreate,
+    #[serde(rename = "artifact.update")]
+    ArtifactUpdate,
+    #[serde(rename = "area.create")]
+    AreaCreate,
+    #[serde(rename = "project.create")]
+    ProjectCreate,
+    #[serde(rename = "project.add-issue")]
+    ProjectAddIssue,
+    #[serde(rename = "issue.add-dependency")]
+    DependencyAdd,
+    #[serde(rename = "issue.remove-dependency")]
+    DependencyRemove,
     #[serde(rename = "bot.register")]
     BotRegister,
 }
 
 impl Kind {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Note => super::issue_note_fingerprint::KIND,
             Self::Create => issue_create::KIND,
             Self::Update => issue_update::KIND,
             Self::ArtifactCreate => artifact_create::KIND,
+            Self::ArtifactUpdate => artifact_update::KIND,
+            Self::AreaCreate => area_create::KIND,
+            Self::ProjectCreate => planning::CREATE,
+            Self::ProjectAddIssue => planning::ADD_ISSUE,
+            Self::DependencyAdd => "issue.add-dependency",
+            Self::DependencyRemove => "issue.remove-dependency",
             Self::BotRegister => bot_register::KIND,
         }
     }
@@ -55,8 +76,17 @@ impl Kind {
             Self::Create => "Issue create",
             Self::Update => "Issue update",
             Self::ArtifactCreate => "Artifact create",
+            Self::ArtifactUpdate => "Artifact update",
+            Self::AreaCreate => "Area create",
+            Self::ProjectCreate => "Project create",
+            Self::ProjectAddIssue => "Project add-issue",
+            Self::DependencyAdd | Self::DependencyRemove => "Issue dependency",
             Self::BotRegister => "Bot register",
         }
+    }
+
+    fn is_dependency(self) -> bool {
+        matches!(self, Self::DependencyAdd | Self::DependencyRemove)
     }
 
     fn grants(self, area: Option<&str>) -> &'static [(&'static str, &'static str)] {
@@ -67,6 +97,16 @@ impl Kind {
                 ("operation_receipts", "INSERT"),
             ],
             Self::Update => &[("issues", "UPDATE"), ("operation_receipts", "INSERT")],
+            Self::DependencyAdd => &[
+                ("issues", "UPDATE"),
+                ("operation_receipts", "INSERT"),
+                ("issue_dependencies", "INSERT"),
+            ],
+            Self::DependencyRemove => &[
+                ("issues", "UPDATE"),
+                ("operation_receipts", "INSERT"),
+                ("issue_dependencies", "DELETE"),
+            ],
             Self::Create => &[
                 ("issues", "INSERT"),
                 ("workspace_counters", "UPDATE"),
@@ -79,8 +119,26 @@ impl Kind {
                 ("operation_receipts", "INSERT"),
             ],
             Self::ArtifactCreate => &[("artifacts", "INSERT"), ("operation_receipts", "INSERT")],
+            Self::ArtifactUpdate => &[("artifacts", "UPDATE"), ("operation_receipts", "INSERT")],
+            Self::AreaCreate if area.is_some() => &[
+                ("areas", "INSERT"),
+                ("areas", "UPDATE"),
+                ("operation_receipts", "INSERT"),
+            ],
+            Self::AreaCreate => &[("areas", "INSERT"), ("operation_receipts", "INSERT")],
+            Self::ProjectCreate => &[("projects", "INSERT"), ("operation_receipts", "INSERT")],
+            Self::ProjectAddIssue => &[
+                ("issues", "UPDATE"),
+                ("projects", "UPDATE"),
+                ("project_issues", "INSERT"),
+                ("operation_receipts", "INSERT"),
+            ],
             Self::BotRegister => &[("bots", "INSERT"), ("operation_receipts", "INSERT")],
         }
+    }
+
+    fn is_project(self) -> bool {
+        matches!(self, Self::ProjectCreate | Self::ProjectAddIssue)
     }
 }
 
@@ -149,7 +207,7 @@ pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
 
 // Version 1 has no kind field and always denotes a progress note. Version 2
 // carries an Issue kind. Version 3 carries an Artifact ID and optional Area.
-// Version 4 carries only a Bot ID as the record scope.
+// Version 4 carries the typed Area, Project or Bot registration identifiers.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Pending {
@@ -184,6 +242,18 @@ pub(crate) struct Pending {
         deserialize_with = "present_id"
     )]
     artifact_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_id"
+    )]
+    parent_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_id"
+    )]
+    project_id: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -235,15 +305,68 @@ impl Pending {
             &self.area_id,
             &self.issue_id,
             &self.artifact_id,
+            &self.parent_id,
+            &self.project_id,
             &self.bot_id,
         ) {
-            (1, None, Some(_), Some(_), None, None) => Ok(Kind::Note),
-            (2, Some(kind @ (Kind::Create | Kind::Update)), Some(_), Some(_), None, None) => {
-                Ok(kind)
+            (1, None, Some(_), Some(_), None, None, None, None) => Ok(Kind::Note),
+            (
+                2,
+                Some(
+                    kind @ (Kind::Create
+                    | Kind::Update
+                    | Kind::DependencyAdd
+                    | Kind::DependencyRemove),
+                ),
+                Some(_),
+                Some(_),
+                None,
+                None,
+                None,
+                None,
+            ) => Ok(kind),
+            (
+                3,
+                Some(kind @ (Kind::ArtifactCreate | Kind::ArtifactUpdate)),
+                _,
+                None,
+                Some(_),
+                None,
+                None,
+                None,
+            ) => Ok(kind),
+            (4, Some(Kind::AreaCreate), Some(area), None, None, parent, None, None)
+                if parent.as_ref() != Some(area) =>
+            {
+                Ok(Kind::AreaCreate)
             }
-            (3, Some(Kind::ArtifactCreate), _, None, Some(_), None) => Ok(Kind::ArtifactCreate),
-            (4, Some(Kind::BotRegister), None, None, None, Some(_)) => Ok(Kind::BotRegister),
+            (4, Some(Kind::ProjectCreate), None, None, None, None, Some(_), None) => {
+                Ok(Kind::ProjectCreate)
+            }
+            (4, Some(Kind::ProjectAddIssue), Some(_), None, None, None, Some(_), None) => {
+                Ok(Kind::ProjectAddIssue)
+            }
+            (4, Some(Kind::BotRegister), None, None, None, None, None, Some(_)) => {
+                Ok(Kind::BotRegister)
+            }
             _ => Err(uncertain()),
+        }
+    }
+
+    fn area_scope(&self, kind: Kind) -> Option<&str> {
+        match kind {
+            Kind::AreaCreate => self.parent_id.as_deref(),
+            _ => self.area_id.as_deref(),
+        }
+    }
+
+    fn record_id(&self, kind: Kind) -> Option<&str> {
+        match kind {
+            Kind::AreaCreate => self.area_id.as_deref(),
+            Kind::ArtifactCreate | Kind::ArtifactUpdate => self.artifact_id.as_deref(),
+            Kind::ProjectCreate | Kind::ProjectAddIssue => self.project_id.as_deref(),
+            Kind::BotRegister => self.bot_id.as_deref(),
+            _ => self.issue_id.as_deref(),
         }
     }
 
@@ -258,6 +381,8 @@ impl Pending {
                 &self.area_id,
                 &self.issue_id,
                 &self.artifact_id,
+                &self.parent_id,
+                &self.project_id,
                 &self.bot_id,
             ]
             .into_iter()
@@ -292,7 +417,7 @@ pub(super) fn execute(
             receipt_at(snapshot, request.request_id, &commit, None).map_err(|_| uncertain())?;
         mutation.verify_decision(observe_time()?)?;
         let (outcome, base, introduced, result) = if let Some(receipt) = existing {
-            if matches!(request.kind, Kind::ArtifactCreate | Kind::BotRegister) {
+            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate | Kind::AreaCreate | Kind::BotRegister) || request.kind.is_project() || request.kind.is_dependency() {
                 check_fingerprint(&receipt.fingerprint, request.fingerprint, request.kind)?;
             }
             let scoped = ScopedReceipt::read(
@@ -317,6 +442,9 @@ pub(super) fn execute(
             if let ScopedReceipt::ArtifactCreate(scoped) = &scoped {
                 artifact_create::check_current_scope(snapshot, scoped)?;
             }
+            if let ScopedReceipt::AreaCreate(scoped) = &scoped {
+                area_create::check_current_scope(snapshot, scoped)?;
+            }
             let introduced = receipt_introduction(snapshot, request.request_id, &receipt)
                 .map_err(|_| uncertain())?;
             let result = scoped
@@ -339,7 +467,15 @@ pub(super) fn execute(
                 "db_commit": if outcome == "confirmed" { &introduced } else { &commit },
                 "policy_revision": workspace.policy_revision(),
                 "scope": match request.kind {
-                    Kind::ArtifactCreate => json!({"area_id": request.area_id, "artifact_id": result["artifact_id"]}),
+                    Kind::AreaCreate => json!({"area_id": result["area_id"], "parent_id": request.area_id}),
+                    Kind::ArtifactCreate | Kind::ArtifactUpdate => json!({"area_id": request.area_id, "artifact_id": result["artifact_id"]}),
+                    Kind::ProjectCreate | Kind::ProjectAddIssue => json!({"project_id": result["project_id"], "area_id": request.area_id,
+                           "issue_id": result["membership"]["issue_id"]}),
+                    Kind::DependencyAdd | Kind::DependencyRemove => json!({
+                        "area_id": request.area_id, "issue_id": result["issue_id"],
+                        "prerequisite_area_id": result["prerequisite_area_id"],
+                        "prerequisite_id": result["prerequisite_id"],
+                    }),
                     Kind::BotRegister => json!({"bot_id": result["bot_id"]}),
                     _ => json!({"area_id": request.area_id, "issue_id": result["issue_id"]}),
                 },
@@ -421,14 +557,26 @@ fn apply(
 
     let (version, kind) = match request.kind {
         Kind::Note => (1, None),
-        kind @ (Kind::Create | Kind::Update) => (2, Some(kind)),
-        Kind::ArtifactCreate => (3, Some(Kind::ArtifactCreate)),
-        Kind::BotRegister => (4, Some(Kind::BotRegister)),
+        kind @ (Kind::Create | Kind::Update | Kind::DependencyAdd | Kind::DependencyRemove) => {
+            (2, Some(kind))
+        }
+        kind @ (Kind::ArtifactCreate | Kind::ArtifactUpdate) => (3, Some(kind)),
+        kind @ (Kind::AreaCreate
+        | Kind::ProjectCreate
+        | Kind::ProjectAddIssue
+        | Kind::BotRegister) => (4, Some(kind)),
     };
-    let (issue_id, artifact_id, bot_id) = match request.kind {
-        Kind::ArtifactCreate => (None, Some(staged.record_id), None),
-        Kind::BotRegister => (None, None, Some(staged.record_id)),
-        _ => (Some(staged.record_id), None, None),
+    let area_scope = request.area_id.map(str::to_owned);
+    let (area_id, parent_id, issue_id, artifact_id, project_id, bot_id) = match request.kind {
+        Kind::AreaCreate => (Some(staged.record_id), area_scope, None, None, None, None),
+        Kind::ArtifactCreate | Kind::ArtifactUpdate => {
+            (area_scope, None, None, Some(staged.record_id), None, None)
+        }
+        Kind::ProjectCreate | Kind::ProjectAddIssue => {
+            (area_scope, None, None, None, Some(staged.record_id), None)
+        }
+        Kind::BotRegister => (None, None, None, None, None, Some(staged.record_id)),
+        _ => (area_scope, None, Some(staged.record_id), None, None, None),
     };
     let marker = Pending {
         version,
@@ -439,9 +587,11 @@ fn apply(
         request_id: request.request_id.to_owned(),
         base_commit: base.to_owned(),
         fingerprint: request.fingerprint.to_owned(),
-        area_id: request.area_id.map(str::to_owned),
+        area_id,
+        parent_id,
         issue_id,
         artifact_id,
+        project_id,
         bot_id,
         receipt_digest: receipt_digest(&receipt),
     };
@@ -470,12 +620,8 @@ fn reconcile(runtime: &WriterRuntime<'_>, workspace: &str) -> Result<Option<Snap
         .map_err(|_| uncertain())?
         .ok_or_else(uncertain)?;
     let marker = Pending::read(&entry.bytes, workspace, runtime.launch_nonce())?;
-    let mut observer = open_verified_writer(
-        runtime,
-        marker.operation()?,
-        marker.area_id.as_deref(),
-        true,
-    )?;
+    let kind = marker.operation()?;
+    let mut observer = open_verified_writer(runtime, kind, marker.area_scope(kind), true)?;
     visible_session(&mut observer.connection, Some(marker.session_id)).map_err(|_| uncertain())?;
 
     // Take a fresh committed snapshot after positive same-launch session evidence.
@@ -499,7 +645,7 @@ fn open_verified_writer(
             "SELECT GRANTEE, TABLE_NAME, PRIVILEGE_TYPE FROM information_schema.TABLE_PRIVILEGES
          WHERE TABLE_SCHEMA = 'db' AND GRANTEE = ?
          AND TABLE_NAME IN ('issues', 'issue_updates', 'workspace_counters', 'operation_receipts',
-                            'artifacts', 'artifact_areas', 'areas', 'bots')",
+                            'artifacts', 'artifact_areas', 'areas', 'projects', 'project_issues', 'issue_dependencies', 'bots')",
             (&grantee,),
         )
         .map_err(read_error)?;
@@ -507,7 +653,11 @@ fn open_verified_writer(
         grants
             .iter()
             .any(|row| row.0 == grantee && row.1 == table && row.2 == privilege)
-    }) {
+    }) && (!kind.is_dependency()
+        || grants.iter().all(|(_, table, privilege)| {
+            table != "issue_dependencies" || matches!(privilege.as_str(), "INSERT" | "DELETE")
+        }))
+    {
         return Ok(writer);
     }
     let guidance = if pending {
@@ -539,16 +689,13 @@ fn confirm(
     {
         return Err(uncertain());
     }
+    let kind = marker.operation()?;
     let scoped = ScopedReceipt::read(
         snapshot,
-        marker.operation()?,
+        kind,
         &marker.request_id,
-        marker.area_id.as_deref(),
-        marker
-            .issue_id
-            .as_deref()
-            .or(marker.artifact_id.as_deref())
-            .or(marker.bot_id.as_deref()),
+        marker.area_scope(kind),
+        marker.record_id(kind),
         &receipt.actor_ref,
         &receipt,
     )?;
@@ -566,6 +713,10 @@ enum ScopedReceipt {
     Create(issue_create::CreateResult),
     Update(Box<issue_update::ScopedUpdate>),
     ArtifactCreate(artifact_create::ScopedCreate),
+    ArtifactUpdate(artifact_update::ScopedUpdate),
+    AreaCreate(area_create::ScopedCreate),
+    Project(Box<planning::ScopedProject>),
+    Dependency(Box<issue_dependency::ScopedDependency>),
     BotRegister(bot_register::RegisterResult),
 }
 
@@ -617,12 +768,56 @@ impl ScopedReceipt {
                 )
                 .map(Self::Create)
             }
+            Kind::DependencyAdd | Kind::DependencyRemove => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                issue_dependency::check_receipt(
+                    snapshot,
+                    kind,
+                    request,
+                    area.ok_or_else(uncertain)?,
+                    record.ok_or_else(uncertain)?,
+                    actor,
+                    receipt,
+                )
+                .map(|dependency| Self::Dependency(Box::new(dependency)))
+                .map_err(|_| uncertain())
+            }
             Kind::ArtifactCreate => {
                 if receipt.kind != kind.name() {
                     return Err(conflict(kind));
                 }
                 artifact_create::check_scope(snapshot, request, area, record, actor, receipt)
                     .map(Self::ArtifactCreate)
+            }
+            Kind::ArtifactUpdate => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                artifact_update::check_scope(
+                    snapshot,
+                    request,
+                    area,
+                    record.ok_or_else(uncertain)?,
+                    actor,
+                    receipt,
+                )
+                .map(Self::ArtifactUpdate)
+            }
+            Kind::AreaCreate => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                area_create::check_scope(snapshot, request, area, record, actor, receipt)
+                    .map(Self::AreaCreate)
+            }
+            Kind::ProjectCreate | Kind::ProjectAddIssue => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                planning::check_scope(snapshot, kind, request, area, record, actor, receipt)
+                    .map(|scoped| Self::Project(Box::new(scoped)))
             }
             Kind::BotRegister => {
                 if receipt.kind != kind.name() {
@@ -655,9 +850,17 @@ impl ScopedReceipt {
                 Ok(json!(note.result))
             }
             Self::Update(update) => issue_update::verify_effect(snapshot, commit, receipt, &update),
+            Self::Dependency(dependency) => dependency.verify_effect(snapshot, commit, receipt),
             Self::ArtifactCreate(scoped) => {
                 artifact_create::verify_effect(snapshot, commit, receipt, &scoped)
             }
+            Self::ArtifactUpdate(scoped) => {
+                artifact_update::verify_effect(snapshot, commit, receipt, &scoped)
+            }
+            Self::AreaCreate(scoped) => {
+                area_create::verify_effect(snapshot, commit, receipt, &scoped)
+            }
+            Self::Project(scoped) => planning::verify_effect(snapshot, commit, receipt, *scoped),
             Self::BotRegister(result) => {
                 bot_register::verify_effect(snapshot, commit, receipt, &result)
             }
@@ -819,7 +1022,21 @@ mod tests {
         let area_id = value.as_object_mut().unwrap().remove("area_id").unwrap();
         let standalone = read(&value).unwrap();
         assert_eq!(json!(standalone), value);
+        value["parent_id"] = area_id.clone();
+        assert!(read(&value).is_err());
+        value.as_object_mut().unwrap().remove("parent_id");
+        value["kind"] = json!("artifact.update");
+        let standalone = read(&value).unwrap();
+        assert!(matches!(standalone.operation(), Ok(Kind::ArtifactUpdate)));
+        assert_eq!(
+            standalone.record_id(Kind::ArtifactUpdate),
+            value["artifact_id"].as_str(),
+        );
+        assert_eq!(json!(standalone), value);
         value["area_id"] = area_id;
+        let linked = read(&value).unwrap();
+        assert!(matches!(linked.operation(), Ok(Kind::ArtifactUpdate)));
+        assert_eq!(json!(linked), value);
         value["issue_id"] = value["artifact_id"].clone();
         assert!(read(&value).is_err());
 
@@ -848,5 +1065,42 @@ mod tests {
         let legacy_bytes = serde_json::to_string(&legacy).unwrap();
         let duplicate = legacy_bytes.replacen(r#""version":1"#, r#""version":1,"version":1"#, 1);
         assert!(Pending::read(duplicate.as_bytes(), "workspace", "launch").is_err());
+
+        let mut project = value;
+        project["version"] = json!(4);
+        project["project_id"] = project
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_id")
+            .unwrap();
+        project.as_object_mut().unwrap().remove("issue_id");
+        project["kind"] = json!("project.add-issue");
+        let linked = read(&project).unwrap();
+        assert!(matches!(linked.operation(), Ok(Kind::ProjectAddIssue)));
+        assert_eq!(json!(linked), project);
+
+        project["kind"] = json!("project.create");
+        assert!(read(&project).is_err());
+        project.as_object_mut().unwrap().remove("area_id");
+        let created = read(&project).unwrap();
+        assert!(matches!(created.operation(), Ok(Kind::ProjectCreate)));
+        assert_eq!(json!(created), project);
+        project["version"] = json!(3);
+        assert!(read(&project).is_err());
+
+        let mut value = json!(legacy);
+        value.as_object_mut().unwrap().remove("issue_id");
+        value["version"] = json!(4);
+        value["kind"] = json!("area.create");
+        let root = read(&value).unwrap();
+        assert!(matches!(root.operation(), Ok(Kind::AreaCreate)));
+        assert_eq!(json!(root), value);
+        value["parent_id"] = json!("01900000-0000-7000-8000-000000000003");
+        let child = read(&value).unwrap();
+        assert_eq!(json!(child), value);
+        value["parent_id"] = value["area_id"].clone();
+        assert!(read(&value).is_err());
+        value["parent_id"] = Value::Null;
+        assert!(read(&value).is_err());
     }
 }

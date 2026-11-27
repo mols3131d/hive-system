@@ -152,6 +152,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::DoltArtifact(DoltArtifactCommand::Create(args)) => {
             dolt::artifact::create(&invocation.common, &args)
         }
+        Command::DoltArtifact(DoltArtifactCommand::Update(args)) => {
+            dolt::artifact::update(&invocation.common, &args)
+        }
         Command::Validate(args) => dolt::validate(&args),
         Command::Operation(cli::OperationCommand::Show(args)) => {
             dolt::operation::show(&invocation.common, &args)
@@ -162,12 +165,14 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
+        Command::Area(AreaCommand::Create(args)) => dolt::area::create(&invocation.common, &args),
         Command::Label(cli::LabelCommand::List(args)) => {
             dolt::label::list(&args, invocation.common.project.as_ref())
         }
         Command::Resource(ResourceCommand::List(args)) => dolt::resource::list(&args),
         Command::Resource(ResourceCommand::Show(args)) => dolt::resource::show(&args),
         Command::ProjectRead(args) => dolt::project_read(&args),
+        Command::ProjectWrite(args) => dolt::project_write(&invocation.common, &args),
         Command::Bot(BotCommand::Register(args)) => dolt::bot::register(&invocation.common, &args),
         Command::Bot(BotCommand::List {
             target,
@@ -208,6 +213,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::IssueNote(args) => dolt::issue_note::write(&invocation.common, &args),
         Command::IssueCreate(args) => dolt::issue_create::write(&invocation.common, &args),
         Command::IssueUpdate(args) => dolt::issue_update::write(&invocation.common, &args),
+        Command::IssueDependency(args, add) => {
+            dolt::issue_dependency::write(&invocation.common, &args, add)
+        }
         Command::ConversationImport(args) => dolt::conversation_import(&invocation.common, &args),
         Command::Conversation(ConversationCommand::Show(args)) => {
             dolt::conversation_read(&invocation.common, &args, None)

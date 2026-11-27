@@ -1575,6 +1575,98 @@ fn dolt_area_reads_require_contract_2_and_an_explicit_target() {
 }
 
 #[test]
+fn unknown_area_create_options_keep_the_late_v2_envelope() {
+    let sandbox = Sandbox::new();
+    for unknown in [
+        &["--unknown=--contract=1"][..],
+        &["--unknown", "fixture-value"],
+        &["--unknown"],
+    ] {
+        let args = [
+            &["area", "create"][..],
+            unknown,
+            &["--contract", "2", "--json"],
+        ]
+        .concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "schema_version": 2, "ok": false, "command": "area create",
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "An argument or command is not recognized.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+    let literal = sandbox.run(&["area", "create", "--unknown=--json", "--contract", "2"]);
+    assert_eq!(literal.status.code(), Some(2));
+    assert!(literal.stdout.is_empty());
+    assert!(!literal.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
+fn malformed_area_create_values_and_conflicts_keep_the_v2_envelope() {
+    let sandbox = Sandbox::new();
+    let command = [
+        "area",
+        "create",
+        "--slug",
+        "fixture",
+        "--name",
+        "Fixture",
+        "--actor",
+        "fixture",
+        "--request-id",
+        "01900000-0000-7000-8000-000000000003",
+        "--evidence-file",
+        "fixture.json",
+        "--workspace",
+        ".",
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+        "--database",
+        "fixture",
+        "--port",
+        "3307",
+    ];
+    let flags = ["--contract", "2", "--json"];
+    for invalid in [&["--project", "BAD!"][..], &["--slug", "duplicate-slug"]] {
+        for args in [
+            [&flags[..], &command, invalid].concat(),
+            [&command[..], invalid, &flags].concat(),
+        ] {
+            let result = sandbox.run(&args);
+            assert_eq!(result.status.code(), Some(2), "{args:?}: {result:?}");
+            assert!(result.stderr.is_empty(), "{args:?}: {result:?}");
+            let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], "area create");
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+            assert!(!report.to_string().contains("BAD!"));
+            assert!(!report.to_string().contains("duplicate-slug"));
+        }
+    }
+    let args = [
+        &command[..],
+        &["--project", "BAD!", "--contract", "2", "--name=--json"],
+    ]
+    .concat();
+    let result = sandbox.run(&args);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(result.stdout.is_empty());
+    assert!(!result.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
 fn malformed_dolt_area_options_preserve_v2_json_at_root_and_leaf() {
     let sandbox = Sandbox::new();
     let target = [
@@ -2307,6 +2399,125 @@ fn unknown_project_long_option_keeps_original_error_with_late_v2_json() {
             "{args:?}",
         );
     }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn unknown_dependency_options_keep_the_late_v2_envelope() {
+    let sandbox = Sandbox::new();
+    let issue = "01900000-0000-7000-8000-000000000003";
+    let prerequisite = "01900000-0000-7000-8000-000000000004";
+    for (action, unknown) in [
+        ("add-dependency", &["--unknown=--contract=1"][..]),
+        ("remove-dependency", &["--unknown", "fixture-value"]),
+    ] {
+        let args = [
+            &["issue", action][..],
+            unknown,
+            &[issue, prerequisite, "--contract", "2", "--json"],
+        ]
+        .concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "schema_version": 2, "ok": false, "command": format!("issue {action}"),
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "An argument or command is not recognized.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+    let literal = sandbox.run(&[
+        "issue",
+        "add-dependency",
+        "--unknown=--json",
+        issue,
+        prerequisite,
+        "--contract",
+        "2",
+    ]);
+    assert_eq!(literal.status.code(), Some(2));
+    assert!(literal.stdout.is_empty());
+    assert!(!literal.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
+fn unknown_project_write_options_keep_the_late_v2_envelope() {
+    let sandbox = Sandbox::new();
+    let project = "01900000-0000-7000-8000-000000000003";
+    let issue = "01900000-0000-7000-8000-000000000004";
+    for (command, args) in [
+        (
+            "project create",
+            &["project", "create", "--unknown=synthetic"][..],
+        ),
+        (
+            "project create",
+            &[
+                "project",
+                "create",
+                "--name",
+                "Fixture",
+                "--unknown",
+                "synthetic",
+            ],
+        ),
+        (
+            "project add-issue",
+            &[
+                "project",
+                "add-issue",
+                "--unknown=--contract=1",
+                project,
+                issue,
+            ],
+        ),
+        (
+            "project add-issue",
+            &[
+                "project",
+                "add-issue",
+                "--unknown",
+                "synthetic",
+                project,
+                issue,
+            ],
+        ),
+        (
+            "project add-issue",
+            &["project", "add-issue", "--unknown", project, issue],
+        ),
+    ] {
+        let args = [args, &["--contract", "2", "--json"]].concat();
+        let result = sandbox.run(&args);
+        assert_eq!(result.status.code(), Some(2), "{args:?}");
+        assert!(result.stderr.is_empty(), "{args:?}: {result:?}");
+        let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "schema_version": 2, "ok": false, "command": command,
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "An argument or command is not recognized.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+    let literal = sandbox.run(&["project", "create", "--unknown=--json", "--contract", "2"]);
+    assert_eq!(literal.status.code(), Some(2));
+    assert!(literal.stdout.is_empty());
+    assert!(!literal.stderr.is_empty());
     sandbox.assert_empty();
 }
 
@@ -3626,5 +3837,72 @@ fn issue_create_is_registered_only_in_v2_grammar() {
     assert_eq!(invalid.status.code(), Some(2));
     assert_eq!(report["command"], "issue create");
     assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    sandbox.assert_empty();
+}
+
+#[test]
+fn dolt_artifact_update_requires_one_explicit_body_and_revision() {
+    let sandbox = Sandbox::new();
+    let target = "01900000-0000-7000-8000-000000000001";
+    let artifact = "01900000-0000-7000-8000-000000000002";
+    let expected = format!("{artifact}=artifact-r1");
+    let base = [
+        "artifact",
+        "update",
+        artifact,
+        "--contract",
+        "2",
+        "--json",
+        "--workspace",
+        WORKSPACE,
+        "--workspace-id",
+        target,
+        "--database",
+        "db",
+        "--port",
+        "3307",
+        "--actor",
+        "fixture-actor",
+        "--request-id",
+        target,
+        "--evidence-file",
+        "decision-fixture.json",
+    ];
+    for invalid in [
+        &["--if-match", &expected][..],
+        &["--file", FILE][..],
+        &[
+            "--file",
+            FILE,
+            "--if-match",
+            &expected,
+            "--if-match",
+            &expected,
+        ][..],
+        &[
+            "--file",
+            FILE,
+            "--if-match",
+            &expected,
+            "--title",
+            "fixture",
+        ][..],
+        &["--file", FILE, "--if-match", &expected, "--standalone"][..],
+    ] {
+        let args = [base.as_slice(), invalid].concat();
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?} {report}");
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "artifact update");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(report.get("data").is_none());
+    }
+    let args = [base.as_slice(), &["--file", FILE, "--if-match", &expected]].concat();
+    let output = sandbox.run(&args);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(3), "{report}");
+    assert_eq!(report["command"], "artifact update");
+    assert_eq!(report["error"]["code"], "NOT_FOUND");
     sandbox.assert_empty();
 }
