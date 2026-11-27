@@ -1,3 +1,5 @@
+#[path = "dolt_validation/area.rs"]
+mod area;
 #[path = "dolt_validation/artifacts.rs"]
 mod artifacts;
 #[path = "dolt_validation/bots.rs"]
@@ -6,6 +8,8 @@ mod bots;
 mod directives;
 #[path = "dolt_validation/issue_list.rs"]
 mod issue_list;
+#[path = "dolt_validation/issue_readiness.rs"]
+mod issue_readiness;
 #[path = "dolt_validation/issue_show.rs"]
 mod issue_show;
 #[path = "dolt_validation/issue_updates.rs"]

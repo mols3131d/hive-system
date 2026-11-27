@@ -108,7 +108,27 @@ The optional filters are `--status`, `--type`, `--priority` (0–3), and `--labe
 
 A selected Issue with malformed summary fields returns `INVALID_RECORD` at the verified commit.
 
-Recursive Area listing, global discovery, readiness and blocker queries, and context resolution are follow-up work.
+`issue ready` and `issue blocked` accept the same target, scopes, filters, and pagination options. Both select executable todo Issues. Ready Issues have no hold, current Claim, unmet prerequisite, or archived Area in their ancestry. Missing prerequisites, invalid readiness metadata, and uncertain Area chains also block readiness. Blocked summaries include a `reasons` array of stable codes. The query reports prerequisite and Area blockers without exposing related records. Each cursor is specific to its view. Readiness describes the observed commit and grants no execution permission.
+
+Recursive Area listing, global discovery, and context resolution are follow-up work.
+
+## Committed Project inspection
+
+Use the same explicit Dolt target and SELECT-only account for `project list` and `project show` under contract 2.
+
+```sh
+hive --contract 2 --json project list --status active --limit 10 \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+
+hive --contract 2 --json project show 01900000-0000-7000-8000-000000000003 \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+List orders summaries by Project ID and accepts exact `active`, `completed`, or `archived` status. The default page size is 25 and the maximum is 100. Pass `next_cursor` as `--cursor` with the same arguments. A changed workspace, commit, status filter, or page size returns `STALE_CURSOR` (exit 5).
+
+Show takes a canonical lowercase UUIDv7 and returns Project details and up to 25 direct member Issue IDs across Areas. The `issues.truncated` field indicates additional members. Use `issue list --project UUID` to page through member summaries.
 
 ## Agent-assisted development
 

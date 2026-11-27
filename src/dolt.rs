@@ -1,6 +1,8 @@
+pub(crate) mod area;
 mod graph;
 mod issue;
 mod issue_list;
+mod issue_readiness;
 mod project;
 mod records;
 
@@ -16,7 +18,7 @@ use crate::cli::{DoltTargetArgs, IssueShowArgs, ValidateArgs};
 use crate::error::{ErrorCode, HiveError};
 
 pub(crate) use issue::show as issue_show;
-pub(crate) use issue_list::list as issue_list;
+pub(crate) use issue_list::{IssueView, list as issue_list};
 pub(crate) use project::read as project_read;
 
 const DOLT_VERSION: &str = "2.7.6";
