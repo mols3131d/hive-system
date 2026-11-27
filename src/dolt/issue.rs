@@ -1,3 +1,8 @@
+// Compile the draft resolver with tests until the authority path is integrated.
+#[cfg(test)]
+#[path = "context.rs"]
+mod context;
+
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -70,6 +75,22 @@ struct IssueDetail {
     resolution_note: Option<String>,
 }
 
+impl IssueDetail {
+    fn inline_bytes(&self) -> usize {
+        [
+            Some(self.title.as_str()),
+            self.body.as_deref(),
+            self.acceptance_criteria.as_deref(),
+            self.hold_reason.as_deref(),
+            self.resolution_note.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::len)
+        .sum()
+    }
+}
+
 #[derive(Serialize)]
 struct BoundedIds {
     items: Vec<String>,
@@ -109,67 +130,9 @@ pub(crate) fn show(args: &IssueShowArgs) -> Result<DoltSuccess, Box<DoltFailure>
 
 fn show_in_snapshot(snapshot: &mut Snapshot, selector: &IssueSelector) -> Result<Value, HiveError> {
     let meta = load_issue_meta(snapshot, selector)?;
-    let (
-        id,
-        number,
-        area_id,
-        parent_id,
-        kind,
-        status,
-        priority,
-        revision,
-        created_at,
-        updated_at,
-        inline_bytes,
-    ) = meta;
-
-    if inline_bytes > MAX_INLINE_BYTES as u64 {
-        return Err(HiveError::new(
-            ErrorCode::ContextLimit,
-            format!(
-                "The selected Issue exceeds the maximum inline detail size of {MAX_INLINE_BYTES} bytes."
-            ),
-        ));
-    }
-
-    let (title, body, acceptance_criteria, hold_reason, closed_at, closed_by_ref, resolution_note) =
-        load_issue_text(snapshot, &id)?;
-    let issue = IssueDetail {
-        id,
-        number,
-        area_id,
-        parent_id,
-        title,
-        body,
-        acceptance_criteria,
-        kind,
-        status,
-        priority,
-        hold_reason,
-        revision,
-        created_at,
-        updated_at,
-        closed_at,
-        closed_by_ref,
-        resolution_note,
-    };
-
+    let issue = load_issue_detail(snapshot, meta, MAX_INLINE_BYTES)?;
     let mut diagnostics = Diagnostics::default();
     validate_issue(&issue, &mut diagnostics);
-
-    let actual_inline_bytes = issue.title.len()
-        + issue.body.as_deref().map_or(0, str::len)
-        + issue.acceptance_criteria.as_deref().map_or(0, str::len)
-        + issue.hold_reason.as_deref().map_or(0, str::len)
-        + issue.resolution_note.as_deref().map_or(0, str::len);
-    if actual_inline_bytes > MAX_INLINE_BYTES {
-        return Err(HiveError::new(
-            ErrorCode::ContextLimit,
-            format!(
-                "The selected Issue exceeds the maximum inline detail size of {MAX_INLINE_BYTES} bytes."
-            ),
-        ));
-    }
 
     let claim_id = load_claim_id(snapshot, &issue, &mut diagnostics)?;
     let children = load_child_ids(snapshot, &issue.id, &mut diagnostics)?;
@@ -277,6 +240,68 @@ fn show_in_snapshot(snapshot: &mut Snapshot, selector: &IssueSelector) -> Result
             "Failed to build Issue response value.",
         )
     })
+}
+
+fn load_issue_detail(
+    snapshot: &mut Snapshot,
+    meta: IssueMetaRow,
+    byte_limit: usize,
+) -> Result<IssueDetail, HiveError> {
+    let (
+        id,
+        number,
+        area_id,
+        parent_id,
+        kind,
+        status,
+        priority,
+        revision,
+        created_at,
+        updated_at,
+        inline_bytes,
+    ) = meta;
+
+    if inline_bytes > byte_limit as u64 {
+        return Err(HiveError::new(
+            ErrorCode::ContextLimit,
+            format!(
+                "The selected Issue exceeds the maximum inline detail size of {byte_limit} bytes."
+            ),
+        ));
+    }
+
+    let (title, body, acceptance_criteria, hold_reason, closed_at, closed_by_ref, resolution_note) =
+        load_issue_text(snapshot, &id)?;
+    let issue = IssueDetail {
+        id,
+        number,
+        area_id,
+        parent_id,
+        title,
+        body,
+        acceptance_criteria,
+        kind,
+        status,
+        priority,
+        hold_reason,
+        revision,
+        created_at,
+        updated_at,
+        closed_at,
+        closed_by_ref,
+        resolution_note,
+    };
+
+    if issue.inline_bytes() > byte_limit {
+        return Err(HiveError::new(
+            ErrorCode::ContextLimit,
+            format!(
+                "The selected Issue exceeds the maximum inline detail size of {byte_limit} bytes."
+            ),
+        ));
+    }
+
+    Ok(issue)
 }
 
 fn parse_selector(value: &str) -> Result<IssueSelector, HiveError> {

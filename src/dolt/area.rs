@@ -186,7 +186,7 @@ fn check_selector(id: &str) -> Result<(), HiveError> {
     }
 }
 
-fn select_area<T: mysql::prelude::FromRow>(
+pub(super) fn select_area<T: mysql::prelude::FromRow>(
     snapshot: &mut Snapshot,
     columns: &str,
     id: &str,
