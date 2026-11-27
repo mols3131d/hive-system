@@ -311,6 +311,24 @@ fn read_work_graph(snapshot: &mut RecordReader<'_>) -> Result<WorkGraph, HiveErr
 }
 
 #[cfg(target_os = "linux")]
+impl WorkGraph {
+    fn require_valid(&self) -> Result<(), HiveError> {
+        use crate::error::ErrorCode;
+
+        if !validate_rows(&self.areas, &self.issues, &self.claims, &self.dependencies)
+            .items
+            .is_empty()
+        {
+            return Err(HiveError::new(
+                ErrorCode::InvalidRecord,
+                "The stored Issue graph or lifecycle state is invalid.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn check_dependency_edit(
     reader: &mut RecordReader<'_>,
     issue: &str,
@@ -319,42 +337,27 @@ pub(super) fn check_dependency_edit(
 ) -> Result<(), HiveError> {
     use crate::error::ErrorCode;
 
-    let WorkGraph {
-        areas,
-        issues,
-        claims,
-        mut dependencies,
-    } = read_work_graph(reader)?;
-    if !validate_rows(&areas, &issues, &claims, &dependencies)
-        .items
-        .is_empty()
-    {
-        return Err(HiveError::new(
-            ErrorCode::InvalidRecord,
-            "The stored Issue graph or lifecycle state is invalid.",
-        ));
-    }
-    let edge = dependencies
+    let mut graph = read_work_graph(reader)?;
+    graph.require_valid()?;
+    let edge = graph
+        .dependencies
         .iter()
         .position(|edge| edge.issue_id == issue && edge.prerequisite_id == prerequisite);
     match (add, edge) {
         (true, None) => {
-            if dependencies.len() == super::MAX_ROWS_PER_TABLE {
+            if graph.dependencies.len() == super::MAX_ROWS_PER_TABLE {
                 return Err(HiveError::new(
                     ErrorCode::ContextLimit,
                     "Adding the dependency exceeds the Issue graph limit.",
                 ));
             }
-            dependencies.push(DependencyRow {
+            graph.dependencies.push(DependencyRow {
                 issue_id: issue.to_owned(),
                 prerequisite_id: prerequisite.to_owned(),
             });
             // The current graph is valid. The added edge can introduce an unmet
             // prerequisite or a cycle in the prerequisite or completion graph.
-            if !validate_rows(&areas, &issues, &claims, &dependencies)
-                .items
-                .is_empty()
-            {
+            if graph.require_valid().is_err() {
                 return Err(HiveError::new(
                     ErrorCode::InvalidTransition,
                     "The dependency violates the Issue prerequisite or completion graph.",
@@ -376,6 +379,61 @@ pub(super) fn check_dependency_edit(
                 "The dependency does not exist.",
             ));
         }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn check_parent_edit(
+    reader: &mut RecordReader<'_>,
+    issue_id: &str,
+    old_parent: Option<&str>,
+    new_parent: Option<&str>,
+) -> Result<(), HiveError> {
+    use crate::error::ErrorCode;
+
+    let mut graph = read_work_graph(reader)?;
+    graph.require_valid()?;
+    let index = graph
+        .issues
+        .iter()
+        .position(|row| row.id == issue_id)
+        .ok_or_else(|| {
+            HiveError::new(
+                ErrorCode::InvalidRecord,
+                "The Issue is absent from the parent graph.",
+            )
+        })?;
+    if graph.issues[index].parent_id.as_deref() != old_parent {
+        return Err(HiveError::new(
+            ErrorCode::StaleRevision,
+            "The expected parent relation is stale.",
+        ));
+    }
+    let protects_children = |id: &str| {
+        graph.issues.iter().any(|row| {
+            row.id == id && matches!(row.status, Some(IssueStatus::Review | IssueStatus::Done))
+        })
+    };
+    let invalid_transition = |message| HiveError::new(ErrorCode::InvalidTransition, message);
+    if old_parent.is_some_and(protects_children) {
+        return Err(invalid_transition(
+            "Changing the child scope of an existing review or accepted parent requires reconciliation.",
+        ));
+    }
+    let protected_new_parent = new_parent.is_some_and(protects_children);
+    let issue = &mut graph.issues[index];
+    if protected_new_parent && issue.status != Some(IssueStatus::Done) {
+        // A planning decision cannot accept a cancelled child's changed scope.
+        return Err(invalid_transition(
+            "A parent in review or done requires an accepted child.",
+        ));
+    }
+    issue.parent_id = new_parent.map(str::to_owned);
+    if graph.require_valid().is_err() {
+        return Err(invalid_transition(
+            "The parent edit violates the Issue hierarchy or completion graph.",
+        ));
     }
     Ok(())
 }
