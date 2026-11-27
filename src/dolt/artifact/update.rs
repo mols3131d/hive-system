@@ -13,7 +13,7 @@ use crate::dolt::{
     read_error,
     receipt_history::{HistoricalReceipt, valid_sha256},
     records::is_artifact_kind,
-    scope::{require_active_area, verify_area_ancestry},
+    scope::{require_active_area, require_active_area_at},
 };
 use crate::error::{ErrorCode, HiveError};
 
@@ -382,18 +382,7 @@ pub(in crate::dolt) fn verify_effect(
         result.area_id.as_deref(),
     )?;
     if let Some(area) = result.area_id.as_deref() {
-        verify_area_ancestry(area, ARCHIVED_AREA, |id| {
-            let rows = snapshot.exec_rows(
-                |_| {
-                    format!(
-                        "SELECT parent_id, slug, archived_at IS NOT NULL
-                    FROM areas AS OF '{base}' WHERE CAST(id AS BINARY) = ? LIMIT 1"
-                    )
-                },
-                (id,),
-            )?;
-            Ok(rows.into_iter().next())
-        })?;
+        require_active_area_at(&mut snapshot.connection, area, base, ARCHIVED_AREA)?;
     }
     let rows: Vec<(String, String, String, bool, String)> = snapshot.exec_rows(
         |_| format!(
