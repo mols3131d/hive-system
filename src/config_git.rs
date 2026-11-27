@@ -95,6 +95,10 @@ pub(crate) fn is_full_oid(oid: &str) -> bool {
     matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+pub(crate) fn is_full_lowercase_oid(oid: &str) -> bool {
+    is_full_oid(oid) && !oid.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
 fn resolve_commit(root: &Path, revision: &str) -> Result<Option<String>, HiveError> {
     let expression = format!("{revision}^{{commit}}");
     let result = git(
@@ -316,6 +320,107 @@ pub(crate) fn read_asset_blob(
     Ok(body)
 }
 
+/// Bind current context to the explicitly selected clean asset HEAD.
+#[cfg(target_os = "linux")]
+pub(crate) struct PinnedAssets<'a> {
+    root: &'a crate::config_file::ScopedDirectory,
+    repository: AssetRepository,
+    revision: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> PinnedAssets<'a> {
+    pub(crate) fn open(
+        root: &'a crate::config_file::ScopedDirectory,
+        revision: &'a str,
+    ) -> Result<Self, HiveError> {
+        if !is_full_lowercase_oid(revision) {
+            return Err(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "Select an exact lowercase asset commit object ID.",
+            ));
+        }
+        let repository = AssetRepository::open(root)?;
+        let config = repository
+            .git_dir
+            .read(OsStr::new("config"))?
+            .unwrap_or_default();
+        let reader = AssetObjectReader::new(&repository.objects, &config, revision.len())?;
+        let tree = reader.commit_tree(revision)?;
+        reader.verified_object("tree", &tree, 1024 * 1024)?;
+        let pinned = Self {
+            root,
+            repository,
+            revision,
+        };
+        pinned.recheck()?;
+        Ok(pinned)
+    }
+
+    pub(crate) fn recheck(&self) -> Result<(), HiveError> {
+        self.repository.verify_selection(self.root)?;
+        let command = || self.repository.status_command();
+        let check_head = || {
+            let head = execute_asset(command()?.args(["rev-parse", "--verify", "HEAD"]), 65, None)?;
+            if !head.status.success() || git_line(&head.stdout) != Some(self.revision.as_bytes()) {
+                return Err(HiveError::new(
+                    ErrorCode::StaleRevision,
+                    "The asset tree HEAD differs from the selected commit.",
+                ));
+            }
+
+            Ok(())
+        };
+        check_head()?;
+        let index = execute_asset(
+            command()?.args(["ls-files", "-v", "-z"]),
+            4 * 1024 * 1024,
+            None,
+        )?;
+        // Lowercase tags mark assume-unchanged entries, and S marks skip-worktree.
+        if !index.status.success()
+            || index
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|entry| !entry.is_empty())
+                .any(|entry| !entry.starts_with(b"H "))
+        {
+            return Err(HiveError::new(
+                ErrorCode::AuthorityUnverified,
+                "The asset index cannot establish a clean worktree.",
+            ));
+        }
+
+        let mut status = command()?;
+        disable_status_filters(command()?, &mut status)?;
+        let result = execute_asset(
+            status.args([
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=normal",
+                "--ignore-submodules=none",
+            ]),
+            4 * 1024 * 1024,
+            None,
+        )?;
+        if !result.status.success() {
+            return Err(HiveError::new(
+                ErrorCode::AuthorityUnverified,
+                "Could not verify the selected asset worktree.",
+            ));
+        }
+        if !result.stdout.is_empty() {
+            return Err(HiveError::new(
+                ErrorCode::DirtyConflict,
+                "The selected asset worktree has staged, modified, or untracked entries.",
+            ));
+        }
+        check_head()?;
+        self.repository.verify_selection(self.root)
+    }
+}
+
 #[cfg(target_os = "linux")]
 struct AssetRepository {
     assets: crate::config_file::ScopedDirectory,
@@ -340,6 +445,23 @@ impl AssetRepository {
             git_dir,
             objects,
         })
+    }
+
+    fn status_command(&self) -> Result<Command, HiveError> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut command = isolated_git_command(Path::new("/"));
+        // SAFETY: all callers run and reap the child while both directories are open.
+        let git_dir = unsafe { self.git_dir.inherit_directory(&mut command)? };
+        let assets = unsafe { self.assets.inherit_directory(&mut command)? };
+        for (prefix, path) in [
+            (b"--git-dir=".as_slice(), git_dir),
+            (b"--work-tree=".as_slice(), assets),
+        ] {
+            let arg = [prefix, path.as_os_str().as_encoded_bytes()].concat();
+            command.arg(std::ffi::OsString::from_vec(arg));
+        }
+        Ok(command)
     }
 
     fn verify_layout(&self) -> Result<(), HiveError> {
@@ -463,17 +585,7 @@ impl<'a> AssetObjectReader<'a> {
     fn read(&self, revision: &str, relative: &Path) -> Result<Option<Vec<u8>>, HiveError> {
         const MAX_METADATA_BYTES: usize = 1024 * 1024;
 
-        let commit =
-            self.verified_object("commit", &revision.to_ascii_lowercase(), MAX_METADATA_BYTES)?;
-        let mut oid = commit
-            .split(|byte| *byte == b'\n')
-            .next()
-            .and_then(|line| line.strip_prefix(b"tree "))
-            .and_then(|oid| str::from_utf8(oid).ok())
-            .filter(|oid| oid.len() == revision.len() && is_full_oid(oid))
-            .ok_or_else(unavailable_blob)?
-            .to_ascii_lowercase();
-
+        let mut oid = self.commit_tree(revision)?;
         let mut path = relative.components().peekable();
         while let Some(component) = path.next() {
             let tree = self.verified_object("tree", &oid, MAX_METADATA_BYTES)?;
@@ -489,6 +601,18 @@ impl<'a> AssetObjectReader<'a> {
             oid = child;
         }
         self.verified_object("blob", &oid, MAX_BLOB_BYTES).map(Some)
+    }
+
+    fn commit_tree(&self, revision: &str) -> Result<String, HiveError> {
+        let commit = self.verified_object("commit", &revision.to_ascii_lowercase(), 1024 * 1024)?;
+        commit
+            .split(|byte| *byte == b'\n')
+            .next()
+            .and_then(|line| line.strip_prefix(b"tree "))
+            .and_then(|oid| str::from_utf8(oid).ok())
+            .filter(|oid| oid.len() == revision.len() && is_full_oid(oid))
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(unavailable_blob)
     }
 
     fn verified_object(&self, kind: &str, oid: &str, limit: usize) -> Result<Vec<u8>, HiveError> {
@@ -708,24 +832,20 @@ fn unavailable_blob() -> HiveError {
     )
 }
 
-pub(crate) fn status(root: &Path) -> Result<bool, HiveError> {
-    let filters = git(
-        root,
-        [
-            "config",
-            "--null",
-            "--name-only",
-            "--get-regexp",
-            r"^filter\..*\.(clean|process|required)$",
-        ],
-    )?;
+fn disable_status_filters(mut config: Command, command: &mut Command) -> Result<(), HiveError> {
+    let filters = execute(config.args([
+        "config",
+        "--null",
+        "--name-only",
+        "--get-regexp",
+        r"^filter\..*\.(clean|process|required)$",
+    ]))?;
     if !matches!(filters.status.code(), Some(0 | 1)) {
         return Err(HiveError::new(
             ErrorCode::IoError,
             "Git could not inspect worktree filter configuration",
         ));
     }
-    let mut command = git_command(root);
     // Git status can start external clean filters when stat data is stale.
     for key in filters
         .stdout
@@ -745,6 +865,12 @@ pub(crate) fn status(root: &Path) -> Result<bool, HiveError> {
         };
         command.args(["-c", &format!("{key}={value}")]);
     }
+    Ok(())
+}
+
+pub(crate) fn status(root: &Path) -> Result<bool, HiveError> {
+    let mut command = git_command(root);
+    disable_status_filters(git_command(root), &mut command)?;
     let result = execute(command.args([
         "status",
         "--porcelain=v1",
@@ -1259,6 +1385,73 @@ mod tests {
                 .unwrap_err()
                 .code,
             ErrorCode::ObjectUnavailable
+        ));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn context_asset_commit_must_be_clean_and_exact() {
+        let root = tempfile::tempdir().unwrap();
+        let assets = root.path().join("assets");
+        std::fs::create_dir(&assets).unwrap();
+        let git = |args: &[&str]| {
+            let result = isolated_git_command(&assets)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            String::from_utf8(result.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(assets.join("fixture.md"), b"synthetic asset\n").unwrap();
+        git(&["add", "fixture.md"]);
+        git(&["commit", "-qm", "Fixture"]);
+        let pin = git(&["rev-parse", "HEAD"]);
+        let candidate = crate::config_file::ScopedDirectory::open_absolute(root.path()).unwrap();
+        let pinned = PinnedAssets::open(&candidate, &pin).unwrap();
+
+        std::fs::write(assets.join("fixture.md"), b"dirty fixture\n").unwrap();
+        assert!(matches!(
+            pinned.recheck().unwrap_err().code,
+            ErrorCode::DirtyConflict
+        ));
+        git(&["add", "fixture.md"]);
+        assert!(matches!(
+            pinned.recheck().unwrap_err().code,
+            ErrorCode::DirtyConflict
+        ));
+        git(&["commit", "-qm", "Next"]);
+        assert!(matches!(
+            pinned.recheck().unwrap_err().code,
+            ErrorCode::StaleRevision
+        ));
+
+        let next = git(&["rev-parse", "HEAD"]);
+        let pinned = PinnedAssets::open(&candidate, &next).unwrap();
+        std::fs::write(assets.join("untracked.md"), b"untracked synthetic asset").unwrap();
+        assert!(matches!(
+            pinned.recheck().unwrap_err().code,
+            ErrorCode::DirtyConflict
+        ));
+        std::fs::remove_file(assets.join("untracked.md")).unwrap();
+        git(&["update-index", "--assume-unchanged", "fixture.md"]);
+        assert!(matches!(
+            pinned.recheck().unwrap_err().code,
+            ErrorCode::AuthorityUnverified
         ));
     }
 }

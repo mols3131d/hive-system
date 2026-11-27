@@ -19,11 +19,11 @@ use super::unix::{
     Loopback, Server, check_identity, check_server, find_state, process_evidence, process_start,
     read_json,
 };
-use crate::cli::{CommonOptions, DoltTargetArgs, Format, WorkspaceCommand};
+use crate::cli::{CommonOptions, Format, WorkspaceCommand};
 use crate::config::json_path;
 use crate::config_file::ScopedDirectory;
-use crate::config_v2::{read_explicit, select_workspace};
-use crate::dolt::{DOLT_VERSION, is_uuid, parse_port, runtime_identity};
+use crate::config_v2::{Candidate, read_explicit, select_workspace};
+use crate::dolt::{DOLT_VERSION, DoltTarget, Snapshot, is_uuid, parse_port};
 use crate::error::{ErrorCode, HiveError};
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -292,6 +292,80 @@ fn stop(
     }))
 }
 
+/// Hold the existing lifecycle lock and process handle around one authenticated read.
+pub(crate) fn with_owned_snapshot<T>(
+    workspace: &Candidate,
+    target: DoltTarget<'_>,
+    read: impl FnOnce(&mut Snapshot) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
+    let id = workspace.workspace_id();
+    let root = json_path(&workspace.root.path)?;
+    let state = find_state(id, &workspace.root.path)?
+        .ok_or_else(|| unverified("No active-root registration exists for this workspace."))?;
+    require_private_dir(&state)?;
+    require_local_filesystem(&state)?;
+    if !state.contains(c"lock")? {
+        return Err(unverified(
+            "The existing workspace lifecycle lock is unavailable.",
+        ));
+    }
+    let lock = lock_file(regular(&state, "lock")?, libc::LOCK_SH)?;
+    let check_selection = || -> Result<(), HiveError> {
+        let selected = read_explicit(&workspace.root.path)?;
+        let lock_now = regular(&state, "lock")?.metadata().map_err(io_error)?;
+        let held = lock.metadata().map_err(io_error)?;
+        if (held.dev(), held.ino()) != (lock_now.dev(), lock_now.ino())
+            || workspace.root.file_identity()? != selected.root.file_identity()?
+            || id != selected.workspace_id()
+            || workspace.policy_revision() != selected.policy_revision()
+            || find_state(id, &workspace.root.path)?
+                .ok_or_else(|| unverified("The workspace state directory disappeared."))?
+                .file_identity()?
+                != state.file_identity()?
+        {
+            return Err(unverified("The selected workspace or its state changed."));
+        }
+        let registration: Registration = read_json(Some(&state), "active-root.json")?
+            .ok_or_else(|| unverified("No active-root registration exists for this workspace."))?;
+        check_identity(
+            registration.version,
+            &registration.workspace_id,
+            &registration.workspace_root,
+            id,
+            root,
+        )?;
+        if state.contains(c"starting")? || state.contains(c"pending-request.json")? {
+            return Err(unverified(
+                "The workspace has an unresolved runtime or write intent.",
+            ));
+        }
+        Ok(())
+    };
+    check_selection()?;
+    let server: Server = read_json(Some(&state), "server.json")?
+        .ok_or_else(|| unverified("No owned server is recorded."))?;
+    check_server(&server, id, root)?;
+    if target.workspace_id != id
+        || target.database != DATABASE
+        || server.endpoint.database != target.database
+        || server.endpoint.port != target.port
+    {
+        return Err(unverified(
+            "The explicit target differs from the owned Dolt endpoint.",
+        ));
+    }
+    let db = child_dir(&workspace.root, DATABASE)?;
+    let noms = child_dir(&child_dir(&db, ".dolt")?, "noms")?;
+    require_local_filesystem(&noms)?;
+    drop(regular(&noms, "manifest")?);
+    let run = child_dir(&state, &format!("run-{}", server.nonce))?;
+    require_private_dir(&run)?;
+    let handle = pidfd(server.pid)?;
+    let result = verify_with(&server, &state, &run, &noms, &handle, read);
+    check_selection()?;
+    result
+}
+
 fn verify(
     server: &Server,
     state: &ScopedDirectory,
@@ -299,6 +373,19 @@ fn verify(
     noms: &ScopedDirectory,
     handle: &OwnedFd,
 ) -> Result<Value, HiveError> {
+    verify_with(server, state, run, noms, handle, |snapshot| {
+        Ok(snapshot.runtime_identity())
+    })
+}
+
+fn verify_with<T>(
+    server: &Server,
+    state: &ScopedDirectory,
+    run: &ScopedDirectory,
+    noms: &ScopedDirectory,
+    handle: &OwnedFd,
+    read: impl FnOnce(&mut Snapshot) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
     let proc = proc_dir(server.pid);
     let root = Path::new(&server.workspace_root).join(DATABASE);
     let check = || -> Result<(), HiveError> {
@@ -343,14 +430,16 @@ fn verify(
     if !is_uuid(&password) {
         return Err(unverified("The private launch credential is invalid."));
     }
-    let target = DoltTargetArgs {
-        workspace_id: Some(server.workspace_id.clone()),
-        database: Some(DATABASE.to_owned()),
-        port: Some(server.endpoint.port.to_string().into()),
+    let target = DoltTarget {
+        workspace_id: &server.workspace_id,
+        database: DATABASE,
+        port: server.endpoint.port,
     };
-    let identity = runtime_identity(&target, &reader_name(&server.nonce), &password)?;
+    let mut snapshot = Snapshot::open_runtime(target, &reader_name(&server.nonce), &password)?;
     check()?;
-    Ok(identity)
+    let result = read(&mut snapshot);
+    check()?;
+    result
 }
 
 fn owns_store(proc: &Path, noms: &ScopedDirectory, pid: i32) -> Result<bool, HiveError> {
@@ -622,9 +711,13 @@ fn lock(state: &ScopedDirectory) -> Result<File, HiveError> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(at(state, "lock"))
         .map_err(io_error)?;
+    lock_file(file, libc::LOCK_EX)
+}
+
+fn lock_file(file: File, mode: libc::c_int) -> Result<File, HiveError> {
     require_private_file(&file)?;
     // SAFETY: the descriptor belongs to file and remains open while locked.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } != 0 {
         let error = io::Error::last_os_error();
         return if error.kind() == io::ErrorKind::WouldBlock {
             Err(HiveError::new(

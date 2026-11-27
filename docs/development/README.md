@@ -286,6 +286,18 @@ hive --contract 2 --json conversation export --workspace /example/hive-v2-userda
 
 The export writes the exact body bytes to the selected path with owner-only permissions. An existing destination returns `ALREADY_EXISTS`. The JSON response identifies the Queen and conversation. If stdout fails after publication, Hive reports the completed export on stderr and leaves the file in place. Export is local and performs no external publication.
 
+## V2 current context
+
+On Linux, run `hive --contract 2 --json context resolve` with an explicit workspace, Dolt target, policy checkout, asset commit, actor, role or Bot, and Area, Issue, or Project selection. The Dolt target must match the workspace's owned running server. The asset commit must be the clean asset repository HEAD, and the system checkout must match the descriptor's policy pin. Hive holds a shared lifecycle lock while it reads the checked asset tree and one authenticated committed Dolt snapshot.
+
+On Linux and macOS, `--evidence-file PATH` selects one local version 1 JSON object of at most 256 KiB. Paths may be absolute or relative to the current directory. Hive refuses parent traversal, symlinks and nonregular files. Fields besides `version` are optional.
+
+- `directive_receipts` lists up to 100 distinct mappings with `directive_id` and `request_id`. Each mapping identifies historical provenance.
+- `handoff` carries one current declaration for the exact handoff. `artifacts` carries one current declaration per distinct `--include-artifact UUID`, up to 25. These declarations require an explicit Issue and a matching `--invocation-id UUID`.
+- Each current declaration carries `version`, `evidence_id`, `revision`, `source_ref`, `issuer_ref`, `workspace_id`, `actor_ref`, optional `bot_id`, `area_id`, `issue_id`, `operations`, `record`, `invocation_id`, `db_commit`, `valid_from`, `expires_at`, and `withdrawn`. Use UTC RFC 3339 timestamps for validity bounds. The `record` has `kind`, `id`, and `revision`. Use `read_handoff_body` for an `issue_update` handoff and `disclose_artifact_body` for an `artifact`.
+
+Supply nonsecret references. Hive checks current declarations, applicable Directive validity and output provenance at one observation time. Missing required provenance fails closed. See the [context resolution contract](../architecture/dolt-mvp-contract.md#context-resolution).
+
 ## Agent-assisted development
 
 Use [instruction ownership](agents/rule-ownership.md) to place scoped guidance, [asset lifecycle](agents/assets.md) when selecting or updating reusable Agent Assets, and [harness verification](agents/harness.md) to distinguish configuration from observed runtime behavior.

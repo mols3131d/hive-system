@@ -1,9 +1,17 @@
 pub(crate) mod area;
 pub(crate) mod artifact;
 pub(crate) mod bot;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod context_evidence;
+pub(crate) mod context_resolve;
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+#[path = "dolt/context/workflow.rs"]
+mod context_workflow;
 #[cfg(unix)]
 mod conversation;
 pub(crate) mod directive;
+#[cfg(any(test, target_os = "linux"))]
+mod directive_receipt;
 mod graph;
 mod issue;
 mod issue_list;
@@ -190,9 +198,11 @@ fn reader_credential(name: &'static str) -> Result<String, HiveError> {
         })
 }
 
-struct Snapshot {
+pub(crate) struct Snapshot {
     connection: Conn,
     commit: String,
+    #[cfg(any(test, target_os = "linux"))]
+    workspace_id: String,
 }
 
 pub(crate) fn is_database_name(database: &str) -> bool {
@@ -283,17 +293,6 @@ pub(crate) fn inspect_workspace_db(target: DoltTarget<'_>) -> Result<(Value, Val
     Ok((identity_report(&snapshot, workspace_id), working_set))
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn runtime_identity(
-    target: &DoltTargetArgs,
-    user: &str,
-    password: &str,
-) -> Result<Value, HiveError> {
-    let (snapshot, workspace_id) =
-        Snapshot::open_with_reader(DoltTarget::parse(target)?, user, password)?;
-    Ok(identity_report(&snapshot, workspace_id))
-}
-
 #[cfg(unix)]
 fn identity_report(snapshot: &Snapshot, workspace_id: String) -> Value {
     json!({
@@ -313,6 +312,20 @@ impl Snapshot {
         let user = reader_credential("HIVE_DOLT_USER")?;
         let password = reader_credential("HIVE_DOLT_PASSWORD")?;
         Self::open_with_reader(target, &user, &password)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_runtime(
+        target: DoltTarget<'_>,
+        user: &str,
+        password: &str,
+    ) -> Result<Self, HiveError> {
+        Self::open_with_reader(target, user, password).map(|(snapshot, _)| snapshot)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn runtime_identity(&self) -> Value {
+        identity_report(self, self.workspace_id.clone())
     }
 
     fn open_with_reader(
@@ -373,7 +386,12 @@ impl Snapshot {
             ));
         }
 
-        let mut snapshot = Snapshot { connection, commit };
+        let mut snapshot = Snapshot {
+            connection,
+            commit,
+            #[cfg(any(test, target_os = "linux"))]
+            workspace_id: workspace_id.to_owned(),
+        };
         snapshot.verify_schema()?;
         let identity: Vec<(i8, String)> = snapshot.rows(
             "workspace_meta",
