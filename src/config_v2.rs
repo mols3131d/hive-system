@@ -10,7 +10,9 @@ mod unix {
     use crate::cli::{CommonOptions, ConfigScope, ConfigShowArgs, Format, View};
     use crate::config::{absolute_env, current_dir, json_path, resolve_path};
     use crate::config_file::{self, OutputFields, ScopedDirectory, parse_v2, present, untagged};
-    use crate::dolt::{STORAGE_SCHEMA_VERSION, is_uuid, is_uuid_v7};
+    use crate::dolt::{
+        DoltTarget, STORAGE_SCHEMA_VERSION, ScopeRef, is_uuid, is_uuid_v7, verify_scope,
+    };
     use crate::error::{ErrorCode, HiveError};
 
     use super::{BOOTSTRAP_LAYOUT, INIT_PENDING, MARKER, has_init_stage_component};
@@ -109,6 +111,11 @@ mod unix {
         format: &mut Format,
     ) -> Result<Value, HiveError> {
         let resolved = matches!(args.target.scope, ConfigScope::Resolved);
+        let dolt_target = args
+            .dolt_target
+            .has_any()
+            .then(|| DoltTarget::parse(&args.dolt_target))
+            .transpose()?;
         if options.project_root.is_some()
             || !matches!(options.view, View::WorkingTree)
             || (!resolved
@@ -136,6 +143,11 @@ mod unix {
         let binding = binding.as_ref();
         let area = args.area.as_deref();
         let project = options.project.as_ref().map(|id| id.as_str());
+        let resource = binding.map(|selected| &selected.binding);
+        let bound_area = resource.and_then(|binding| binding.area_id.as_deref());
+        let bound_project = resource.and_then(|binding| binding.project_id.as_deref());
+        let effective_area = ScopeRef::select(area, bound_area);
+        let effective_project = ScopeRef::select(project, bound_project);
         let descriptor = &candidate.descriptor;
         let mut report = json!({
             "scope": if resolved { "resolved" } else { "workspace" },
@@ -157,24 +169,42 @@ mod unix {
         }
         if resolved {
             report["verification"]["scope_membership"] = json!("unverified");
-            let mut bound_area = None;
-            let mut bound_project = None;
             if let Some(selected) = binding {
                 report["binding"] = json!(json_path(&selected.file)?);
                 report["resource_root"] = json!(json_path(&selected.root)?);
                 report["resource_id"] = json!(selected.binding.resource_id);
                 report["sources"]["resource"] = json!("binding");
-                bound_area = selected.binding.area_id.as_deref();
-                bound_project = selected.binding.project_id.as_deref();
             }
-            for (scope, field, cli, bound) in [
-                ("area", "area_id", area, bound_area),
-                ("project", "project_id", project, bound_project),
+            for (scope, field, reference) in [
+                ("area", "area_id", effective_area),
+                ("project", "project_id", effective_project),
             ] {
-                if let Some(id) = cli.or(bound) {
-                    report[field] = json!(id);
-                    report["sources"][scope] = json!(if cli.is_some() { "cli" } else { "binding" });
+                if let Some(reference) = reference {
+                    report[field] = json!(reference.id);
+                    report["sources"][scope] = json!(reference.source);
                 }
+            }
+        }
+        if let Some(target) = dolt_target {
+            if target.workspace_id != descriptor.workspace_id {
+                return Err(HiveError::new(
+                    ErrorCode::AuthorityUnverified,
+                    "The expected workspace ID does not match the selected descriptor.",
+                )
+                .with_input("dolt_target", "cli"));
+            }
+            let verified = verify_scope(
+                target,
+                ScopeRef::select(None, resource.map(|binding| binding.resource_id.as_str())),
+                effective_area,
+                effective_project,
+            )?;
+            report["dolt_commit"] = json!(verified.commit);
+            report["verification"]["committed_identity"] = json!("verified");
+            report["verification"]["scope_membership"] = json!("verified");
+            if let Some(area) = verified.inferred_area {
+                report["area_id"] = json!(area);
+                report["sources"]["area"] = json!("binding");
             }
         }
         Ok(report)
@@ -195,6 +225,7 @@ mod unix {
             },
             area: None,
             resource: None,
+            dolt_target: Default::default(),
         };
         select(options, &args, format)
     }

@@ -5,6 +5,9 @@ mod artifacts;
 #[path = "dolt_validation/bots.rs"]
 mod bots;
 #[cfg(unix)]
+#[path = "dolt_validation/config_bindings.rs"]
+mod config_bindings;
+#[cfg(unix)]
 #[path = "dolt_validation/conversation.rs"]
 mod conversation;
 #[path = "dolt_validation/directives.rs"]
