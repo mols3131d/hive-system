@@ -34,6 +34,17 @@ cargo install --locked --path . --root "$hive_install_root"
 
 Use an isolated synthetic workspace to test `config show`, `config validate`, `context` and local `doctor`. Git-backed inspection requires native Git with `--no-lazy-fetch` support and was tested on Linux with Git 2.53.0. Commands that are still pending return `NOT_IMPLEMENTED`. Follow the [CLI contract](../architecture/cli-contract.md) for configuration, output and exit codes.
 
+## Dolt workspace descriptor inspection
+
+On an isolated synthetic v2 workspace, use the read-only configuration command to check the descriptor and how the CLI selected it.
+
+```sh
+hive --contract 2 --json config show --scope workspace \
+  --workspace /example/hive-v2-userdata
+```
+
+An explicit workspace takes precedence. Without one, the CLI uses the v2 user configuration or checks the v2 XDG data candidate. The report identifies the selected source and marks the committed Dolt identity and runtime as unverified. Continue to supply the explicit database, port, and expected workspace UUID for Dolt record commands. See the [v2 local file contract](../architecture/dolt-workspace-contract.md) for configuration and descriptor fields.
+
 ## Dolt record validation
 
 The v2 validator reads a single committed snapshot of Dolt `main` through a dedicated SELECT-only account on loopback. It verifies the pinned server version, required tables, migration ledger version and digest, and expected workspace UUID. It checks canonical UUIDv7 Area and Issue IDs, their graph references, lowercase sibling slugs, Issue numbers, and cycles in Area ancestry, Issue parentage, prerequisites and combined completion obligations. Validation returns up to 100 diagnostics and refuses scans above 100,000 rows per checked table. The JSON result identifies the observed Dolt commit after schema and identity verification.

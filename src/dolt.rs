@@ -19,7 +19,7 @@ pub(crate) use issue::show as issue_show;
 pub(crate) use issue_list::{IssueView, list as issue_list};
 
 const DOLT_VERSION: &str = "2.7.6";
-const STORAGE_SCHEMA_VERSION: u32 = 1;
+pub(crate) const STORAGE_SCHEMA_VERSION: u32 = 1;
 const INITIAL_SCHEMA: &[u8] = include_bytes!("../assets/schema/dolt/0001_initial.sql");
 const INITIAL_SCHEMA_MANIFEST: &str = include_str!("../assets/schema/dolt/0001_schema.sha256");
 const MAX_ROWS_PER_TABLE: usize = 100_000;
@@ -380,7 +380,7 @@ fn is_commit_hash(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'v').contains(&byte))
 }
 
-fn is_uuid(value: &str) -> bool {
+pub(crate) fn is_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| match index {
             8 | 13 | 18 | 23 => byte == b'-',
