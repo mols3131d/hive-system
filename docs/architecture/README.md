@@ -8,7 +8,7 @@ description: "Use when locating component boundaries, design decisions, dependen
 
 ## Dolt v2 development baseline
 
-The operator adopted Dolt v2 for MVP development in [#22](https://github.com/mols3131d/hive-system/issues/22#issuecomment-7198810176). Read the [Dolt architecture](dolt-redesign.md) for the Area and Issue model and storage boundaries, the [MVP contract](dolt-mvp-contract.md) for domain operations and acceptance, and the [relational schema](dolt-schema.md) for tables, constraints and validation. Begin with [read-only schema and record validation (#10)](https://github.com/mols3131d/hive-system/issues/10) and follow the [delivery order and acceptance plan (#15)](https://github.com/mols3131d/hive-system/issues/15).
+The operator adopted Dolt v2 for MVP development in [#22](https://github.com/mols3131d/hive-system/issues/22#issuecomment-7198810176), and [#34](https://github.com/mols3131d/hive-system/issues/34) reconciles the v2 product identity, Queen–Overlord–Drone roles, external representation boundary, Queen conversation preservation, and Bot Memory reassessment on top of that baseline without altering the initial schema migration, stable IDs, or domain guards. Read the [Dolt architecture](dolt-redesign.md) for the Area and Issue model, role/continuity boundaries, and storage ownership, the [MVP contract](dolt-mvp-contract.md) for domain operations, open implementation questions, and acceptance, and the [relational schema](dolt-schema.md) for tables, constraints and validation. Begin with [read-only schema and record validation (#10)](https://github.com/mols3131d/hive-system/issues/10) and follow the [delivery order and acceptance plan (#15)](https://github.com/mols3131d/hive-system/issues/15).
 
 ## v1 compatibility
 
