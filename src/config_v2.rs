@@ -16,6 +16,14 @@ mod unix {
 
     const MARKER: &str = "hive-workspace.yml";
 
+    struct Selection {
+        candidate: Candidate,
+        workspace_source: &'static str,
+        output_source: &'static str,
+        user: Option<UserSource>,
+        binding: Option<bindings::Selected>,
+    }
+
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct UserFields {
@@ -97,6 +105,90 @@ mod unix {
             ));
         }
 
+        let Selection {
+            candidate,
+            workspace_source,
+            output_source,
+            user,
+            binding,
+        } = select(options, args, format)?;
+        let binding = binding.as_ref();
+        let area = args.area.as_deref();
+        let project = options.project.as_ref().map(|id| id.as_str());
+        let descriptor = candidate.descriptor;
+        let mut report = json!({
+            "scope": if resolved { "resolved" } else { "workspace" },
+            "workspace_root": json_path(&candidate.root.path)?,
+            "workspace_id": descriptor.workspace_id,
+            "policy_revision": descriptor.policy_revision,
+            "storage_schema_version": STORAGE_SCHEMA_VERSION,
+            "descriptor": json_path(&candidate.root.path.join(MARKER))?,
+            "output_format": format.as_str(),
+            "sources": {"workspace": workspace_source, "output_format": output_source},
+            "verification": {
+                "descriptor": "verified",
+                "committed_identity": "unverified",
+                "runtime": "unverified"
+            }
+        });
+        if let Some(source) = user
+            && (workspace_source == "user"
+                || output_source == "user"
+                || binding.is_some_and(|selected| selected.binding.workspace.is_none()))
+        {
+            report["user_config"] = json!(json_path(&source.path)?);
+        }
+        if resolved {
+            report["verification"]["scope_membership"] = json!("unverified");
+            let mut bound_area = None;
+            let mut bound_project = None;
+            if let Some(selected) = binding {
+                report["binding"] = json!(json_path(&selected.file)?);
+                report["resource_root"] = json!(json_path(&selected.root)?);
+                report["resource_id"] = json!(selected.binding.resource_id);
+                report["sources"]["resource"] = json!("binding");
+                bound_area = selected.binding.area_id.as_deref();
+                bound_project = selected.binding.project_id.as_deref();
+            }
+            for (scope, field, cli, bound) in [
+                ("area", "area_id", area, bound_area),
+                ("project", "project_id", project, bound_project),
+            ] {
+                if let Some(id) = cli.or(bound) {
+                    report[field] = json!(id);
+                    report["sources"][scope] = json!(if cli.is_some() { "cli" } else { "binding" });
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    pub(crate) fn select_workspace(
+        options: &CommonOptions,
+        format: &mut Format,
+    ) -> Result<(Candidate, &'static str), HiveError> {
+        let args = ConfigShowArgs {
+            target: crate::cli::ConfigScopeArgs {
+                scope: if options.workspace.is_some() {
+                    // Status uses the explicit descriptor without pairing it to Resource scope.
+                    ConfigScope::Workspace
+                } else {
+                    ConfigScope::Resolved
+                },
+            },
+            area: None,
+            resource: None,
+        };
+        let selected = select(options, &args, format)?;
+        Ok((selected.candidate, selected.workspace_source))
+    }
+
+    fn select(
+        options: &CommonOptions,
+        args: &ConfigShowArgs,
+        format: &mut Format,
+    ) -> Result<Selection, HiveError> {
+        let resolved = matches!(args.target.scope, ConfigScope::Resolved);
         let workspace_error = |source, error| {
             if resolved {
                 source_error(source, error)
@@ -168,8 +260,7 @@ mod unix {
                 .map(|path| (path, source.path.as_path()))
         });
 
-        let mut binding = binding.as_ref();
-        let (candidate, workspace_source) = if let Some(selected) = binding {
+        let (candidate, workspace_source) = if let Some(selected) = binding.as_ref() {
             let source = if explicit.is_some() { "cli" } else { "binding" };
             let (candidate, applies) =
                 resolve_bound_workspace(selected, explicit, user_workspace, home)
@@ -209,52 +300,13 @@ mod unix {
             (None, Some(_)) => "user",
             (None, None) => "default",
         };
-        let descriptor = candidate.descriptor;
-        let mut report = json!({
-            "scope": if resolved { "resolved" } else { "workspace" },
-            "workspace_root": json_path(&candidate.root.path)?,
-            "workspace_id": descriptor.workspace_id,
-            "policy_revision": descriptor.policy_revision,
-            "storage_schema_version": STORAGE_SCHEMA_VERSION,
-            "descriptor": json_path(&candidate.root.path.join(MARKER))?,
-            "output_format": format.as_str(),
-            "sources": {"workspace": workspace_source, "output_format": output_source},
-            "verification": {
-                "descriptor": "verified",
-                "committed_identity": "unverified",
-                "runtime": "unverified"
-            }
-        });
-        if let Some(source) = user
-            && (workspace_source == "user"
-                || output_source == "user"
-                || binding.is_some_and(|selected| selected.binding.workspace.is_none()))
-        {
-            report["user_config"] = json!(json_path(&source.path)?);
-        }
-        if resolved {
-            report["verification"]["scope_membership"] = json!("unverified");
-            let mut bound_area = None;
-            let mut bound_project = None;
-            if let Some(selected) = binding {
-                report["binding"] = json!(json_path(&selected.file)?);
-                report["resource_root"] = json!(json_path(&selected.root)?);
-                report["resource_id"] = json!(selected.binding.resource_id);
-                report["sources"]["resource"] = json!("binding");
-                bound_area = selected.binding.area_id.as_deref();
-                bound_project = selected.binding.project_id.as_deref();
-            }
-            for (scope, field, cli, bound) in [
-                ("area", "area_id", area, bound_area),
-                ("project", "project_id", project, bound_project),
-            ] {
-                if let Some(id) = cli.or(bound) {
-                    report[field] = json!(id);
-                    report["sources"][scope] = json!(if cli.is_some() { "cli" } else { "binding" });
-                }
-            }
-        }
-        Ok(report)
+        Ok(Selection {
+            candidate,
+            workspace_source,
+            output_source,
+            user,
+            binding,
+        })
     }
 
     fn resolve_bound_workspace(
@@ -320,7 +372,11 @@ mod unix {
         root
     }
 
-    fn xdg_root(variable: &str, home: Option<&Path>, fallback: &str) -> Result<PathBuf, HiveError> {
+    pub(crate) fn xdg_root(
+        variable: &str,
+        home: Option<&Path>,
+        fallback: &str,
+    ) -> Result<PathBuf, HiveError> {
         absolute_env(variable)
             .or_else(|| home.map(|path| path.join(fallback)))
             .map(|path| path.join("hive/v2"))
@@ -425,7 +481,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub(crate) use unix::{Candidate, read_explicit};
+pub(crate) use unix::{Candidate, read_explicit, select_workspace, xdg_root};
 
 use crate::cli::{CommonOptions, ConfigShowArgs, Format};
 use crate::error::HiveError;

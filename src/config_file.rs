@@ -407,6 +407,20 @@ mod filesystem {
             })
         }
 
+        pub(crate) fn open_child_directory(&self, name: &OsStr) -> Result<Option<Self>, HiveError> {
+            Ok(
+                open_child(&self.file, name, libc::O_DIRECTORY)?.map(|file| Self {
+                    file,
+                    path: self.path.join(name),
+                }),
+            )
+        }
+
+        #[cfg(target_os = "linux")]
+        pub(crate) fn handle(&self) -> &File {
+            &self.file
+        }
+
         pub(crate) fn contains(&self, name: &std::ffi::CStr) -> Result<bool, HiveError> {
             let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
             // SAFETY: The directory descriptor, name, and output buffer are valid.

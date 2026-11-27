@@ -238,15 +238,19 @@ impl Fixture {
     }
 
     fn run_hive(&self, args: &[&str], password: &str) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_hive"))
+        self.hive_command(args, password).output().unwrap()
+    }
+
+    fn hive_command(&self, args: &[&str], password: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hive"));
+        command
             .args(args)
             .current_dir(&self.root)
             .env_clear()
             .env("HOME", self.root.join("home"))
             .env("HIVE_DOLT_USER", READER)
-            .env("HIVE_DOLT_PASSWORD", password)
-            .output()
-            .unwrap()
+            .env("HIVE_DOLT_PASSWORD", password);
+        command
     }
 
     fn validate(&self, workspace_id: &str, password: &str, port: u16) -> Output {
@@ -959,4 +963,71 @@ fn validates_committed_dolt_records_without_writes() {
             .unwrap()
             .contains("workspace_counters")
     );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
+fn workspace_status_checks_committed_identity_independently_of_registration() {
+    let fixture = Fixture::start();
+    let mut admin = fixture.connect(ADMIN);
+    let workspace_id = id(1);
+    let other_id = id(99);
+    admin
+        .exec_drop("UPDATE workspace_meta SET workspace_id = ?", (&other_id,))
+        .unwrap();
+    let before = storage_state(&mut admin);
+    let root = fixture.root.join("status-workspace");
+    fs::create_dir(&root).unwrap();
+    let marker = root.join("hive-workspace.yml");
+    let write_descriptor = |id: &str| {
+        fs::write(&marker, format!(
+            "version: 2\nworkspace_id: {id}\nschema_version: 1\npolicy_revision: c66b3c50150e18426485d134de92c6b311dac125\n"
+        )).unwrap();
+    };
+    write_descriptor(&workspace_id);
+    let status = |workspace_id: &str| {
+        fixture.run_hive(
+            &[
+                "--contract",
+                "2",
+                "--json",
+                "workspace",
+                "status",
+                "--workspace",
+                "status-workspace",
+                "--workspace-id",
+                workspace_id,
+                "--database",
+                DATABASE,
+                "--port",
+                &fixture.port.to_string(),
+            ],
+            &fixture.password,
+        )
+    };
+    let output = status(&workspace_id);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["data"]["committed_identity"]["workspace_id"],
+        workspace_id
+    );
+    assert_eq!(result["data"]["active_root"], "unregistered");
+    assert_eq!(
+        result["data"]["runtime"]["endpoint_ownership"],
+        "unverified"
+    );
+
+    write_descriptor(&other_id);
+    let output = status(&other_id);
+    assert_eq!(output.status.code(), Some(7));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert_eq!(storage_state(&mut admin), before);
+    assert!(!fixture.root.join("home/.local/state").exists());
 }

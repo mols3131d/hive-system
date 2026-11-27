@@ -264,6 +264,8 @@ pub(crate) enum Command {
     #[command(skip)]
     Resource(ResourceCommand),
     #[command(skip)]
+    Workspace(WorkspaceCommand),
+    #[command(skip)]
     Label(LabelCommand),
     /// Inspect preserved Queen conversations under contract 2.
     #[command(subcommand, hide = true)]
@@ -767,13 +769,27 @@ pub(crate) struct DoltTargetArgs {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum WorkspaceCommand {
+    /// Observe the selected workspace and local runtime evidence.
+    Status(DoltTargetArgs),
+}
+
+#[derive(Subcommand)]
 pub(crate) enum ConversationCommand {
     /// Show one preserved Queen conversation.
-    Show(ConversationShowArgs),
+    Show(ConversationSelectionArgs),
+    /// Export one preserved Queen conversation to a new Markdown file.
+    Export {
+        #[command(flatten)]
+        selection: ConversationSelectionArgs,
+        /// Explicit path to a new Markdown file.
+        #[arg(long, value_name = "PATH")]
+        destination: Option<PathBuf>,
+    },
 }
 
 #[derive(Args)]
-pub(crate) struct ConversationShowArgs {
+pub(crate) struct ConversationSelectionArgs {
     /// Canonical lowercase UUIDv7 of the registered Queen.
     #[arg(long, value_name = "UUID", allow_negative_numbers = true)]
     pub(crate) bot: Option<OsString>,
@@ -982,6 +998,9 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     if let Some(project) = project_v2::parse(&cli, &args) {
         return project;
     }
+    if let Some(workspace) = workspace_parser(&cli, &args) {
+        cli = workspace;
+    }
     let mut config_error_matches = None;
     let extension = resource_parser(&cli, &args).or_else(|| label_parser(&cli, &args));
     let (parsed, extension_matches) = if let Some(extension) = extension {
@@ -1030,11 +1049,16 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "context"))
                 .or_else(|| retry_conversation_failure(&cli, &args, error.kind(), "show"))
+                .or_else(|| retry_conversation_failure(&cli, &args, error.kind(), "export"))
+                .or_else(|| retry_workspace_conflict(&cli, &args, error.kind()))
                 .or_else(|| {
-                    cli.clone()
+                    let partial = cli
+                        .clone()
                         .ignore_errors(true)
                         .try_get_matches_from(&args)
-                        .ok()
+                        .ok()?;
+                    recover_unknown_long(&cli, &args, &partial, &error, "workspace")
+                        .or(Some(partial))
                 });
             let root = partial.as_ref();
             let matched = root.and_then(|args| matched_leaf(&cli, args));
@@ -1090,20 +1114,24 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
         let leaf_options =
             CommonArgs::from_arg_matches(leaf).map_err(|error| safe_parse_message(error.kind()))?;
         let common = root.resolve(leaf_options)?;
-        let mut command = if let Some(("resource", resource)) = matches.subcommand() {
-            Command::Resource(
+        let mut command = match matches.subcommand() {
+            Some(("resource", resource)) => Command::Resource(
                 ResourceCommand::from_arg_matches(resource)
                     .map_err(|error| safe_parse_message(error.kind()))?,
-            )
-        } else if let Some(("label", label)) = matches.subcommand() {
-            Command::Label(
+            ),
+            Some(("workspace", workspace)) => Command::Workspace(
+                WorkspaceCommand::from_arg_matches(workspace)
+                    .map_err(|error| safe_parse_message(error.kind()))?,
+            ),
+            Some(("label", label)) => Command::Label(
                 LabelCommand::from_arg_matches(label)
                     .map_err(|error| safe_parse_message(error.kind()))?,
-            )
-        } else {
-            Cli::from_arg_matches(&matches)
-                .map_err(|error| safe_parse_message(error.kind()))?
-                .command
+            ),
+            _ => {
+                Cli::from_arg_matches(&matches)
+                    .map_err(|error| safe_parse_message(error.kind()))?
+                    .command
+            }
         };
         if common.contract == Contract::V2
             && let Command::Bot(BotCommand::List { page, .. })
@@ -1136,6 +1164,83 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             message: message.to_owned(),
         }),
     }
+}
+
+fn workspace_parser(legacy: &clap::Command, args: &[OsString]) -> Option<clap::Command> {
+    if !args.iter().skip(1).any(|arg| arg == "workspace") {
+        return None;
+    }
+    // Probe only the v2 grammar so v1 help and unknown-command errors stay identical.
+    let cli = legacy.clone().subcommand(
+        WorkspaceCommand::augment_subcommands(
+            clap::Command::new("workspace").about("Inspect the v2 workspace."),
+        )
+        .subcommand_required(true)
+        .mut_subcommands(add_leaf_options),
+    );
+    let probe = cli
+        .clone()
+        .disable_help_flag(true)
+        .mut_subcommand("workspace", |domain| {
+            domain.disable_help_flag(true).mut_subcommands(|leaf| {
+                leaf.disable_help_flag(true).arg(
+                    Arg::new("help")
+                        .short('h')
+                        .long("help")
+                        .action(ArgAction::SetTrue),
+                )
+            })
+        });
+    let matches = match probe.clone().try_get_matches_from(args) {
+        Ok(matches) => matches,
+        Err(error) => {
+            let partial = probe
+                .clone()
+                .ignore_errors(true)
+                .try_get_matches_from(args)
+                .ok()?;
+            retry_workspace_conflict(&probe, args, error.kind())
+                .or_else(|| recover_unknown_long(&probe, args, &partial, &error, "workspace"))
+                .unwrap_or(partial)
+        }
+    };
+    let ("workspace", _) = matches.subcommand()? else {
+        return None;
+    };
+    let leaf = matched_leaf(&cli, &matches);
+    (requested_contract(Some(&matches), leaf.as_ref().map(|(_, leaf)| *leaf)) == Contract::V2)
+        .then_some(cli)
+}
+
+fn retry_workspace_conflict(
+    cli: &clap::Command,
+    args: &[OsString],
+    kind: ErrorKind,
+) -> Option<ArgMatches> {
+    if kind != ErrorKind::ArgumentConflict {
+        return None;
+    }
+    cli.find_subcommand("workspace")?;
+    // Accept repeated target options only to recover contract and output flags.
+    // Status takes no positional values. A standalone -- ends options, while
+    // attached values stay intact for Clap. Keep the original parse error.
+    let end = args
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, arg)| *arg == "--")
+        .map_or(args.len(), |(index, _)| index);
+    cli.clone()
+        .mut_subcommand("workspace", |workspace| {
+            workspace.mut_subcommand("status", |status| {
+                status.mut_args(|arg| match arg.get_id().as_str() {
+                    "workspace_id" | "database" | "port" => arg.action(ArgAction::Append),
+                    _ => arg,
+                })
+            })
+        })
+        .try_get_matches_from(&args[..end])
+        .ok()
 }
 
 fn parse_dolt_artifact(
@@ -1308,9 +1413,17 @@ fn recover_unknown_long(
     if error.kind() != ErrorKind::UnknownArgument {
         return None;
     }
-    let (action @ ("list" | "show"), _) = partial.subcommand_matches(domain)?.subcommand()? else {
+    let (matched_domain, matched) = partial.subcommand()?;
+    if matched_domain != domain {
         return None;
-    };
+    }
+    let (action, _) = matched.subcommand()?;
+    if !matches!(
+        (domain, action),
+        ("workspace", "status") | (_, "list" | "show")
+    ) {
+        return None;
+    }
     let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
         return None;
     };
@@ -1658,10 +1771,17 @@ fn retry_conversation_failure(
         return None;
     }
     const SCOPED_VALUES: &[&str] = &["workspace", "project", "project-root", "at"];
-    let leaf_values: &[&str] = if action == "list" {
-        &["bot", "limit", "cursor", "workspace-id", "database", "port"]
-    } else {
-        &["bot", "id", "workspace-id", "database", "port"]
+    let leaf_values: &[&str] = match action {
+        "list" => &["bot", "limit", "cursor", "workspace-id", "database", "port"],
+        "export" => &[
+            "bot",
+            "id",
+            "workspace-id",
+            "database",
+            "port",
+            "destination",
+        ],
+        _ => &["bot", "id", "workspace-id", "database", "port"],
     };
     let recover_metadata = |command: clap::Command, leaf: bool| {
         command.mut_args(|arg| {
@@ -1945,6 +2065,22 @@ impl Command {
                 Self::Context(_) => Err("Use context inspect with an explicit contract 2 target."),
                 Self::Area(command) => command.validate_dolt_selection(common),
                 Self::Resource(command) => command.validate_dolt_selection(common),
+                Self::Workspace(WorkspaceCommand::Status(target)) => {
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Workspace status accepts only workspace, database, and output selection.",
+                        );
+                    }
+                    if target.has_any() && !target.has_all() {
+                        return Err(
+                            "Database inspection requires --workspace-id, --database, and --port.",
+                        );
+                    }
+                    Ok(())
+                }
                 Self::Label(LabelCommand::List(args)) => {
                     if !args.target.has_all()
                         || common.workspace.is_some()
@@ -1958,8 +2094,25 @@ impl Command {
                     Ok(())
                 }
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
-                Self::Conversation(ConversationCommand::Show(args)) => {
-                    if common.workspace.is_none() || !args.target.has_all() {
+                Self::Conversation(command) => {
+                    let (selection, destination) = match command {
+                        ConversationCommand::Show(selection) => (selection, None),
+                        ConversationCommand::Export {
+                            selection,
+                            destination,
+                        } => {
+                            if destination.is_none() {
+                                return Err("Conversation export requires --destination.");
+                            }
+                            (selection, destination.as_ref())
+                        }
+                    };
+                    if common.workspace.is_none() || !selection.target.has_all() {
+                        if destination.is_some() {
+                            return Err(
+                                "Conversation export requires --workspace, --workspace-id, --database, and --port.",
+                            );
+                        }
                         return Err(
                             "Conversation show requires --workspace, --workspace-id, --database, and --port.",
                         );
@@ -1968,9 +2121,11 @@ impl Command {
                         || common.project_root.is_some()
                         || !matches!(common.view, View::WorkingTree)
                     {
-                        return Err(
-                            "Conversation show accepts only explicit workspace and conversation selection.",
-                        );
+                        return Err(if destination.is_some() {
+                            "Conversation export accepts only explicit workspace and conversation selection."
+                        } else {
+                            "Conversation show accepts only explicit workspace and conversation selection."
+                        });
                     }
                     Ok(())
                 }
@@ -2115,7 +2270,7 @@ impl BotCommand {
 }
 
 impl DoltTargetArgs {
-    fn has_any(&self) -> bool {
+    pub(crate) fn has_any(&self) -> bool {
         self.workspace_id.is_some() || self.database.is_some() || self.port.is_some()
     }
 
