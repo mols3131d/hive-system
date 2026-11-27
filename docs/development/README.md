@@ -130,6 +130,21 @@ List orders summaries by Project ID and accepts exact `active`, `completed`, or 
 
 Show takes a canonical lowercase UUIDv7 and returns Project details and up to 25 direct member Issue IDs across Areas. The `issues.truncated` field indicates additional members. Use `issue list --project UUID` to page through member summaries.
 
+## Committed Bot metadata
+
+Use the same explicit Dolt target and SELECT-only account for contract 2 Bot reads.
+
+```sh
+hive --contract 2 --json bot list --status retired --limit 10 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+hive --contract 2 --json bot show 01900000-0000-7000-8000-00000000000a \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+`bot list` defaults to `--status active` and accepts `retired` or `all`. It orders entries by ascending Bot UUID, with 25 results per page by default and a maximum of 100. Pass `next_cursor` as `--cursor` with the same target, status and page size. Changes to the committed snapshot or query return `STALE_CURSOR`.
+
+`bot show` takes an exact lowercase UUIDv7 and can inspect retired Queens. Both commands return registry metadata and the verified Dolt commit. Registry status describes retirement. Committed Soul inspection requires the workspace and asset repository pairing from [#18](https://github.com/mols3131d/hive-system/issues/18).
+
 ## Agent-assisted development
 
 Use [instruction ownership](agents/rule-ownership.md) to place scoped guidance, [asset lifecycle](agents/assets.md) when selecting or updating reusable Agent Assets, and [harness verification](agents/harness.md) to distinguish configuration from observed runtime behavior.

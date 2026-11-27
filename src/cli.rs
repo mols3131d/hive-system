@@ -593,17 +593,26 @@ pub(crate) enum DirectiveStatus {
 }
 
 #[derive(Subcommand)]
-#[allow(dead_code, reason = "Bot operations follow the CLI bootstrap")]
 pub(crate) enum BotCommand {
     /// List registered Manager Bots.
     List {
         #[command(flatten)]
         page: ListArgs,
+        /// Contract 2 registry filter (active by default, retired, or all).
+        #[arg(long, hide = true)]
+        status: Option<String>,
+        /// Contract 2 continuation from next_cursor.
+        #[arg(long, hide = true)]
+        cursor: Option<String>,
+        #[command(flatten)]
+        target: DoltTargetArgs,
     },
     /// Show a registered Bot's identity and routing metadata.
     Show {
         #[arg(value_name = "BOT-ID", value_parser = parse_slug)]
         bot_id: String,
+        #[command(flatten)]
+        target: DoltTargetArgs,
     },
 }
 
@@ -742,7 +751,17 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     let cli = Cli::command();
     // Global clap arguments propagate values across levels. Separate declarations
     // retain every occurrence at the root and at the selected leaf.
-    let mut cli = CommonArgs::augment_args(cli.mut_subcommands(add_leaf_options));
+    let mut cli = CommonArgs::augment_args(cli.mut_subcommands(add_leaf_options)).mut_subcommand(
+        "bot",
+        |bot| {
+            bot.mut_subcommands(|leaf| {
+                leaf.mut_args(|arg| match arg.get_id().as_str() {
+                    "workspace_id" | "database" | "port" => arg.hide(true),
+                    _ => arg,
+                })
+            })
+        },
+    );
     if let Some(project) = project_v2::parse(&cli, &args) {
         return project;
     }
@@ -771,12 +790,14 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 }
                 _ => None,
             };
-            let partial = area_matches.or_else(|| {
-                cli.clone()
-                    .ignore_errors(true)
-                    .try_get_matches_from(&args)
-                    .ok()
-            });
+            let partial = area_matches
+                .or_else(|| retry_bot_failure(&cli, &args, error.kind()))
+                .or_else(|| {
+                    cli.clone()
+                        .ignore_errors(true)
+                        .try_get_matches_from(&args)
+                        .ok()
+                });
             let root = partial.as_ref();
             let matched = root.and_then(|args| matched_leaf(&cli, args));
             let leaf = matched.as_ref().map(|(_, args)| *args);
@@ -811,11 +832,17 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     let parsed = || -> Result<_, &'static str> {
         let root = CommonArgs::from_arg_matches(&matches)
             .map_err(|error| safe_parse_message(error.kind()))?;
-        let leaf =
+        let leaf_options =
             CommonArgs::from_arg_matches(leaf).map_err(|error| safe_parse_message(error.kind()))?;
-        let common = root.resolve(leaf)?;
-        let Cli { command } =
+        let common = root.resolve(leaf_options)?;
+        let Cli { mut command } =
             Cli::from_arg_matches(&matches).map_err(|error| safe_parse_message(error.kind()))?;
+        if common.contract == Contract::V2
+            && let Command::Bot(BotCommand::List { page, .. }) = &mut command
+            && leaf.value_source("limit") == Some(clap::parser::ValueSource::DefaultValue)
+        {
+            page.limit = 25;
+        }
         command.validate(&common)?;
         Ok((common, command))
     };
@@ -849,6 +876,55 @@ fn retry_issue_query(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatche
         command.as_str(),
         "issue list" | "issue ready" | "issue blocked"
     ) && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+        .then_some(matches)
+}
+
+fn retry_bot_failure(
+    cli: &clap::Command,
+    args: &[OsString],
+    kind: ErrorKind,
+) -> Option<ArgMatches> {
+    if !matches!(
+        kind,
+        ErrorKind::ValueValidation
+            | ErrorKind::InvalidValue
+            | ErrorKind::UnknownArgument
+            | ErrorKind::ArgumentConflict
+    ) {
+        return None;
+    }
+    // Recover the output envelope from Clap's actual option boundaries. The
+    // original parse error still applies and these values never reach dispatch.
+    let recover_value = |arg: clap::Arg| {
+        arg.action(ArgAction::Append)
+            .allow_negative_numbers(true)
+            .num_args(0..=1)
+    };
+    let recover_scope = |command| {
+        defer_project_check(command).mut_args(|arg| match arg.get_id().as_str() {
+            "project" => recover_value(arg),
+            "at" | "workspace" | "project_root" => {
+                recover_value(arg.value_parser(StringValueParser::new()))
+            }
+            _ => arg,
+        })
+    };
+    let retry = recover_scope(cli.clone().mut_subcommand("bot", |bot| {
+        bot.mut_subcommands(|leaf| {
+            recover_scope(leaf).mut_args(|arg| match arg.get_id().as_str() {
+                "database" | "workspace_id" | "port" | "cursor" | "status" => recover_value(arg),
+                "limit" | "after" => recover_value(arg.value_parser(StringValueParser::new())),
+                "bot_id" => arg
+                    .value_parser(StringValueParser::new())
+                    .allow_negative_numbers(true),
+                _ => arg,
+            })
+        })
+    }));
+    let matches = retry.try_get_matches_from(args).ok()?;
+    let (command, leaf) = matched_leaf(cli, &matches)?;
+    (matches!(command.as_str(), "bot list" | "bot show")
+        && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }
 
@@ -1058,6 +1134,7 @@ impl Command {
                     | IssueCommand::Blocked(args),
                 ) => args.validate_dolt_selection(common),
                 Self::Project(_) => Err("Use contract 2 Project read options."),
+                Self::Bot(command) => command.validate(common),
                 _ => Ok(()),
             };
         }
@@ -1077,6 +1154,7 @@ impl Command {
             }
             Self::Area(_) => Err("Area commands require --contract 2."),
             Self::Issue(_) => Err("Issue commands require --contract 2."),
+            Self::Bot(command) => command.validate(common),
             Self::Validate(args) => {
                 if args.all || args.target.has_any() {
                     return Err("Dolt validation requires --contract 2.");
@@ -1090,6 +1168,48 @@ impl Command {
             Self::Artifact(command) => command.validate(common),
             _ => Ok(()),
         }
+    }
+}
+
+impl BotCommand {
+    fn validate(&self, common: &CommonOptions) -> Result<(), &'static str> {
+        let target = match self {
+            Self::List { target, .. } | Self::Show { target, .. } => target,
+        };
+        if common.contract == Contract::V1 {
+            if target.has_any()
+                || matches!(
+                    self,
+                    Self::List {
+                        status: Some(_),
+                        ..
+                    } | Self::List {
+                        cursor: Some(_),
+                        ..
+                    }
+                )
+            {
+                return Err("Dolt Bot options require --contract 2.");
+            }
+            return Ok(());
+        }
+        target.validate_common(
+            common,
+            "Dolt Bot inspection accepts only an explicit local database and workspace ID.",
+        )?;
+        if !target.has_all() {
+            return Err("Dolt Bot inspection requires --workspace-id, --database, and --port.");
+        }
+        if matches!(
+            self,
+            Self::List {
+                page: ListArgs { after: Some(_), .. },
+                ..
+            }
+        ) {
+            return Err("Use --cursor for Dolt Bot pagination.");
+        }
+        Ok(())
     }
 }
 
