@@ -1575,6 +1575,44 @@ fn dolt_area_reads_require_contract_2_and_an_explicit_target() {
 }
 
 #[test]
+fn unknown_area_create_options_keep_the_late_v2_envelope() {
+    let sandbox = Sandbox::new();
+    for unknown in [
+        &["--unknown=--contract=1"][..],
+        &["--unknown", "fixture-value"],
+        &["--unknown"],
+    ] {
+        let args = [
+            &["area", "create"][..],
+            unknown,
+            &["--contract", "2", "--json"],
+        ]
+        .concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "schema_version": 2, "ok": false, "command": "area create",
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "An argument or command is not recognized.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+    let literal = sandbox.run(&["area", "create", "--unknown=--json", "--contract", "2"]);
+    assert_eq!(literal.status.code(), Some(2));
+    assert!(literal.stdout.is_empty());
+    assert!(!literal.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
 fn malformed_dolt_area_options_preserve_v2_json_at_root_and_leaf() {
     let sandbox = Sandbox::new();
     let target = [

@@ -1360,6 +1360,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                         .try_get_matches_from(&args)
                         .ok()?;
                     recover_unknown_long(&cli, &args, &partial, &error, "workspace")
+                        .or_else(|| recover_unknown_long(&cli, &args, &partial, &error, "area"))
                         .or_else(|| recover_context_resolve(&cli, &args, &partial, &error))
                         .or(Some(partial))
                 });
@@ -1935,7 +1936,7 @@ fn recover_unknown_long(
         (
             "workspace",
             "init" | "status" | "start" | "stop" | "recover"
-        ) | ("artifact", "create")
+        ) | ("artifact" | "area", "create")
             | (_, "list" | "show")
     ) {
         return None;
@@ -1950,8 +1951,12 @@ fn recover_unknown_long(
     // positionals, so the temporary option can take one plain separated
     // value. The original parse error still determines the result.
     let workspace_init = (domain, action) == ("workspace", "init");
-    let allow_separated_value =
-        workspace_init || matches!((domain, action), ("label", "list") | ("artifact", "create"));
+    let area_create = (domain, action) == ("area", "create");
+    let allow_separated_value = workspace_init
+        || matches!(
+            (domain, action),
+            ("label", "list") | ("artifact" | "area", "create")
+        );
     const UNKNOWN_LONG: &str = "recovered_unknown_long";
     let retry = cli.clone().mut_subcommand(domain, |command| {
         command.mut_subcommand(action, |leaf| {
@@ -1981,7 +1986,14 @@ fn recover_unknown_long(
     } else {
         args.len()
     };
-    let matches = retry.try_get_matches_from(&args[..end]).ok()?;
+    let matches = match retry.clone().try_get_matches_from(&args[..end]) {
+        Ok(matches) => matches,
+        Err(error) if area_create && error.kind() == ErrorKind::MissingRequiredArgument => retry
+            .ignore_errors(true)
+            .try_get_matches_from(&args[..end])
+            .ok()?,
+        Err(_) => return None,
+    };
     let recovered = matches
         .subcommand_matches(domain)?
         .subcommand_matches(action)?;
