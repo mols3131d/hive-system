@@ -293,17 +293,6 @@ pub(crate) fn inspect_workspace_db(target: DoltTarget<'_>) -> Result<(Value, Val
     Ok((identity_report(&snapshot, workspace_id), working_set))
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn runtime_identity(
-    target: &DoltTargetArgs,
-    user: &str,
-    password: &str,
-) -> Result<Value, HiveError> {
-    let (snapshot, workspace_id) =
-        Snapshot::open_with_reader(DoltTarget::parse(target)?, user, password)?;
-    Ok(identity_report(&snapshot, workspace_id))
-}
-
 #[cfg(unix)]
 fn identity_report(snapshot: &Snapshot, workspace_id: String) -> Value {
     json!({
