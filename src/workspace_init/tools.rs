@@ -357,13 +357,25 @@ fn run_version(mut command: Command, engine: &str) -> Result<String, HiveError> 
             format!("{engine} version probe {reason}."),
         )
     };
+    let mut disposition = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: The buffer is valid and a null action only reads the disposition.
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), disposition.as_mut_ptr()) } != 0 {
+        return Err(failed("could not inspect child reaping"));
+    }
+    // SAFETY: sigaction initialized the disposition.
+    let disposition = unsafe { disposition.assume_init() };
+    if disposition.sa_sigaction != libc::SIG_DFL || disposition.sa_flags & libc::SA_NOCLDWAIT != 0 {
+        return Err(failed("requires waitable children"));
+    }
     let deadline = Instant::now() + TIMEOUT;
     let mut child = command
+        .process_group(0)
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|_| failed("could not start"))?;
+    let leader = child.id() as libc::pid_t;
     let mut stdout = child.stdout.take().expect("version stdout is piped");
-    let result = (|| {
+    let output = (|| {
         let mut output = Vec::new();
         let mut buffer = [0; 256];
         let mut poll_fd = libc::pollfd {
@@ -401,28 +413,56 @@ fn run_version(mut command: Command, engine: &str) -> Result<String, HiveError> 
             }
             output.extend_from_slice(&buffer[..count]);
         }
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(failed("timed out"));
-            }
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|_| failed("could not be reaped"))?
-            {
-                if !status.success() {
-                    return Err(failed("failed"));
-                }
-                return String::from_utf8(output).map_err(|_| failed("returned invalid output"));
-            }
-            std::thread::sleep(remaining.min(Duration::from_millis(10)));
-        }
+        Ok(output)
     })();
-    if result.is_err() {
+
+    let output = loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: The buffer is valid and leader is the PID returned by spawn.
+        // WNOWAIT observes exit without releasing the PID that names our group.
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                leader as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } != 0
+        {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // Without waitable-child evidence, do not signal the numeric group.
+            return Err(failed("could not verify its child"));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if output.is_err() {
+            break output;
+        }
+        if remaining.is_zero() {
+            break Err(failed("timed out"));
+        }
+        // SAFETY: On success waitid returned a child event or left si_pid zero.
+        if unsafe { info.assume_init().si_pid() } != 0 {
+            break output;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    };
+
+    // SAFETY: spawn placed this probe in a fresh group named by its leader.
+    // The waitable leader remains unreaped, reserving that ID until after killpg.
+    let signaled = unsafe { libc::killpg(leader, libc::SIGKILL) };
+    if signaled != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
         let _ = child.kill();
         let _ = child.wait();
+        return Err(failed("could not terminate its process group"));
     }
-    result
+    let status = child.wait().map_err(|_| failed("could not be reaped"))?;
+    let output = output?;
+    if !status.success() {
+        return Err(failed("failed"));
+    }
+    String::from_utf8(output).map_err(|_| failed("returned invalid output"))
 }
 
 fn unrecognized_git_version() -> HiveError {

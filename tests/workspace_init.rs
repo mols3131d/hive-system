@@ -211,6 +211,86 @@ fn doctor_bounds_version_output_and_exit_time() {
 }
 
 #[test]
+fn doctor_terminates_version_helpers_before_reaping_the_wrapper() {
+    for (tail, reason) in [
+        ("exit 0", "timed out"),
+        (
+            "/usr/bin/head -c 65536 /dev/zero",
+            "exceeded its output limit",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let target = fixture.dir("empty");
+        fixture.fake_dolt(&format!(
+            r#"
+            marker="${{0%/*}}/../helper"
+            (
+                [ -d "$HOME" ] || exit 1
+                printf '%s\n' "${{HOME##*/}}" > "$marker.fd"
+                exec /bin/sleep 8
+            ) &
+            printf '%s\n' "$!" > "$marker.pid"
+            while [ ! -s "$marker.fd" ]; do :; done
+            {tail}
+            "#
+        ));
+        fixture.fake_git_version();
+        let report = response(fixture.doctor_target(&target).output().unwrap(), 7);
+        assert_eq!(report["error"]["code"], "RUNTIME_UNAVAILABLE");
+        assert_eq!(
+            report["error"]["message"],
+            format!("Dolt version probe {reason}.")
+        );
+        let helper: u32 = fs::read_to_string(fixture.0.join("helper.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let fd: u32 = fs::read_to_string(fixture.0.join("helper.fd"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let scratch_fd = PathBuf::from(format!("/proc/{helper}/fd/{fd}"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match fs::symlink_metadata(&scratch_fd) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => panic!("could not inspect the version helper's descriptor: {error}"),
+                Ok(_) => assert!(
+                    Instant::now() < deadline,
+                    "version helper still holds scratch"
+                ),
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+fn doctor_refuses_version_probes_when_children_are_auto_reaped() {
+    let fixture = Fixture::new();
+    let target = fixture.dir("empty");
+    fixture.fake_dolt("exit 42");
+    fixture.fake_git_version();
+    let mut doctor = fixture.doctor_target(&target);
+    // SAFETY: signal sets a disposition only in the forked child, before exec.
+    unsafe {
+        doctor.pre_exec(|| {
+            if libc::signal(libc::SIGCHLD, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let report = response(doctor.output().unwrap(), 7);
+    assert_eq!(
+        report["error"]["message"],
+        "Dolt version probe requires waitable children."
+    );
+}
+
+#[test]
 fn doctor_uses_status_for_initialized_inspection_and_requires_explicit_selection() {
     let fixture = Fixture::new();
     let target = fixture.dir("initialized");
