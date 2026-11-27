@@ -8,6 +8,9 @@ use crate::error::HiveError;
 #[path = "workspace_init/linux.rs"]
 mod linux;
 
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{inspect_empty_target, probe_versions};
+
 pub(crate) fn run(target: &Path, register_runtime: bool) -> Result<Value, HiveError> {
     #[cfg(target_os = "linux")]
     {

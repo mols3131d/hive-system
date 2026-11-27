@@ -41,7 +41,7 @@ pub(crate) fn observe(
     #[cfg(unix)]
     {
         let mut format = options.format.unwrap_or_default();
-        let result = unix::observe(options, target, &mut format);
+        let result = unix::observe(options, target, &mut format, false);
         (format, result)
     }
     #[cfg(not(unix))]
@@ -57,10 +57,21 @@ pub(crate) fn observe(
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn diagnose(
+    options: &CommonOptions,
+    target: &DoltTargetArgs,
+) -> (Format, Result<Value, HiveError>) {
+    let mut format = options.format.unwrap_or_default();
+    let result = unix::observe(options, target, &mut format, true);
+    (format, result)
+}
+
 #[cfg(unix)]
 mod unix {
     use std::ffi::OsStr;
     use std::num::NonZeroU16;
+    use std::os::unix::fs::MetadataExt;
 
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
     use serde_json::{Value, json};
@@ -71,7 +82,8 @@ mod unix {
     use crate::config_file::ScopedDirectory;
     use crate::config_v2::{select_workspace, xdg_root};
     use crate::dolt::{
-        DoltTarget, STORAGE_SCHEMA_VERSION, committed_identity, is_database_name, is_uuid,
+        DoltTarget, STORAGE_SCHEMA_VERSION, committed_identity, inspect_workspace_db,
+        is_database_name, is_uuid,
     };
     use crate::error::{ErrorCode, HiveError};
 
@@ -99,12 +111,14 @@ mod unix {
         options: &CommonOptions,
         target: &DoltTargetArgs,
         format: &mut Format,
+        doctor: bool,
     ) -> Result<Value, HiveError> {
         let target = target
             .has_any()
             .then(|| DoltTarget::parse(target))
             .transpose()?;
-        let (workspace, source) = select_workspace(options, format)?;
+        let selection = select_workspace(options, format)?;
+        let workspace = &selection.candidate;
         let workspace_id = workspace.workspace_id();
         let root = json_path(&workspace.root.path)?;
         // An absent DB is valid for descriptor-only inspection. An existing
@@ -138,6 +152,7 @@ mod unix {
 
         let pending = read_state(state, "pending-request.json")?.is_some();
         let mut committed = None;
+        let mut working_set = None;
         if let Some(target) = target {
             if target.workspace_id != workspace_id {
                 return Err(unverified(
@@ -152,7 +167,13 @@ mod unix {
                     "The explicit database target differs from the recorded endpoint.",
                 ));
             }
-            committed = Some(committed_identity(target)?);
+            if doctor {
+                let (identity, evidence) = inspect_workspace_db(target)?;
+                committed = Some(identity);
+                working_set = Some(evidence);
+            } else {
+                committed = Some(committed_identity(target)?);
+            }
         }
         // Recheck process identity after the optional connection. The SQL result
         // establishes committed identity at the endpoint, independently of this PID.
@@ -164,10 +185,10 @@ mod unix {
             process
         };
 
-        Ok(json!({
+        let mut report = json!({
             "workspace_root": root,
             "workspace_id": workspace_id,
-            "workspace_source": source,
+            "workspace_source": selection.workspace_source,
             "policy_revision": workspace.policy_revision(),
             "storage_schema_version": STORAGE_SCHEMA_VERSION,
             "active_root": if registration.is_some() { "matched" } else { "unregistered" },
@@ -183,7 +204,40 @@ mod unix {
                 "endpoint_ownership": "unverified",
             },
             "committed_identity": committed,
-        }))
+        });
+        if doctor {
+            report["sources"] = json!({
+                "workspace": selection.workspace_source,
+                "output_format": selection.output_source,
+            });
+            report["descriptor"] = json!(json_path(
+                &workspace.root.path.join(crate::config_v2::MARKER)
+            )?);
+            if let Some(path) = selection.user_config() {
+                report["user_config"] = json!(json_path(path)?);
+            }
+            report["state_directory"] = state_permissions(state);
+            report["working_set"] = working_set
+                .unwrap_or_else(|| json!({"unavailable": "authenticated_endpoint_not_supplied"}));
+        }
+        Ok(report)
+    }
+
+    fn state_permissions(state: Option<&ScopedDirectory>) -> Value {
+        let Some(state) = state else {
+            return json!({"unavailable": "state_directory_missing"});
+        };
+        let Ok(metadata) = state.directory_file().metadata() else {
+            return json!({"unavailable": "state_metadata_unavailable"});
+        };
+        let mode = metadata.mode() & 0o7777;
+        // SAFETY: geteuid takes no arguments.
+        let owned = metadata.uid() == unsafe { libc::geteuid() };
+        json!({
+            "owned_by_caller": owned,
+            "mode": format!("{mode:04o}"),
+            "private": owned && mode == 0o700,
+        })
     }
 
     pub(super) fn find_state(
