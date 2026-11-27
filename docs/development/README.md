@@ -46,6 +46,8 @@ Validation checks canonical UUIDv7 IDs for Artifacts and Directives. It checks A
 
 Validation checks canonical UUIDv7 IDs, owning Issue references, exact lowercase update kinds, and paired JSON-object `transition_json` payloads for committed Issue updates. For committed operation receipts, it checks canonical lowercase UUID `request_id` values, 64-character lowercase hexadecimal SHA-256 `fingerprint` values, and JSON-object `workflow_evidence_json` and `result_json` payloads. Typed payload schemas, historical transition provenance, receipt replay, and guarded authorization semantics remain for guarded write implementation.
 
+Validation checks canonical lowercase UUIDv7 `id` values and exact portable lowercase kebab-case `slug` values for committed `bots` rows, including retired rows. It does not impose extra `display_name` or `revision` invariants, assume Claims bind registered Queens, inspect filesystem Soul assets, or validate deferred `bot_memories` semantics.
+
 The validator compares each required table's `SHOW CREATE TABLE ... AS OF` output with the migration's Dolt 2.7.6 schema shape. Dirty and staged definitions are outside the inspected commit. The exact `issue_number` counter key must have a positive next value greater than every Issue number at that commit. Historical issuance and reuse require separate history evidence.
 
 For an explicitly provisioned synthetic server on Dolt 2.7.6, supply the reader credentials in the process environment as `HIVE_DOLT_USER` and `HIVE_DOLT_PASSWORD`. Select the database, port and expected UUID explicitly.
