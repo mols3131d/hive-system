@@ -1524,3 +1524,115 @@ fn conversation_show_rejects_default_selection_and_preserves_late_v2_json() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["schema_version"], 1);
 }
+
+#[test]
+fn conversation_show_recovers_v2_json_for_duplicate_and_hyphenated_selectors() {
+    let sandbox = Sandbox::new();
+    let uuid = "01900000-0000-7000-8000-000000000001";
+    let command = [
+        "conversation",
+        "show",
+        "--workspace",
+        ".",
+        "--workspace-id",
+        uuid,
+        "--database",
+        "fixture",
+        "--port",
+        "3306",
+    ];
+    let late = ["--contract", "2", "--json"];
+    for selectors in [
+        &["--bot", uuid, "--bot", uuid, "--id", uuid][..],
+        &[
+            "--bot",
+            uuid,
+            "--id",
+            uuid,
+            "--id",
+            "private-invalid-selector",
+        ],
+        &["--bot", "-invalid", "--id", uuid],
+        &["--bot", uuid, "--id", "-invalid"],
+        &["--bot", uuid, "--bot=--json", "--id", uuid],
+        &["--bot", uuid, "--id", uuid, "--id=--contract"],
+        &["--bot=-invalid", "--id", uuid],
+        &["--bot", uuid, "--id=-invalid"],
+        &["--bot", uuid, "--id"],
+        &["--id", uuid, "--bot"],
+    ] {
+        let args = [&command[..], selectors, &late].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], "conversation show");
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(report.get("data").is_none());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!stdout.contains("-invalid"));
+    }
+
+    for selectors in [
+        &[
+            "--bot",
+            uuid,
+            "--bot=--json",
+            "--id",
+            uuid,
+            "--contract",
+            "2",
+        ][..],
+        &[
+            "--bot",
+            "123",
+            "--id",
+            uuid,
+            "--id=--json",
+            "--contract",
+            "2",
+        ],
+        &[
+            "--bot",
+            "-invalid",
+            "--id",
+            uuid,
+            "--",
+            "--contract",
+            "2",
+            "--json",
+        ],
+        &[
+            "--bot",
+            uuid,
+            "--id",
+            uuid,
+            "--id",
+            uuid,
+            "--",
+            "--contract",
+            "2",
+            "--json",
+        ],
+        &[
+            "--bot",
+            uuid,
+            "--id",
+            uuid,
+            "--id",
+            "--",
+            "--contract",
+            "2",
+            "--json",
+        ],
+    ] {
+        let args = [&command[..], selectors].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("-invalid"));
+    }
+    sandbox.assert_empty();
+}

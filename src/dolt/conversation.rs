@@ -6,7 +6,7 @@ use serde_saphyr::Tagged;
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use super::{DoltFailure, DoltSuccess, Snapshot, is_uuid, is_uuid_v7, unverified_authority};
+use super::{DoltSuccess, Snapshot, is_uuid, unverified_authority};
 use crate::cli::{CommonOptions, ConversationShowArgs, is_slug};
 use crate::config_file::{MAX_FILE_BYTES, parse_v2, present, untagged};
 use crate::config_v2;
@@ -63,16 +63,12 @@ enum Source {
     Stdin,
 }
 
-pub(crate) fn show(
+pub(super) fn read(
     common: &CommonOptions,
     args: &ConversationShowArgs,
-) -> Result<DoltSuccess, Box<DoltFailure>> {
-    read(common, args).map_err(DoltFailure::without_context)
-}
-
-fn read(common: &CommonOptions, args: &ConversationShowArgs) -> Result<DoltSuccess, HiveError> {
-    let bot_id = selector(args.bot.as_deref(), "--bot")?;
-    let conversation_id = selector(args.id.as_deref(), "--id")?;
+    bot_id: &str,
+    conversation_id: &str,
+) -> Result<DoltSuccess, HiveError> {
     let expected_id = args
         .target
         .workspace_id
@@ -143,18 +139,6 @@ fn read(common: &CommonOptions, args: &ConversationShowArgs) -> Result<DoltSucce
     })
 }
 
-fn selector<'a>(value: Option<&'a OsStr>, flag: &str) -> Result<&'a str, HiveError> {
-    value
-        .and_then(OsStr::to_str)
-        .filter(|id| is_uuid_v7(id))
-        .ok_or_else(|| {
-            HiveError::new(
-                ErrorCode::InvalidArgument,
-                format!("Supply {flag} as a canonical lowercase UUIDv7."),
-            )
-        })
-}
-
 fn validate_file<'a>(
     bytes: &'a [u8],
     workspace_id: &str,
@@ -192,8 +176,9 @@ fn validate_file<'a>(
             "The conversation frontmatter identity does not match its selection.",
         ));
     }
-    if !OffsetDateTime::parse(&metadata.imported_at, &Rfc3339)
-        .is_ok_and(|time| time.offset().is_utc())
+    if !matches!(metadata.imported_at.as_bytes().get(10), Some(b'T' | b't'))
+        || !OffsetDateTime::parse(&metadata.imported_at, &Rfc3339)
+            .is_ok_and(|time| time.offset().is_utc())
         || metadata.imported_at.ends_with("-00:00")
         || metadata.title.as_deref().is_some_and(|title| {
             title.is_empty() || !valid_label(title) || title.contains(['\u{2028}', '\u{2029}'])
@@ -287,6 +272,8 @@ mod tests {
                 assert_eq!(metadata.provenance.session_ref, None);
             }
         }
+        let lowercase = fixture("", "\n").replace("T09:00:00Z", "t09:00:00Z");
+        assert!(parse(lowercase.as_bytes()).is_ok());
     }
 
     #[test]
@@ -305,6 +292,8 @@ mod tests {
             ("version: 1", "version: 2"),
             ("source: stdin", "source: private-source"),
             ("2026-11-27T09:00:00Z", "2026-02-30T09:00:00Z"),
+            ("2026-11-27T09:00:00Z", "2026-11-27X09:00:00Z"),
+            ("2026-11-27T09:00:00Z", "2026-11-27\\t09:00:00Z"),
             ("2026-11-27T09:00:00Z", "2026-11-27T09:00:00-00:00"),
             ("2026-11-27T09:00:00Z", "2026-11-27T09:00:00+01:00"),
             ("private-fixture-body", "private-changed-body"),

@@ -1,7 +1,12 @@
 use super::*;
 
 const POLICY: &str = "c66b3c50150e18426485d134de92c6b311dac125";
-const BODY: &str = "\r\n# Synthetic 기록\r\n---\nLast line without a newline";
+const PRIVATE_BODY_MARKER: &str = "private-conversation-fixture-body";
+const BODY: &str = concat!(
+    "\r\n# Synthetic 기록\r\n---\n",
+    "private-conversation-fixture-body",
+    "\nLast line without a newline"
+);
 
 fn descriptor(workspace_id: &str) -> String {
     format!(
@@ -80,7 +85,7 @@ fn conversation_show_reads_only_the_explicit_verified_copy() {
             assert!(json.get("data").is_none());
             let response = String::from_utf8(output.stdout).unwrap();
             for private in [
-                BODY,
+                PRIVATE_BODY_MARKER,
                 "Synthetic title",
                 "synthetic-session",
                 "private-header-value",

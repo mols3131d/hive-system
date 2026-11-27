@@ -815,6 +815,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             };
             let partial = area_matches
                 .or_else(|| retry_bot_failure(&cli, &args, error.kind()))
+                .or_else(|| retry_conversation_failure(&cli, &args, error.kind()))
                 .or_else(|| {
                     cli.clone()
                         .ignore_errors(true)
@@ -947,6 +948,51 @@ fn retry_bot_failure(
     let matches = retry.try_get_matches_from(args).ok()?;
     let (command, leaf) = matched_leaf(cli, &matches)?;
     (matches!(command.as_str(), "bot list" | "bot show")
+        && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+        .then_some(matches)
+}
+
+fn retry_conversation_failure(
+    cli: &clap::Command,
+    args: &[OsString],
+    kind: ErrorKind,
+) -> Option<ArgMatches> {
+    if !matches!(
+        kind,
+        ErrorKind::UnknownArgument | ErrorKind::ArgumentConflict
+    ) {
+        return None;
+    }
+    let retry = cli.clone().mut_subcommand("conversation", |conversation| {
+        conversation.mut_subcommand("show", |show| {
+            show.mut_arg("bot", |arg| arg.action(ArgAction::Append))
+                .mut_arg("id", |arg| arg.action(ArgAction::Append))
+        })
+    });
+    // Join split single-dash selector values for this metadata-only retry.
+    // Preserve long options, help switches, equals values, and the -- boundary.
+    let mut args = args.iter().cloned().peekable();
+    let mut normalized = Vec::new();
+    normalized.extend(args.next());
+    while let Some(mut arg) = args.next() {
+        if arg == "--" {
+            normalized.push(arg);
+            normalized.extend(args);
+            break;
+        }
+        if (arg == "--bot" || arg == "--id")
+            && args.peek().is_some_and(|value| {
+                matches!(value.as_encoded_bytes(), [b'-', next, ..] if !matches!(next, b'-' | b'h' | b'V'))
+            })
+        {
+            arg.push("=");
+            arg.push(args.next().expect("peeked selector value"));
+        }
+        normalized.push(arg);
+    }
+    let matches = retry.try_get_matches_from(normalized).ok()?;
+    let (command, leaf) = matched_leaf(cli, &matches)?;
+    (command == "conversation show"
         && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }
