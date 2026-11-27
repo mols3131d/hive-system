@@ -125,6 +125,21 @@ hive --contract 2 --json area tree \
 
 The result contains an array of root summaries, including archived Areas, and a `children` array at each node. Roots and siblings sort by bytewise slug, then ID. A known leaf has empty children, while an unknown root returns `NOT_FOUND`. The limit is 100 nodes across the entire result and 32 levels, with each returned root at level 1. Larger selections return `CONTEXT_LIMIT`. Cycles encountered during traversal return `INVALID_RECORD`.
 
+## Committed Bot metadata
+
+Use the same explicit Dolt target and SELECT-only account for contract 2 Bot reads.
+
+```sh
+hive --contract 2 --json bot list --status retired --limit 10 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+hive --contract 2 --json bot show 01900000-0000-7000-8000-00000000000a \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+`bot list` defaults to `--status active` and accepts `retired` or `all`. It orders entries by ascending Bot UUID, with 25 results per page by default and a maximum of 100. Pass `next_cursor` as `--cursor` with the same target, status and page size. Changes to the committed snapshot or query return `STALE_CURSOR`.
+
+`bot show` takes an exact lowercase UUIDv7 and can inspect retired Queens. Both commands return registry metadata and the verified Dolt commit. Registry status describes retirement. Committed Soul inspection requires the workspace and asset repository pairing from [#18](https://github.com/mols3131d/hive-system/issues/18).
+
 ## Agent-assisted development
 
 Use [instruction ownership](agents/rule-ownership.md) to place scoped guidance, [asset lifecycle](agents/assets.md) when selecting or updating reusable Agent Assets, and [harness verification](agents/harness.md) to distinguish configuration from observed runtime behavior.
