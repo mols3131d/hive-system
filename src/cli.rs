@@ -726,6 +726,15 @@ pub(crate) struct DoltTargetArgs {
 pub(crate) enum WorkspaceCommand {
     /// Observe the selected workspace and local runtime evidence.
     Status(DoltTargetArgs),
+    /// Start Dolt for an explicitly selected active v2 workspace.
+    Start {
+        #[arg(long, value_name = "PATH")]
+        dolt_bin: std::path::PathBuf,
+        #[arg(long, value_name = "PORT")]
+        port: OsString,
+    },
+    /// Gracefully stop the owned Dolt process for an explicitly selected workspace.
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -1068,7 +1077,7 @@ fn workspace_parser(legacy: &clap::Command, args: &[OsString]) -> Option<clap::C
     // Probe only the v2 grammar so v1 help and unknown-command errors stay identical.
     let cli = legacy.clone().subcommand(
         WorkspaceCommand::augment_subcommands(
-            clap::Command::new("workspace").about("Inspect the v2 workspace."),
+            clap::Command::new("workspace").about("Inspect or operate the v2 workspace."),
         )
         .subcommand_required(true)
         .mut_subcommands(add_leaf_options),
@@ -1282,7 +1291,7 @@ fn recover_unknown_long(
     let (action, _) = matched.subcommand()?;
     if !matches!(
         (domain, action),
-        ("workspace", "status") | (_, "list" | "show")
+        ("workspace", "status" | "start" | "stop") | (_, "list" | "show")
     ) {
         return None;
     }
@@ -1873,6 +1882,18 @@ impl Command {
                     if target.has_any() && !target.has_all() {
                         return Err(
                             "Database inspection requires --workspace-id, --database, and --port.",
+                        );
+                    }
+                    Ok(())
+                }
+                Self::Workspace(WorkspaceCommand::Start { .. } | WorkspaceCommand::Stop) => {
+                    if common.workspace.is_none()
+                        || common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Workspace lifecycle requires an explicit --workspace and working view.",
                         );
                     }
                     Ok(())

@@ -31,7 +31,7 @@ pub(crate) use issue::show as issue_show;
 pub(crate) use issue_list::{IssueView, list as issue_list};
 pub(crate) use project::read as project_read;
 
-const DOLT_VERSION: &str = "2.7.6";
+pub(crate) const DOLT_VERSION: &str = "2.7.6";
 pub(crate) const STORAGE_SCHEMA_VERSION: u32 = 1;
 const INITIAL_SCHEMA: &[u8] = include_bytes!("../assets/schema/dolt/0001_initial.sql");
 const INITIAL_SCHEMA_MANIFEST: &str = include_str!("../assets/schema/dolt/0001_schema.sha256");
@@ -210,16 +210,38 @@ pub(crate) fn parse_port(port: &std::ffi::OsStr) -> Result<NonZeroU16, HiveError
 #[cfg(unix)]
 pub(crate) fn committed_identity(target: &DoltTargetArgs) -> Result<Value, HiveError> {
     let (snapshot, workspace_id) = Snapshot::open(target)?;
-    Ok(json!({
+    Ok(identity_report(&snapshot, workspace_id))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn runtime_identity(
+    target: &DoltTargetArgs,
+    user: &str,
+    password: &str,
+) -> Result<Value, HiveError> {
+    let (snapshot, workspace_id) = Snapshot::open_with_reader(target, Some((user, password)))?;
+    Ok(identity_report(&snapshot, workspace_id))
+}
+
+#[cfg(unix)]
+fn identity_report(snapshot: &Snapshot, workspace_id: String) -> Value {
+    json!({
         "workspace_id": workspace_id,
         "dolt_commit": snapshot.commit,
         "dolt_version": DOLT_VERSION,
         "storage_schema_version": STORAGE_SCHEMA_VERSION,
-    }))
+    })
 }
 
 impl Snapshot {
     fn open(target: &DoltTargetArgs) -> Result<(Self, String), HiveError> {
+        Self::open_with_reader(target, None)
+    }
+
+    fn open_with_reader(
+        target: &DoltTargetArgs,
+        reader: Option<(&str, &str)>,
+    ) -> Result<(Self, String), HiveError> {
         let (Some(database), Some(port), Some(workspace_id)) = (
             target.database.as_deref(),
             target.port.as_deref(),
@@ -246,8 +268,13 @@ impl Snapshot {
             ));
         }
 
-        let user = reader_credential("HIVE_DOLT_USER")?;
-        let password = reader_credential("HIVE_DOLT_PASSWORD")?;
+        let (user, password) = match reader {
+            Some((user, password)) => (user.to_owned(), password.to_owned()),
+            None => (
+                reader_credential("HIVE_DOLT_USER")?,
+                reader_credential("HIVE_DOLT_PASSWORD")?,
+            ),
+        };
         if user.eq_ignore_ascii_case("root") {
             return Err(HiveError::new(
                 ErrorCode::InvalidArgument,
