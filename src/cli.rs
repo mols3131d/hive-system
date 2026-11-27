@@ -1473,7 +1473,9 @@ fn recover_unknown_long(
     let (action, _) = matched.subcommand()?;
     if !matches!(
         (domain, action),
-        ("workspace", "init" | "status" | "start" | "stop") | (_, "list" | "show")
+        ("workspace", "init" | "status" | "start" | "stop")
+            | ("context", "resolve")
+            | (_, "list" | "show")
     ) {
         return None;
     }

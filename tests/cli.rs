@@ -238,6 +238,58 @@ fn context_resolve_rejects_parent_options_with_the_requested_v2_envelope() {
 }
 
 #[test]
+fn unknown_context_resolve_option_preserves_v2_errors_and_literal_boundaries() {
+    let sandbox = Sandbox::new();
+    let command = ["context", "resolve"];
+    for (prefix, options) in [
+        (&["--contract", "2"][..], &["--unknown", "--json"][..]),
+        (&[], &["--unknown", "--contract", "2", "--json"]),
+        (&[], &["--unknown=--contract=1", "--contract=2", "--json"]),
+        (&[], &["--unknown=--", "--contract=2", "--format=json"]),
+    ] {
+        let args = [prefix, &command, options].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            serde_json::json!({
+                "schema_version": 2,
+                "ok": false,
+                "command": "context resolve",
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "An argument or command is not recognized.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+
+    for options in [
+        &["--unknown=--json", "--contract=2"][..],
+        &["--unknown", "--contract=2", "--", "--json"],
+        &["--", "--unknown", "--contract=2", "--json"],
+        &["--unknown", "detached", "--contract=2", "--json"],
+    ] {
+        let args = [&command[..], options].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+
+    let args = ["--json", "context", "resolve", "--unknown=--contract=2"];
+    assert_json_failure(&sandbox.run(&args), &args, "context", "INVALID_ARGUMENT", 2);
+    let help = sandbox.run(&["context", "--help"]);
+    assert!(help.status.success());
+    assert!(help.stderr.is_empty());
+    assert!(!String::from_utf8(help.stdout).unwrap().contains("resolve"));
+    sandbox.assert_empty();
+}
+
+#[test]
 fn malformed_dolt_port_preserves_the_explicit_contract_and_format() {
     let sandbox = Sandbox::new();
     let target = [
