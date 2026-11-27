@@ -10,6 +10,7 @@ use time::OffsetDateTime;
 
 use super::{
     DoltSuccess, DoltTarget, Snapshot,
+    area::create as area_create,
     artifact::{create as artifact_create, update as artifact_update},
     context_evidence::read_evidence_bytes,
     context_resolve::observe_time,
@@ -35,6 +36,8 @@ pub(super) enum Kind {
     ArtifactCreate,
     #[serde(rename = "artifact.update")]
     ArtifactUpdate,
+    #[serde(rename = "area.create")]
+    AreaCreate,
 }
 
 impl Kind {
@@ -45,6 +48,7 @@ impl Kind {
             Self::Update => issue_update::KIND,
             Self::ArtifactCreate => artifact_create::KIND,
             Self::ArtifactUpdate => artifact_update::KIND,
+            Self::AreaCreate => area_create::KIND,
         }
     }
 
@@ -55,6 +59,7 @@ impl Kind {
             Self::Update => "Issue update",
             Self::ArtifactCreate => "Artifact create",
             Self::ArtifactUpdate => "Artifact update",
+            Self::AreaCreate => "Area create",
         }
     }
 
@@ -79,6 +84,12 @@ impl Kind {
             ],
             Self::ArtifactCreate => &[("artifacts", "INSERT"), ("operation_receipts", "INSERT")],
             Self::ArtifactUpdate => &[("artifacts", "UPDATE"), ("operation_receipts", "INSERT")],
+            Self::AreaCreate if area.is_some() => &[
+                ("areas", "INSERT"),
+                ("areas", "UPDATE"),
+                ("operation_receipts", "INSERT"),
+            ],
+            Self::AreaCreate => &[("areas", "INSERT"), ("operation_receipts", "INSERT")],
         }
     }
 }
@@ -148,6 +159,7 @@ pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
 
 // Version 1 has no kind field and always denotes a progress note. Version 2
 // carries an Issue kind. Version 3 carries an Artifact ID and optional Area.
+// Version 4 carries the new Area ID and optional parent.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Pending {
@@ -182,6 +194,12 @@ pub(crate) struct Pending {
         deserialize_with = "present_id"
     )]
     artifact_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_id"
+    )]
+    parent_id: Option<String>,
     receipt_digest: String,
 }
 
@@ -227,13 +245,41 @@ impl Pending {
             &self.area_id,
             &self.issue_id,
             &self.artifact_id,
+            &self.parent_id,
         ) {
-            (1, None, Some(_), Some(_), None) => Ok(Kind::Note),
-            (2, Some(kind @ (Kind::Create | Kind::Update)), Some(_), Some(_), None) => Ok(kind),
-            (3, Some(kind @ (Kind::ArtifactCreate | Kind::ArtifactUpdate)), _, None, Some(_)) => {
+            (1, None, Some(_), Some(_), None, None) => Ok(Kind::Note),
+            (2, Some(kind @ (Kind::Create | Kind::Update)), Some(_), Some(_), None, None) => {
                 Ok(kind)
             }
+            (
+                3,
+                Some(kind @ (Kind::ArtifactCreate | Kind::ArtifactUpdate)),
+                _,
+                None,
+                Some(_),
+                None,
+            ) => Ok(kind),
+            (4, Some(Kind::AreaCreate), Some(area), None, None, parent)
+                if parent.as_ref() != Some(area) =>
+            {
+                Ok(Kind::AreaCreate)
+            }
             _ => Err(uncertain()),
+        }
+    }
+
+    fn area_scope(&self, kind: Kind) -> Option<&str> {
+        match kind {
+            Kind::AreaCreate => self.parent_id.as_deref(),
+            _ => self.area_id.as_deref(),
+        }
+    }
+
+    fn record_id(&self, kind: Kind) -> Option<&str> {
+        match kind {
+            Kind::AreaCreate => self.area_id.as_deref(),
+            Kind::ArtifactCreate | Kind::ArtifactUpdate => self.artifact_id.as_deref(),
+            _ => self.issue_id.as_deref(),
         }
     }
 
@@ -244,10 +290,15 @@ impl Pending {
             || self.session_id == 0
             || !is_uuid(&self.request_id)
             || !is_commit_hash(&self.base_commit)
-            || [&self.area_id, &self.issue_id, &self.artifact_id]
-                .into_iter()
-                .flatten()
-                .any(|id| !is_uuid_v7(id))
+            || [
+                &self.area_id,
+                &self.issue_id,
+                &self.artifact_id,
+                &self.parent_id,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|id| !is_uuid_v7(id))
             || !valid_sha256(&self.fingerprint)
             || !valid_sha256(&self.receipt_digest)
         {
@@ -277,7 +328,7 @@ pub(super) fn execute(
             receipt_at(snapshot, request.request_id, &commit, None).map_err(|_| uncertain())?;
         mutation.verify_decision(observe_time()?)?;
         let (outcome, base, introduced, result) = if let Some(receipt) = existing {
-            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate) {
+            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate | Kind::AreaCreate) {
                 check_fingerprint(&receipt.fingerprint, request.fingerprint, request.kind)?;
             }
             let scoped = ScopedReceipt::read(
@@ -302,6 +353,9 @@ pub(super) fn execute(
             if let ScopedReceipt::ArtifactCreate(scoped) = &scoped {
                 artifact_create::check_current_scope(snapshot, scoped)?;
             }
+            if let ScopedReceipt::AreaCreate(scoped) = &scoped {
+                area_create::check_current_scope(snapshot, scoped)?;
+            }
             let introduced = receipt_introduction(snapshot, request.request_id, &receipt)
                 .map_err(|_| uncertain())?;
             let result = scoped
@@ -323,10 +377,10 @@ pub(super) fn execute(
                 "workspace_id": workspace.workspace_id(),
                 "db_commit": if outcome == "confirmed" { &introduced } else { &commit },
                 "policy_revision": workspace.policy_revision(),
-                "scope": if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate) {
-                    json!({"area_id": request.area_id, "artifact_id": result["artifact_id"]})
-                } else {
-                    json!({"area_id": request.area_id, "issue_id": result["issue_id"]})
+                "scope": match request.kind {
+                    Kind::AreaCreate => json!({"area_id": result["area_id"], "parent_id": request.area_id}),
+                    Kind::ArtifactCreate | Kind::ArtifactUpdate => json!({"area_id": request.area_id, "artifact_id": result["artifact_id"]}),
+                    _ => json!({"area_id": request.area_id, "issue_id": result["issue_id"]}),
                 },
             }),
             data: json!({
@@ -408,10 +462,15 @@ fn apply(
         Kind::Note => (1, None),
         kind @ (Kind::Create | Kind::Update) => (2, Some(kind)),
         kind @ (Kind::ArtifactCreate | Kind::ArtifactUpdate) => (3, Some(kind)),
+        Kind::AreaCreate => (4, Some(Kind::AreaCreate)),
     };
-    let (issue_id, artifact_id) = match request.kind {
-        Kind::ArtifactCreate | Kind::ArtifactUpdate => (None, Some(staged.record_id)),
-        _ => (Some(staged.record_id), None),
+    let area_scope = request.area_id.map(str::to_owned);
+    let (area_id, parent_id, issue_id, artifact_id) = match request.kind {
+        Kind::AreaCreate => (Some(staged.record_id), area_scope, None, None),
+        Kind::ArtifactCreate | Kind::ArtifactUpdate => {
+            (area_scope, None, None, Some(staged.record_id))
+        }
+        _ => (area_scope, None, Some(staged.record_id), None),
     };
     let marker = Pending {
         version,
@@ -422,7 +481,8 @@ fn apply(
         request_id: request.request_id.to_owned(),
         base_commit: base.to_owned(),
         fingerprint: request.fingerprint.to_owned(),
-        area_id: request.area_id.map(str::to_owned),
+        area_id,
+        parent_id,
         issue_id,
         artifact_id,
         receipt_digest: receipt_digest(&receipt),
@@ -452,12 +512,8 @@ fn reconcile(runtime: &WriterRuntime<'_>, workspace: &str) -> Result<Option<Snap
         .map_err(|_| uncertain())?
         .ok_or_else(uncertain)?;
     let marker = Pending::read(&entry.bytes, workspace, runtime.launch_nonce())?;
-    let mut observer = open_verified_writer(
-        runtime,
-        marker.operation()?,
-        marker.area_id.as_deref(),
-        true,
-    )?;
+    let kind = marker.operation()?;
+    let mut observer = open_verified_writer(runtime, kind, marker.area_scope(kind), true)?;
     visible_session(&mut observer.connection, Some(marker.session_id)).map_err(|_| uncertain())?;
 
     // Take a fresh committed snapshot after positive same-launch session evidence.
@@ -521,12 +577,13 @@ fn confirm(
     {
         return Err(uncertain());
     }
+    let kind = marker.operation()?;
     let scoped = ScopedReceipt::read(
         snapshot,
-        marker.operation()?,
+        kind,
         &marker.request_id,
-        marker.area_id.as_deref(),
-        marker.issue_id.as_deref().or(marker.artifact_id.as_deref()),
+        marker.area_scope(kind),
+        marker.record_id(kind),
         &receipt.actor_ref,
         &receipt,
     )?;
@@ -545,6 +602,7 @@ enum ScopedReceipt {
     Update(Box<issue_update::ScopedUpdate>),
     ArtifactCreate(artifact_create::ScopedCreate),
     ArtifactUpdate(artifact_update::ScopedUpdate),
+    AreaCreate(area_create::ScopedCreate),
 }
 
 impl ScopedReceipt {
@@ -616,6 +674,13 @@ impl ScopedReceipt {
                 )
                 .map(Self::ArtifactUpdate)
             }
+            Kind::AreaCreate => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                area_create::check_scope(snapshot, request, area, record, actor, receipt)
+                    .map(Self::AreaCreate)
+            }
         }
     }
 
@@ -645,6 +710,9 @@ impl ScopedReceipt {
             }
             Self::ArtifactUpdate(scoped) => {
                 artifact_update::verify_effect(snapshot, commit, receipt, &scoped)
+            }
+            Self::AreaCreate(scoped) => {
+                area_create::verify_effect(snapshot, commit, receipt, &scoped)
             }
             Self::Create(result) => {
                 issue_create::verify_effect(snapshot, commit, receipt, &result)?;
@@ -804,9 +872,16 @@ mod tests {
         let area_id = value.as_object_mut().unwrap().remove("area_id").unwrap();
         let standalone = read(&value).unwrap();
         assert_eq!(json!(standalone), value);
+        value["parent_id"] = area_id.clone();
+        assert!(read(&value).is_err());
+        value.as_object_mut().unwrap().remove("parent_id");
         value["kind"] = json!("artifact.update");
         let standalone = read(&value).unwrap();
         assert!(matches!(standalone.operation(), Ok(Kind::ArtifactUpdate)));
+        assert_eq!(
+            standalone.record_id(Kind::ArtifactUpdate),
+            value["artifact_id"].as_str(),
+        );
         assert_eq!(json!(standalone), value);
         value["area_id"] = area_id;
         let linked = read(&value).unwrap();
@@ -822,5 +897,20 @@ mod tests {
         let legacy_bytes = serde_json::to_string(&legacy).unwrap();
         let duplicate = legacy_bytes.replacen(r#""version":1"#, r#""version":1,"version":1"#, 1);
         assert!(Pending::read(duplicate.as_bytes(), "workspace", "launch").is_err());
+
+        let mut value = json!(legacy);
+        value.as_object_mut().unwrap().remove("issue_id");
+        value["version"] = json!(4);
+        value["kind"] = json!("area.create");
+        let root = read(&value).unwrap();
+        assert!(matches!(root.operation(), Ok(Kind::AreaCreate)));
+        assert_eq!(json!(root), value);
+        value["parent_id"] = json!("01900000-0000-7000-8000-000000000003");
+        let child = read(&value).unwrap();
+        assert_eq!(json!(child), value);
+        value["parent_id"] = value["area_id"].clone();
+        assert!(read(&value).is_err());
+        value["parent_id"] = Value::Null;
+        assert!(read(&value).is_err());
     }
 }

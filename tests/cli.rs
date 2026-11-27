@@ -40,7 +40,7 @@ impl Sandbox {
         Self(path)
     }
 
-    fn run(&self, args: &[&str]) -> Output {
+    fn run(&self, args: &[impl AsRef<std::ffi::OsStr> + std::fmt::Debug]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_hive"))
             .args(args)
             .env_clear()
@@ -1570,6 +1570,127 @@ fn dolt_area_reads_require_contract_2_and_an_explicit_target() {
         assert_eq!(report["command"], "area list");
         assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
         assert!(!report.to_string().contains("unsafe'path/fixture"));
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn unknown_area_create_options_keep_the_late_v2_envelope() {
+    let sandbox = Sandbox::new();
+    for unknown in [
+        &["--unknown=--contract=1"][..],
+        &["--unknown", "fixture-value"],
+        &["--unknown"],
+    ] {
+        let args = [
+            &["area", "create"][..],
+            unknown,
+            &["--contract", "2", "--json"],
+        ]
+        .concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "schema_version": 2, "ok": false, "command": "area create",
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "An argument or command is not recognized.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+    let literal = sandbox.run(&["area", "create", "--unknown=--json", "--contract", "2"]);
+    assert_eq!(literal.status.code(), Some(2));
+    assert!(literal.stdout.is_empty());
+    assert!(!literal.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
+fn malformed_area_create_values_and_conflicts_keep_the_v2_envelope() {
+    let sandbox = Sandbox::new();
+    let command = [
+        "area",
+        "create",
+        "--slug",
+        "fixture",
+        "--name",
+        "Fixture",
+        "--actor",
+        "fixture",
+        "--request-id",
+        "01900000-0000-7000-8000-000000000003",
+        "--evidence-file",
+        "fixture.json",
+        "--workspace",
+        ".",
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+        "--database",
+        "fixture",
+        "--port",
+        "3307",
+    ];
+    let flags = ["--contract", "2", "--json"];
+    for invalid in [
+        &["--project", "BAD!"][..],
+        &["--slug", "duplicate-slug"],
+        &["unexpected-position"],
+    ] {
+        for args in [
+            [&flags[..], &command, invalid].concat(),
+            [&command[..], invalid, &flags].concat(),
+        ] {
+            let result = sandbox.run(&args);
+            assert_eq!(result.status.code(), Some(2), "{args:?}: {result:?}");
+            assert!(result.stderr.is_empty(), "{args:?}: {result:?}");
+            let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], "area create");
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+            assert!(!report.to_string().contains("BAD!"));
+            assert!(!report.to_string().contains("duplicate-slug"));
+        }
+    }
+    let args = [
+        &command[..],
+        &["--project", "BAD!", "--contract", "2", "--name=--json"],
+    ]
+    .concat();
+    let result = sandbox.run(&args);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(result.stdout.is_empty());
+    assert!(!result.stderr.is_empty());
+    let before_end = [
+        &command[..],
+        &["unexpected-position", "--", "--contract", "2", "--json"],
+    ]
+    .concat();
+    let result = sandbox.run(&before_end);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(result.stdout.is_empty());
+
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let mut invalid: Vec<_> = command.iter().map(OsString::from).collect();
+        let name = command.iter().position(|arg| *arg == "--name").unwrap();
+        invalid[name + 1] = OsString::from_vec(vec![255]);
+        invalid.extend(flags.into_iter().map(OsString::from));
+        let output = sandbox.run(&invalid);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "area create");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
     }
     sandbox.assert_empty();
 }

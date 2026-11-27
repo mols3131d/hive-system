@@ -976,6 +976,31 @@ pub(crate) enum AreaCommand {
     Tree(AreaTreeArgs),
     /// Show one committed Area.
     Show(AreaShowArgs),
+    /// Create a root Area or a direct child of an explicit parent.
+    Create(AreaCreateArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct AreaCreateArgs {
+    #[arg(long)]
+    pub(crate) slug: String,
+    #[arg(long)]
+    pub(crate) name: String,
+    /// Exact parent UUIDv7. Omit for a root Area.
+    #[arg(long)]
+    pub(crate) parent: Option<String>,
+    /// Expected revision of the selected parent as PARENT=REV.
+    #[arg(long)]
+    pub(crate) if_match: Option<String>,
+    #[arg(long)]
+    pub(crate) actor: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Args)]
@@ -1322,6 +1347,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             let partial = extension_matches
                 .or(config_error_matches)
                 .or(area_matches)
+                .or_else(|| retry_area_create_failure(&cli, &args, error.kind()))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "context"))
@@ -1335,6 +1361,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                         .try_get_matches_from(&args)
                         .ok()?;
                     recover_unknown_long(&cli, &args, &partial, &error, "workspace")
+                        .or_else(|| recover_unknown_long(&cli, &args, &partial, &error, "area"))
                         .or_else(|| recover_context_resolve(&cli, &args, &partial, &error))
                         .or(Some(partial))
                 });
@@ -1910,7 +1937,7 @@ fn recover_unknown_long(
         (
             "workspace",
             "init" | "status" | "start" | "stop" | "recover"
-        ) | ("artifact", "create")
+        ) | ("artifact" | "area", "create")
             | (_, "list" | "show")
     ) {
         return None;
@@ -1925,8 +1952,12 @@ fn recover_unknown_long(
     // positionals, so the temporary option can take one plain separated
     // value. The original parse error still determines the result.
     let workspace_init = (domain, action) == ("workspace", "init");
-    let allow_separated_value =
-        workspace_init || matches!((domain, action), ("label", "list") | ("artifact", "create"));
+    let area_create = (domain, action) == ("area", "create");
+    let allow_separated_value = workspace_init
+        || matches!(
+            (domain, action),
+            ("label", "list") | ("artifact" | "area", "create")
+        );
     const UNKNOWN_LONG: &str = "recovered_unknown_long";
     let retry = cli.clone().mut_subcommand(domain, |command| {
         command.mut_subcommand(action, |leaf| {
@@ -1956,7 +1987,14 @@ fn recover_unknown_long(
     } else {
         args.len()
     };
-    let matches = retry.try_get_matches_from(&args[..end]).ok()?;
+    let matches = match retry.clone().try_get_matches_from(&args[..end]) {
+        Ok(matches) => matches,
+        Err(error) if area_create && error.kind() == ErrorKind::MissingRequiredArgument => retry
+            .ignore_errors(true)
+            .try_get_matches_from(&args[..end])
+            .ok()?,
+        Err(_) => return None,
+    };
     let recovered = matches
         .subcommand_matches(domain)?
         .subcommand_matches(action)?;
@@ -2476,6 +2514,54 @@ fn retry_conversation_failure(
     let (command, leaf) = matched_leaf(cli, &matches)?;
     (command == format!("conversation {action}")
         && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+        .then_some(matches)
+}
+
+fn retry_area_create_failure(
+    cli: &clap::Command,
+    args: &[OsString],
+    kind: ErrorKind,
+) -> Option<ArgMatches> {
+    if !matches!(
+        kind,
+        ErrorKind::ValueValidation
+            | ErrorKind::InvalidValue
+            | ErrorKind::ArgumentConflict
+            | ErrorKind::UnknownArgument
+            | ErrorKind::TooManyValues
+            | ErrorKind::InvalidUtf8
+    ) {
+        return None;
+    }
+    let recover_values = |command| {
+        extended_error_options(command).mut_args(|arg| {
+            if arg.get_long().is_some()
+                && !matches!(
+                    arg.get_id().as_str(),
+                    "contract" | "format" | "json" | "extended_help_probe"
+                )
+            {
+                arg.value_parser(OsStringValueParser::new())
+            } else {
+                arg
+            }
+        })
+    };
+    let retry =
+        recover_values(cli.clone().disable_help_subcommand(true)).mut_subcommand("area", |area| {
+            extended_help_probe(area).mut_subcommand("create", |create| {
+                recover_values(create).arg(
+                    Arg::new("area_create_extra_values")
+                        .num_args(0..)
+                        .action(ArgAction::Append)
+                        .value_parser(OsStringValueParser::new())
+                        .hide(true),
+                )
+            })
+        });
+    let matches = retry.try_get_matches_from(args).ok()?;
+    let (command, leaf) = matched_leaf(cli, &matches)?;
+    (command == "area create" && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }
 
@@ -3134,6 +3220,20 @@ impl AreaCommand {
             Self::List(args) => &args.target,
             Self::Tree(args) => &args.target,
             Self::Show(args) => &args.target,
+            Self::Create(args) => {
+                if common.workspace.is_none() || !args.target.has_all() {
+                    return Err(
+                        "Area create requires --workspace, --workspace-id, --database, and --port.",
+                    );
+                }
+                if common.project.is_some()
+                    || common.project_root.is_some()
+                    || !matches!(common.view, View::WorkingTree)
+                {
+                    return Err("Area create requires explicit workspace or exact parent scope.");
+                }
+                return Ok(());
+            }
         };
         target.validate_common(
             common,
