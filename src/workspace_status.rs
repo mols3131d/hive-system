@@ -18,7 +18,8 @@ mod runtime;
 
 #[cfg(target_os = "linux")]
 pub(crate) use runtime::{
-    WriterRuntime, token, with_operation_snapshot, with_owned_snapshot, with_writer_runtime,
+    WriterRuntime, token, with_exclusive_owned_snapshot, with_operation_snapshot,
+    with_owned_snapshot, with_writer_runtime,
 };
 
 pub(crate) fn run(
