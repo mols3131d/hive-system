@@ -240,7 +240,7 @@ pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
     .map_err(|_| workflow::unverified())
 }
 
-// Version 1 has no kind field and always denotes a progress note. Version 2
+// Version 1 has no kind field and always denotes a holder-scoped Issue note. Version 2
 // carries an Issue kind. Version 3 carries an Artifact ID and optional Area.
 // Version 4 carries a typed transition or the Area, Project or Bot registration identifiers.
 #[derive(Serialize, Deserialize)]
@@ -926,7 +926,7 @@ impl ScopedReceipt {
                     commit,
                     receipt,
                     &note,
-                    Some("progress"),
+                    Some(super::issue_note::HOLDER_NOTE_KINDS),
                 )?;
                 Ok(json!(note.result))
             }

@@ -1159,7 +1159,7 @@ pub(crate) enum IssueCommand {
 pub(crate) struct IssueNoteArgs {
     /// Exact Issue UUIDv7.
     pub(crate) issue: String,
-    /// Note kind. This writer supports progress.
+    /// Choose progress, evidence or handoff.
     #[arg(long)]
     pub(crate) kind: String,
     /// Exact Area UUIDv7.
@@ -1176,7 +1176,7 @@ pub(crate) struct IssueNoteArgs {
     pub(crate) if_match: String,
     #[arg(long)]
     pub(crate) request_id: String,
-    /// UTF-8 progress note file.
+    /// UTF-8 Issue note file.
     #[arg(long)]
     pub(crate) file: PathBuf,
     /// Fresh, request-bound operator decision file.
@@ -2322,7 +2322,7 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
         issue
             .subcommand(add_leaf_options(IssueNoteArgs::augment_args(
                 clap::Command::new("note")
-                    .about("Append a scoped progress note with a current operator decision."),
+                    .about("Append a scoped progress note, evidence note, or handoff."),
             )))
             .subcommand(add_leaf_options(IssueCreateArgs::augment_args(
                 clap::Command::new("create").about(
@@ -3541,8 +3541,8 @@ impl Command {
                     Ok(())
                 }
                 Self::IssueNote(args) => {
-                    if args.kind != "progress" {
-                        return Err("Issue note requires --kind progress.");
+                    if !crate::dolt::issue_note::HOLDER_NOTE_KINDS.contains(&args.kind.as_str()) {
+                        return Err("Issue note requires --kind progress, evidence, or handoff.");
                     }
                     if common.workspace.is_none() || !args.target.has_all() {
                         return Err(

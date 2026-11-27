@@ -32,7 +32,7 @@ pub(super) fn write(
         crate::config_v2::read_explicit(common.workspace.as_deref().expect("validated workspace"))?;
     let request = Request::read(args, workspace.workspace_id())?;
     let decision: Decision<NoteEvidence> = issue_writer::read_decision(&args.evidence_file)?;
-    issue_writer::execute(&workspace, target, &Progress { request, decision })
+    issue_writer::execute(&workspace, target, &Note { request, decision })
 }
 
 impl<'a> Request<'a> {
@@ -57,16 +57,16 @@ impl<'a> Request<'a> {
         }
         let body_bytes = read_evidence_bytes(&args.file, MAX_BODY_BYTES).map_err(|error| {
             let message = if matches!(error.code, ErrorCode::ContextLimit) {
-                "The progress note exceeds the supported byte limit."
+                "The Issue note exceeds the supported byte limit."
             } else {
-                "Could not read the explicit regular progress note file."
+                "Could not read the explicit regular Issue note file."
             };
             HiveError::new(error.code, message)
         })?;
-        let body = String::from_utf8(body_bytes)
-            .map_err(|_| invalid("The progress note must be UTF-8."))?;
+        let body =
+            String::from_utf8(body_bytes).map_err(|_| invalid("The Issue note must be UTF-8."))?;
         if body.trim().is_empty() {
-            return Err(invalid("The progress note must have a body."));
+            return Err(invalid("The Issue note must have a body."));
         }
         let fingerprint = NoteFingerprint {
             workspace_id: workspace,
@@ -162,7 +162,7 @@ fn guard_issue(db: &mut impl Queryable, request: &Request<'_>) -> Result<(), Hiv
     require_active_area(
         db,
         &args.area,
-        "A progress note requires active Area ancestry.",
+        "An Issue note requires active Area ancestry.",
     )
 }
 
@@ -183,7 +183,7 @@ fn verify_issue(
     if status != "in-progress" || !matches!(kind.as_str(), "feature" | "task" | "bug") {
         return Err(HiveError::new(
             ErrorCode::InvalidTransition,
-            "A progress note requires an in-progress executable Issue.",
+            "An Issue note requires an in-progress executable Issue.",
         ));
     }
     if !matches!(claim, Some((id, holder)) if id == request.args.claim && holder == request.args.actor)
@@ -196,12 +196,12 @@ fn verify_issue(
     Ok(())
 }
 
-struct Progress<'a> {
+struct Note<'a> {
     request: Request<'a>,
     decision: Decision<NoteEvidence>,
 }
 
-impl Mutation for Progress<'_> {
+impl Mutation for Note<'_> {
     type Guard = ();
 
     fn identity(&self) -> WriteIdentity<'_> {
@@ -270,10 +270,11 @@ impl Mutation for Progress<'_> {
         }
         tx.exec_drop(
             "INSERT INTO issue_updates (id, issue_id, kind, body, author_ref, created_at)
-         VALUES (?, ?, 'progress', ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?)",
             (
                 &result.note_id,
                 &args.issue,
+                &args.kind,
                 &request.body,
                 &args.actor,
                 sql_time,

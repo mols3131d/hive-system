@@ -1,9 +1,11 @@
-//! A holder-scoped progress note with a durable local commit intent.
+//! A holder-scoped Issue note with a durable local commit intent.
 
 use crate::cli::{CommonOptions, IssueNoteArgs};
 use crate::error::{ErrorCode, HiveError};
 
 use super::{DoltFailure, DoltSuccess};
+
+pub(crate) const HOLDER_NOTE_KINDS: &[&str] = &["progress", "evidence", "handoff"];
 
 pub(crate) fn write(
     common: &CommonOptions,
