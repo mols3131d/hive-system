@@ -274,9 +274,19 @@ pub(crate) enum Command {
     #[command(skip)]
     IssueClaim(IssueClaimArgs),
     #[command(skip)]
+    IssueCancel(IssueReconcileArgs),
+    #[command(skip)]
+    IssueReopen(IssueReconcileArgs),
+    #[command(skip)]
     IssueRelease(IssueReleaseArgs, bool),
     #[command(skip)]
     IssueSubmit(IssueSubmitArgs),
+    #[command(skip)]
+    IssueSubmitEpic(IssueSubmitEpicArgs),
+    #[command(skip)]
+    IssueRequestChanges(IssueReviewArgs),
+    #[command(skip)]
+    IssueAccept(IssueAcceptArgs),
     #[command(skip)]
     IssueDependency(IssueDependencyArgs, bool),
     #[command(skip)]
@@ -1176,7 +1186,7 @@ pub(crate) enum IssueCommand {
 pub(crate) struct IssueNoteArgs {
     /// Exact Issue UUIDv7.
     pub(crate) issue: String,
-    /// Note kind. This writer supports progress.
+    /// Choose progress, evidence or handoff.
     #[arg(long)]
     pub(crate) kind: String,
     /// Exact Area UUIDv7.
@@ -1193,7 +1203,7 @@ pub(crate) struct IssueNoteArgs {
     pub(crate) if_match: String,
     #[arg(long)]
     pub(crate) request_id: String,
-    /// UTF-8 progress note file.
+    /// UTF-8 Issue note file.
     #[arg(long)]
     pub(crate) file: PathBuf,
     /// Fresh, request-bound operator decision file.
@@ -1366,6 +1376,15 @@ pub(crate) struct IssueClaimArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueReconcileArgs {
+    #[command(flatten)]
+    pub(crate) transition: IssueTransitionArgs,
+    /// Reviewed reason for the lifecycle change.
+    #[arg(long)]
+    pub(crate) reason: String,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueStopArgs {
     #[command(flatten)]
     pub(crate) claim_args: IssueClaimArgs,
@@ -1396,6 +1415,42 @@ pub(crate) struct IssueSubmitArgs {
     /// UTF-8 Markdown submission.
     #[arg(long)]
     pub(crate) file: PathBuf,
+}
+
+#[derive(Args)]
+pub(crate) struct IssueSubmitEpicArgs {
+    #[command(flatten)]
+    pub(crate) transition: IssueTransitionArgs,
+    /// Reference to the submitted result evidence.
+    #[arg(long)]
+    pub(crate) evidence: String,
+    /// UTF-8 Markdown submission.
+    #[arg(long)]
+    pub(crate) file: PathBuf,
+}
+
+#[derive(Args)]
+pub(crate) struct IssueReviewArgs {
+    #[command(flatten)]
+    pub(crate) transition: IssueTransitionArgs,
+    /// Exact current submission transition UUIDv7.
+    #[arg(long)]
+    pub(crate) submission: String,
+    /// Authorization reference in the reviewed decision file.
+    #[arg(long)]
+    pub(crate) approval: String,
+    /// UTF-8 Markdown review outcome.
+    #[arg(long)]
+    pub(crate) file: PathBuf,
+}
+
+#[derive(Args)]
+pub(crate) struct IssueAcceptArgs {
+    #[command(flatten)]
+    pub(crate) review: IssueReviewArgs,
+    /// Exact cancelled immediate child acknowledged in this scope change. Repeat for each.
+    #[arg(long)]
+    pub(crate) ack_cancelled_child: Vec<String>,
 }
 
 #[derive(Args)]
@@ -1652,6 +1707,17 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
             }
+            Some(("issue", issue))
+                if matches!(issue.subcommand_name(), Some("cancel" | "reopen")) =>
+            {
+                let args = IssueReconcileArgs::from_arg_matches(leaf)
+                    .map_err(|error| safe_parse_message(error.kind()))?;
+                if issue.subcommand_name() == Some("cancel") {
+                    Command::IssueCancel(args)
+                } else {
+                    Command::IssueReopen(args)
+                }
+            }
             Some(("issue", issue)) if issue.subcommand_name() == Some("set-parent") => {
                 Command::IssueParent(
                     IssueParentArgs::from_arg_matches(leaf)
@@ -1670,6 +1736,24 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             Some(("issue", issue)) if issue.subcommand_name() == Some("submit") => {
                 Command::IssueSubmit(
                     IssueSubmitArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("submit-epic") => {
+                Command::IssueSubmitEpic(
+                    IssueSubmitEpicArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("request-changes") => {
+                Command::IssueRequestChanges(
+                    IssueReviewArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("accept") => {
+                Command::IssueAccept(
+                    IssueAcceptArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
             }
@@ -2195,7 +2279,18 @@ fn recover_unknown_long(
     let (action, _) = matched.subcommand()?;
     if matches!(
         (domain, action),
-        ("issue", "set-parent" | "release" | "recover" | "submit")
+        (
+            "issue",
+            "set-parent"
+                | "release"
+                | "recover"
+                | "submit"
+                | "cancel"
+                | "reopen"
+                | "submit-epic"
+                | "request-changes"
+                | "accept"
+        )
     ) {
         return [true, false].into_iter().find_map(|equals| {
             replay_unknown_options(cli, args, error, (domain, action), equals, true)
@@ -2217,6 +2312,9 @@ fn recover_unknown_long(
                     | "release"
                     | "recover"
                     | "submit"
+                    | "submit-epic"
+                    | "request-changes"
+                    | "accept"
                     | "set-parent"
             )
             | ("bot", "retire")
@@ -2323,7 +2421,7 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
         issue
             .subcommand(add_leaf_options(IssueNoteArgs::augment_args(
                 clap::Command::new("note")
-                    .about("Append a scoped progress note with a current operator decision."),
+                    .about("Append a scoped progress note, evidence note, or handoff."),
             )))
             .subcommand(add_leaf_options(IssueCreateArgs::augment_args(
                 clap::Command::new("create").about(
@@ -2340,6 +2438,12 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             .subcommand(add_leaf_options(IssueClaimArgs::augment_args(
                 clap::Command::new("claim").about("Record an exclusive Claim for a ready Issue."),
             )))
+            .subcommand(add_leaf_options(IssueReconcileArgs::augment_args(
+                clap::Command::new("cancel").about("Cancel an Issue after execution has stopped."),
+            )))
+            .subcommand(add_leaf_options(IssueReconcileArgs::augment_args(
+                clap::Command::new("reopen").about("Return a reconciled terminal Issue to todo."),
+            )))
             .subcommand(add_leaf_options(IssueReleaseArgs::augment_args(
                 clap::Command::new("release").about("Release the exact stopped execution Claim."),
             )))
@@ -2349,6 +2453,17 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             )))
             .subcommand(add_leaf_options(IssueSubmitArgs::augment_args(
                 clap::Command::new("submit").about("Submit a stopped execution for review."),
+            )))
+            .subcommand(add_leaf_options(IssueSubmitEpicArgs::augment_args(
+                clap::Command::new("submit-epic").about("Submit a resolved epic for review."),
+            )))
+            .subcommand(add_leaf_options(IssueReviewArgs::augment_args(
+                clap::Command::new("request-changes")
+                    .about("Return the exact reviewed submission to todo."),
+            )))
+            .subcommand(add_leaf_options(IssueAcceptArgs::augment_args(
+                clap::Command::new("accept")
+                    .about("Accept the exact reviewed submission and close the Issue."),
             )))
             .subcommand(add_leaf_options(IssueParentArgs::augment_args(
                 clap::Command::new("set-parent")
@@ -2375,6 +2490,11 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             "release",
             "recover",
             "submit",
+            "submit-epic",
+            "request-changes",
+            "accept",
+            "cancel",
+            "reopen",
             "add-dependency",
             "remove-dependency",
         ]
@@ -2391,10 +2511,15 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .mut_subcommand("update", extended_error_options)
                 .mut_subcommand("select", extended_error_options)
                 .mut_subcommand("claim", extended_error_options)
+                .mut_subcommand("cancel", extended_error_options)
+                .mut_subcommand("reopen", extended_error_options)
                 .mut_subcommand("set-parent", extended_error_options)
                 .mut_subcommand("release", extended_error_options)
                 .mut_subcommand("recover", extended_error_options)
                 .mut_subcommand("submit", extended_error_options)
+                .mut_subcommand("submit-epic", extended_error_options)
+                .mut_subcommand("request-changes", extended_error_options)
+                .mut_subcommand("accept", extended_error_options)
                 .mut_subcommand("add-dependency", extended_error_options)
                 .mut_subcommand("remove-dependency", extended_error_options)
                 .subcommand(issue_help("help"))
@@ -2418,10 +2543,15 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                     "remove-dependency",
                     "select",
                     "claim",
+                    "cancel",
+                    "reopen",
                     "set-parent",
                     "release",
                     "recover",
                     "submit",
+                    "submit-epic",
+                    "request-changes",
+                    "accept",
                 ],
             )
             .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "issue"))
@@ -2441,7 +2571,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
         Some(("issue", issue)) => match issue.subcommand() {
             Some((
                 "note" | "create" | "update" | "select" | "claim" | "release" | "recover"
-                | "submit" | "add-dependency" | "remove-dependency" | "set-parent",
+                | "submit" | "cancel" | "reopen" | "submit-epic" | "request-changes" | "accept"
+                | "add-dependency" | "remove-dependency" | "set-parent",
                 leaf,
             )) => Some(leaf),
             Some(("help", _)) => help_leaf.map(|(_, leaf)| leaf),
@@ -3461,6 +3592,12 @@ impl Command {
                 | Self::IssueClaim(IssueClaimArgs {
                     transition: args, ..
                 })
+                | Self::IssueCancel(IssueReconcileArgs {
+                    transition: args, ..
+                })
+                | Self::IssueReopen(IssueReconcileArgs {
+                    transition: args, ..
+                })
                 | Self::IssueRelease(
                     IssueReleaseArgs {
                         stopped:
@@ -3475,6 +3612,19 @@ impl Command {
                     },
                     _,
                 )
+                | Self::IssueSubmitEpic(IssueSubmitEpicArgs {
+                    transition: args, ..
+                })
+                | Self::IssueRequestChanges(IssueReviewArgs {
+                    transition: args, ..
+                })
+                | Self::IssueAccept(IssueAcceptArgs {
+                    review:
+                        IssueReviewArgs {
+                            transition: args, ..
+                        },
+                    ..
+                })
                 | Self::IssueSubmit(IssueSubmitArgs {
                     stopped:
                         IssueStopArgs {
@@ -3534,8 +3684,8 @@ impl Command {
                     Ok(())
                 }
                 Self::IssueNote(args) => {
-                    if args.kind != "progress" {
-                        return Err("Issue note requires --kind progress.");
+                    if !crate::dolt::issue_note::HOLDER_NOTE_KINDS.contains(&args.kind.as_str()) {
+                        return Err("Issue note requires --kind progress, evidence, or handoff.");
                     }
                     if common.workspace.is_none() || !args.target.has_all() {
                         return Err(
@@ -3635,6 +3785,9 @@ impl Command {
             | Self::IssueParent(_)
             | Self::IssueRelease(_, _)
             | Self::IssueSubmit(_)
+            | Self::IssueSubmitEpic(_)
+            | Self::IssueRequestChanges(_)
+            | Self::IssueAccept(_)
             | Self::IssueDependency(_, _) => Err("Issue commands require --contract 2."),
             Self::Backup(_) => Err("Backup commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),

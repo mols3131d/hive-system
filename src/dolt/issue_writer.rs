@@ -94,6 +94,8 @@ impl Kind {
             Self::BotRetire => "Bot retire",
             Self::Transition(issue_transition::Operation::Select) => "Issue select",
             Self::Transition(issue_transition::Operation::Claim) => "Issue claim",
+            Self::Transition(issue_transition::Operation::Cancel) => "Issue cancel",
+            Self::Transition(issue_transition::Operation::Reopen) => "Issue reopen",
             Self::SetParent => "Issue set-parent",
             Self::Transition(operation) => operation.name(),
         }
@@ -111,12 +113,24 @@ impl Kind {
                 ("issue_claims", "INSERT"),
                 ("operation_receipts", "INSERT"),
             ],
-            Self::Note | Self::Transition(issue_transition::Operation::Select) => &[
+            Self::Note
+            | Self::Transition(
+                issue_transition::Operation::Select
+                | issue_transition::Operation::SubmitEpic
+                | issue_transition::Operation::RequestChanges
+                | issue_transition::Operation::Accept
+                | issue_transition::Operation::Cancel
+                | issue_transition::Operation::Reopen,
+            ) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
                 ("operation_receipts", "INSERT"),
             ],
-            Self::Transition(_) => &[
+            Self::Transition(
+                issue_transition::Operation::Release
+                | issue_transition::Operation::Recover
+                | issue_transition::Operation::Submit,
+            ) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
                 ("issue_claims", "DELETE"),
@@ -193,6 +207,13 @@ pub(super) trait Mutation {
     fn verify_decision(&self, now: OffsetDateTime) -> Result<(), HiveError>;
     fn evidence(&self) -> Result<String, HiveError>;
     fn check_scope(&self, snapshot: &mut Snapshot) -> Result<(), HiveError>;
+    fn verify_replay_decision(
+        &self,
+        _snapshot: &mut Snapshot,
+        _base: &str,
+    ) -> Result<(), HiveError> {
+        Ok(())
+    }
     fn guard(
         &self,
         db: &mut Transaction<'_>,
@@ -234,7 +255,7 @@ pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
     .map_err(|_| workflow::unverified())
 }
 
-// Version 1 has no kind field and always denotes a progress note. Version 2
+// Version 1 has no kind field and always denotes a holder-scoped Issue note. Version 2
 // carries an Issue kind. Version 3 carries an Artifact ID and optional Area.
 // Version 4 carries a typed transition or the Area, Project or Bot identifiers.
 #[derive(Serialize, Deserialize)]
@@ -490,6 +511,7 @@ pub(super) fn execute(
             let result = scoped
                 .verify(snapshot, &introduced, &receipt)
                 .map_err(|_| uncertain())?;
+            mutation.verify_replay_decision(snapshot, &receipt.base_commit)?;
             require_clean(&mut snapshot.connection, &commit)?;
             runtime.check()?;
             mutation.verify_decision(observe_time()?)?;
@@ -944,7 +966,7 @@ impl ScopedReceipt {
                     commit,
                     receipt,
                     &note,
-                    Some("progress"),
+                    Some(super::issue_note::HOLDER_NOTE_KINDS),
                 )?;
                 Ok(json!(note.result))
             }
@@ -1178,13 +1200,21 @@ mod tests {
             ("issue.release", issue_transition::Operation::Release),
             ("issue.recover", issue_transition::Operation::Recover),
             ("issue.submit", issue_transition::Operation::Submit),
+            ("issue.submit-epic", issue_transition::Operation::SubmitEpic),
+            (
+                "issue.request-changes",
+                issue_transition::Operation::RequestChanges,
+            ),
+            ("issue.accept", issue_transition::Operation::Accept),
+            ("issue.cancel", issue_transition::Operation::Cancel),
+            ("issue.reopen", issue_transition::Operation::Reopen),
         ] {
             transition["kind"] = json!(name);
             let marker = read(&transition).unwrap();
             assert!(matches!(marker.operation(), Ok(Kind::Transition(kind)) if kind == operation));
             assert_eq!(json!(marker), transition);
         }
-        transition["kind"] = json!("issue.submit-epic");
+        transition["kind"] = json!("issue.unknown-transition");
         assert!(read(&transition).is_err());
 
         let legacy_bytes = serde_json::to_string(&legacy).unwrap();

@@ -17,6 +17,10 @@ mod bot_retire;
 mod issue_dependency;
 #[path = "runtime/issue_parent.rs"]
 mod issue_parent;
+#[path = "runtime/issue_reconcile.rs"]
+mod issue_reconcile;
+#[path = "runtime/issue_review.rs"]
+mod issue_review;
 #[path = "runtime/issue_transition.rs"]
 mod issue_transition;
 #[path = "runtime/issue_update.rs"]
@@ -1315,6 +1319,7 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
         &restart,
         &dolt,
     );
+    issue_reconcile::exercise(&state, &fixture_root, &port, &dolt, &run, &restart);
     issue_dependency::exercise(&state, &fixture_root, &port, &dolt, &invoke, &restart);
     issue_parent::exercise(&state, &fixture_root, &port, &dolt, &invoke, &restart);
     issue_update::exercise(&state, &fixture_root, &port, &dolt, &run, &restart);
@@ -1345,7 +1350,7 @@ fn issue_note_writer_fixture(
     let body_path = fixture_root.join("progress.txt");
     let decision_path = fixture_root.join("decision.json");
     let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-    let note = |request: &str, actor: &str, expected: &str, body: &str, exit| {
+    let append = |kind: &str, request: &str, actor: &str, expected: &str, body: &str, exit| {
         let payload = serde_json::json!([
             1,
             "issue.note",
@@ -1355,7 +1360,7 @@ fn issue_note_writer_fixture(
             actor,
             claim,
             expected,
-            "progress",
+            kind,
             digest(body.as_bytes()),
         ]);
         let now = fixture_now();
@@ -1381,7 +1386,7 @@ fn issue_note_writer_fixture(
                 "note",
                 &issue,
                 "--kind",
-                "progress",
+                kind,
                 "--workspace-id",
                 &workspace,
                 "--database",
@@ -1408,6 +1413,10 @@ fn issue_note_writer_fixture(
         assert_eq!(report["command"], "issue note");
         assert!(!report.to_string().contains("fixture-write-authorization"));
         report
+    };
+
+    let note = |request: &str, actor: &str, expected: &str, body: &str, exit| {
+        append("progress", request, actor, expected, body, exit)
     };
 
     let marker = state.join("pending-request.json");
@@ -1670,6 +1679,49 @@ fn issue_note_writer_fixture(
     assert_eq!(
         storage_state(&mut connect("reader")),
         clean_before_receipt_probe
+    );
+
+    let mut reader = connect("reader");
+    for (kind, request, body) in [
+        (
+            "evidence",
+            id(98),
+            "Synthetic evidence for a fresh worker\r\nλ\n",
+        ),
+        (
+            "handoff",
+            id(99),
+            "Synthetic handoff for a fresh worker\r\nλ\n",
+        ),
+    ] {
+        let expected: String = reader
+            .exec_first("SELECT revision FROM issues WHERE id = ?", (&issue,))
+            .unwrap()
+            .unwrap();
+        let appended = append(kind, &request, "fixture-holder", &expected, body, 0);
+        assert_eq!(appended["data"]["outcome"], "confirmed");
+        assert!(!appended.to_string().contains("Synthetic"));
+        let note_id = appended["data"]["result"]["note_id"].as_str().unwrap();
+        let stored: (String, Vec<u8>, Option<String>) = reader
+            .exec_first(
+                "SELECT kind, CAST(body AS BINARY), transition_json FROM issue_updates WHERE id = ?",
+                (note_id,),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, (kind.to_owned(), body.as_bytes().to_vec(), None));
+        let replay = append(kind, &request, "fixture-holder", &expected, body, 0);
+        assert_eq!(replay["data"]["outcome"], "replayed");
+        assert_eq!(replay["data"]["result"], appended["data"]["result"]);
+        let changed = append("progress", &request, "fixture-holder", &expected, body, 5);
+        assert_eq!(changed["error"]["code"], "REQUEST_CONFLICT");
+    }
+    drop(reader);
+    restart(
+        Some(OfflineFixtureEdit::RestoreHead(
+            &clean_before_receipt_probe.0,
+        )),
+        None,
     );
 }
 

@@ -1,21 +1,31 @@
 //! Guarded Issue lifecycle transitions.
 
-use crate::cli::{CommonOptions, IssueReleaseArgs, IssueSubmitArgs, IssueTransitionArgs};
+use crate::cli::{
+    CommonOptions, IssueReleaseArgs, IssueReviewArgs, IssueSubmitArgs, IssueSubmitEpicArgs,
+    IssueTransitionArgs,
+};
 
 use super::{DoltFailure, DoltSuccess};
+
+pub(crate) enum Input<'a> {
+    Select,
+    Claim(&'a str),
+    Cancel(&'a str),
+    Reopen(&'a str),
+}
 
 pub(crate) fn write(
     common: &CommonOptions,
     args: &IssueTransitionArgs,
-    holder: Option<&str>,
+    input: Input<'_>,
 ) -> Result<DoltSuccess, Box<DoltFailure>> {
     #[cfg(target_os = "linux")]
     {
-        linux::write(common, args, holder).map_err(DoltFailure::without_context)
+        linux::write(common, args, input).map_err(DoltFailure::without_context)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (common, args, holder);
+        let _ = (common, args, input);
         unavailable()
     }
 }
@@ -47,6 +57,37 @@ pub(crate) fn submit(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (common, args);
+        unavailable()
+    }
+}
+
+pub(crate) fn submit_epic(
+    common: &CommonOptions,
+    args: &IssueSubmitEpicArgs,
+) -> Result<DoltSuccess, Box<DoltFailure>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::submit_epic(common, args).map_err(DoltFailure::without_context)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (common, args);
+        unavailable()
+    }
+}
+
+pub(crate) fn review(
+    common: &CommonOptions,
+    args: &IssueReviewArgs,
+    acknowledged: Option<&[String]>,
+) -> Result<DoltSuccess, Box<DoltFailure>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::review(common, args, acknowledged).map_err(DoltFailure::without_context)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (common, args, acknowledged);
         unavailable()
     }
 }
