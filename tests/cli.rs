@@ -2658,6 +2658,32 @@ fn malformed_project_write_values_keep_the_v2_envelope() {
 }
 
 #[test]
+fn malformed_bot_register_keeps_the_late_v2_envelope() {
+    let sandbox = Sandbox::new();
+    let command = ["bot", "register", "--slug", "fixture"];
+    let selectors = ["--contract", "2", "--json"];
+    for invalid in [
+        &["--unknown=--contract=1"][..],
+        &["--slug", "duplicate-slug"],
+        &["unexpected-position"],
+    ] {
+        let args = [&command[..], invalid, &selectors].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "bot register");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    }
+    let literal = sandbox.run(&["bot", "register", "--unknown=--json", "--contract", "2"]);
+    assert_eq!(literal.status.code(), Some(2));
+    assert!(literal.stdout.is_empty());
+    assert!(!literal.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
 fn unknown_project_long_option_recovery_keeps_literals_and_legacy_boundaries() {
     let sandbox = Sandbox::new();
     for args in [
@@ -3992,6 +4018,25 @@ fn issue_transitions_are_scoped_to_v2_issue_commands() {
         let text = String::from_utf8(help.stdout).unwrap();
         assert!(text.contains("--if-match") && text.contains("--evidence-file"));
         assert_eq!(text.contains("--holder"), holder);
+
+        for invalid in ["unexpected-position", "--unknown=--json"] {
+            let args = [
+                "issue",
+                action,
+                "01900000-0000-7000-8000-000000000001",
+                invalid,
+                "--contract",
+                "2",
+                "--json",
+            ];
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+            assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], format!("issue {action}"));
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        }
 
         let root_help = sandbox.run(&["--contract", "2", "--help"]);
         let text = String::from_utf8(root_help.stdout).unwrap();

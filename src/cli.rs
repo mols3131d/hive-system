@@ -1482,6 +1482,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 .or(config_error_matches)
                 .or(area_matches)
                 .or_else(|| retry_write_failure(&cli, &args, error.kind(), "area", &["create"]))
+                .or_else(|| retry_write_failure(&cli, &args, error.kind(), "bot", &["register"]))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "context"))
@@ -1496,6 +1497,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                         .ok()?;
                     recover_unknown_long(&cli, &args, &partial, &error, "workspace")
                         .or_else(|| recover_unknown_long(&cli, &args, &partial, &error, "area"))
+                        .or_else(|| recover_unknown_long(&cli, &args, &partial, &error, "bot"))
                         .or_else(|| recover_context_resolve(&cli, &args, &partial, &error))
                         .or(Some(partial))
                 });
@@ -2096,7 +2098,10 @@ fn recover_unknown_long(
         return None;
     }
     let (action, _) = matched.subcommand()?;
-    let named_write = matches!((domain, action), ("area" | "project", "create"));
+    let named_write = matches!(
+        (domain, action),
+        ("area" | "project", "create") | ("bot", "register")
+    );
     let positional_write = matches!(
         (domain, action),
         ("project", "add-issue")
