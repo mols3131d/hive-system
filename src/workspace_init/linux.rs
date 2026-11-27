@@ -974,6 +974,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn registration_refuses_state_inside_other_workspace_and_git_assets() {
+        for (marker, reason) in [
+            (config_v2::MARKER, "existing Hive workspace"),
+            (".git/HEAD", "existing Git repository"),
+        ] {
+            let fixture = Publication::new();
+            let other = fixture.root.join("other");
+            private_dir(&other).unwrap();
+            if marker == ".git/HEAD" {
+                private_dir(&other.join(".git")).unwrap();
+            }
+            let marker_path = other.join(marker);
+            fs::write(&marker_path, b"existing synthetic content").unwrap();
+            let xdg = other.join("new-state");
+            let error = publish_fixture(
+                &fixture.target,
+                &fixture.payload,
+                Some(&xdg.join("hive/v2")),
+                |_| {},
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            assert!(matches!(error.code, ErrorCode::InvalidArgument));
+            assert!(error.to_string().contains(reason));
+            assert_unpublished(&fixture.target);
+            assert!(!xdg.exists());
+            assert_eq!(fs::read_dir(&other).unwrap().count(), 1);
+            assert_eq!(
+                fs::read_dir(marker_path.parent().unwrap()).unwrap().count(),
+                1
+            );
+            assert_eq!(
+                fs::read(marker_path).unwrap(),
+                b"existing synthetic content"
+            );
+        }
+    }
+
     impl Drop for Publication {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.root).unwrap();

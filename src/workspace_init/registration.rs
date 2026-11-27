@@ -1,6 +1,7 @@
 use super::{
-    dir_metadata, fd_path, open_directory, rename_entry, require_local_filesystem,
-    require_trusted_component, same_directory, same_inode, sync_directory, verify_entry,
+    dir_metadata, fd_path, open_directory, refuse_workspace_ancestor, rename_entry,
+    require_local_filesystem, require_trusted_component, same_directory, same_inode,
+    sync_directory, verify_entry,
 };
 use crate::config::{absolute_env, json_path};
 use crate::config_file::{MAX_FILE_BYTES, ScopedDirectory};
@@ -147,6 +148,15 @@ impl Published {
 fn open_state_parent(path: &Path, target: &File) -> Result<File, HiveError> {
     let target = dir_metadata(target)?;
     let mut directory = open_directory(Path::new("/"))?;
+    let check_ancestry = |directory: &File| {
+        refuse_workspace_ancestor(directory).map_err(|error| {
+            HiveError::new(
+                error.code,
+                format!("Unsafe runtime state ancestry. {error}"),
+            )
+        })
+    };
+    check_ancestry(&directory)?;
     let root = dir_metadata(&directory)?;
     let mut traversed = PathBuf::from("/");
     let private_start = path.components().count() - 3; // hive/v2/workspaces
@@ -163,7 +173,6 @@ fn open_state_parent(path: &Path, target: &File) -> Result<File, HiveError> {
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(state_io(error)),
                 }
-                sync_directory(&directory)?;
                 open_directory(&entry)?
             }
             result => result?,
@@ -177,6 +186,10 @@ fn open_state_parent(path: &Path, target: &File) -> Result<File, HiveError> {
         if index >= private_start {
             require_private_directory(&child)?;
         }
+        check_ancestry(&child)?;
+        // An existing child may have just been created by another init
+        // whose sync is still pending. Persist this link before descending.
+        sync_directory(&directory)?;
         directory = child;
     }
     require_local_filesystem(&directory)?;
