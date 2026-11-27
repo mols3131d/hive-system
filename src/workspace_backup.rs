@@ -13,7 +13,10 @@ use sha2::{Digest, Sha256};
 use crate::config_file::ScopedDirectory;
 use crate::config_git::with_asset_bundle;
 use crate::config_v2::Candidate;
-use crate::dolt::{DOLT_VERSION, INITIAL_SCHEMA, STORAGE_SCHEMA_VERSION, is_commit_hash, is_uuid};
+use crate::dolt::{
+    DOLT_VERSION, INITIAL_SCHEMA, STORAGE_SCHEMA_VERSION, is_commit_hash, is_uuid,
+    validate_backup_souls,
+};
 use crate::error::{ErrorCode, HiveError};
 use crate::workspace_init::{Installed, fd_path, sync_tree};
 use crate::workspace_status::require_local_filesystem;
@@ -110,7 +113,7 @@ pub(crate) fn create(
         &workspace.root,
         Path::new(&process_fd(&scratch_dir)),
         &bundle,
-        |asset_revision, recheck_assets| {
+        |asset_revision, verified_assets, recheck_assets| {
             // The source cwd is pinned by the parent before exec.
             installed.dolt(&source, &["backup", "sync-url", &backup_url], None)?;
             installed.dolt(&scratch, &["backup", "restore", &backup_url, "db"], None)?;
@@ -122,6 +125,13 @@ pub(crate) fn create(
                     "The staged Dolt backup differs from the selected committed revision.",
                 ));
             }
+            validate_backup_souls(
+                &installed,
+                &restored_db,
+                &revision,
+                workspace.workspace_id(),
+                |path| installed.read_committed_soul(verified_assets, asset_revision, path),
+            )?;
             // This is an empty lock file created by the local native transport.
             for lock in ["dolt/LOCK", "dolt/oldgen/LOCK"] {
                 let lock = payload.join(lock);

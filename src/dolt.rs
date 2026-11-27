@@ -201,12 +201,12 @@ pub(crate) fn validate(args: &ValidateArgs) -> Result<DoltSuccess, Box<DoltFailu
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn validate_restored_records(
+pub(crate) fn validate_restored_records<T: AsRef<[u8]>>(
     installed: &crate::workspace_init::Installed<'_>,
     db: &std::path::Path,
     commit: &str,
     workspace_id: &str,
-    read_soul_blob: impl FnMut(&str) -> Result<String, HiveError>,
+    read_soul_blob: impl FnMut(&str) -> Result<T, HiveError>,
 ) -> Result<(), HiveError> {
     let mut reader = records::RecordReader::Offline {
         installed,
@@ -220,7 +220,23 @@ pub(crate) fn validate_restored_records(
             diagnostics.truncated,
         ));
     }
-    bot::validate_restored_souls(&mut reader, workspace_id, read_soul_blob)
+    bot::validate_snapshot_souls(&mut reader, workspace_id, read_soul_blob)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_backup_souls(
+    installed: &crate::workspace_init::Installed<'_>,
+    db: &std::path::Path,
+    commit: &str,
+    workspace_id: &str,
+    read_soul_blob: impl FnMut(&str) -> Result<Vec<u8>, HiveError>,
+) -> Result<(), HiveError> {
+    let mut reader = records::RecordReader::Offline {
+        installed,
+        db,
+        commit,
+    };
+    bot::validate_snapshot_souls(&mut reader, workspace_id, read_soul_blob)
 }
 
 fn encode_id_cursor(id: &str, binding: &Value) -> String {

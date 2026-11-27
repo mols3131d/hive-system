@@ -36,9 +36,7 @@ mod linux {
 
     use crate::config::json_path;
     use crate::config_file::ScopedDirectory;
-    use crate::config_git::{
-        ASSET_BACKUP_REF, MAX_BLOB_BYTES, is_full_lowercase_oid, verify_checkout_tree,
-    };
+    use crate::config_git::{ASSET_BACKUP_REF, is_full_lowercase_oid, verify_checkout_tree};
     use crate::config_v2::{BOOTSTRAP_LAYOUT, MARKER, verify_bootstrap_layout};
     use crate::dolt::{
         DOLT_VERSION, STORAGE_SCHEMA_VERSION, is_commit_hash, is_uuid, validate_restored_records,
@@ -162,18 +160,7 @@ mod linux {
             &db,
             &manifest.dolt_commit,
             &manifest.workspace_id,
-            |path| {
-                let object = format!("{}:{path}", manifest.asset_git_commit);
-                let size = installed.git(&assets, &["cat-file", "-s", &object])?;
-                if !size
-                    .trim()
-                    .parse::<usize>()
-                    .is_ok_and(|size| size <= MAX_BLOB_BYTES)
-                {
-                    return Err(unverified("A restored Soul exceeds the asset blob limit."));
-                }
-                installed.git(&assets, &["cat-file", "blob", &object])
-            },
+            |path| installed.read_committed_soul(&assets, &manifest.asset_git_commit, path),
         )?;
         verify_bootstrap_layout(&payload_dir)?;
         let mut descriptor = private_file(&payload.join(MARKER))?;

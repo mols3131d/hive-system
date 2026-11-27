@@ -1399,7 +1399,12 @@ fn creates_and_restores_exact_local_backup_and_refuses_unverified_inputs() {
     };
     let db = root.join("db");
     let asset_root = root.join("assets");
-    let source_soul = b"# Synthetic Soul
+    let source_soul = b"---
+bot_slug: synthetic
+display_name: Synthetic Queen
+role: queen
+---
+# Synthetic Soul
 
 Two lines.
 ";
