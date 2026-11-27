@@ -247,10 +247,22 @@ pub(crate) enum Command {
     /// Inspect Issues under contract 2.
     #[command(subcommand, hide = true)]
     Issue(IssueCommand),
+    /// Manage a local workspace under contract 2.
+    #[command(subcommand, hide = true)]
+    Workspace(WorkspaceCommand),
     /// Validate workspace records.
     Validate(ValidateArgs),
     /// Check the local environment and workspace.
     Doctor,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WorkspaceCommand {
+    /// Initialize a new workspace in an existing empty directory.
+    Init {
+        #[arg(long, value_name = "EMPTY_DIR")]
+        target: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1137,6 +1149,14 @@ impl Command {
                     | IssueCommand::Blocked(args),
                 ) => args.validate_dolt_selection(common),
                 Self::Bot(command) => command.validate(common),
+                Self::Workspace(_)
+                    if common.workspace.is_some()
+                        || common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree) =>
+                {
+                    Err("workspace init accepts only --target and output selection.")
+                }
                 _ => Ok(()),
             };
         }
@@ -1156,6 +1176,7 @@ impl Command {
             }
             Self::Area(_) => Err("Area commands require --contract 2."),
             Self::Issue(_) => Err("Issue commands require --contract 2."),
+            Self::Workspace(_) => Err("Workspace commands require --contract 2."),
             Self::Bot(command) => command.validate(common),
             Self::Validate(args) => {
                 if args.all || args.target.has_any() {

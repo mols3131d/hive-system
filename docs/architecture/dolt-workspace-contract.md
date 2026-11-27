@@ -4,7 +4,7 @@ description: "Use when implementing or verifying Dolt v2 workspace layout, descr
 
 # Dolt v2 Workspace Layout and Local File Contract
 
-**Status: design contract only.** This document specifies the Dolt v2 local filesystem layout, workspace descriptor, XDG configuration, local Area/resource bindings, canonical asset root, runtime state, and private Queen conversation storage for `#22`, `#18`, and `#20` against approved baseline `c66b3c50150e18426485d134de92c6b311dac125`. These v2 storage and CLI features are **not yet implemented** in `src/`. Existing workspaces continue under their [pinned v1 contracts](README.md#v1-compatibility). Migration mapping, live migration, and an authority switch are out of scope and require separate explicit approval.
+**Status: partially implemented.** This document specifies the Dolt v2 local filesystem layout, workspace descriptor, XDG configuration, local Area/resource bindings, canonical asset root, runtime state, and private Queen conversation storage for `#22`, `#18`, and `#20` against approved baseline `c66b3c50150e18426485d134de92c6b311dac125`. The Rust CLI supports [descriptor inspection and inactive workspace initialization](../development/README.md#dolt-workspace-descriptor-inspection). The remaining layout and lifecycle rules guide later implementation. Existing workspaces continue under their [pinned v1 contracts](README.md#v1-compatibility). Migration mapping, live migration, and an authority switch are out of scope and require separate explicit approval.
 
 Read this with the [Dolt v2 architecture](dolt-redesign.md), [MVP contract](dolt-mvp-contract.md), and [relational schema](dolt-schema.md).
 

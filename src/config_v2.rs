@@ -12,7 +12,7 @@ mod unix {
     use crate::dolt::{STORAGE_SCHEMA_VERSION, is_uuid};
     use crate::error::{ErrorCode, HiveError};
 
-    const MARKER: &str = "hive-workspace.yml";
+    use super::MARKER;
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -190,7 +190,20 @@ mod unix {
                     "The v2 workspace descriptor is missing.",
                 )
             })?;
-        let descriptor: Descriptor = parse_v2(&bytes, "Workspace descriptor")?;
+        let descriptor = parse_descriptor(&bytes)?;
+        Ok(Candidate {
+            root: root.path,
+            descriptor,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn verify_descriptor(bytes: &[u8]) -> Result<(), HiveError> {
+        parse_descriptor(bytes).map(|_| ())
+    }
+
+    fn parse_descriptor(bytes: &[u8]) -> Result<Descriptor, HiveError> {
+        let descriptor: Descriptor = parse_v2(bytes, "Workspace descriptor")?;
         require_version(&descriptor.version, 2, "Workspace descriptor version")?;
         require_version(
             &descriptor.schema_version,
@@ -212,10 +225,7 @@ mod unix {
                 "Workspace descriptor policy revision must be a lowercase Git commit SHA.",
             ));
         }
-        Ok(Candidate {
-            root: root.path,
-            descriptor,
-        })
+        Ok(descriptor)
     }
 
     fn require_version(value: &Value, expected: u32, field: &str) -> Result<(), HiveError> {
@@ -263,4 +273,12 @@ pub(crate) fn show(options: &CommonOptions) -> (Format, Result<Value, HiveError>
             )),
         )
     }
+}
+
+#[cfg(unix)]
+pub(crate) const MARKER: &str = "hive-workspace.yml";
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_descriptor(bytes: &[u8]) -> Result<(), HiveError> {
+    unix::verify_descriptor(bytes)
 }

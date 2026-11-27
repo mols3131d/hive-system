@@ -45,6 +45,24 @@ hive --contract 2 --json config show --scope workspace \
 
 An explicit workspace takes precedence. Without one, the CLI uses the v2 user configuration or checks the v2 XDG data candidate. The report identifies the selected source and marks the committed Dolt identity and runtime as unverified. Continue to supply the explicit database, port, and expected workspace UUID for Dolt record commands. See the [v2 local file contract](../architecture/dolt-workspace-contract.md) for configuration and descriptor fields.
 
+## Dolt workspace initialization
+
+Use a new, existing empty directory owned by the invoking user. Bootstrap currently supports Linux on an ext-family filesystem or tmpfs. Supply installed Dolt 2.7.6 and Git on absolute `PATH` entries.
+
+```sh
+workspace=$(mktemp -d)
+hive --contract 2 --json workspace init --target "$workspace"
+hive --contract 2 --json config show --scope workspace --workspace "$workspace"
+```
+
+Init builds the Dolt and Git commits in a private sibling staging directory. It verifies the committed schema, migration ledger, workspace identity, initial Issue counter, and empty asset history before atomically replacing the empty directory. The published root contains the descriptor, `db/`, `assets/`, and a private `conversations/` directory. Init leaves the workspace inactive and leaves XDG configuration and runtime state untouched. A failed or interrupted initialization can leave a private sibling named `.hive-init-incomplete-*` for inspection.
+
+To run the disposable init tests with the actual installed engines, supply the absolute path to Dolt 2.7.6.
+
+```sh
+HIVE_DOLT_BIN=/absolute/path/to/dolt cargo test --locked --test workspace_init -- --include-ignored
+```
+
 ## Dolt record validation
 
 The v2 validator reads a single committed snapshot of Dolt `main` through a dedicated SELECT-only account on loopback. It verifies the pinned server version, required tables, migration ledger version and digest, and expected workspace UUID. It checks canonical UUIDv7 Area and Issue IDs, their graph references, lowercase sibling slugs, Issue numbers, and cycles in Area ancestry, Issue parentage, prerequisites and combined completion obligations. Validation returns up to 100 diagnostics and refuses scans above 100,000 rows per checked table. The JSON result identifies the observed Dolt commit after schema and identity verification.
@@ -69,7 +87,7 @@ hive --contract 2 --json validate --all \
   --workspace-id 01900000-0000-7000-8000-000000000001
 ```
 
-Contract 1 remains the CLI default. Under contract 2, schema incompatibility and record violations exit 4. Reader authentication failures exit 6. Unverified workspace identity and unavailable runtime exit 7. Explicit workspace path and scoped validation, full lifecycle provenance checks, and bootstrap and migration commands are follow-up work.
+Contract 1 remains the CLI default. Under contract 2, schema incompatibility and record violations exit 4. Reader authentication failures exit 6. Unverified workspace identity and unavailable runtime exit 7. Explicit workspace path and scoped validation, full lifecycle provenance checks, and migration commands are follow-up work.
 
 Run the integration tests with the pinned Dolt executable. The fixtures provision disposable data and accounts, invoke the Hive binary built by Cargo, and compare the database commit and working and staged states before and after validation.
 
