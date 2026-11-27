@@ -748,15 +748,16 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     // Global clap arguments propagate values across levels. Separate declarations
     // retain every occurrence at the root and at the selected leaf.
     let mut cli = CommonArgs::augment_args(cli.mut_subcommands(add_leaf_options));
+    let mut config_error_matches = None;
     let matches = match cli.clone().try_get_matches_from(&args).or_else(|error| {
         match error.kind() {
-            ErrorKind::ValueValidation => {
-                retry_issue_query(&cli, &args).or_else(|| retry_config_show(&cli, &args))
-            }
-            ErrorKind::UnknownArgument => retry_config_show(&cli, &args),
+            ErrorKind::ValueValidation => retry_issue_query(&cli, &args)
+                .map(Ok)
+                .or_else(|| retry_config_show(&cli, &args, &mut config_error_matches)),
+            ErrorKind::UnknownArgument => retry_config_show(&cli, &args, &mut config_error_matches),
             _ => None,
         }
-        .ok_or(error)
+        .unwrap_or(Err(error))
     }) {
         Ok(matches) => matches,
         Err(error)
@@ -776,7 +777,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 }
                 _ => None,
             };
-            let partial = area_matches.or_else(|| {
+            let partial = config_error_matches.or(area_matches).or_else(|| {
                 cli.clone()
                     .ignore_errors(true)
                     .try_get_matches_from(&args)
@@ -865,7 +866,11 @@ fn retry_issue_query(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatche
         .then_some(matches)
 }
 
-fn retry_config_show(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {
+fn retry_config_show(
+    cli: &clap::Command,
+    args: &[OsString],
+    error_matches: &mut Option<ArgMatches>,
+) -> Option<Result<ArgMatches, clap::Error>> {
     // Add v2-only options on retry to preserve legacy config help and errors.
     let accept_numeric_project = |command: clap::Command| {
         defer_project_check(command).mut_arg("project", |arg| arg.allow_negative_numbers(true))
@@ -881,10 +886,30 @@ fn retry_config_show(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatche
                 )
         })
     }));
-    let matches = retry.try_get_matches_from(args).ok()?;
-    let (command, leaf) = matched_leaf(cli, &matches)?;
-    (command == "config show" && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
-        .then_some(matches)
+    let is_v2_config = |matches: &ArgMatches| {
+        matched_leaf(cli, matches).is_some_and(|(command, leaf)| {
+            command == "config show"
+                && requested_contract(Some(matches), Some(leaf)) == Contract::V2
+        })
+    };
+    match retry.clone().try_get_matches_from(args) {
+        Ok(matches) => is_v2_config(&matches).then_some(Ok(matches)),
+        Err(error) => {
+            // Allow duplicates and missing values only while recovering metadata
+            // for this failure. Clap still distinguishes flags from values.
+            let relaxed = |arg: Arg| arg.action(ArgAction::Append).num_args(0..=1);
+            *error_matches = retry
+                .mut_subcommand("config", |config| {
+                    config.mut_subcommand("show", |show| {
+                        show.mut_arg("area", relaxed).mut_arg("resource", relaxed)
+                    })
+                })
+                .try_get_matches_from(args)
+                .ok()
+                .filter(is_v2_config);
+            error_matches.as_ref().map(|_| Err(error))
+        }
+    }
 }
 
 fn retry_area_read(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {

@@ -1174,3 +1174,46 @@ fn dolt_area_option_recovery_preserves_literals_and_v1_errors() {
     }
     sandbox.assert_empty();
 }
+
+#[test]
+fn duplicate_and_missing_config_scope_options_preserve_v2_parse_errors() {
+    let sandbox = Sandbox::new();
+    let command = ["config", "show"];
+    let selectors = ["--contract", "2", "--json"];
+    let area = "01900000-0000-7000-8000-000000000001";
+    for (invalid, message) in [
+        (&["--area", area, "--area", area][..], "Arguments conflict."),
+        (
+            &["--resource", ".", "--resource", "."],
+            "Arguments conflict.",
+        ),
+        (&["--area"], "An argument has a missing or invalid value."),
+        (
+            &["--resource"],
+            "An argument has a missing or invalid value.",
+        ),
+    ] {
+        let early = sandbox.run(&[&selectors[..], &command, invalid].concat());
+        let late = sandbox.run(&[&command[..], invalid, &selectors].concat());
+        for output in [&early, &late] {
+            assert_eq!(output.status.code(), Some(2), "{invalid:?}");
+            assert!(output.stderr.is_empty(), "{invalid:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2, "{invalid:?}");
+            assert_eq!(report["command"], "config show", "{invalid:?}");
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT", "{invalid:?}");
+            assert_eq!(report["error"]["message"], message, "{invalid:?}");
+        }
+        assert_eq!(early.stdout, late.stdout, "{invalid:?}");
+    }
+
+    for args in [
+        &["--area=--json", "--area"][..],
+        &["--resource=--json", "--resource"],
+    ] {
+        let output = sandbox.run(&[&command[..], args, &["--contract", "2"]].concat());
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+}

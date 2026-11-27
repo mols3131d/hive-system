@@ -76,10 +76,21 @@ mod unix {
         {
             return Err(HiveError::new(
                 ErrorCode::InvalidArgument,
-                "Unsupported scope or view option for this configuration report.",
+                if resolved {
+                    "Unsupported scope or view option for this configuration report."
+                } else {
+                    "Workspace descriptor inspection accepts only workspace and output selection."
+                },
             ));
         }
 
+        let workspace_error = |source, error| {
+            if resolved {
+                source_error(source, error)
+            } else {
+                error
+            }
+        };
         let home = absolute_env("HOME");
         let home = home.as_deref();
         let explicit = options
@@ -91,7 +102,7 @@ mod unix {
                 read_candidate(&target)
             })
             .transpose()
-            .map_err(|error| source_error("CLI workspace", error))?;
+            .map_err(|error| workspace_error("CLI workspace", error))?;
 
         let area = args.area.as_deref();
         let project = options.project.as_ref().map(|id| id.as_str());
@@ -108,9 +119,14 @@ mod unix {
             .as_deref()
             .map(|path| bindings::explicit_root(path, home))
             .transpose()?;
+        let mut binding = if let Some(root) = &resource_root {
+            bindings::select(Some(root), home)?
+        } else {
+            None
+        };
 
         // Resolve the format first when it might come from user configuration,
-        // so a subsequent binding failure uses the selected output format.
+        // so an implicit binding failure uses the selected output format.
         let mut user = if options.format.is_none() {
             read_user(home)?
         } else {
@@ -126,11 +142,9 @@ mod unix {
             (None, None) => "default",
         };
 
-        let binding = if resolved {
-            bindings::select(resource_root.as_deref(), home)?
-        } else {
-            None
-        };
+        if resolved && resource_root.is_none() {
+            binding = bindings::select(None, home)?;
+        }
         let needs_user_workspace = binding.as_ref().map_or(explicit.is_none(), |selected| {
             selected.binding.workspace.is_none()
         });
@@ -164,13 +178,13 @@ mod unix {
             (candidate, "cli")
         } else if let Some((path, source)) = user_workspace {
             let target = resolve_path(path, config_parent(source), home)?;
-            let candidate =
-                read_candidate(&target).map_err(|error| source_error("User workspace", error))?;
+            let candidate = read_candidate(&target)
+                .map_err(|error| workspace_error("User workspace", error))?;
             (candidate, "user")
         } else {
             let path = xdg_root("XDG_DATA_HOME", home, ".local/share")?.join("userdata");
             let candidate = read_candidate(&path)
-                .map_err(|error| source_error("XDG default workspace", error))?;
+                .map_err(|error| workspace_error("XDG default workspace", error))?;
             (candidate, "xdg-default")
         };
 

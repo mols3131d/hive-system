@@ -1712,3 +1712,96 @@ fn v2_bindings_refuse_invalid_selected_inputs_and_unsafe_files() {
         v2_error(fixture.run(&[V2_RESOLVED, extra].concat()), exit, code);
     }
 }
+
+#[test]
+fn v2_binding_selection_opens_only_the_winning_resource_path() {
+    let fixture = Sandbox::new();
+    let invocation = fixture.0.join("invocation");
+    let child = invocation.join("child");
+    fs::create_dir(&child).unwrap();
+    symlink(&child, invocation.join("shortcut")).unwrap();
+    write(
+        &fixture.0.join("workspace/hive-workspace.yml"),
+        V2_DESCRIPTOR,
+    );
+    let yaml = fixture.0.join("xdg/hive/v2/bindings.yml");
+    let binding = |path: &str| v2_binding(path, "../../../workspace");
+    let parent = binding("../../../invocation");
+    let unrelated = binding("../../../unrelated-missing");
+    write(&yaml, format!("version: 2\nbindings:\n{unrelated}{parent}"));
+    for scope in [&[][..], &["--resource", ".."]] {
+        let report = v2_json(fixture.run_in(&child, &[V2_RESOLVED, scope].concat()), 0);
+        assert_eq!(
+            report["data"]["resource_root"],
+            invocation.to_str().unwrap()
+        );
+    }
+
+    let duplicate = binding("../../../unrelated-missing/another/..");
+    write(
+        &yaml,
+        format!("version: 2\nbindings:\n{parent}{unrelated}{duplicate}"),
+    );
+    v2_error(fixture.run(V2_RESOLVED), 2, "INVALID_CONFIG");
+
+    for (component, exit, code) in [
+        ("missing", 3, "NOT_FOUND"),
+        ("shortcut", 2, "INVALID_CONFIG"),
+    ] {
+        let winner = binding(&format!("../../../invocation/{component}/../child"));
+        write(&yaml, format!("version: 2\nbindings:\n{parent}{winner}"));
+        for scope in [&[][..], &["--resource", "."]] {
+            let output = fixture.run_in(&child, &[V2_RESOLVED, scope].concat());
+            v2_error(output, exit, code);
+        }
+    }
+}
+
+#[test]
+fn v2_explicit_unbound_resource_precedes_malformed_user_config() {
+    let fixture = Sandbox::new();
+    write(
+        &fixture.0.join("xdg/hive/v2/config.yml"),
+        "synthetic-private: [",
+    );
+    let message = "The CLI Resource directory has no exact machine-local binding.";
+    let output = fixture.run(&["--contract", "2", "config", "show", "--resource", "."]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, format!("error: {message}\n").as_bytes());
+
+    let output = fixture.run(&[V2_RESOLVED, &["--resource", "."]].concat());
+    let report = v2_json(output, 3);
+    assert_eq!(report["error"]["code"], "NOT_FOUND");
+    assert_eq!(report["error"]["message"], message);
+}
+
+#[test]
+fn v2_workspace_scope_preserves_descriptor_failure_diagnostics() {
+    let fixture = Sandbox::new();
+    for (selection, exit, code, message) in [
+        (
+            &["--workspace", "../absent"][..],
+            3,
+            "NOT_FOUND",
+            "Workspace directory does not exist",
+        ),
+        (
+            &["--authority"][..],
+            2,
+            "INVALID_ARGUMENT",
+            "Workspace descriptor inspection accepts only workspace and output selection.",
+        ),
+    ] {
+        let output = show_v2(&fixture, selection).output().unwrap();
+        assert_eq!(output.status.code(), Some(exit));
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, format!("error: {message}\n").as_bytes());
+        let output = show_v2(&fixture, &[selection, &["--json"]].concat())
+            .output()
+            .unwrap();
+        let report = v2_json(output, exit);
+        assert_eq!(report["error"]["code"], code);
+        assert_eq!(report["error"]["message"], message);
+    }
+}

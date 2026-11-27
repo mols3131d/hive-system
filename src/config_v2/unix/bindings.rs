@@ -10,7 +10,7 @@ use crate::config_file::{ScopedDirectory, parse_v2, present, untagged};
 use crate::dolt::{is_uuid, is_uuid_v7};
 use crate::error::{ErrorCode, HiveError};
 
-use super::{invalid, require_version, source_error, validate_path, xdg_root};
+use super::{invalid, normalized_root, require_version, source_error, validate_path, xdg_root};
 
 const FILE: &str = "bindings.yml";
 
@@ -110,7 +110,10 @@ fn select_binding(
     let mut selected = None;
     let mut depth = 0;
     for binding in fields.bindings {
-        let root = directory(Path::new(&binding.path), base, home)?;
+        let path = Path::new(&binding.path);
+        validate_path(path)?;
+        let path = resolve_path(path, base, home)?;
+        let root = normalized_root(&path);
         if !roots.insert(root.clone()) {
             return Err(invalid("Duplicate canonical Resource directories."));
         }
@@ -122,14 +125,20 @@ fn select_binding(
         let root_depth = root.components().count();
         if applies && root_depth > depth {
             depth = root_depth;
-            selected = Some(Selected {
-                file: base.join(FILE),
-                root,
-                binding,
-            });
+            selected = Some((path, binding));
         }
     }
-    Ok(selected)
+    // Verify the original spelling of the winner, including components erased
+    // by normalization. A missing directory or symlink fails this selection.
+    selected
+        .map(|(path, binding)| {
+            Ok(Selected {
+                file: base.join(FILE),
+                root: ScopedDirectory::open_absolute(&path)?.path,
+                binding,
+            })
+        })
+        .transpose()
 }
 
 fn directory(path: &Path, base: &Path, home: Option<&Path>) -> Result<PathBuf, HiveError> {
