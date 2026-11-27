@@ -2684,6 +2684,7 @@ fn malformed_bot_register_keeps_the_late_v2_envelope() {
         for args in [
             [&["--contract", "2"][..], &command].concat(),
             [&command[..], &["--contract", "2"]].concat(),
+            [&["--contract", "2", "--workspace", "issue"][..], &command].concat(),
         ] {
             let help = sandbox.run(&args);
             assert!(help.status.success(), "{args:?}: {help:?}");
