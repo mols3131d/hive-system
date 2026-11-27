@@ -452,7 +452,16 @@ fn failing_child_leaves_only_private_marked_staging() {
         "case $1 in version) echo 'dolt version 2.7.6';; init) /bin/mkdir .dolt; echo private-child-output >&2; exit 17;; esac",
     );
     fixture.fake_git_version();
-    let error = response(fixture.init(&target).output().unwrap(), 7);
+    let state = fixture.0.join("state");
+    let error = response(
+        fixture
+            .init(&target)
+            .arg("--register-runtime")
+            .env("XDG_STATE_HOME", &state)
+            .output()
+            .unwrap(),
+        7,
+    );
     assert_eq!(error["error"]["code"], "IO_ERROR");
     assert!(
         error["error"]["message"]
@@ -462,6 +471,7 @@ fn failing_child_leaves_only_private_marked_staging() {
     );
     assert!(!error.to_string().contains("private-child-output"));
     assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+    assert!(!state.exists());
     let stages = fixture.stages();
     assert_eq!(stages.len(), 1);
     assert_eq!(
@@ -470,6 +480,60 @@ fn failing_child_leaves_only_private_marked_staging() {
     );
     assert!(!stages[0].join("scratch").exists());
     assert!(!stages[0].join("workspace/hive-workspace.yml").exists());
+}
+
+#[test]
+fn registration_refuses_copied_descriptors_and_state_inside_the_target() {
+    let fixture = Fixture::new();
+    let copy = fixture.dir("copy");
+    let descriptor = "version: 2\nworkspace_id: 01900000-0000-7000-8000-000000000001\nschema_version: 1\npolicy_revision: c66b3c50150e18426485d134de92c6b311dac125\n";
+    fs::write(copy.join("hive-workspace.yml"), descriptor).unwrap();
+    let state = fixture.0.join("state");
+    let error = response(
+        fixture
+            .init(&copy)
+            .arg("--register-runtime")
+            .env("XDG_STATE_HOME", &state)
+            .output()
+            .unwrap(),
+        5,
+    );
+    assert_eq!(error["error"]["code"], "ALREADY_EXISTS");
+    assert_eq!(
+        fs::read_to_string(copy.join("hive-workspace.yml")).unwrap(),
+        descriptor
+    );
+    assert!(!state.exists());
+
+    let empty = fixture.dir("empty");
+    let error = response(
+        fixture
+            .init(&empty)
+            .arg("--register-runtime")
+            .env("XDG_STATE_HOME", &empty)
+            .output()
+            .unwrap(),
+        7,
+    );
+    assert_eq!(error["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+
+    // The versioned XDG directory can be an ancestor of the target while
+    // the record and UUID lock would still be published inside the target.
+    let workspaces = fixture.0.join("state/hive/v2/workspaces");
+    fs::create_dir_all(&workspaces).unwrap();
+    let error = response(
+        fixture
+            .init(&workspaces)
+            .arg("--register-runtime")
+            .env("XDG_STATE_HOME", &state)
+            .output()
+            .unwrap(),
+        7,
+    );
+    assert_eq!(error["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert_eq!(fs::read_dir(workspaces).unwrap().count(), 0);
+    assert!(fixture.stages().is_empty());
 }
 
 #[test]
@@ -636,13 +700,45 @@ fn publishes_verified_workspace_with_isolated_children() {
     );
     assert_eq!(fs::read_dir(unrelated_git).unwrap().count(), 0);
     assert!(!target.join("assets/.git/hooks/pre-commit").exists());
-    assert_eq!(fs::read_dir(xdg).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&xdg).unwrap().count(), 0);
     assert_eq!(fs::read(&global).unwrap(), global_contents);
     assert_eq!(fs::read_dir(home.join(".dolt")).unwrap().count(), 1);
     assert_eq!(fs::read_dir(home).unwrap().count(), 2);
     assert!(fixture.stages().is_empty());
     let repeat = response(fixture.init(&target).output().unwrap(), 5);
     assert_eq!(repeat["error"]["code"], "ALREADY_EXISTS");
+
+    let registered = fixture.dir("registered");
+    let data = response(
+        fixture
+            .init(&registered)
+            .arg("--register-runtime")
+            .env("XDG_STATE_HOME", &xdg)
+            .output()
+            .unwrap(),
+        0,
+    );
+    assert_eq!(data["data"]["active_root"], "matched");
+    let status = response(
+        fixture
+            .hive()
+            .args([
+                "--contract",
+                "2",
+                "--json",
+                "workspace",
+                "status",
+                "--workspace",
+            ])
+            .arg(&registered)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("XDG_STATE_HOME", &xdg)
+            .output()
+            .unwrap(),
+        0,
+    );
+    assert_eq!(status["data"]["active_root"], "matched");
+    assert_eq!(status["data"]["workspace_id"], data["data"]["workspace_id"]);
 }
 
 #[test]

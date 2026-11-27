@@ -13,6 +13,7 @@ use crate::dolt::{DOLT_VERSION, STORAGE_SCHEMA_VERSION};
 use crate::error::{ErrorCode, HiveError};
 use crate::{config_file, config_v2};
 
+mod registration;
 mod tools;
 
 const POLICY_REVISION: &str = "c66b3c50150e18426485d134de92c6b311dac125";
@@ -29,6 +30,7 @@ struct Prepared {
     asset_commit: String,
     asset_object_digest: [u8; 32],
     asset_tree_digest: [u8; 32],
+    registration: Option<registration::FreshRegistration>,
 }
 
 impl Prepared {
@@ -56,7 +58,7 @@ impl Prepared {
     }
 }
 
-pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
+pub(super) fn run(target: &Path, register_runtime: bool) -> Result<Value, HiveError> {
     let input = json_path(target)?;
     if input.trim().is_empty() || input.contains("://") || input.chars().any(char::is_control) {
         return Err(invalid_target("Supply an explicit local directory path."));
@@ -77,6 +79,9 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
             "Could not generate a workspace identity.",
         )
     })?;
+    let registration = register_runtime
+        .then(|| registration::FreshRegistration::resolve(&target, &workspace_id))
+        .transpose()?;
     let stage_name = format!("{}{workspace_id}", config_v2::INIT_STAGE_PREFIX);
     let stage_entry = fd_path(&parent).join(&stage_name);
     private_dir(&stage_entry)?;
@@ -113,6 +118,7 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
             asset_commit,
             asset_object_digest,
             asset_tree_digest,
+            registration,
         };
         let descriptor = format!(
             "version: 2\nworkspace_id: {workspace_id}\nschema_version: {STORAGE_SCHEMA_VERSION}\npolicy_revision: {POLICY_REVISION}\nbootstrap_layout: {}\n",
@@ -156,7 +162,7 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
                 format!("{error} Any moved entries remain in the original target directory."),
             )
         })?;
-        Ok(json!({
+        let mut output = json!({
             "workspace_root": target_json,
             "workspace_id": workspace_id,
             "policy_revision": POLICY_REVISION,
@@ -164,7 +170,11 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
             "dolt_version": DOLT_VERSION,
             "db_commit": db_commit,
             "asset_commit": prepared.asset_commit,
-        }))
+        });
+        if register_runtime {
+            output["active_root"] = json!("matched");
+        }
+        Ok(output)
     })();
 
     // Scratch remains available to the engine until the moved database has
@@ -316,8 +326,29 @@ fn publish(
     require_entries(target, &PAYLOAD_ENTRIES)?;
     verify_entry(payload, config_v2::MARKER, descriptor)?;
     verify_descriptor_bytes(descriptor, descriptor_bytes)?;
-    check_path()?;
-    move_entry(payload, target, config_v2::MARKER)?;
+    // Both locks stay held through descriptor publication. An interruption
+    // after the state write leaves an unselectable root and reserves its UUID.
+    let registration = prepared
+        .registration
+        .as_ref()
+        .map(|registration| registration.publish(target))
+        .transpose()?;
+    (|| {
+        check_path()?;
+        if let Some(registration) = &registration {
+            registration.verify()?;
+            prepared.verify(target)?;
+            require_entries(target, &PAYLOAD_ENTRIES)?;
+            verify_entry(payload, config_v2::MARKER, descriptor)?;
+            verify_descriptor_bytes(descriptor, descriptor_bytes)?;
+            check_path()?;
+        }
+        move_entry(payload, target, config_v2::MARKER)
+    })()
+    .map_err(|error| match &registration {
+        Some(registration) => registration.preserved(error),
+        None => error,
+    })?;
     target.sync_all().map_err(|_| {
         HiveError::new(
             ErrorCode::UnknownWriteOutcome,
@@ -453,14 +484,24 @@ fn verify_entry(target: &File, name: &str, expected: &File) -> Result<(), HiveEr
 }
 
 fn move_entry(source: &File, target: &File, name: &str) -> Result<(), HiveError> {
-    let name = CString::new(name).expect("fixed workspace entry names contain no NUL");
+    rename_entry(source, name, target, name)
+}
+
+fn rename_entry(
+    source: &File,
+    source_name: &str,
+    target: &File,
+    target_name: &str,
+) -> Result<(), HiveError> {
+    let source_name = CString::new(source_name).expect("fixed entry names contain no NUL");
+    let target_name = CString::new(target_name).expect("fixed entry names contain no NUL");
     // SAFETY: The descriptors are pinned and the name is a single component.
     if unsafe {
         libc::renameat2(
             source.as_raw_fd(),
-            name.as_ptr(),
+            source_name.as_ptr(),
             target.as_raw_fd(),
-            name.as_ptr(),
+            target_name.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
     } == 0
@@ -505,12 +546,7 @@ fn inspect(target: &Path) -> Result<(File, File), HiveError> {
             let child = dir_metadata(&directory)?;
             // A managed Linux namespace may display a system-owned /tmp
             // mount and its root under the same unmapped UID.
-            let system_tmp = path == Path::new("/tmp")
-                && child.uid() == root.uid()
-                && child.dev() != root.dev()
-                && child.mode() & 0o1000 != 0
-                && filesystem_kind(&directory)? == libc::TMPFS_MAGIC;
-            require_trusted(&directory, &child, system_tmp)?;
+            require_trusted_component(&directory, &path, &child, &root)?;
         }
     }
     refuse_workspace_ancestor(&directory)?;
@@ -566,6 +602,20 @@ fn same_directory(left: &File, right: &File) -> Result<bool, HiveError> {
 
 fn same_inode(left: &Metadata, right: &Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+fn require_trusted_component(
+    directory: &File,
+    path: &Path,
+    metadata: &Metadata,
+    root: &Metadata,
+) -> Result<(), HiveError> {
+    let system_tmp = path == Path::new("/tmp")
+        && metadata.uid() == root.uid()
+        && metadata.dev() != root.dev()
+        && metadata.mode() & 0o1000 != 0
+        && filesystem_kind(directory)? == libc::TMPFS_MAGIC;
+    require_trusted(directory, metadata, system_tmp)
 }
 
 fn require_trusted(
@@ -725,6 +775,7 @@ mod tests {
         "policy_revision: c66b3c50150e18426485d134de92c6b311dac125\n",
         "bootstrap_layout: dolt-native-v1\n",
     );
+    const FIXTURE_ID: &str = "01900000-0000-7000-8000-000000000001";
 
     struct Publication {
         root: PathBuf,
@@ -775,14 +826,20 @@ mod tests {
         }
 
         fn publish_with(&self, after_check: impl FnMut(usize)) -> Result<(), HiveError> {
-            publish_fixture(&self.target, &self.payload, after_check)
+            publish_fixture(&self.target, &self.payload, None, after_check, |_| Ok(()))
+        }
+
+        fn state(&self) -> PathBuf {
+            self.root.join("xdg/hive/v2")
         }
     }
 
     fn publish_fixture(
         path: &Path,
         source: &Path,
+        state: Option<&Path>,
         mut after_check: impl FnMut(usize),
+        verify_db: impl FnOnce(&File) -> Result<(), HiveError>,
     ) -> Result<(), HiveError> {
         let (parent, target) = inspect(path)?;
         lock_target(&target)?;
@@ -801,6 +858,9 @@ mod tests {
             asset_commit: FIXTURE_COMMIT.to_owned(),
             asset_object_digest: Sha256::digest(b"fixture object").into(),
             asset_tree_digest: Sha256::digest(b"fixture empty tree").into(),
+            registration: state
+                .map(|state| registration::FreshRegistration::new(state, path, FIXTURE_ID))
+                .transpose()?,
         };
         let mut checks = 0;
         publish(
@@ -815,8 +875,142 @@ mod tests {
                 after_check(checks);
                 Ok(())
             },
-            |_| Ok(()),
+            verify_db,
         )
+    }
+
+    #[test]
+    fn registration_requires_opt_in_and_verified_moved_db() {
+        let ordinary = Publication::new();
+        ordinary.publish_with(|_| {}).unwrap();
+        assert!(!ordinary.root.join("xdg").exists());
+
+        let failed = Publication::new();
+        let error = publish_fixture(
+            &failed.target,
+            &failed.payload,
+            Some(&failed.state()),
+            |_| {},
+            |_| {
+                Err(HiveError::new(
+                    ErrorCode::AuthorityUnverified,
+                    "Wrong moved DB",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error.code, ErrorCode::AuthorityUnverified));
+        assert!(!failed.root.join("xdg").exists());
+        assert_unpublished(&failed.target);
+    }
+
+    #[test]
+    fn registration_refuses_existing_uuid_state_even_when_empty() {
+        for occupied in [false, true] {
+            let fixture = Publication::new();
+            let workspaces = fixture.state().join("workspaces");
+            for path in [
+                fixture.root.join("xdg"),
+                fixture.root.join("xdg/hive"),
+                fixture.state(),
+                workspaces.clone(),
+            ] {
+                private_dir(&path).unwrap();
+            }
+            let state = workspaces.join(FIXTURE_ID);
+            private_dir(&state).unwrap();
+            let record = state.join("active-root.json");
+            if occupied {
+                fs::write(&record, b"prior registration").unwrap();
+            }
+            let error = publish_fixture(
+                &fixture.target,
+                &fixture.payload,
+                Some(&fixture.state()),
+                |_| {},
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            assert!(matches!(error.code, ErrorCode::AuthorityUnverified));
+            assert_unpublished(&fixture.target);
+            assert!(!state.join("lock").exists());
+            if occupied {
+                assert_eq!(fs::read(record).unwrap(), b"prior registration");
+            } else {
+                assert_eq!(fs::read_dir(state).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn registration_refuses_linked_or_nonprivate_state_directories() {
+        for linked in [false, true] {
+            let fixture = Publication::new();
+            let xdg = fixture.root.join("xdg");
+            let other = fixture.root.join("other");
+            private_dir(&xdg).unwrap();
+            private_dir(&other).unwrap();
+            if linked {
+                symlink(&other, xdg.join("hive")).unwrap();
+            } else {
+                fs::create_dir(xdg.join("hive")).unwrap();
+                fs::set_permissions(
+                    xdg.join("hive"),
+                    std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                )
+                .unwrap();
+            }
+            let result = publish_fixture(
+                &fixture.target,
+                &fixture.payload,
+                Some(&fixture.state()),
+                |_| {},
+                |_| Ok(()),
+            );
+            assert!(result.is_err());
+            assert_unpublished(&fixture.target);
+            assert!(!fixture.state().exists());
+            assert_eq!(fs::read_dir(other).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn registration_refuses_state_inside_other_workspace_and_git_assets() {
+        for (marker, reason) in [
+            (config_v2::MARKER, "existing Hive workspace"),
+            (".git/HEAD", "existing Git repository"),
+        ] {
+            let fixture = Publication::new();
+            let other = fixture.root.join("other");
+            private_dir(&other).unwrap();
+            if marker == ".git/HEAD" {
+                private_dir(&other.join(".git")).unwrap();
+            }
+            let marker_path = other.join(marker);
+            fs::write(&marker_path, b"existing synthetic content").unwrap();
+            let xdg = other.join("new-state");
+            let error = publish_fixture(
+                &fixture.target,
+                &fixture.payload,
+                Some(&xdg.join("hive/v2")),
+                |_| {},
+                |_| Ok(()),
+            )
+            .unwrap_err();
+            assert!(matches!(error.code, ErrorCode::InvalidArgument));
+            assert!(error.to_string().contains(reason));
+            assert_unpublished(&fixture.target);
+            assert!(!xdg.exists());
+            assert_eq!(fs::read_dir(&other).unwrap().count(), 1);
+            assert_eq!(
+                fs::read_dir(marker_path.parent().unwrap()).unwrap().count(),
+                1
+            );
+            assert_eq!(
+                fs::read(marker_path).unwrap(),
+                b"existing synthetic content"
+            );
+        }
     }
 
     impl Drop for Publication {
@@ -1004,6 +1198,8 @@ mod tests {
             (3, "replaced"),
             (3, "killed"),
             (5, "killed"),
+            (5, "registered-killed"),
+            (5, "registered-complete"),
         ] {
             let fixture = Publication::new();
             let ready = fixture.root.join("ready");
@@ -1017,6 +1213,8 @@ mod tests {
                 .env("HIVE_TEST_PUBLICATION_ROOT", &fixture.root)
                 .env("HIVE_TEST_PUBLICATION_MODE", mode)
                 .env("HIVE_TEST_PUBLICATION_PAUSE", pause.to_string())
+                .env("XDG_CONFIG_HOME", fixture.root.join("config"))
+                .env("XDG_STATE_HOME", fixture.root.join("xdg"))
                 .stdout(Stdio::piped())
                 .spawn()
                 .unwrap();
@@ -1037,6 +1235,37 @@ mod tests {
                 &fixture.target
             };
             assert!(!observed.join(config_v2::MARKER).exists());
+            let registration = fixture.state().join("workspaces").join(FIXTURE_ID);
+            if mode.starts_with("registered-") {
+                let record: Value = serde_json::from_slice(
+                    &fs::read(registration.join("active-root.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    record,
+                    json!({
+                        "version": 2, "workspace_id": FIXTURE_ID, "workspace_root": observed,
+                    })
+                );
+                let lock = File::open(registration.join("lock")).unwrap();
+                assert_eq!(lock.metadata().unwrap().mode() & 0o777, 0o600);
+                assert_eq!(registration.metadata().unwrap().mode() & 0o777, 0o700);
+                assert_eq!(
+                    registration
+                        .join("active-root.json")
+                        .metadata()
+                        .unwrap()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+                // SAFETY: The descriptor belongs to the open lock file.
+                assert_eq!(
+                    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    -1
+                );
+                assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+            }
             let pending = observed.join(config_v2::INIT_PENDING.to_str().unwrap());
             if pause == 2 {
                 assert!(pending.is_file());
@@ -1051,17 +1280,19 @@ mod tests {
                 fs::create_dir(observed.join("db")).unwrap();
                 fs::write(observed.join("db/keep"), b"replacement").unwrap();
             }
-            if mode == "killed" {
+            if mode.ends_with("killed") {
                 writer.kill().unwrap();
                 assert!(!writer.wait().unwrap().success());
                 assert!(!observed.join(config_v2::MARKER).exists());
-                assert_eq!(fs::read(observed.join("db/keep")).unwrap(), b"replacement");
+                if mode == "registered-killed" {
+                    assert!(registration.join("active-root.json").is_file());
+                }
             } else {
                 fs::write(fixture.root.join("release"), b"go").unwrap();
                 let output = writer.wait_with_output().unwrap();
                 assert!(output.status.success(), "{output:?}");
             }
-            if mode == "complete" {
+            if mode.ends_with("complete") {
                 let candidate = config_v2::read_explicit(observed).unwrap();
                 assert_eq!(
                     candidate.workspace_id(),
@@ -1125,9 +1356,12 @@ mod tests {
             .unwrap()
             .parse::<usize>()
             .unwrap();
+        let mode = std::env::var("HIVE_TEST_PUBLICATION_MODE").unwrap();
+        let state = root.join("xdg/hive/v2");
         let result = publish_fixture(
             &root.join("parent/target"),
             &root.join("payload"),
+            mode.starts_with("registered-").then_some(state.as_path()),
             |check| {
                 if check == pause {
                     fs::write(root.join("ready"), b"writer paused").unwrap();
@@ -1137,19 +1371,37 @@ mod tests {
                     );
                 }
             },
+            |_| Ok(()),
         );
-        if matches!(
-            std::env::var("HIVE_TEST_PUBLICATION_MODE")
-                .unwrap()
-                .as_str(),
-            "moved" | "replaced"
-        ) {
+        if matches!(mode.as_str(), "moved" | "replaced") {
             assert!(matches!(
                 result.unwrap_err().code,
                 ErrorCode::ConcurrentChange
             ));
         } else {
             result.unwrap();
+        }
+        if mode == "registered-complete" {
+            use crate::cli::{CommonOptions, Contract, DoltTargetArgs, View};
+
+            let (_, status) = crate::workspace_status::observe(
+                &CommonOptions {
+                    contract: Contract::V2,
+                    workspace: Some(root.join("parent/target")),
+                    project: None,
+                    project_root: None,
+                    format: None,
+                    view: View::WorkingTree,
+                },
+                &DoltTargetArgs {
+                    workspace_id: None,
+                    database: None,
+                    port: None,
+                },
+            );
+            let status = status.unwrap();
+            assert_eq!(status["active_root"], "matched");
+            assert_eq!(status["workspace_id"], FIXTURE_ID);
         }
     }
 
@@ -1163,6 +1415,10 @@ mod tests {
             lock_target(&second).unwrap_err().code,
             ErrorCode::ConcurrentChange
         ));
+        // Release the lock explicitly before asserting immediate reacquisition
+        // while other tests may be spawning child processes.
+        // SAFETY: The first directory still owns its open descriptor.
+        assert_eq!(unsafe { libc::flock(first.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(first);
         lock_target(&second).unwrap();
     }
