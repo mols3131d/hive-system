@@ -2119,7 +2119,15 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .ignore_errors(true)
                 .try_get_matches_from(args)
                 .ok()?;
-            recover_unknown_long(&recovery, args, &partial, &error, "issue").unwrap_or(partial)
+            retry_write_failure(
+                &extended,
+                args,
+                error.kind(),
+                "issue",
+                &["add-dependency", "remove-dependency"],
+            )
+            .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "issue"))
+            .unwrap_or(partial)
         }
     };
     let leaf = match partial.subcommand() {
