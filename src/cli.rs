@@ -268,6 +268,10 @@ pub(crate) enum Command {
     #[command(skip)]
     IssueUpdate(IssueUpdateArgs),
     #[command(skip)]
+    IssueSelect(IssueTransitionArgs),
+    #[command(skip)]
+    IssueClaim(IssueClaimArgs),
+    #[command(skip)]
     Resource(ResourceCommand),
     #[command(skip)]
     Workspace(WorkspaceAction),
@@ -1185,6 +1189,38 @@ pub(crate) struct IssueUpdateArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueTransitionArgs {
+    /// Exact Issue UUIDv7.
+    pub(crate) issue: String,
+    /// Exact owning Area UUIDv7.
+    #[arg(long)]
+    pub(crate) area: String,
+    /// Operator-selected actor reference.
+    #[arg(long)]
+    pub(crate) actor: String,
+    /// Expected Issue revision as ISSUE=REV.
+    #[arg(long)]
+    pub(crate) if_match: String,
+    /// Exact request UUID.
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision file.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct IssueClaimArgs {
+    #[command(flatten)]
+    pub(crate) transition: IssueTransitionArgs,
+    /// Exact execution holder reference.
+    #[arg(long)]
+    pub(crate) holder: String,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueListArgs {
     /// Select Issues across the workspace.
     #[arg(long)]
@@ -1408,6 +1444,18 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             Some(("issue", issue)) if issue.subcommand_name() == Some("update") => {
                 Command::IssueUpdate(
                     IssueUpdateArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("select") => {
+                Command::IssueSelect(
+                    IssueTransitionArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("claim") => {
+                Command::IssueClaim(
+                    IssueClaimArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
             }
@@ -1988,6 +2036,12 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 clap::Command::new("update")
                     .about("Edit an Issue with a current operator decision."),
             )))
+            .subcommand(add_leaf_options(IssueTransitionArgs::augment_args(
+                clap::Command::new("select").about("Select a backlog Issue for planning."),
+            )))
+            .subcommand(add_leaf_options(IssueClaimArgs::augment_args(
+                clap::Command::new("claim").about("Record an exclusive Claim for a ready Issue."),
+            )))
     });
     // Probe contract selection through Clap so a file name or an actor that
     // resembles a switch does not introduce the new leaf into the v1 grammar.
@@ -1997,6 +2051,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .mut_subcommand("note", extended_error_options)
                 .mut_subcommand("create", extended_error_options)
                 .mut_subcommand("update", extended_error_options)
+                .mut_subcommand("select", extended_error_options)
+                .mut_subcommand("claim", extended_error_options)
         });
     let partial = match recovery.clone().try_get_matches_from(args) {
         Ok(matches) => matches,
@@ -2011,7 +2067,7 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
     };
     let leaf = match partial.subcommand() {
         Some(("issue", issue)) => match issue.subcommand() {
-            Some(("note" | "create" | "update", leaf)) => Some(leaf),
+            Some(("note" | "create" | "update" | "select" | "claim", leaf)) => Some(leaf),
             None => None,
             _ => return None,
         },
@@ -2862,6 +2918,25 @@ impl Command {
                     }
                     Ok(())
                 }
+                Self::IssueSelect(args)
+                | Self::IssueClaim(IssueClaimArgs {
+                    transition: args, ..
+                }) => {
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Issue transitions require --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Issue transitions require exact current Area and Issue scope.",
+                        );
+                    }
+                    Ok(())
+                }
                 Self::IssueNote(args) => {
                     if args.kind != "progress" {
                         return Err("Issue note requires --kind progress.");
@@ -2955,9 +3030,12 @@ impl Command {
             }
             Self::Operation(_) => Err("Operation show requires --contract 2."),
             Self::Area(_) => Err("Area commands require --contract 2."),
-            Self::Issue(_) | Self::IssueNote(_) | Self::IssueCreate(_) | Self::IssueUpdate(_) => {
-                Err("Issue commands require --contract 2.")
-            }
+            Self::Issue(_)
+            | Self::IssueNote(_)
+            | Self::IssueCreate(_)
+            | Self::IssueUpdate(_)
+            | Self::IssueSelect(_)
+            | Self::IssueClaim(_) => Err("Issue commands require --contract 2."),
             Self::Backup(_) => Err("Backup commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),
             Self::Conversation(_) => Err("Conversation commands require --contract 2."),

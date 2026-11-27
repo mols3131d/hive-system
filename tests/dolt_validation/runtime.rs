@@ -7,8 +7,36 @@ use std::path::Path;
 mod artifact_create;
 #[path = "runtime/artifact_update.rs"]
 mod artifact_update;
+#[path = "runtime/issue_transition.rs"]
+mod issue_transition;
 #[path = "runtime/issue_update.rs"]
 mod issue_update;
+
+type Receipt = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+fn stored_receipt(connection: &mut Conn, request: &str) -> Receipt {
+    connection.exec_first(
+        "SELECT kind, actor_ref, fingerprint, authorization_ref, base_commit,
+                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'), workflow_evidence_json, result_json
+           FROM operation_receipts WHERE request_id = ?",
+        (request,),
+    ).unwrap().unwrap()
+}
+
+fn record_intent(state: &Path, intent: &Value) {
+    let marker = state.join("pending-request.json");
+    fs::write(&marker, intent.to_string()).unwrap();
+    fs::set_permissions(&marker, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+}
 
 fn random_uuid() -> String {
     fs::read_to_string("/proc/sys/kernel/random/uuid")
@@ -1276,6 +1304,7 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
         &dolt,
     );
     issue_update::exercise(&state, &fixture_root, &port, &dolt, &run, &restart);
+    issue_transition::exercise(&state, &fixture_root, &port, &dolt, &invoke, &restart);
     issue_create_writer_fixture(&state, &fixture_root, &port, &dolt, &run, &restart);
     assert!(cleanup.finish(), "Verified runtime fixture stop failed");
 }
@@ -2070,6 +2099,7 @@ fn issue_create_writer_fixture(
         [
             "artifact_areas",
             "artifacts",
+            "issue_claims",
             "issue_updates",
             "issues",
             "operation_receipts",

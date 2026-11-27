@@ -14,7 +14,7 @@ use super::{
     context_evidence::read_evidence_bytes,
     context_resolve::observe_time,
     context_workflow as workflow, is_commit_hash, is_uuid, is_uuid_v7, issue_create,
-    issue_note_receipt, issue_update, read_error,
+    issue_note_receipt, issue_transition, issue_update, read_error,
     receipt_history::{
         HistoricalReceipt, has_receipt_history, receipt_at, receipt_introduction, valid_sha256,
     },
@@ -35,6 +35,8 @@ pub(super) enum Kind {
     ArtifactCreate,
     #[serde(rename = "artifact.update")]
     ArtifactUpdate,
+    #[serde(untagged)]
+    Transition(issue_transition::Operation),
 }
 
 impl Kind {
@@ -45,6 +47,7 @@ impl Kind {
             Self::Update => issue_update::KIND,
             Self::ArtifactCreate => artifact_create::KIND,
             Self::ArtifactUpdate => artifact_update::KIND,
+            Self::Transition(operation) => operation.name(),
         }
     }
 
@@ -55,12 +58,20 @@ impl Kind {
             Self::Update => "Issue update",
             Self::ArtifactCreate => "Artifact create",
             Self::ArtifactUpdate => "Artifact update",
+            Self::Transition(issue_transition::Operation::Select) => "Issue select",
+            Self::Transition(issue_transition::Operation::Claim) => "Issue claim",
         }
     }
 
     fn grants(self, area: Option<&str>) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Note => &[
+            Self::Transition(issue_transition::Operation::Claim) => &[
+                ("issues", "UPDATE"),
+                ("issue_updates", "INSERT"),
+                ("issue_claims", "INSERT"),
+                ("operation_receipts", "INSERT"),
+            ],
+            Self::Note | Self::Transition(issue_transition::Operation::Select) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
                 ("operation_receipts", "INSERT"),
@@ -148,6 +159,7 @@ pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
 
 // Version 1 has no kind field and always denotes a progress note. Version 2
 // carries an Issue kind. Version 3 carries an Artifact ID and optional Area.
+// Version 4 carries an Issue transition kind.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Pending {
@@ -233,6 +245,7 @@ impl Pending {
             (3, Some(kind @ (Kind::ArtifactCreate | Kind::ArtifactUpdate)), _, None, Some(_)) => {
                 Ok(kind)
             }
+            (4, Some(kind @ Kind::Transition(_)), Some(_), Some(_), None) => Ok(kind),
             _ => Err(uncertain()),
         }
     }
@@ -277,7 +290,7 @@ pub(super) fn execute(
             receipt_at(snapshot, request.request_id, &commit, None).map_err(|_| uncertain())?;
         mutation.verify_decision(observe_time()?)?;
         let (outcome, base, introduced, result) = if let Some(receipt) = existing {
-            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate) {
+            if matches!(request.kind, Kind::ArtifactCreate | Kind::ArtifactUpdate | Kind::Transition(_)) {
                 check_fingerprint(&receipt.fingerprint, request.fingerprint, request.kind)?;
             }
             let scoped = ScopedReceipt::read(
@@ -408,6 +421,7 @@ fn apply(
         Kind::Note => (1, None),
         kind @ (Kind::Create | Kind::Update) => (2, Some(kind)),
         kind @ (Kind::ArtifactCreate | Kind::ArtifactUpdate) => (3, Some(kind)),
+        kind @ Kind::Transition(_) => (4, Some(kind)),
     };
     let (issue_id, artifact_id) = match request.kind {
         Kind::ArtifactCreate | Kind::ArtifactUpdate => (None, Some(staged.record_id)),
@@ -481,7 +495,7 @@ fn open_verified_writer(
             "SELECT GRANTEE, TABLE_NAME, PRIVILEGE_TYPE FROM information_schema.TABLE_PRIVILEGES
          WHERE TABLE_SCHEMA = 'db' AND GRANTEE = ?
          AND TABLE_NAME IN ('issues', 'issue_updates', 'workspace_counters', 'operation_receipts',
-                            'artifacts', 'artifact_areas', 'areas')",
+                            'artifacts', 'artifact_areas', 'areas', 'issue_claims')",
             (&grantee,),
         )
         .map_err(read_error)?;
@@ -545,6 +559,7 @@ enum ScopedReceipt {
     Update(Box<issue_update::ScopedUpdate>),
     ArtifactCreate(artifact_create::ScopedCreate),
     ArtifactUpdate(artifact_update::ScopedUpdate),
+    Transition(Box<issue_transition::Record>),
 }
 
 impl ScopedReceipt {
@@ -558,6 +573,21 @@ impl ScopedReceipt {
         receipt: &HistoricalReceipt,
     ) -> Result<Self, HiveError> {
         match kind {
+            Kind::Transition(operation) => {
+                if receipt.kind != kind.name() {
+                    return Err(conflict(kind));
+                }
+                issue_transition::check_scope(
+                    snapshot,
+                    operation,
+                    request,
+                    area.ok_or_else(uncertain)?,
+                    record.ok_or_else(uncertain)?,
+                    actor,
+                    receipt,
+                )
+                .map(|record| Self::Transition(Box::new(record)))
+            }
             Kind::Note => issue_note_receipt::check_scope(
                 snapshot,
                 request,
@@ -640,6 +670,9 @@ impl ScopedReceipt {
                 Ok(json!(note.result))
             }
             Self::Update(update) => issue_update::verify_effect(snapshot, commit, receipt, &update),
+            Self::Transition(record) => {
+                issue_transition::verify_effect(snapshot, commit, receipt, &record)
+            }
             Self::ArtifactCreate(scoped) => {
                 artifact_create::verify_effect(snapshot, commit, receipt, &scoped)
             }
@@ -819,6 +852,21 @@ mod tests {
         assert!(read(&value).is_err());
         value["kind"] = Value::Null;
         assert!(read(&value).is_err());
+        value.as_object_mut().unwrap().remove("artifact_id");
+        value["issue_id"] = json!("01900000-0000-7000-8000-000000000003");
+        value["version"] = json!(4);
+        for (name, operation) in [
+            ("issue.select", issue_transition::Operation::Select),
+            ("issue.claim", issue_transition::Operation::Claim),
+        ] {
+            value["kind"] = json!(name);
+            let marker = read(&value).unwrap();
+            assert!(matches!(marker.operation(), Ok(Kind::Transition(kind)) if kind == operation));
+            assert_eq!(json!(marker), value);
+        }
+        value["kind"] = json!("issue.release");
+        assert!(read(&value).is_err());
+
         let legacy_bytes = serde_json::to_string(&legacy).unwrap();
         let duplicate = legacy_bytes.replacen(r#""version":1"#, r#""version":1,"version":1"#, 1);
         assert!(Pending::read(duplicate.as_bytes(), "workspace", "launch").is_err());
