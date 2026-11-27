@@ -1455,6 +1455,24 @@ Two lines.
     expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
     fs::write(&server_config, &stopped_config).unwrap();
 
+    // The source YAML can be valid while the selected state directory cannot
+    // be represented as a UTF-8 path. Refuse that mismatch with typed JSON.
+    use std::os::unix::ffi::OsStrExt as _;
+    let non_utf8_state = fixture.0.join(std::ffi::OsStr::from_bytes(b"state-\xff"));
+    fs::rename(&xdg, &non_utf8_state).unwrap();
+    let output = fixture
+        .hive()
+        .env("XDG_STATE_HOME", &non_utf8_state)
+        .args(["--contract", "2", "--json", "--workspace"])
+        .arg(&root)
+        .args(["backup", "create", "--destination", "non-utf8-backup"])
+        .output()
+        .unwrap();
+    fs::rename(&non_utf8_state, &xdg).unwrap();
+    let refused = response(output, 7);
+    assert_eq!(refused["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert!(!fixture.0.join("non-utf8-backup").exists());
+
     let native_config = db.join(".dolt/config.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&native_config).unwrap()).unwrap();
     config["sqlserver.global.server_uuid"] = serde_json::json!("not-an-engine-uuid");

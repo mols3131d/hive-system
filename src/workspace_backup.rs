@@ -323,6 +323,10 @@ fn verify_server_config(state: &ScopedDirectory, db: &ScopedDirectory) -> Result
         .filter(|nonce| is_uuid(nonce))
         .ok_or_else(unsupported)?;
     let expected_run = state.path.join(format!("run-{nonce}"));
+    let privilege_path = expected_run.join("privileges.db");
+    let expected_data = db.path.to_str().ok_or_else(unsupported)?;
+    let expected_cfg = expected_run.to_str().ok_or_else(unsupported)?;
+    let expected_privilege = privilege_path.to_str().ok_or_else(unsupported)?;
     let port = config["listener"]["port"]
         .as_u64()
         .filter(|port| (1024..=65535).contains(port))
@@ -334,9 +338,9 @@ fn verify_server_config(state: &ScopedDirectory, db: &ScopedDirectory) -> Result
             "log_level": "error",
             "behavior": {"event_scheduler": "OFF"},
             "listener": {"host": "127.0.0.1", "port": port},
-            "data_dir": db.path,
-            "cfg_dir": expected_run,
-            "privilege_file": expected_run.join("privileges.db"),
+            "data_dir": expected_data,
+            "cfg_dir": expected_cfg,
+            "privilege_file": expected_privilege,
         })
     {
         return Err(unsupported());
