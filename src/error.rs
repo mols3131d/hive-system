@@ -23,6 +23,7 @@ pub(crate) enum ErrorCode {
     AlreadyClaimed,
     ClaimMismatch,
     StaleRevision,
+    StaleCursor,
     ConcurrentChange,
     DirtyConflict,
     Unauthorized,
@@ -54,6 +55,7 @@ impl ErrorCode {
             | Self::AlreadyClaimed
             | Self::ClaimMismatch
             | Self::StaleRevision
+            | Self::StaleCursor
             | Self::ConcurrentChange
             | Self::DirtyConflict => 5,
             Self::Unauthorized => 6,

@@ -4,7 +4,9 @@ use std::str::FromStr;
 
 use clap::{
     ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
-    builder::NonEmptyStringValueParser, error::ErrorKind, value_parser,
+    builder::{NonEmptyStringValueParser, StringValueParser, TypedValueParser},
+    error::ErrorKind,
+    value_parser,
 };
 
 pub(crate) struct Invocation {
@@ -632,6 +634,38 @@ pub(crate) struct DoltTargetArgs {
 pub(crate) enum IssueCommand {
     /// Show an Issue and its bounded direct relation IDs.
     Show(IssueShowArgs),
+    /// List committed Issue summaries under contract 2.
+    List(IssueListArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct IssueListArgs {
+    /// Select Issues across the workspace.
+    #[arg(long)]
+    pub(crate) all: bool,
+    /// Select one exact Area UUIDv7.
+    #[arg(long, value_name = "ID", allow_negative_numbers = true)]
+    pub(crate) area: Option<String>,
+    /// Filter by exact Issue status.
+    #[arg(long)]
+    pub(crate) status: Option<String>,
+    /// Filter by exact Issue type.
+    #[arg(long = "type", value_name = "TYPE")]
+    pub(crate) kind: Option<String>,
+    /// Filter by priority (0–3).
+    #[arg(long, allow_negative_numbers = true)]
+    pub(crate) priority: Option<String>,
+    /// Filter by exact Label name.
+    #[arg(long)]
+    pub(crate) label: Option<String>,
+    /// Page size (default 25, maximum 100).
+    #[arg(long, default_value = "25", allow_negative_numbers = true)]
+    pub(crate) limit: String,
+    /// Continue from the previous page's next_cursor.
+    #[arg(long)]
+    pub(crate) cursor: Option<String>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Args)]
@@ -664,7 +698,13 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     // Global clap arguments propagate values across levels. Separate declarations
     // retain every occurrence at the root and at the selected leaf.
     let mut cli = CommonArgs::augment_args(cli.mut_subcommands(add_leaf_options));
-    let matches = match cli.clone().try_get_matches_from(&args) {
+    let matches = match cli.clone().try_get_matches_from(&args).or_else(|error| {
+        if error.kind() == ErrorKind::ValueValidation {
+            retry_issue_list(&cli, &args).ok_or(error)
+        } else {
+            Err(error)
+        }
+    }) {
         Ok(matches) => matches,
         Err(error)
             if matches!(
@@ -737,6 +777,23 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             message: message.to_owned(),
         }),
     }
+}
+
+fn retry_issue_list(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {
+    // A malformed Project must reach the v2 UUID check after Clap has read
+    // the contract and format. Keep the original parser for all other commands.
+    let defer_project_check = |command: clap::Command| {
+        command.mut_arg("project", |arg| {
+            arg.value_parser(StringValueParser::new().map(ProjectId::Ordinary))
+        })
+    };
+    let retry = defer_project_check(cli.clone().mut_subcommand("issue", |issue| {
+        issue.mut_subcommand("list", defer_project_check)
+    }));
+    let matches = retry.try_get_matches_from(args).ok()?;
+    let (command, leaf) = matched_leaf(cli, &matches)?;
+    (command == "issue list" && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+        .then_some(matches)
 }
 
 fn add_leaf_options(command: clap::Command) -> clap::Command {
@@ -916,6 +973,7 @@ impl Command {
             return match self {
                 Self::Validate(args) => args.validate_dolt_selection(common),
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
+                Self::Issue(IssueCommand::List(args)) => args.validate_dolt_selection(common),
                 _ => Ok(()),
             };
         }
@@ -998,6 +1056,21 @@ impl IssueShowArgs {
         )?;
         if !self.target.has_all() {
             return Err("Dolt issue show requires --workspace-id, --database, and --port.");
+        }
+        Ok(())
+    }
+}
+
+impl IssueListArgs {
+    fn validate_dolt_selection(&self, common: &CommonOptions) -> Result<(), &'static str> {
+        if !self.target.has_all() {
+            return Err("Dolt issue list requires --workspace-id, --database, and --port.");
+        }
+        if common.workspace.is_some()
+            || common.project_root.is_some()
+            || !matches!(common.view, View::WorkingTree)
+        {
+            return Err("Dolt issue list requires explicit Dolt selection and scope.");
         }
         Ok(())
     }

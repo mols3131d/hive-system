@@ -4,6 +4,8 @@ mod artifacts;
 mod bots;
 #[path = "dolt_validation/directives.rs"]
 mod directives;
+#[path = "dolt_validation/issue_list.rs"]
+mod issue_list;
 #[path = "dolt_validation/issue_show.rs"]
 mod issue_show;
 #[path = "dolt_validation/issue_updates.rs"]
