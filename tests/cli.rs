@@ -2660,6 +2660,22 @@ fn malformed_project_write_values_keep_the_v2_envelope() {
 #[test]
 fn malformed_bot_register_keeps_the_late_v2_envelope() {
     let sandbox = Sandbox::new();
+    for selection in [&[][..], &["--contract", "1"][..]] {
+        let actual = sandbox.run(&[selection, &["bot", "register", "--help"]].concat());
+        let unknown = sandbox.run(&[selection, &["bot", "unknown-leaf", "--help"]].concat());
+        assert_eq!(actual.status.code(), Some(2));
+        assert_eq!(actual.stdout, unknown.stdout);
+        assert_eq!(actual.stderr, unknown.stderr);
+    }
+    for args in [
+        ["--contract", "2", "bot", "register", "--help"],
+        ["bot", "register", "--help", "--contract", "2"],
+    ] {
+        let help = sandbox.run(&args);
+        assert!(help.status.success(), "{args:?}: {help:?}");
+        assert!(String::from_utf8_lossy(&help.stdout).contains("--asset-revision"));
+        assert!(help.stderr.is_empty());
+    }
     let command = ["bot", "register", "--slug", "fixture"];
     let selectors = ["--contract", "2", "--json"];
     for invalid in [
@@ -4109,6 +4125,48 @@ fn dolt_artifact_update_requires_one_explicit_body_and_revision() {
     assert_eq!(output.status.code(), Some(3), "{report}");
     assert_eq!(report["command"], "artifact update");
     assert_eq!(report["error"]["code"], "NOT_FOUND");
+    sandbox.assert_empty();
+}
+
+#[test]
+fn stopped_issue_transitions_keep_output_options_and_literal_boundaries() {
+    let sandbox = Sandbox::new();
+    let issue = "01900000-0000-7000-8000-000000000003";
+    let output = ["--contract", "2", "--json"];
+    for action in ["release", "recover", "submit"] {
+        let command = ["issue", action];
+        for invalid in [
+            &["--unknown=--contract=1", issue][..],
+            &["-Z", issue],
+            &[issue, "--claim"],
+            &[issue, "--holder", "a", "--holder", "b"],
+        ] {
+            let early = [&output[..], &command, invalid].concat();
+            let late = [&command[..], invalid, &output].concat();
+            let early = sandbox.run(&early);
+            let late = sandbox.run(&late);
+            for report in [&early, &late] {
+                assert_eq!(report.status.code(), Some(2), "{invalid:?}");
+                assert!(report.stderr.is_empty(), "{invalid:?}");
+                let envelope: Value = serde_json::from_slice(&report.stdout).unwrap();
+                assert_eq!(envelope["schema_version"], 2);
+                assert_eq!(envelope["ok"], false);
+                assert_eq!(envelope["command"], format!("issue {action}"));
+                assert_eq!(envelope["error"]["code"], "INVALID_ARGUMENT");
+            }
+            assert_eq!(early.stdout, late.stdout);
+        }
+        for literal in [
+            &["--contract", "2", "--stop-evidence=--json", issue][..],
+            &["--contract", "2", "--unknown=--json", issue],
+            &["--contract", "2", "--", "--json"],
+        ] {
+            let report = sandbox.run(&[&command[..], literal].concat());
+            assert_eq!(report.status.code(), Some(2));
+            assert!(report.stdout.is_empty(), "{literal:?}");
+            assert!(!report.stderr.is_empty(), "{literal:?}");
+        }
+    }
     sandbox.assert_empty();
 }
 

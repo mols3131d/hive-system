@@ -93,6 +93,7 @@ impl Kind {
             Self::Transition(issue_transition::Operation::Cancel) => "Issue cancel",
             Self::Transition(issue_transition::Operation::Reopen) => "Issue reopen",
             Self::SetParent => "Issue set-parent",
+            Self::Transition(operation) => operation.name(),
         }
     }
 
@@ -108,9 +109,24 @@ impl Kind {
                 ("issue_claims", "INSERT"),
                 ("operation_receipts", "INSERT"),
             ],
-            Self::Note | Self::Transition(_) => &[
+            Self::Note
+            | Self::Transition(
+                issue_transition::Operation::Select
+                | issue_transition::Operation::Cancel
+                | issue_transition::Operation::Reopen,
+            ) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
+                ("operation_receipts", "INSERT"),
+            ],
+            Self::Transition(
+                issue_transition::Operation::Release
+                | issue_transition::Operation::Recover
+                | issue_transition::Operation::Submit,
+            ) => &[
+                ("issues", "UPDATE"),
+                ("issue_updates", "INSERT"),
+                ("issue_claims", "DELETE"),
                 ("operation_receipts", "INSERT"),
             ],
             Self::Update | Self::SetParent => {
@@ -1131,22 +1147,26 @@ mod tests {
         assert!(read(&value).is_err());
         value["kind"] = Value::Null;
         assert!(read(&value).is_err());
-        value.as_object_mut().unwrap().remove("artifact_id");
-        value["issue_id"] = json!("01900000-0000-7000-8000-000000000003");
-        value["version"] = json!(4);
+        let mut transition = value.clone();
+        transition.as_object_mut().unwrap().remove("artifact_id");
+        transition["issue_id"] = json!("01900000-0000-7000-8000-000000000003");
+        transition["version"] = json!(4);
         for (name, operation) in [
             ("issue.select", issue_transition::Operation::Select),
             ("issue.claim", issue_transition::Operation::Claim),
+            ("issue.release", issue_transition::Operation::Release),
+            ("issue.recover", issue_transition::Operation::Recover),
+            ("issue.submit", issue_transition::Operation::Submit),
             ("issue.cancel", issue_transition::Operation::Cancel),
             ("issue.reopen", issue_transition::Operation::Reopen),
         ] {
-            value["kind"] = json!(name);
-            let marker = read(&value).unwrap();
+            transition["kind"] = json!(name);
+            let marker = read(&transition).unwrap();
             assert!(matches!(marker.operation(), Ok(Kind::Transition(kind)) if kind == operation));
-            assert_eq!(json!(marker), value);
+            assert_eq!(json!(marker), transition);
         }
-        value["kind"] = json!("issue.release");
-        assert!(read(&value).is_err());
+        transition["kind"] = json!("issue.submit-epic");
+        assert!(read(&transition).is_err());
 
         let legacy_bytes = serde_json::to_string(&legacy).unwrap();
         let duplicate = legacy_bytes.replacen(r#""version":1"#, r#""version":1,"version":1"#, 1);
@@ -1154,7 +1174,12 @@ mod tests {
 
         let mut project = value;
         project["version"] = json!(4);
-        project["project_id"] = project.as_object_mut().unwrap().remove("issue_id").unwrap();
+        project["project_id"] = project
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_id")
+            .unwrap();
+        project.as_object_mut().unwrap().remove("issue_id");
         project["kind"] = json!("project.add-issue");
         let linked = read(&project).unwrap();
         assert!(matches!(linked.operation(), Ok(Kind::ProjectAddIssue)));
