@@ -802,3 +802,76 @@ fn dolt_issue_show_requires_contract_2_and_validates_explicit_target_and_selecto
     }
     sandbox.assert_empty();
 }
+
+#[test]
+fn dolt_issue_list_requires_one_explicit_scope_and_preserves_v1_help() {
+    let sandbox = Sandbox::new();
+    let default = sandbox.run(&["--help"]);
+    let v1 = sandbox.run(&["--contract", "1", "--help"]);
+    assert_eq!(default.status.code(), Some(0));
+    assert_eq!(default.stdout, v1.stdout);
+    assert!(
+        !String::from_utf8(default.stdout)
+            .unwrap()
+            .contains("Inspect Issues")
+    );
+
+    let leaf = sandbox.run(&["issue", "list", "--help"]);
+    assert_eq!(leaf.status.code(), Some(0));
+    let help = String::from_utf8(leaf.stdout).unwrap();
+    assert!(help.contains("Usage: hive issue list"));
+    for option in ["--all", "--area", "--project", "--limit", "--cursor"] {
+        assert!(help.contains(option), "{help}");
+    }
+
+    let v1_list = ["--json", "issue", "list", "--all"];
+    assert_json_failure(
+        &sandbox.run(&v1_list),
+        &v1_list,
+        "issue list",
+        "INVALID_ARGUMENT",
+        2,
+    );
+
+    let target = [
+        "--contract",
+        "2",
+        "--json",
+        "issue",
+        "list",
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+    ];
+    let uuid = "01900000-0000-7000-8000-00000000000a";
+    for (options, code) in [
+        ([].as_slice(), "INVALID_ARGUMENT"),
+        (&["--area", "root"], "INVALID_ARGUMENT"),
+        (
+            &["--area", "01900000-0000-7000-8000-00000000000A"],
+            "INVALID_ARGUMENT",
+        ),
+        (&["--project", "project-slug"], "INVALID_ARGUMENT"),
+        (&["--all", "--area", uuid], "AMBIGUOUS_SCOPE"),
+        (&["--area", uuid, "--project", uuid], "AMBIGUOUS_SCOPE"),
+        (&["--all", "--project", uuid], "AMBIGUOUS_SCOPE"),
+        (&["--all", "--limit", "0"], "INVALID_ARGUMENT"),
+        (&["--all", "--limit", "101"], "INVALID_ARGUMENT"),
+        (&["--all", "--status", "TODO"], "INVALID_ARGUMENT"),
+        (&["--all", "--type", "Task"], "INVALID_ARGUMENT"),
+        (&["--all", "--priority", "-1"], "INVALID_ARGUMENT"),
+        (&["--all", "--project-root", "."], "INVALID_ARGUMENT"),
+    ] {
+        let args: Vec<_> = target.iter().chain(options).copied().collect();
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?} {report}");
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], "issue list", "{args:?}");
+        assert_eq!(report["error"]["code"], code, "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+    }
+}

@@ -4,6 +4,7 @@ mod directives;
 mod issue_updates;
 mod receipts;
 mod relations;
+pub(super) use relations::is_canonical_label_name;
 
 use std::collections::{BTreeSet, HashMap, VecDeque, hash_map::Entry};
 
@@ -36,6 +37,10 @@ impl IssueRow {
         self.status == Some(IssueStatus::Done)
             || (self.kind == "epic" && self.status == Some(IssueStatus::Review))
     }
+}
+
+pub(super) fn is_issue_type(value: &str) -> bool {
+    matches!(value, "epic" | "feature" | "task" | "bug")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -377,7 +382,7 @@ fn validate_rows(
             }
         }
         // SQL CHECK comparisons can accept other spellings under a case-insensitive collation.
-        if !matches!(kind.as_str(), "epic" | "feature" | "task" | "bug") {
+        if !is_issue_type(kind) {
             diagnostics.add(
                 "INVALID_ISSUE_TYPE",
                 "issues",
