@@ -2067,7 +2067,14 @@ fn issue_create_writer_fixture(
     insert_tables.sort_unstable();
     assert_eq!(
         insert_tables,
-        ["issue_updates", "issues", "operation_receipts"]
+        [
+            "areas",
+            "artifact_areas",
+            "artifacts",
+            "issue_updates",
+            "issues",
+            "operation_receipts"
+        ]
     );
     let mut prior = connect("writer");
     prior.query_drop("START TRANSACTION").unwrap();
