@@ -1440,7 +1440,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             let partial = extension_matches
                 .or(config_error_matches)
                 .or(area_matches)
-                .or_else(|| retry_area_create_failure(&cli, &args, error.kind()))
+                .or_else(|| retry_write_failure(&cli, &args, error.kind(), "area", &["create"]))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "context"))
@@ -2206,7 +2206,15 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .ignore_errors(true)
                 .try_get_matches_from(args)
                 .ok()?;
-            recover_unknown_long(&recovery, args, &partial, &error, "issue").unwrap_or(partial)
+            retry_write_failure(
+                &extended,
+                args,
+                error.kind(),
+                "issue",
+                &["add-dependency", "remove-dependency"],
+            )
+            .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "issue"))
+            .unwrap_or(partial)
         }
     };
     let leaf = match partial.subcommand() {
@@ -2411,7 +2419,14 @@ fn extended_error_options(command: clap::Command) -> clap::Command {
 }
 
 fn extended_help_probe(command: clap::Command) -> clap::Command {
-    command.disable_help_flag(true).arg(
+    let command = command.disable_help_flag(true);
+    if command
+        .get_arguments()
+        .any(|arg| arg.get_long() == Some("help"))
+    {
+        return command;
+    }
+    command.arg(
         Arg::new("extended_help_probe")
             .short('h')
             .long("help")
@@ -2683,10 +2698,12 @@ fn retry_conversation_failure(
         .then_some(matches)
 }
 
-fn retry_area_create_failure(
+fn retry_write_failure(
     cli: &clap::Command,
     args: &[OsString],
     kind: ErrorKind,
+    domain: &str,
+    actions: &[&str],
 ) -> Option<ArgMatches> {
     if !matches!(
         kind,
@@ -2701,33 +2718,41 @@ fn retry_area_create_failure(
     }
     let recover_values = |command| {
         extended_error_options(command).mut_args(|arg| {
-            if arg.get_long().is_some()
+            if (arg.get_long().is_some() || arg.is_positional())
                 && !matches!(
                     arg.get_id().as_str(),
                     "contract" | "format" | "json" | "extended_help_probe"
                 )
             {
-                arg.value_parser(OsStringValueParser::new())
+                arg.required(false).value_parser(OsStringValueParser::new())
             } else {
                 arg
             }
         })
     };
-    let retry =
-        recover_values(cli.clone().disable_help_subcommand(true)).mut_subcommand("area", |area| {
-            extended_help_probe(area).mut_subcommand("create", |create| {
-                recover_values(create).arg(
-                    Arg::new("area_create_extra_values")
+    let retry = recover_values(cli.clone().disable_help_subcommand(true)).mut_subcommand(
+        domain,
+        |command| {
+            extended_help_probe(command).mut_subcommands(|leaf| {
+                if !actions.contains(&leaf.get_name()) {
+                    return leaf;
+                }
+                recover_values(leaf).arg(
+                    Arg::new("write_error_extra_values")
                         .num_args(0..)
                         .action(ArgAction::Append)
                         .value_parser(OsStringValueParser::new())
                         .hide(true),
                 )
             })
-        });
+        },
+    );
     let matches = retry.try_get_matches_from(args).ok()?;
     let (command, leaf) = matched_leaf(cli, &matches)?;
-    (command == "area create" && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+    let (actual_domain, action) = command.split_once(' ')?;
+    (actual_domain == domain
+        && actions.contains(&action)
+        && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }
 

@@ -129,8 +129,15 @@ pub(super) fn parse(
                 .ignore_errors(true)
                 .try_get_matches_from(args)
                 .ok()?;
-            let matches =
-                recover_unknown_long(&cli, args, &partial, &error, "project").unwrap_or(partial);
+            let matches = super::retry_write_failure(
+                &cli,
+                args,
+                error.kind(),
+                "project",
+                &["create", "add-issue"],
+            )
+            .or_else(|| recover_unknown_long(&cli, args, &partial, &error, "project"))
+            .unwrap_or(partial);
             (matches, Some(error.kind()))
         }
     };
