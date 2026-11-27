@@ -199,10 +199,12 @@ fn reads_artifact_metadata_and_gates_committed_bodies_by_exact_scope() {
     ] {
         insert_artifact(&mut writer, artifact, "report");
     }
-    let fixture_body = "Committed café\n[reference](file:///unread-fixture)";
+    let private_marker = "artifact-body-private-marker";
+    let fixture_body =
+        format!("Committed café\n{private_marker}\n[reference](file:///unread-fixture)");
     writer.exec_drop(
         "UPDATE artifacts SET title='Cross-linked', body=?, source_ref='hidden-source' WHERE id=?",
-        (fixture_body, &cross),
+        (&fixture_body, &cross),
     ).unwrap();
     writer
         .exec_drop(
@@ -301,7 +303,7 @@ fn reads_artifact_metadata_and_gates_committed_bodies_by_exact_scope() {
     );
     for hidden in [
         "Hidden neighboring title",
-        "Committed café",
+        private_marker,
         "hidden-source",
         &id(3),
         &id(RESOURCE),
@@ -348,7 +350,12 @@ fn reads_artifact_metadata_and_gates_committed_bodies_by_exact_scope() {
     let denial = run("show", &selection, 6);
     assert_eq!(denial["error"]["code"], "UNAUTHORIZED");
     assert!(denial.get("data").is_none_or(serde_json::Value::is_null));
-    for hidden in [&id(RESOURCE), "Cross-linked", fixture_body, "hidden-source"] {
+    for hidden in [
+        &id(RESOURCE),
+        "Cross-linked",
+        private_marker,
+        "hidden-source",
+    ] {
         assert!(!denial.to_string().contains(hidden));
     }
     assert_eq!(run("show", &[&cross], 6)["error"]["code"], "UNAUTHORIZED");

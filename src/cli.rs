@@ -10,7 +10,8 @@ use clap::{
     builder::{
         NonEmptyStringValueParser, OsStringValueParser, StringValueParser, TypedValueParser,
     },
-    error::ErrorKind,
+    error::{ContextKind, ContextValue, ErrorKind},
+    parser::ValueSource,
     value_parser,
 };
 
@@ -1020,7 +1021,26 @@ fn parse_dolt_artifact(
             }
         })
     });
-    let matched = probe.try_get_matches_from(args).ok()?;
+    let (matched, recovery_error) = match probe.clone().try_get_matches_from(args) {
+        Ok(matches) => (matches, None),
+        Err(error) if error.kind() == ErrorKind::UnknownArgument => {
+            let partial = probe
+                .clone()
+                .ignore_errors(true)
+                .try_get_matches_from(args)
+                .ok()?;
+            // Keep probe-only positionals from absorbing a detached value.
+            let retry = probe.mut_subcommand("artifact", |artifact| {
+                artifact
+                    .mut_subcommand("list", |list| list.mut_arg("extra", |arg| arg.last(true)))
+                    .mut_subcommand("show", |show| show.mut_arg("id", |arg| arg.num_args(0..=1)))
+            });
+            let matches =
+                recover_unknown_long(&retry, args, "artifact", &partial, &error).unwrap_or(partial);
+            (matches, Some(error.kind()))
+        }
+        Err(_) => return None,
+    };
     let (command_name, leaf) = matched_leaf(&v2, &matched)?;
     if !matches!(command_name.as_str(), "artifact list" | "artifact show")
         || requested_contract(Some(&matched), Some(leaf)) != Contract::V2
@@ -1034,6 +1054,10 @@ fn parse_dolt_artifact(
         command: Some(command_name.clone()),
         message: message.to_owned(),
     };
+
+    if let Some(error) = recovery_error {
+        return Some(Err(invalid(safe_parse_message(error))));
+    }
 
     Some((|| {
         let matches = v2.try_get_matches_from(args).map_err(|error| {
@@ -1070,6 +1094,62 @@ fn parse_dolt_artifact(
             command_name: command_name.clone(),
         })
     })())
+}
+
+fn recover_unknown_long(
+    cli: &clap::Command,
+    args: &[OsString],
+    domain: &str,
+    partial: &ArgMatches,
+    error: &clap::Error,
+) -> Option<ArgMatches> {
+    if error.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    let (action @ ("list" | "show"), _) = partial.subcommand_matches(domain)?.subcommand()? else {
+        return None;
+    };
+    let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
+        return None;
+    };
+    let long = invalid.strip_prefix("--")?.split('=').next()?;
+    if !long.starts_with(|ch: char| ch.is_ascii_alphanumeric())
+        || !long
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
+    if leaf.get_arguments().any(|arg| {
+        arg.get_long() == Some(long)
+            || arg
+                .get_all_aliases()
+                .is_some_and(|aliases| aliases.contains(&long))
+    }) {
+        return None;
+    }
+
+    // Let Clap replay the original tokens. The temporary option can take an
+    // attached value, and the original parse error still determines the result.
+    const UNKNOWN_LONG: &str = "recovered_unknown_long";
+    let retry = cli.clone().mut_subcommand(domain, |command| {
+        command.mut_subcommand(action, |leaf| {
+            leaf.arg(
+                Arg::new(UNKNOWN_LONG)
+                    .long(long.to_owned())
+                    .num_args(0..=1)
+                    .require_equals(true)
+                    .value_parser(OsStringValueParser::new())
+                    .hide(true),
+            )
+        })
+    });
+    let matches = retry.try_get_matches_from(args).ok()?;
+    let recovered = matches
+        .subcommand_matches(domain)?
+        .subcommand_matches(action)?;
+    (recovered.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine)).then_some(matches)
 }
 
 fn retry_issue_query(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {
