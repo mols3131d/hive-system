@@ -5,6 +5,7 @@ mod graph;
 mod issue;
 mod issue_list;
 mod issue_readiness;
+mod project;
 mod records;
 
 use std::num::NonZeroU16;
@@ -20,6 +21,7 @@ use crate::error::{ErrorCode, HiveError};
 
 pub(crate) use issue::show as issue_show;
 pub(crate) use issue_list::{IssueView, list as issue_list};
+pub(crate) use project::read as project_read;
 
 const DOLT_VERSION: &str = "2.7.6";
 pub(crate) const STORAGE_SCHEMA_VERSION: u32 = 1;
@@ -411,6 +413,6 @@ pub(crate) fn is_uuid(value: &str) -> bool {
         })
 }
 
-fn is_uuid_v7(value: &str) -> bool {
+pub(crate) fn is_uuid_v7(value: &str) -> bool {
     is_uuid(value) && value.as_bytes()[14] == b'7'
 }

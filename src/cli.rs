@@ -1,13 +1,20 @@
+mod project_v2;
+
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::{
-    ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
-    builder::{NonEmptyStringValueParser, StringValueParser, TypedValueParser},
+    Arg, ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand,
+    ValueEnum,
+    builder::{
+        NonEmptyStringValueParser, OsStringValueParser, StringValueParser, TypedValueParser,
+    },
     error::ErrorKind,
     value_parser,
 };
+
+pub(crate) use project_v2::ProjectRead;
 
 pub(crate) struct Invocation {
     pub(crate) common: CommonOptions,
@@ -224,6 +231,8 @@ pub(crate) enum Command {
     /// List projects or inspect a project scope.
     #[command(subcommand)]
     Project(ProjectCommand),
+    #[command(skip)]
+    ProjectRead(ProjectRead),
     /// Read or manage task records.
     #[command(subcommand)]
     Task(TaskCommand),
@@ -260,7 +269,7 @@ pub(crate) enum Command {
 )]
 pub(crate) enum ConfigCommand {
     /// Show configuration and its provenance.
-    Show(ConfigScopeArgs),
+    Show(ConfigShowArgs),
     /// Validate configuration at the selected scope.
     Validate(ConfigScopeArgs),
     /// Create a project binding for an existing workspace scope.
@@ -275,6 +284,16 @@ pub(crate) enum ConfigCommand {
 pub(crate) struct ConfigScopeArgs {
     #[arg(long, value_enum, default_value = "resolved")]
     pub(crate) scope: ConfigScope,
+}
+
+#[derive(Args)]
+pub(crate) struct ConfigShowArgs {
+    #[command(flatten)]
+    pub(crate) target: ConfigScopeArgs,
+    #[arg(skip)]
+    pub(crate) area: Option<String>,
+    #[arg(skip)]
+    pub(crate) resource: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -781,12 +800,19 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             })
         });
     }
+    if let Some(project) = project_v2::parse(&cli, &args) {
+        return project;
+    }
+    let mut config_error_matches = None;
     let matches = match cli.clone().try_get_matches_from(&args).or_else(|error| {
-        if error.kind() == ErrorKind::ValueValidation {
-            retry_issue_query(&cli, &args).ok_or(error)
-        } else {
-            Err(error)
+        match error.kind() {
+            ErrorKind::ValueValidation => retry_issue_query(&cli, &args)
+                .map(Ok)
+                .or_else(|| retry_config_show(&cli, &args, &mut config_error_matches)),
+            ErrorKind::UnknownArgument => retry_config_show(&cli, &args, &mut config_error_matches),
+            _ => None,
         }
+        .unwrap_or(Err(error))
     }) {
         Ok(matches) => matches,
         Err(error)
@@ -806,7 +832,8 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 }
                 _ => None,
             };
-            let partial = area_matches
+            let partial = config_error_matches
+                .or(area_matches)
                 .or_else(|| retry_scoped_read_failure(&cli, &args, error.kind(), "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, error.kind(), "directive"))
                 .or_else(|| {
@@ -861,6 +888,14 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
         {
             page.limit = 25;
         }
+        if let Command::Config(ConfigCommand::Show(args)) = &mut command {
+            args.area = leaf.try_get_one::<String>("area").ok().flatten().cloned();
+            args.resource = leaf
+                .try_get_one::<PathBuf>("resource")
+                .ok()
+                .flatten()
+                .cloned();
+        }
         command.validate(&common)?;
         Ok((common, command))
     };
@@ -895,6 +930,56 @@ fn retry_issue_query(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatche
         "issue list" | "issue ready" | "issue blocked"
     ) && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
+}
+
+fn retry_config_show(
+    cli: &clap::Command,
+    args: &[OsString],
+    error_matches: &mut Option<ArgMatches>,
+) -> Option<Result<ArgMatches, clap::Error>> {
+    // Add v2-only options on retry to preserve legacy config help and errors.
+    let accept_numeric_project = |command: clap::Command| {
+        defer_project_check(command).mut_arg("project", |arg| arg.allow_negative_numbers(true))
+    };
+    let retry = accept_numeric_project(cli.clone().mut_subcommand("config", |config| {
+        config.mut_subcommand("show", |show| {
+            accept_numeric_project(show)
+                .arg(Arg::new("area").long("area").allow_negative_numbers(true))
+                .arg(
+                    Arg::new("resource")
+                        .long("resource")
+                        .value_parser(value_parser!(PathBuf)),
+                )
+        })
+    }));
+    let is_v2_config = |matches: &ArgMatches| {
+        matched_leaf(cli, matches).is_some_and(|(command, leaf)| {
+            command == "config show"
+                && requested_contract(Some(matches), Some(leaf)) == Contract::V2
+        })
+    };
+    match retry.clone().try_get_matches_from(args) {
+        Ok(matches) => is_v2_config(&matches).then_some(Ok(matches)),
+        Err(error) => {
+            // Recover metadata past duplicate, missing, or empty values.
+            // Clap still distinguishes flags from values.
+            let relaxed = |arg: Arg| {
+                arg.action(ArgAction::Append)
+                    .num_args(0..=1)
+                    .value_parser(OsStringValueParser::new())
+            };
+            *error_matches = retry
+                .mut_subcommand("config", |config| {
+                    config.mut_subcommand("show", |show| {
+                        show.mut_arg("area", relaxed).mut_arg("resource", relaxed)
+                    })
+                })
+                .try_get_matches_from(args)
+                .ok()
+                .filter(is_v2_config);
+            error_matches.as_ref().map(|_| Err(error))
+        }
+    }
 }
 
 fn retry_scoped_read_failure(
@@ -1161,6 +1246,7 @@ impl Command {
                     | IssueCommand::Ready(args)
                     | IssueCommand::Blocked(args),
                 ) => args.validate_dolt_selection(common),
+                Self::Project(_) => Err("Use contract 2 Project read options."),
                 Self::Bot(command) => command.validate(common),
                 Self::Directive(command) => command.validate(common),
                 _ => Ok(()),
