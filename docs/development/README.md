@@ -264,7 +264,20 @@ hive --contract 2 --json backup create --workspace /example/hive-v2-userdata \
   --destination /example/backups/snapshot
 ```
 
-Hive verifies the staged Dolt history and Git asset bundle before publishing the directory. The manifest records both commits, the workspace and policy identities, and a SHA-256 digest for each payload file. The default manifest marks conversations omitted. See the [backup and restore contract](../architecture/dolt-mvp-contract.md#installation-lifecycle-and-recovery).
+Hive verifies the staged Dolt history and Git asset bundle before publishing the directory. The manifest records both commits, the workspace and policy identities, and a SHA-256 digest for each payload file. The default backup uses manifest format 1 and marks conversations omitted. Add `--include-conversations` to create a private format-2 backup with the verified published snapshots of registered active and retired Queens. The manifest includes a `conversations.files` list even when empty. Each entry records the workspace ID, Queen ID and slug, conversation ID, relative path, byte count, and SHA-256 digest of the complete Markdown file. See the [backup and restore contract](../architecture/dolt-mvp-contract.md#installation-lifecycle-and-recovery).
+
+## Restore a local workspace backup
+
+On Linux, restore a format-1 or format-2 backup with installed Dolt 2.7.6 and Git. Select an explicit local backup directory and a separate target with an existing parent. Hive atomically publishes the verified workspace at a new path or replaces an explicitly selected empty directory. An occupied target causes the operation to fail.
+
+```sh
+hive --contract 2 --json backup restore --source /example/backups/snapshot \
+  --target /example/restored-userdata
+```
+
+Hive verifies the manifest and SHA-256 digests while copying the payload into private staging. The limits are 512 KiB for the manifest and 2,048 files and 64 GiB for the paired payload. Native integrity checks cover both pinned revisions and their reachable history. Hive also checks the pinned schema, committed records, and registered Queens' Soul files before publishing. The manifest is the operator-selected integrity reference.
+
+The result is inactive. By default, the private `conversations/` directory is empty even for a format-2 backup. Hive refuses a target named by the selected identity's local active-root registration, including a stale registration for an absent path. Restore creates fresh repository metadata locally and leaves runtime registration, credentials, and machine bindings outside the target. Add `--include-conversations` to restore the snapshots listed in a format-2 manifest. Hive requires the section before staging and verifies the archived Queen identity, private paths and permissions, file digests, and conversation frontmatter and body before publishing. The section supports up to 2,048 files within the shared manifest limit, and each file uses the conversation format's 64 KiB frontmatter and 4 MiB body limits.
 
 ## Import a Queen conversation
 

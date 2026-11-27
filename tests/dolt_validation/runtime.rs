@@ -2073,7 +2073,7 @@ fn issue_create_writer_fixture(
             "artifacts",
             "issue_updates",
             "issues",
-            "operation_receipts"
+            "operation_receipts",
         ]
     );
     let mut prior = connect("writer");

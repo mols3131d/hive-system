@@ -303,17 +303,41 @@ pub(super) fn exercise(
         .unwrap()
         .unwrap();
     assert!(hold);
+    let cleared_commit = cleared["data"]["confirmed_commit"].as_str().unwrap();
+    let cleared_revision = cleared["data"]["result"]["issue_revision"]
+        .as_str()
+        .unwrap();
+    let archive_ancestor = format!(
+        "UPDATE areas SET archived_at = UTC_TIMESTAMP(6) WHERE id = '{}';",
+        id(2)
+    );
+    drop(reader);
+    restart(Some(OfflineFixtureEdit::CommitSql(&archive_ancestor)), None);
+    let mut reader = connect_owned(state, port, "reader");
+    let archived = storage_state(&mut reader);
+    assert_ne!(archived.0, cleared_commit);
+    assert_eq!(
+        update(
+            &id(198),
+            &area,
+            &issue,
+            cleared_revision,
+            &title_edit,
+            title_values.clone(),
+            4
+        )["error"]["code"],
+        "INVALID_TRANSITION"
+    );
     let replayed = update(
         &request, &area, &issue, &expected, &all_edits, all_values, 0,
     );
     assert_eq!(replayed["data"]["result"], *result);
     assert_eq!(replayed["data"]["confirmed_commit"], after.0);
-    assert_eq!(
-        replayed["context"]["db_commit"],
-        cleared["data"]["confirmed_commit"]
-    );
+    assert_eq!(replayed["context"]["db_commit"], archived.0);
+    assert_eq!(storage_state(&mut reader), archived);
+    assert!(!marker.exists());
 
-    let commit = cleared["data"]["confirmed_commit"].as_str().unwrap();
+    let commit = &archived.0;
     let invocation = id(192);
     let now = fixture_now();
     let proof = json!({
@@ -358,6 +382,7 @@ pub(super) fn exercise(
     assert!(!inspected.to_string().contains("Synthetic revised body"));
 
     drop(reader);
+    restart(Some(OfflineFixtureEdit::RestoreHead(cleared_commit)), None);
     restart(
         Some(OfflineFixtureEdit::CommitSql(&format!(
             "UPDATE issues SET status='review' WHERE id = '{}';",
@@ -413,9 +438,6 @@ pub(super) fn exercise(
     let forged_base = storage_state(&mut reader).0;
     let forged = id(194);
     let forged_revision = id(195);
-    let cleared_revision = cleared["data"]["result"]["issue_revision"]
-        .as_str()
-        .unwrap();
     let priority_values = json!([null, null, null, 1, null]);
     let fingerprint = digest(
         json!([
@@ -440,16 +462,25 @@ pub(super) fn exercise(
         "issue_revision": forged_revision, "fields": ["priority"],
     });
     let timestamp = receipt.5.trim_end_matches('Z').replace('T', " ");
-    drop(reader);
-    restart(Some(OfflineFixtureEdit::CommitSql(&format!(
+    let edit_with_receipt = |base: &str| {
+        format!(
         "UPDATE issues SET priority = 1, revision = '{forged_revision}', updated_at = '{timestamp}' WHERE id = '{issue}';
-         UPDATE issues SET priority = 2 WHERE id = '{}';
          INSERT INTO operation_receipts (request_id, kind, fingerprint, actor_ref, authorization_ref,
              base_commit, workflow_evidence_json, result_json, created_at)
          VALUES ('{forged}', 'issue.update', '{fingerprint}', '{actor}', '{}',
-             '{forged_base}', '{forged_evidence}', '{forged_result}', '{timestamp}');",
-        id(10), receipt.3,
-    ))), None);
+             '{base}', '{forged_evidence}', '{forged_result}', '{timestamp}');",
+        receipt.3,
+    )
+    };
+    drop(reader);
+    restart(
+        Some(OfflineFixtureEdit::CommitSql(&format!(
+            "{} UPDATE issues SET priority = 2 WHERE id = '{}';",
+            edit_with_receipt(&forged_base),
+            id(10),
+        ))),
+        None,
+    );
     let mut reader = connect_owned(state, port, "reader");
     let forged_state = storage_state(&mut reader);
     assert_eq!(
@@ -459,7 +490,7 @@ pub(super) fn exercise(
             &issue,
             cleared_revision,
             &["--priority", "1"],
-            priority_values,
+            priority_values.clone(),
             8
         )["error"]["code"],
         "COMMIT_UNCERTAIN",
@@ -503,6 +534,42 @@ pub(super) fn exercise(
         storage_state(&mut connect_owned(state, port, "reader")),
         forged_state
     );
+    restart(Some(OfflineFixtureEdit::RestoreHead(&forged_base)), None);
+
+    // This fixture commit changes only the target Issue and adds its matching
+    // receipt, but the target's ancestor was archived at the edit's base.
+    restart(Some(OfflineFixtureEdit::CommitSql(&archive_ancestor)), None);
+    let archived_base = storage_state(&mut connect_owned(state, port, "reader")).0;
+    restart(
+        Some(OfflineFixtureEdit::CommitSql(&edit_with_receipt(
+            &archived_base,
+        ))),
+        None,
+    );
+    restart(
+        Some(OfflineFixtureEdit::CommitSql(&format!(
+            "UPDATE areas SET archived_at = NULL WHERE id = '{}';",
+            id(2)
+        ))),
+        None,
+    );
+    let mut reader = connect_owned(state, port, "reader");
+    let after_restore = storage_state(&mut reader);
+    assert_eq!(
+        update(
+            &forged,
+            &area,
+            &issue,
+            cleared_revision,
+            &["--priority", "1"],
+            priority_values,
+            8
+        )["error"]["code"],
+        "COMMIT_UNCERTAIN"
+    );
+    assert_eq!(storage_state(&mut reader), after_restore);
+    assert!(!marker.exists());
+    drop(reader);
     restart(Some(OfflineFixtureEdit::RestoreHead(&forged_base)), None);
     assert_eq!(
         storage_state(&mut connect_owned(state, port, "reader")).0,

@@ -22,6 +22,9 @@ pub(crate) use runtime::{
     with_operation_snapshot, with_owned_snapshot, with_writer_runtime,
 };
 
+#[cfg(target_os = "linux")]
+pub(crate) use unix::require_inactive_target;
+
 pub(crate) fn run(
     options: &CommonOptions,
     command: &WorkspaceCommand,
@@ -44,35 +47,40 @@ pub(crate) fn backup(
     options: &CommonOptions,
     command: &crate::cli::BackupCommand,
 ) -> (Format, Result<Value, HiveError>) {
-    use crate::error::ErrorCode;
+    use crate::cli::BackupCommand;
 
-    let crate::cli::BackupCommand::Create {
-        destination,
-        include_conversations,
-    } = command;
     let format = options.format.unwrap_or_default();
-    if *include_conversations {
+    if let BackupCommand::Restore {
+        source,
+        target,
+        include_conversations,
+    } = command
+    {
         return (
             format,
-            Err(HiveError::new(
-                ErrorCode::NotImplemented,
-                "Backup conversation inclusion requires a later contract-2 implementation.",
-            )),
+            crate::workspace_restore::run(source, target, *include_conversations),
         );
     }
+    let BackupCommand::Create {
+        destination,
+        include_conversations,
+    } = command
+    else {
+        unreachable!("restore returned above");
+    };
     #[cfg(target_os = "linux")]
     {
         let mut format = format;
-        let result = runtime::backup(options, destination, &mut format);
+        let result = runtime::backup(options, destination, *include_conversations, &mut format);
         (format, result)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = destination;
+        let _ = (destination, include_conversations);
         (
             format,
             Err(HiveError::new(
-                ErrorCode::NotImplemented,
+                crate::error::ErrorCode::NotImplemented,
                 "Backup creation is supported only on Linux.",
             )),
         )
@@ -315,6 +323,32 @@ mod unix {
             Some(workspaces) => workspaces.open_child_directory(OsStr::new(workspace_id)),
             None => Ok(None),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn require_inactive_target(
+        workspace_id: &str,
+        target: &std::path::Path,
+    ) -> Result<(), HiveError> {
+        let Some(state) = find_state(workspace_id, target)? else {
+            return Ok(());
+        };
+        if target.starts_with(&state.path) {
+            return Err(invalid(
+                "The restore target must be outside workspace runtime state.",
+            ));
+        }
+        // A stale registration can still match an absent or empty path.
+        // Runtime compares the exact canonical path from the descriptor.
+        let path = json_path(target)?;
+        if read_json::<Registration>(Some(&state), "active-root.json")?
+            .is_some_and(|record| record.workspace_root == path)
+        {
+            return Err(unverified(
+                "The restore target is the registered active root.",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn check_server(server: &Server, id: &str, root: &str) -> Result<(), HiveError> {

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use super::{Diagnostics, Graph, HiveError, Snapshot, is_uuid_v7};
+use super::{Diagnostics, Graph, HiveError, RecordReader, is_uuid_v7};
 
 const TABLE: &str = "directives";
 
@@ -71,7 +71,7 @@ impl DirectiveRow {
 }
 
 pub(super) fn validate(
-    snapshot: &mut Snapshot,
+    snapshot: &mut RecordReader<'_>,
     area_ids: &HashSet<&str>,
     project_ids: &HashSet<&str>,
     diagnostics: &mut Diagnostics,
@@ -89,7 +89,7 @@ pub(super) fn validate(
             Option<String>,
         )>(
             TABLE,
-            "id, scope_kind, area_id, project_id, include_descendants, status,
+            "id, scope_kind, area_id, project_id, CAST(include_descendants AS SIGNED), status,
              approval_ref IS NOT NULL, (valid_from IS NULL OR expires_at IS NULL OR expires_at > valid_from),
              supersedes_id",
             "id",

@@ -295,7 +295,7 @@ fn uncertain(metadata: &Metadata, reason: &'static str) -> HiveError {
     )
 }
 
-fn outside_git(directory: &ScopedDirectory) -> Result<(), HiveError> {
+pub(super) fn outside_git(directory: &ScopedDirectory) -> Result<(), HiveError> {
     if directory.contains(c".git")?
         || (directory.contains(c"HEAD")? && directory.contains(c"objects")?)
     {
@@ -327,6 +327,15 @@ fn private_child_with(
         }
     }
     let directory = parent.require_child_directory(name)?;
+    require_private_directory(&directory)?;
+    parent
+        .handle()
+        .sync_all()
+        .map_err(|_| io_error("Could not synchronize the conversation directory hierarchy."))?;
+    Ok(directory)
+}
+
+pub(super) fn require_private_directory(directory: &ScopedDirectory) -> Result<(), HiveError> {
     let info = directory
         .handle()
         .metadata()
@@ -338,12 +347,7 @@ fn private_child_with(
             "Conversation directories must be owned by the caller with mode 0700.",
         ));
     }
-    outside_git(&directory)?;
-    parent
-        .handle()
-        .sync_all()
-        .map_err(|_| io_error("Could not synchronize the conversation directory hierarchy."))?;
-    Ok(directory)
+    outside_git(directory)
 }
 
 fn create_private_directory(parent: &File, name: &OsStr) -> rustix::io::Result<()> {
