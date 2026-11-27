@@ -265,7 +265,7 @@ hive --contract 2 --json conversation import --workspace /example/hive-v2-userda
   --bot 01900000-0000-7000-8000-00000000000a --file /example/input/conversation.md
 ```
 
-The selected Queen is verified in the committed registry under the exclusive workspace lock. The optional `--title` and `--session-ref` become file metadata. For the private layout and supported paths, see the [conversation contract](../architecture/dolt-workspace-contract.md#private-queen-conversation-storage).
+The selected Queen is verified in the committed registry under the exclusive workspace lock. The optional `--title` and `--session-ref` become file metadata. For the private layout and supported paths, see the [conversation contract](../architecture/dolt-workspace-contract.md#private-queen-conversation-file-contract).
 
 ## Historical Queen conversations
 
