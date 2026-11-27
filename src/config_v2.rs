@@ -425,7 +425,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub(crate) use unix::read_explicit;
+pub(crate) use unix::{Candidate, read_explicit};
 
 use crate::cli::{CommonOptions, ConfigShowArgs, Format};
 use crate::error::HiveError;
