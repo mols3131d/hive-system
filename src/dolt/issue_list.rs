@@ -6,10 +6,19 @@ use sha2::{Digest, Sha256};
 use crate::cli::{IssueListArgs, ProjectId};
 use crate::error::{ErrorCode, HiveError};
 
+use super::issue_readiness::Readiness;
 use super::records::{IssueStatus, is_canonical_label_name, is_issue_type};
 use super::{DoltFailure, DoltSuccess, Snapshot, is_uuid_v7};
 
 const MAX_LIMIT: u64 = 100;
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IssueView {
+    List,
+    Ready,
+    Blocked,
+}
+
 const SORT: &str = "i.priority IS NULL ASC, i.priority ASC, i.created_at ASC, i.id ASC";
 
 #[derive(Clone, Copy, Serialize)]
@@ -30,7 +39,7 @@ struct Query<'a> {
     limit: u64,
 }
 
-type SummaryRow = (
+pub(super) type SummaryRow = (
     String,
     u64,
     String,
@@ -45,6 +54,7 @@ type SummaryRow = (
 pub(crate) fn list(
     args: &IssueListArgs,
     project: Option<&ProjectId>,
+    view: IssueView,
 ) -> Result<DoltSuccess, Box<DoltFailure>> {
     let query = Query::parse(args, project).map_err(DoltFailure::without_context)?;
     let (mut snapshot, workspace_id) =
@@ -54,8 +64,25 @@ pub(crate) fn list(
         "db_commit": snapshot.commit,
         "scope": query.scope,
     });
-    let binding = json!(["issue-list-v1", workspace_id, snapshot.commit, SORT, query]);
-    match list_page(&mut snapshot, &query, &binding, args.cursor.as_deref()) {
+    let binding = if view == IssueView::List {
+        json!(["issue-list-v1", workspace_id, snapshot.commit, SORT, query])
+    } else {
+        json!([
+            "issue-readiness-v1",
+            view,
+            workspace_id,
+            snapshot.commit,
+            SORT,
+            query
+        ])
+    };
+    match list_page(
+        &mut snapshot,
+        &query,
+        view,
+        &binding,
+        args.cursor.as_deref(),
+    ) {
         Ok(data) => Ok(DoltSuccess { context, data }),
         Err(error) => Err(DoltFailure::with_context(context, error)),
     }
@@ -127,15 +154,86 @@ impl<'a> Query<'a> {
 fn list_page(
     snapshot: &mut Snapshot,
     query: &Query<'_>,
+    view: IssueView,
     binding: &Value,
     cursor: Option<&str>,
 ) -> Result<Value, HiveError> {
     let offset = match cursor {
-        Some(cursor) => cursor_offset(cursor, binding)?,
+        Some(cursor) => cursor_offset(cursor, binding, view)?,
         None => 0,
     };
     verify_scope(snapshot, query.scope)?;
 
+    let mut items = Vec::new();
+    let mut next_offset = None;
+    if view == IssueView::List {
+        let rows = summary_rows(snapshot, query, view, query.limit + 1, offset)?;
+        validate_summaries(&rows)?;
+        if rows.len() as u64 > query.limit {
+            next_offset = Some(offset + query.limit);
+        }
+        items.extend(rows.into_iter().take(query.limit as usize).map(summary));
+    } else {
+        let mut readiness = Readiness::default();
+        let mut position = offset;
+        let scan_limit = super::MAX_ROWS_PER_TABLE as u64;
+        'pages: loop {
+            let remaining = scan_limit - (position - offset);
+            // Read one extra candidate at the scan boundary to distinguish exhaustion.
+            let batch_size = MAX_LIMIT.min(remaining.max(1));
+            let rows = summary_rows(snapshot, query, view, batch_size, position)?;
+            if rows.len() as u64 > remaining {
+                return Err(HiveError::new(
+                    ErrorCode::ContextLimit,
+                    "The readiness query exceeds the candidate scan limit.",
+                ));
+            }
+            validate_summaries(&rows)?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut reasons = readiness.reasons(snapshot, &rows)?;
+            let exhausted = (rows.len() as u64) < batch_size;
+            for row in rows {
+                let blockers = reasons.remove(&row.0).ok_or_else(|| {
+                    HiveError::new(
+                        ErrorCode::InvalidRecord,
+                        "Committed Issue metadata is missing.",
+                    )
+                })?;
+                if blockers.is_empty() == (view == IssueView::Ready) {
+                    if items.len() as u64 == query.limit {
+                        next_offset = Some(position);
+                        break 'pages;
+                    }
+                    let mut item = summary(row);
+                    if view == IssueView::Blocked {
+                        item["reasons"] = json!(blockers);
+                    }
+                    items.push(item);
+                }
+                position += 1;
+            }
+            if exhausted {
+                break;
+            }
+        }
+    }
+    Ok(json!({
+        "items": items,
+        "next_cursor": next_offset.map(|position| encode_cursor(position, binding)),
+        "truncated": next_offset.is_some(),
+        "observed_revision": snapshot.commit,
+    }))
+}
+
+fn summary_rows(
+    snapshot: &mut Snapshot,
+    query: &Query<'_>,
+    view: IssueView,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<SummaryRow>, HiveError> {
     let (scope_predicate, scope_id) = match query.scope {
         Scope::All => ("", None),
         Scope::Area(id) => ("CAST(i.area_id AS BINARY) = ?", Some(id)),
@@ -161,8 +259,11 @@ fn list_page(
             params.push(value);
         }
     }
-    params.extend([SqlValue::from(query.limit + 1), SqlValue::from(offset)]);
-    let rows: Vec<SummaryRow> = snapshot.exec_rows(
+    if view != IssueView::List {
+        predicates.push("CAST(i.status AS BINARY) = 'todo' AND CAST(i.type AS BINARY) IN ('feature', 'task', 'bug')");
+    }
+    params.extend([SqlValue::from(limit), SqlValue::from(offset)]);
+    snapshot.exec_rows(
         |commit| {
             // Only static SQL fragments and the verified commit are interpolated.
             let mut sql = format!(
@@ -191,8 +292,11 @@ fn list_page(
             sql
         },
         params,
-    )?;
-    for (id, number, area_id, _, kind, status, priority, _, _) in &rows {
+    )
+}
+
+fn validate_summaries(rows: &[SummaryRow]) -> Result<(), HiveError> {
+    for (id, number, area_id, _, kind, status, priority, _, _) in rows {
         if !is_uuid_v7(id)
             || *number == 0
             || !is_uuid_v7(area_id)
@@ -206,24 +310,16 @@ fn list_page(
             ));
         }
     }
-    let truncated = rows.len() as u64 > query.limit;
-    let items: Vec<_> = rows
-        .into_iter()
-        .take(query.limit as usize)
-        .map(|(id, number, area_id, title, kind, status, priority, revision, created_at)| {
-            json!({
-                "id": id, "number": number, "area_id": area_id, "title": title, "type": kind,
-                "status": status, "priority": priority, "revision": revision, "created_at": created_at,
-            })
-        })
-        .collect();
-    let next_cursor = truncated.then(|| encode_cursor(offset + query.limit, binding));
-    Ok(json!({
-        "items": items,
-        "next_cursor": next_cursor,
-        "truncated": truncated,
-        "observed_revision": snapshot.commit,
-    }))
+    Ok(())
+}
+
+fn summary(
+    (id, number, area_id, title, kind, status, priority, revision, created_at): SummaryRow,
+) -> Value {
+    json!({
+        "id": id, "number": number, "area_id": area_id, "title": title, "type": kind,
+        "status": status, "priority": priority, "revision": revision, "created_at": created_at,
+    })
 }
 
 fn verify_scope(snapshot: &mut Snapshot, scope: Scope<'_>) -> Result<(), HiveError> {
@@ -253,12 +349,17 @@ fn encode_cursor(offset: u64, binding: &Value) -> String {
     format!("{offset}.{digest:x}")
 }
 
-fn cursor_offset(cursor: &str, binding: &Value) -> Result<u64, HiveError> {
+fn cursor_offset(cursor: &str, binding: &Value, view: IssueView) -> Result<u64, HiveError> {
+    let max_advance = if view == IssueView::List {
+        MAX_LIMIT
+    } else {
+        super::MAX_ROWS_PER_TABLE as u64
+    };
     if cursor.len() <= 85
         && let Some((offset, _)) = cursor.split_once('.')
         && let Ok(offset) = offset.parse::<u64>()
         && offset > 0
-        && offset <= u64::MAX - MAX_LIMIT
+        && offset <= u64::MAX - max_advance
         && cursor == encode_cursor(offset, binding)
     {
         return Ok(offset);
