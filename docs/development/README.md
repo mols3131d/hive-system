@@ -255,6 +255,18 @@ hive --contract 2 --json resource show 01900000-0000-7000-8000-000000000014 \
 
 List pages contain Resource IDs, kinds, names, and revisions in ascending bytewise ID order, with 25 items by default and a maximum of 100. Pass `next_cursor` as `--cursor` with the same target, scope, and page size. A changed snapshot or query returns `STALE_CURSOR`. Exact-ID `resource show` adds the stored URI to the selected record. Both commands report the verified Dolt commit and leave URIs unopened.
 
+## Import a Queen conversation
+
+On Linux, explicitly import UTF-8 Markdown for an active registered Queen in a running, owned workspace. Use exactly one of `--file PATH` and `--stdin`. Each successful import returns a fresh conversation ID and preserves the original body bytes in private local storage.
+
+```sh
+hive --contract 2 --json conversation import --workspace /example/hive-v2-userdata \
+  --database db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001 \
+  --bot 01900000-0000-7000-8000-00000000000a --file /example/input/conversation.md
+```
+
+The selected Queen is verified in the committed registry under the exclusive workspace lock. The optional `--title` and `--session-ref` become file metadata. For the private layout and supported paths, see the [conversation contract](../architecture/dolt-workspace-contract.md#private-queen-conversation-storage).
+
 ## Historical Queen conversations
 
 Use contract 2 with an explicit workspace root, the same authenticated Dolt reader and target options, and exact lowercase UUIDv7 selectors for the Queen and conversation.
