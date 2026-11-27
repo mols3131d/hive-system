@@ -1,14 +1,18 @@
 use super::*;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 
-fn random_token() -> String {
+fn random_uuid() -> String {
     fs::read_to_string("/proc/sys/kernel/random/uuid")
         .unwrap()
         .trim()
-        .replace('-', "")
+        .to_owned()
+}
+
+fn random_token() -> String {
+    random_uuid().replace('-', "")
 }
 
 fn prepare() -> (Fixture, String, String) {
@@ -16,11 +20,12 @@ fn prepare() -> (Fixture, String, String) {
     let state = fixture.root.join("runtime");
     fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
     let grants = state.join("privileges.db");
-    let nonce = random_token()[..24].to_owned();
-    fixture.password = random_token();
+    let nonce = random_uuid();
+    let suffix = &nonce.replace('-', "")[..24];
+    fixture.password = random_uuid();
     let writer_password = random_token();
-    let reader = format!("reader_{nonce}");
-    let writer = format!("writer_{nonce}");
+    let reader = format!("reader_{suffix}");
+    let writer = format!("writer_{suffix}");
     let config = format!("--doltcfg-dir={}", state.display());
     let privilege_file = format!("--privilege-file={}", grants.display());
 
@@ -82,6 +87,7 @@ fn workspace_runtime_provisions_grants_offline() {
 fn workspace_runtime_probes_ownership_and_graceful_stop() {
     let available = TcpListener::bind((HOST, 0)).unwrap();
     let (mut fixture, nonce, writer_password) = prepare();
+    let nonce = &nonce.replace('-', "")[..24];
     let state = fixture.root.join("runtime");
     let db = fixture.root.join(DATABASE);
     let head_query = "SELECT DOLT_HASHOF('HEAD') AS head";
@@ -91,25 +97,7 @@ fn workspace_runtime_probes_ownership_and_graceful_stop() {
 
     fixture.port = available.local_addr().unwrap().port();
     drop(available);
-    let server = fixture
-        .dolt_command()
-        .current_dir(&state)
-        .args([
-            "sql-server",
-            "--skip-root-user-initialization",
-            "--host=127.0.0.1",
-            &format!("--port={}", fixture.port),
-            &format!("--data-dir={}", db.display()),
-            &format!("--doltcfg-dir={}", state.display()),
-            &format!("--privilege-file={}", state.join("privileges.db").display()),
-            "--event-scheduler=OFF",
-            "--loglevel=error",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let server = spawn_legacy_server(&fixture, &db, &state);
     let pid = server.id();
     fixture.server = Some(server);
     let handle = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -286,6 +274,28 @@ fn assert_access_denied(connection: Result<Conn, mysql::Error>) {
     );
 }
 
+fn spawn_legacy_server(fixture: &Fixture, db: &Path, run: &Path) -> Child {
+    fixture
+        .dolt_command()
+        .current_dir(run)
+        .args([
+            "sql-server",
+            "--skip-root-user-initialization",
+            "--host=127.0.0.1",
+            &format!("--port={}", fixture.port),
+            &format!("--data-dir={}", db.display()),
+            &format!("--doltcfg-dir={}", run.display()),
+            &format!("--privilege-file={}", run.join("privileges.db").display()),
+            "--event-scheduler=OFF",
+            "--loglevel=error",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
 fn process_identity(proc: &Path) -> (String, u64) {
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
     let stat = fs::read_to_string(proc.join("stat")).unwrap();
@@ -330,19 +340,8 @@ fn assert_only_loopback_listener(proc: &Path, port: u16) {
     }
 }
 
-#[test]
-#[ignore = "requires pinned Dolt at HIVE_DOLT_BIN, local TCP and Linux pidfds"]
-fn workspace_runtime_cli_starts_and_stops_registered_workspace() {
-    let fixture = Fixture::initialize(&empty_seed_sql(CASE_INSENSITIVE));
-    let available = TcpListener::bind((HOST, 0)).unwrap();
-    let port = available.local_addr().unwrap().port().to_string();
-    drop(available);
-
-    let workspace = fixture.root.join("workspace");
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&workspace)
-        .unwrap();
+fn register_fixture(fixture: &Fixture, workspace: &Path, state: &Path) -> Value {
+    fs::DirBuilder::new().mode(0o700).create(workspace).unwrap();
     fs::rename(fixture.root.join(DATABASE), workspace.join("db")).unwrap();
     let workspace_id = id(1);
     fs::write(
@@ -353,12 +352,10 @@ fn workspace_runtime_cli_starts_and_stops_registered_workspace() {
         ),
     )
     .unwrap();
-    let state_home = fixture.root.join("state");
-    let state = state_home.join("hive/v2/workspaces").join(&workspace_id);
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(&state)
+        .create(state)
         .unwrap();
     let registration = state.join("active-root.json");
     let registered_root = serde_json::json!({
@@ -366,17 +363,50 @@ fn workspace_runtime_cli_starts_and_stops_registered_workspace() {
         "workspace_id": workspace_id,
         "workspace_root": workspace
     });
-    fs::write(&registration, registered_root.to_string()).unwrap();
+    fs::write(registration, registered_root.to_string()).unwrap();
+    registered_root
+}
 
+fn lifecycle_command(fixture: &Fixture, workspace: &Path, state_home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hive"));
+    command
+        .env_clear()
+        .env("HOME", fixture.root.join("home"))
+        .env("XDG_STATE_HOME", state_home)
+        .current_dir(&fixture.root)
+        .args(["--contract", "2", "--json", "--workspace"])
+        .arg(workspace)
+        .arg("workspace");
+    command
+}
+
+#[test]
+#[ignore = "requires pinned Dolt at HIVE_DOLT_BIN, local TCP, Linux pidfds and native Git"]
+fn workspace_runtime_cli_starts_and_stops_registered_workspace() {
+    let fixture = Fixture::initialize(&empty_seed_sql(CASE_INSENSITIVE));
+    let baseline = fixture.local(
+        &["sql", "-r", "csv", "-q", "SELECT DOLT_HASHOF('HEAD')"],
+        None,
+    );
+    let baseline = baseline.lines().nth(1).unwrap();
+    let available = TcpListener::bind((HOST, 0)).unwrap();
+    let port = available.local_addr().unwrap().port().to_string();
+    drop(available);
+
+    let workspace = fixture.root.join("work $HOME");
+    let state_home = fixture.root.join("state ${HOME}");
+    let workspace_id = id(1);
+    let state = state_home.join("hive/v2/workspaces").join(&workspace_id);
+    let registered_root = register_fixture(&fixture, &workspace, &state);
+    let registration = state.join("active-root.json");
+    let bin = fixture.root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(&fixture.dolt, bin.join("dolt")).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path))).unwrap();
     let invoke = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_hive"))
-            .env_clear()
-            .env("HOME", fixture.root.join("home"))
-            .env("XDG_STATE_HOME", &state_home)
-            .current_dir(&fixture.root)
-            .args(["--contract", "2", "--json", "--workspace"])
-            .arg(&workspace)
-            .arg("workspace")
+        lifecycle_command(&fixture, &workspace, &state_home)
             .args(args)
             .output()
             .unwrap()
@@ -405,6 +435,61 @@ fn workspace_runtime_cli_starts_and_stops_registered_workspace() {
         let started = invoke(&start);
         let start_report: Value = serde_json::from_slice(&started.stdout).unwrap();
         assert!(started.status.success(), "{start_report}");
+        assert!(!workspace.join("db/config.yaml").exists());
+        let password_file = Path::new(
+            start_report["data"]["reader_password_file"]
+                .as_str()
+                .unwrap(),
+        );
+        let run = password_file.parent().unwrap();
+        assert_eq!(run.parent(), Some(state.as_path()));
+        assert_eq!(fs::metadata(run).unwrap().mode() & 0o777, 0o700);
+        for name in [
+            "server-config.yaml",
+            "reader-password",
+            "writer-password",
+            "privileges.db",
+        ] {
+            assert_eq!(fs::metadata(run.join(name)).unwrap().mode() & 0o777, 0o600);
+        }
+        let password = fs::read_to_string(password_file).unwrap();
+        let config = fs::read_to_string(run.join("server-config.yaml")).unwrap();
+        assert!(!config.contains(&password));
+        assert!(!config.contains(&fs::read_to_string(run.join("writer-password")).unwrap()));
+        let expected = &start_report["data"]["committed_identity"];
+        assert_eq!(expected["dolt_commit"], baseline);
+        for command in ["status", "doctor"] {
+            let output = lifecycle_command(&fixture, &workspace, &state_home)
+                .env("PATH", &path)
+                .env(
+                    "HIVE_DOLT_USER",
+                    start_report["data"]["reader_user"].as_str().unwrap(),
+                )
+                .env("HIVE_DOLT_PASSWORD", &password)
+                .args([
+                    command,
+                    "--workspace-id",
+                    &workspace_id,
+                    "--database",
+                    "db",
+                    "--port",
+                    &port,
+                ])
+                .output()
+                .unwrap();
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(output.status.success(), "{report}");
+            assert_eq!(&report["data"]["committed_identity"], expected);
+        }
+        assert_access_denied(Conn::new(
+            OptsBuilder::new()
+                .ip_or_hostname(Some(HOST))
+                .tcp_port(port.parse().unwrap())
+                .prefer_socket(false)
+                .tcp_connect_timeout(Some(Duration::from_secs(3)))
+                .read_timeout(Some(Duration::from_secs(3)))
+                .user(Some("root")),
+        ));
         let running = invoke(&["status"]);
         let repeated = invoke(&start);
         fs::write(&pending, b"synthetic pending").unwrap();
@@ -445,6 +530,114 @@ fn workspace_runtime_cli_starts_and_stops_registered_workspace() {
     assert_eq!(fs::read(pending).unwrap(), b"synthetic pending");
     assert!(!state.join("server.json").exists());
     assert!(state.join("lock").exists());
+    assert!(!workspace.join("db/config.yaml").exists());
+    assert!(
+        !Path::new(
+            start_report["data"]["reader_password_file"]
+                .as_str()
+                .unwrap()
+        )
+        .parent()
+        .unwrap()
+        .exists()
+    );
+}
+
+#[test]
+#[ignore = "requires pinned Dolt at HIVE_DOLT_BIN, local TCP and Linux pidfds"]
+fn workspace_runtime_cli_stops_legacy_launch_and_preserves_its_config() {
+    let (mut fixture, nonce, _) = prepare();
+    let workspace = fixture.root.join("workspace");
+    let state_home = fixture.root.join("state");
+    let workspace_id = id(1);
+    let state = state_home.join("hive/v2/workspaces").join(&workspace_id);
+    register_fixture(&fixture, &workspace, &state);
+    let db = workspace.join("db");
+    let artifact = db.join("config.yaml");
+    let run = state.join(format!("run-{nonce}"));
+    fs::rename(fixture.root.join("runtime"), &run).unwrap();
+    let binary = fs::metadata(&fixture.dolt).unwrap();
+    for (name, data) in [
+        ("binary-id", format!("{}:{}", binary.dev(), binary.ino())),
+        ("reader-password", fixture.password.clone()),
+    ] {
+        let file = run.join(name);
+        fs::write(&file, data).unwrap();
+        fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let available = TcpListener::bind((HOST, 0)).unwrap();
+    fixture.port = available.local_addr().unwrap().port();
+    drop(available);
+    let child = spawn_legacy_server(&fixture, &db, &run);
+    let pid = child.id();
+    fixture.server = Some(child);
+    fixture.wait_for_listener();
+    let (boot, start_ticks) = process_identity(&PathBuf::from(format!("/proc/{pid}")));
+    let record = serde_json::json!({
+        "version": 2,
+        "workspace_id": workspace_id,
+        "workspace_root": workspace,
+        "pid": pid,
+        "boot_id": boot.trim(),
+        "start_ticks": start_ticks,
+        "nonce": nonce,
+        "endpoint": { "port": fixture.port, "database": "db" },
+    });
+    fs::write(state.join("server.json"), record.to_string()).unwrap();
+    let invoke = |args: &[&str]| {
+        let output = lifecycle_command(&fixture, &workspace, &state_home)
+            .env(
+                "HIVE_DOLT_USER",
+                format!("reader_{}", &nonce.replace('-', "")[..24]),
+            )
+            .env("HIVE_DOLT_PASSWORD", &fixture.password)
+            .args(args)
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(output.status.success(), "{report}");
+        report
+    };
+    let port = fixture.port.to_string();
+    let status = invoke(&[
+        "status",
+        "--workspace-id",
+        &workspace_id,
+        "--database",
+        "db",
+        "--port",
+        &port,
+    ]);
+    assert_eq!(status["data"]["runtime"]["process"], "pid_start_verified");
+    assert_eq!(
+        status["data"]["runtime"]["endpoint"],
+        "committed_identity_verified"
+    );
+    let original = fs::read(&artifact).unwrap();
+    let inode = fs::metadata(&artifact).unwrap().ino();
+    assert_eq!(invoke(&["stop"])["data"]["process_exit"], "pidfd_verified");
+    assert!(!run.exists());
+    assert_eq!(fs::read(&artifact).unwrap(), original);
+
+    let available = TcpListener::bind((HOST, 0)).unwrap();
+    let restart_port = available.local_addr().unwrap().port().to_string();
+    drop(available);
+    let started = invoke(&[
+        "start",
+        "--dolt-bin",
+        fixture.dolt.to_str().unwrap(),
+        "--port",
+        &restart_port,
+    ]);
+    let running_artifact = fs::read(&artifact);
+    invoke(&["stop"]);
+    assert_eq!(
+        started["data"]["committed_identity"],
+        status["data"]["committed_identity"]
+    );
+    assert_eq!(running_artifact.unwrap(), original);
+    assert_eq!(fs::read(&artifact).unwrap(), original);
+    assert_eq!(fs::metadata(&artifact).unwrap().ino(), inode);
 }
 
 #[test]

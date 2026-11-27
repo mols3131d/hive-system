@@ -29,6 +29,7 @@ use crate::error::{ErrorCode, HiveError};
 const WAIT: Duration = Duration::from_secs(10);
 const RETRY: Duration = Duration::from_millis(25);
 const DATABASE: &str = "db";
+const SERVER_CONFIG: &str = "server-config.yaml";
 
 pub(super) fn run(
     options: &CommonOptions,
@@ -167,6 +168,13 @@ fn start(
         regular(&run, "privileges.db")?
             .sync_all()
             .map_err(io_error)?;
+        write_new(
+            &run,
+            SERVER_CONFIG,
+            &server_config(&db.path, &run.path, port)?,
+        )?;
+        require_private_dir(&run)?;
+        require_private_file(&regular(&run, SERVER_CONFIG)?)?;
         sync(&run)?;
         record_launch_intent(state, &run, db, &nonce)
     };
@@ -179,7 +187,7 @@ fn start(
 
     drop(available);
     let mut launch = command();
-    launch.args(server_args(&db.path, &run.path, port));
+    launch.args(server_args(&run.path));
     let mut child = match launch.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -558,22 +566,17 @@ fn verify_with<T>(
         let exe = fs::metadata(proc.join("exe")).map_err(io_error)?;
         let binary_id = read_private(run, "binary-id")?;
         let cmdline = fs::read(proc.join("cmdline")).map_err(io_error)?;
-        let args = server_args(&root, &run.path, server.endpoint.port);
         for dir in [state, run, noms] {
             require_current_directory(dir)?;
         }
-        let actual = cmdline.strip_suffix(&[0]).unwrap_or(&cmdline);
         if (cwd.dev(), cwd.ino()) != run.file_identity()?
             || binary_id != format!("{}:{}", exe.dev(), exe.ino())
-            || !actual
-                .split(|byte| *byte == 0)
-                .skip(1)
-                .eq(args.iter().map(|arg| arg.as_bytes()))
         {
             return Err(unverified(
-                "Dolt executable, launch arguments, or canonical directories changed.",
+                "Dolt executable or canonical working directory changed.",
             ));
         }
+        verify_server_launch(&cmdline, &root, run, server.endpoint.port)?;
         if !owns_store(&proc, noms, server.pid)? {
             return Err(unverified(
                 "Dolt does not hold the selected store's exclusive lock.",
@@ -777,8 +780,17 @@ fn path_flag(flag: &str, path: &Path) -> OsString {
     arg
 }
 
-fn server_args(db: &Path, run: &Path, port: NonZeroU16) -> Vec<OsString> {
-    vec![
+fn server_args(run: &Path) -> [OsString; 4] {
+    [
+        "sql-server".into(),
+        "--config".into(),
+        run.join(SERVER_CONFIG).into_os_string(),
+        "--skip-root-user-initialization".into(),
+    ]
+}
+
+fn legacy_server_args(db: &Path, run: &Path, port: NonZeroU16) -> [OsString; 9] {
+    [
         "sql-server".into(),
         "--skip-root-user-initialization".into(),
         "--host=127.0.0.1".into(),
@@ -789,6 +801,53 @@ fn server_args(db: &Path, run: &Path, port: NonZeroU16) -> Vec<OsString> {
         "--event-scheduler=OFF".into(),
         "--loglevel=error".into(),
     ]
+}
+
+fn server_config(db: &Path, run: &Path, port: NonZeroU16) -> Result<Vec<u8>, HiveError> {
+    // Dolt expands environment variables before parsing YAML. Double each
+    // dollar so paths are literal, and use JSON quoting for YAML scalars.
+    let literal = |path: &Path| json_path(path).map(|path| path.replace('$', "$$"));
+    serde_json::to_vec(&json!({
+        "log_level": "error",
+        "behavior": { "event_scheduler": "OFF" },
+        "listener": { "host": "127.0.0.1", "port": port },
+        "data_dir": literal(db)?,
+        "cfg_dir": literal(run)?,
+        "privilege_file": literal(&run.join("privileges.db"))?,
+    }))
+    .map_err(|_| unavailable("Could not encode the Dolt launch configuration."))
+}
+
+fn verify_server_launch(
+    cmdline: &[u8],
+    db: &Path,
+    run: &ScopedDirectory,
+    port: NonZeroU16,
+) -> Result<(), HiveError> {
+    let actual = cmdline
+        .strip_suffix(&[0])
+        .ok_or_else(|| unverified("Dolt launch arguments are unavailable."))?;
+    let matches = |args: &[OsString]| {
+        actual
+            .split(|byte| *byte == 0)
+            .skip(1)
+            .eq(args.iter().map(|arg| arg.as_bytes()))
+    };
+    if matches(&server_args(&run.path)) {
+        let expected = server_config(db, &run.path, port)?;
+        let file = regular(run, SERVER_CONFIG)?;
+        require_private_file(&file)?;
+        let mut contents = Vec::new();
+        file.take(expected.len() as u64 + 1)
+            .read_to_end(&mut contents)
+            .map_err(io_error)?;
+        if contents != expected {
+            return Err(unverified("The private Dolt launch configuration changed."));
+        }
+    } else if !matches(&legacy_server_args(db, &run.path, port)) {
+        return Err(unverified("Dolt launch arguments changed."));
+    }
+    Ok(())
 }
 
 fn dolt_command(executable: &Path, directory: &Path) -> Command {
@@ -1041,6 +1100,7 @@ fn io_error(error: io::Error) -> HiveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn pidfd_requires_one_matching_positive_procfs_pid() {
@@ -1056,6 +1116,64 @@ mod tests {
             assert!(!pidfd_matches(info, 123), "{info:?}");
         }
         assert!(!pidfd_matches("Pid:\t0\n", 0));
+    }
+
+    #[test]
+    fn verifies_exact_configured_and_legacy_launches() {
+        let directory = tempfile::Builder::new()
+            .prefix("hive-runtime-$HOME-")
+            .tempdir()
+            .unwrap();
+        let root = directory.path();
+        let run = ScopedDirectory::open_absolute(root).unwrap();
+        let db = root.join("data ${HOME} $$ ' \"\\\n");
+        let port = NonZeroU16::new(3307).unwrap();
+        let encode = |args: &[OsString]| {
+            let mut cmdline = b"/fixture/dolt\0".to_vec();
+            for arg in args {
+                cmdline.extend_from_slice(arg.as_bytes());
+                cmdline.push(0);
+            }
+            cmdline
+        };
+        let configured = encode(&server_args(root));
+        let legacy = encode(&legacy_server_args(&db, root, port));
+        assert!(verify_server_launch(&configured, &db, &run, port).is_err());
+        verify_server_launch(&legacy, &db, &run, port).unwrap();
+        assert!(
+            verify_server_launch(
+                &[legacy, b"--config=other\0".to_vec()].concat(),
+                &db,
+                &run,
+                port
+            )
+            .is_err()
+        );
+
+        let bytes = server_config(&db, root, port).unwrap();
+        let config: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            config["data_dir"],
+            format!(
+                "{}/data $${{HOME}} $$$$ ' \"\\\n",
+                root.display().to_string().replace('$', "$$")
+            )
+        );
+        assert_eq!(config["behavior"]["event_scheduler"], "OFF");
+        write_new(&run, SERVER_CONFIG, &bytes).unwrap();
+        verify_server_launch(&configured, &db, &run, port).unwrap();
+        assert!(
+            verify_server_launch(&configured, &db, &run, NonZeroU16::new(3308).unwrap()).is_err()
+        );
+
+        let path = root.join(SERVER_CONFIG);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(verify_server_launch(&configured, &db, &run, port).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let moved = root.join("moved-config");
+        fs::rename(&path, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &path).unwrap();
+        assert!(verify_server_launch(&configured, &db, &run, port).is_err());
     }
 
     #[test]
