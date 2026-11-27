@@ -10,8 +10,8 @@ mod output;
 use std::process::ExitCode;
 
 use cli::{
-    AreaCommand, BotCommand, Command, ConfigCommand, Contract, DirectiveCommand, Invocation,
-    IssueCommand, ParseFailure,
+    AreaCommand, BotCommand, Command, ConfigCommand, Contract, ConversationCommand,
+    DirectiveCommand, Invocation, IssueCommand, ParseFailure,
 };
 use error::{ErrorCode, HiveError};
 
@@ -132,6 +132,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
             dolt::directive::show(&selection, invocation.common.project.as_ref(), &id)
         }
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
+        Command::Conversation(ConversationCommand::Show(args)) => {
+            dolt::conversation_show(&invocation.common, &args)
+        }
         Command::Issue(IssueCommand::List(args)) => dolt::issue_list(
             &args,
             invocation.common.project.as_ref(),

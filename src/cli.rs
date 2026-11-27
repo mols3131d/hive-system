@@ -256,6 +256,9 @@ pub(crate) enum Command {
     /// Inspect Issues under contract 2.
     #[command(subcommand, hide = true)]
     Issue(IssueCommand),
+    /// Inspect preserved Queen conversations under contract 2.
+    #[command(subcommand, hide = true)]
+    Conversation(ConversationCommand),
     /// Validate workspace records.
     Validate(ValidateArgs),
     /// Check the local environment and workspace.
@@ -677,6 +680,24 @@ pub(crate) struct DoltTargetArgs {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum ConversationCommand {
+    /// Show one preserved Queen conversation.
+    Show(ConversationShowArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ConversationShowArgs {
+    /// Canonical lowercase UUIDv7 of the registered Queen.
+    #[arg(long, value_name = "UUID", allow_negative_numbers = true)]
+    pub(crate) bot: Option<OsString>,
+    /// Canonical lowercase UUIDv7 of the preserved conversation.
+    #[arg(long, value_name = "UUID", allow_negative_numbers = true)]
+    pub(crate) id: Option<OsString>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Subcommand)]
 pub(crate) enum AreaCommand {
     /// List committed root Areas or the direct children of one Area.
     List(AreaListArgs),
@@ -836,6 +857,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 .or(area_matches)
                 .or_else(|| retry_scoped_read_failure(&cli, &args, error.kind(), "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, error.kind(), "directive"))
+                .or_else(|| retry_conversation_failure(&cli, &args, error.kind()))
                 .or_else(|| {
                     cli.clone()
                         .ignore_errors(true)
@@ -1036,6 +1058,78 @@ fn retry_scoped_read_failure(
     (command
         .split_once(' ')
         .is_some_and(|(matched, _)| matched == domain)
+        && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+        .then_some(matches)
+}
+
+fn retry_conversation_failure(
+    cli: &clap::Command,
+    args: &[OsString],
+    kind: ErrorKind,
+) -> Option<ArgMatches> {
+    if !matches!(
+        kind,
+        ErrorKind::UnknownArgument
+            | ErrorKind::ArgumentConflict
+            | ErrorKind::ValueValidation
+            | ErrorKind::InvalidValue
+            | ErrorKind::InvalidUtf8
+            | ErrorKind::TooManyValues
+    ) {
+        return None;
+    }
+    const SCOPED_VALUES: &[&str] = &["workspace", "project", "project-root", "at"];
+    const LEAF_VALUES: &[&str] = &["bot", "id", "workspace-id", "database", "port"];
+    let recover_metadata = |command: clap::Command, leaf: bool| {
+        command.mut_args(|arg| {
+            let Some(long) = arg.get_long() else {
+                return arg;
+            };
+            if !SCOPED_VALUES.contains(&long)
+                && !(leaf && LEAF_VALUES.contains(&long))
+                && long != "authority"
+            {
+                return arg;
+            }
+            let attached_only = long == "authority";
+            arg.action(ArgAction::Append)
+                .value_parser(OsStringValueParser::new())
+                .num_args(0..=1)
+                .require_equals(attached_only)
+        })
+    };
+    let retry = recover_metadata(cli.clone(), false)
+        .mut_subcommand("conversation", |conversation| {
+            conversation.mut_subcommand("show", |show| recover_metadata(show, true))
+        });
+    // Join a split single-dash value only after a known value-taking option.
+    // Clap still recognizes all long options, equals values and the -- boundary.
+    // These matches supply output metadata only. The original error is retained.
+    let mut args = args.iter().cloned().peekable();
+    let mut normalized = Vec::new();
+    normalized.extend(args.next());
+    while let Some(mut arg) = args.next() {
+        if arg == "--" {
+            normalized.push(arg);
+            normalized.extend(args);
+            break;
+        }
+        if arg
+            .to_str()
+            .and_then(|arg| arg.strip_prefix("--"))
+            .is_some_and(|name| SCOPED_VALUES.contains(&name) || LEAF_VALUES.contains(&name))
+            && args.peek().is_some_and(
+                |value| matches!(value.as_encoded_bytes(), [b'-', next, ..] if *next != b'-'),
+            )
+        {
+            arg.push("=");
+            arg.push(args.next().expect("peeked selector value"));
+        }
+        normalized.push(arg);
+    }
+    let matches = retry.try_get_matches_from(normalized).ok()?;
+    let (command, leaf) = matched_leaf(cli, &matches)?;
+    (command == "conversation show"
         && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
 }
@@ -1241,6 +1335,22 @@ impl Command {
                 Self::Validate(args) => args.validate_dolt_selection(common),
                 Self::Area(command) => command.validate_dolt_selection(common),
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
+                Self::Conversation(ConversationCommand::Show(args)) => {
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Conversation show requires --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Conversation show accepts only explicit workspace and conversation selection.",
+                        );
+                    }
+                    Ok(())
+                }
                 Self::Issue(
                     IssueCommand::List(args)
                     | IssueCommand::Ready(args)
@@ -1268,6 +1378,7 @@ impl Command {
             }
             Self::Area(_) => Err("Area commands require --contract 2."),
             Self::Issue(_) => Err("Issue commands require --contract 2."),
+            Self::Conversation(_) => Err("Conversation commands require --contract 2."),
             Self::Bot(command) => command.validate(common),
             Self::Directive(command) => command.validate(common),
             Self::Validate(args) => {
