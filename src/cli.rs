@@ -241,6 +241,9 @@ pub(crate) enum Command {
     Memory(MemoryCommand),
     /// Show the selected workspace context.
     Context,
+    /// Inspect Areas under contract 2.
+    #[command(subcommand, hide = true)]
+    Area(AreaCommand),
     /// Inspect Issues under contract 2.
     #[command(subcommand, hide = true)]
     Issue(IssueCommand),
@@ -631,6 +634,38 @@ pub(crate) struct DoltTargetArgs {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum AreaCommand {
+    /// List committed root Areas or the direct children of one Area.
+    List(AreaListArgs),
+    /// Show one committed Area.
+    Show(AreaShowArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct AreaListArgs {
+    /// Select the direct children of this canonical lowercase UUIDv7.
+    #[arg(long, value_name = "ID", allow_negative_numbers = true)]
+    pub(crate) parent: Option<String>,
+    /// Page size (default 25, maximum 100).
+    #[arg(long, default_value = "25", allow_negative_numbers = true)]
+    pub(crate) limit: String,
+    /// Continue from the previous page's next_cursor.
+    #[arg(long)]
+    pub(crate) cursor: Option<String>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct AreaShowArgs {
+    /// Canonical lowercase UUIDv7 Area selector.
+    #[arg(value_name = "ID", allow_negative_numbers = true)]
+    pub(crate) area: String,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Subcommand)]
 pub(crate) enum IssueCommand {
     /// Show an Issue and its bounded direct relation IDs.
     Show(IssueShowArgs),
@@ -715,13 +750,20 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             return Err(ParseFailure::Display(error));
         }
         Err(error) => {
-            // Use whatever clap recognized before the error. This keeps option
-            // values and positionals that resemble switches out of selection.
-            let partial = cli
-                .clone()
-                .ignore_errors(true)
-                .try_get_matches_from(&args)
-                .ok();
+            // Only use output options recognized by Clap, including on retry.
+            // Values and positionals that resemble switches stay literal.
+            let area_matches = match error.kind() {
+                ErrorKind::UnknownArgument | ErrorKind::ValueValidation => {
+                    retry_area_read(&cli, &args)
+                }
+                _ => None,
+            };
+            let partial = area_matches.or_else(|| {
+                cli.clone()
+                    .ignore_errors(true)
+                    .try_get_matches_from(&args)
+                    .ok()
+            });
             let root = partial.as_ref();
             let matched = root.and_then(|args| matched_leaf(&cli, args));
             let leaf = matched.as_ref().map(|(_, args)| *args);
@@ -782,11 +824,6 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
 fn retry_issue_list(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {
     // A malformed Project must reach the v2 UUID check after Clap has read
     // the contract and format. Keep the original parser for all other commands.
-    let defer_project_check = |command: clap::Command| {
-        command.mut_arg("project", |arg| {
-            arg.value_parser(StringValueParser::new().map(ProjectId::Ordinary))
-        })
-    };
     let retry = defer_project_check(cli.clone().mut_subcommand("issue", |issue| {
         issue.mut_subcommand("list", defer_project_check)
     }));
@@ -794,6 +831,28 @@ fn retry_issue_list(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches
     let (command, leaf) = matched_leaf(cli, &matches)?;
     (command == "issue list" && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
         .then_some(matches)
+}
+
+fn retry_area_read(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {
+    // Recover the output options for the original error. A forbidden Project
+    // or negative cursor can stop the initial parse before it sees them.
+    let retry = defer_project_check(cli.clone().mut_subcommand("area", |area| {
+        area.mut_subcommand("list", |list| {
+            defer_project_check(list).mut_arg("cursor", |arg| arg.allow_negative_numbers(true))
+        })
+        .mut_subcommand("show", defer_project_check)
+    }));
+    let matches = retry.try_get_matches_from(args).ok()?;
+    let (command, leaf) = matched_leaf(cli, &matches)?;
+    (matches!(command.as_str(), "area list" | "area show")
+        && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+        .then_some(matches)
+}
+
+fn defer_project_check(command: clap::Command) -> clap::Command {
+    command.mut_arg("project", |arg| {
+        arg.value_parser(StringValueParser::new().map(ProjectId::Ordinary))
+    })
 }
 
 fn add_leaf_options(command: clap::Command) -> clap::Command {
@@ -972,6 +1031,7 @@ impl Command {
         if common.contract == Contract::V2 {
             return match self {
                 Self::Validate(args) => args.validate_dolt_selection(common),
+                Self::Area(command) => command.validate_dolt_selection(common),
                 Self::Issue(IssueCommand::Show(args)) => args.validate_dolt_selection(common),
                 Self::Issue(IssueCommand::List(args)) => args.validate_dolt_selection(common),
                 _ => Ok(()),
@@ -991,6 +1051,7 @@ impl Command {
             Self::Project(ProjectCommand::Show { project_id }) => {
                 common.check_project(project_id.as_ref())
             }
+            Self::Area(_) => Err("Area commands require --contract 2."),
             Self::Issue(_) => Err("Issue commands require --contract 2."),
             Self::Validate(args) => {
                 if args.all || args.target.has_any() {
@@ -1043,6 +1104,23 @@ impl ValidateArgs {
         self.target.validate_common(common, ERROR)?;
         if !self.all || !self.target.has_all() {
             return Err("Dolt validation requires --all, --workspace-id, --database, and --port.");
+        }
+        Ok(())
+    }
+}
+
+impl AreaCommand {
+    fn validate_dolt_selection(&self, common: &CommonOptions) -> Result<(), &'static str> {
+        let target = match self {
+            Self::List(args) => &args.target,
+            Self::Show(args) => &args.target,
+        };
+        target.validate_common(
+            common,
+            "Dolt Area reads accept only an explicit local database and workspace ID.",
+        )?;
+        if !target.has_all() {
+            return Err("Dolt Area reads require --workspace-id, --database, and --port.");
         }
         Ok(())
     }
