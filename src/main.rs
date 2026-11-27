@@ -140,8 +140,12 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         }
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
         Command::Conversation(ConversationCommand::Show(args)) => {
-            dolt::conversation_show(&invocation.common, &args)
+            dolt::conversation_read(&invocation.common, &args, None)
         }
+        Command::Conversation(ConversationCommand::Export {
+            selection,
+            destination: Some(destination),
+        }) => dolt::conversation_read(&invocation.common, &selection, Some(&destination)),
         Command::ConversationList(args) => dolt::conversation_list(&invocation.common, &args),
         Command::Issue(IssueCommand::List(args)) => dolt::issue_list(
             &args,

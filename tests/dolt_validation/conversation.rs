@@ -25,7 +25,7 @@ fn published(workspace_id: &str, bot: &str, slug: &str, conversation: &str) -> S
 
 #[test]
 #[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
-fn conversation_show_reads_only_the_explicit_verified_copy() {
+fn conversation_reads_only_the_explicit_verified_copy() {
     let fixture = Fixture::start();
     let workspace_id = id(1);
     let retired = id(16);
@@ -50,30 +50,36 @@ fn conversation_show_reads_only_the_explicit_verified_copy() {
     let marker = copy.join("hive-workspace.yml");
     fs::write(&marker, descriptor(&workspace_id)).unwrap();
     let port = fixture.port.to_string();
-    let show = |bot: &str, expected_workspace: &str, password: &str| {
-        fixture.run_hive(
-            &[
-                "conversation",
-                "show",
-                "--workspace",
-                "copy",
-                "--workspace-id",
-                expected_workspace,
-                "--database",
-                DATABASE,
-                "--port",
-                &port,
-                "--bot",
-                bot,
-                "--id",
-                &conversation,
-                "--contract",
-                "2",
-                "--json",
-            ],
-            password,
-        )
+    let run = |bot: &str, expected_workspace: &str, password: &str, destination: Option<&str>| {
+        let mut args = vec![
+            "conversation",
+            if destination.is_some() {
+                "export"
+            } else {
+                "show"
+            },
+            "--workspace",
+            "copy",
+            "--workspace-id",
+            expected_workspace,
+            "--database",
+            DATABASE,
+            "--port",
+            &port,
+            "--bot",
+            bot,
+            "--id",
+            &conversation,
+            "--contract",
+            "2",
+            "--json",
+        ];
+        if let Some(destination) = destination {
+            args.extend(["--destination", destination]);
+        }
+        fixture.run_hive(&args, password)
     };
+    let show = |bot, expected_workspace, password| run(bot, expected_workspace, password, None);
     let report = |output: Output, status: i32| {
         let json: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(output.status.code(), Some(status), "{json}");
@@ -95,6 +101,27 @@ fn conversation_show_reads_only_the_explicit_verified_copy() {
         }
         json
     };
+    #[cfg(target_os = "linux")]
+    let export =
+        |bot: &str, expected_workspace: &str, password: &str, destination: &str, status| {
+            let output = run(bot, expected_workspace, password, Some(destination));
+            let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(output.status.code(), Some(status), "{json}");
+            assert!(output.stderr.is_empty());
+            assert_eq!(json["schema_version"], 2);
+            assert_eq!(json["command"], "conversation export");
+            assert_eq!(json["ok"], status == 0);
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            for private in [
+                PRIVATE_BODY_MARKER,
+                "Synthetic title",
+                "synthetic-session",
+                destination,
+            ] {
+                assert!(!stdout.contains(private));
+            }
+            json
+        };
     let active = id(15);
     for (bot, slug) in [(&active, "fixture"), (&retired, "retired")] {
         let folder = copy.join("conversations/bots").join(bot);
@@ -108,6 +135,24 @@ fn conversation_show_reads_only_the_explicit_verified_copy() {
         assert_eq!(json["data"]["metadata"]["bot_slug"], slug);
         assert_eq!(json["data"]["metadata"]["conversation_id"], conversation);
         assert_eq!(json["data"]["body"], BODY);
+        #[cfg(target_os = "linux")]
+        {
+            let destination = format!("export-{slug}.md");
+            let json = export(bot, &workspace_id, &fixture.password, &destination, 0);
+            assert_eq!(json["context"]["db_commit"], before.0);
+            assert_eq!(json["data"]["conversation_id"], conversation);
+            assert_eq!(json["data"]["bot_id"], *bot);
+            assert_eq!(
+                fs::read(fixture.root.join(&destination)).unwrap(),
+                BODY.as_bytes()
+            );
+            let json = export(bot, &workspace_id, &fixture.password, &destination, 5);
+            assert_eq!(json["error"]["code"], "ALREADY_EXISTS");
+            assert_eq!(
+                fs::read(fixture.root.join(&destination)).unwrap(),
+                BODY.as_bytes()
+            );
+        }
         assert_eq!(fs::read(&path).unwrap(), content.as_bytes());
     }
     let folder = copy.join("conversations/bots").join(&active);
@@ -134,6 +179,24 @@ fn conversation_show_reads_only_the_explicit_verified_copy() {
             report(show(&active, &workspace_id, &fixture.password), 4)["error"]["code"],
             "INVALID_RECORD"
         );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let destination = "failed-export.md";
+        fs::write(&path, content.replace("Last line", "Changed line")).unwrap();
+        let json = export(&active, &workspace_id, &fixture.password, destination, 4);
+        assert_eq!(json["error"]["code"], "INVALID_RECORD");
+        let json = export(&active, &other_workspace, &fixture.password, destination, 7);
+        assert_eq!(json["error"]["code"], "AUTHORITY_UNVERIFIED");
+        let json = export(
+            &active,
+            &workspace_id,
+            "invalid-fixture-password",
+            destination,
+            6,
+        );
+        assert_eq!(json["error"]["code"], "UNAUTHORIZED");
+        assert!(!fixture.root.join(destination).exists());
     }
     fs::write(&path, &content).unwrap();
 
@@ -163,6 +226,13 @@ fn conversation_show_reads_only_the_explicit_verified_copy() {
         report(show(&active, &workspace_id, &fixture.password), 2)["error"]["code"],
         "INVALID_CONFIG"
     );
+    #[cfg(target_os = "linux")]
+    {
+        let destination = "failed-export.md";
+        let json = export(&active, &workspace_id, &fixture.password, destination, 2);
+        assert_eq!(json["error"]["code"], "INVALID_CONFIG");
+        assert!(!fixture.root.join(destination).exists());
+    }
     fs::remove_file(&path).unwrap();
     fs::rename(&saved_file, &path).unwrap();
     let saved_folder = folder.with_file_name("saved");
