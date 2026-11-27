@@ -408,7 +408,7 @@ mod filesystem {
         }
 
         #[cfg(target_os = "linux")]
-        pub(crate) fn open_directory(&self, name: &OsStr) -> Result<Self, HiveError> {
+        pub(crate) fn open_child_directory(&self, name: &OsStr) -> Result<Self, HiveError> {
             let file = open_child(&self.file, name, libc::O_DIRECTORY)?.ok_or_else(|| {
                 HiveError::new(
                     ErrorCode::NotFound,
@@ -451,7 +451,7 @@ mod filesystem {
                 match FileType::from_raw_mode(metadata.st_mode) {
                     FileType::RegularFile => {}
                     FileType::Directory => self
-                        .open_directory(OsStr::from_bytes(name.to_bytes()))?
+                        .open_child_directory(OsStr::from_bytes(name.to_bytes()))?
                         .check_object_entries(depth + 1)?,
                     _ => return Err(unsafe_store()),
                 }

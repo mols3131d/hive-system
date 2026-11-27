@@ -332,9 +332,9 @@ impl AssetRepository {
     }
 
     fn select_directories(root: &crate::config_file::ScopedDirectory) -> Result<Self, HiveError> {
-        let assets = root.open_directory(OsStr::new("assets"))?;
-        let git_dir = assets.open_directory(OsStr::new(".git"))?;
-        let objects = git_dir.open_directory(OsStr::new("objects"))?;
+        let assets = root.open_child_directory(OsStr::new("assets"))?;
+        let git_dir = assets.open_child_directory(OsStr::new(".git"))?;
+        let objects = git_dir.open_child_directory(OsStr::new("objects"))?;
         Ok(Self {
             assets,
             git_dir,
