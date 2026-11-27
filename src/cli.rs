@@ -826,7 +826,7 @@ pub(crate) enum DirectiveStatus {
 #[derive(Subcommand)]
 pub(crate) enum BotCommand {
     /// Register a Queen from a reviewed, committed Soul (contract 2).
-    #[command(hide = true)]
+    #[command(skip)]
     Register(BotRegisterArgs),
     /// List registered Manager Bots.
     List {
@@ -1325,9 +1325,6 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     for domain in ["bot", "directive"] {
         cli = cli.mut_subcommand(domain, |command| {
             command.mut_subcommands(|leaf| {
-                if leaf.get_name() == "register" {
-                    return leaf;
-                }
                 leaf.mut_args(|arg| match arg.get_id().as_str() {
                     "workspace_id" | "database" | "port" => arg.hide(true),
                     _ => arg,
@@ -1361,6 +1358,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     let extension = resource_parser(&cli, &args)
         .or_else(|| label_parser(&cli, &args))
         .or_else(|| issue_writer_parser(&cli, &args))
+        .or_else(|| bot_writer_parser(&cli, &args))
         .or_else(|| operation_parser(&cli, &args));
     let (parsed, extension_matches) = if let Some(extension) = extension {
         cli = extension.cli;
@@ -1405,7 +1403,6 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 .or(config_error_matches)
                 .or(area_matches)
                 .or_else(|| retry_write_failure(&cli, &args, error.kind(), "area", &["create"]))
-                .or_else(|| retry_write_failure(&cli, &args, error.kind(), "bot", &["register"]))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "context"))
@@ -1420,7 +1417,6 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                         .ok()?;
                     recover_unknown_long(&cli, &args, &partial, &error, "workspace")
                         .or_else(|| recover_unknown_long(&cli, &args, &partial, &error, "area"))
-                        .or_else(|| recover_unknown_long(&cli, &args, &partial, &error, "bot"))
                         .or_else(|| recover_context_resolve(&cli, &args, &partial, &error))
                         .or(Some(partial))
                 });
@@ -1479,6 +1475,12 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             CommonArgs::from_arg_matches(leaf).map_err(|error| safe_parse_message(error.kind()))?;
         let common = root.resolve(leaf_options)?;
         let mut command = match matches.subcommand() {
+            Some(("bot", bot)) if bot.subcommand_name() == Some("register") => {
+                Command::Bot(BotCommand::Register(
+                    BotRegisterArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                ))
+            }
             Some(("issue", issue)) if issue.subcommand_name() == Some("note") => {
                 Command::IssueNote(
                     IssueNoteArgs::from_arg_matches(leaf)
@@ -2177,6 +2179,43 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
         return None;
     }
     Some(ExtendedParse {
+        parsed: extended.clone().try_get_matches_from(args),
+        cli: extended,
+        partial: Some(partial),
+    })
+}
+
+fn bot_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedParse> {
+    if !args.iter().skip(1).any(|arg| arg == "bot") {
+        return None;
+    }
+    let extended = cli.clone().mut_subcommand("bot", |bot| {
+        bot.subcommand(add_leaf_options(BotRegisterArgs::augment_args(
+            clap::Command::new("register")
+                .about("Register a Queen from a reviewed, committed Soul."),
+        )))
+    });
+    let recovery = extended_error_options(extended.clone().disable_help_subcommand(true))
+        .mut_subcommand("bot", |bot| {
+            extended_help_probe(bot).mut_subcommand("register", extended_error_options)
+        });
+    let partial = match recovery.clone().try_get_matches_from(args) {
+        Ok(matches) => matches,
+        Err(error) => {
+            let partial = recovery
+                .clone()
+                .ignore_errors(true)
+                .try_get_matches_from(args)
+                .ok()?;
+            retry_write_failure(&extended, args, error.kind(), "bot", &["register"])
+                .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "bot"))
+                .unwrap_or(partial)
+        }
+    };
+    let leaf = partial
+        .subcommand_matches("bot")?
+        .subcommand_matches("register")?;
+    (requested_contract(Some(&partial), Some(leaf)) == Contract::V2).then(|| ExtendedParse {
         parsed: extended.clone().try_get_matches_from(args),
         cli: extended,
         partial: Some(partial),
