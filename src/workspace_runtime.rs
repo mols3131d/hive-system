@@ -42,38 +42,42 @@ pub(super) fn run(
         .ok_or_else(|| unverified("No active-root registration exists for this workspace."))?;
     require_private_dir(&state)?;
     require_local_filesystem(&state)?;
-    let _lock = lock(&state)?;
+    let held = if matches!(command, WorkspaceCommand::Start { .. }) {
+        lock(&state)?
+    } else {
+        lock_file(regular(&state, "lock")?, libc::LOCK_EX)?
+    };
 
     // Resolve again after taking the lock. A moved path or replaced descriptor
     // must not give a different root or UUID access to this state.
-    let selected = read_explicit(&workspace.root.path)?;
-    if workspace.root.file_identity()? != selected.root.file_identity()?
-        || selected.workspace_id() != id
-        || find_state(id, &workspace.root.path)?
-            .ok_or_else(|| unverified("The workspace state directory disappeared."))?
-            .file_identity()?
-            != state.file_identity()?
-    {
-        return Err(unverified("The selected workspace or its state changed."));
-    }
-    let registration: Registration = read_json(Some(&state), "active-root.json")?
-        .ok_or_else(|| unverified("No active-root registration exists for this workspace."))?;
-    check_identity(
-        registration.version,
-        &registration.workspace_id,
-        &registration.workspace_root,
-        id,
-        root,
-    )?;
-    let db = child_dir(&workspace.root, DATABASE)?;
-    let noms = child_dir(&child_dir(&db, ".dolt")?, "noms")?;
-    require_local_filesystem(&noms)?;
-    let manifest = regular(&noms, "manifest")?;
-    drop(manifest);
-
-    if state.contains(c"starting")? {
-        return Err(unverified("An interrupted launch requires inspection."));
-    }
+    let check_selection = || -> Result<(), HiveError> {
+        let selected = read_explicit(&workspace.root.path)?;
+        if !same_file(&held, &regular(&state, "lock")?)?
+            || workspace.root.file_identity()? != selected.root.file_identity()?
+            || selected.workspace_id() != id
+            || find_state(id, &workspace.root.path)?
+                .ok_or_else(|| unverified("The workspace state directory disappeared."))?
+                .file_identity()?
+                != state.file_identity()?
+        {
+            return Err(unverified("The selected workspace or its state changed."));
+        }
+        let registration: Registration = read_json(Some(&state), "active-root.json")?
+            .ok_or_else(|| unverified("No active-root registration exists for this workspace."))?;
+        check_identity(
+            registration.version,
+            &registration.workspace_id,
+            &registration.workspace_root,
+            id,
+            root,
+        )?;
+        if state.contains(c"starting")? {
+            return Err(unverified("An interrupted launch requires inspection."));
+        }
+        Ok(())
+    };
+    check_selection()?;
+    let store = recovery::Store::open(&workspace.root)?;
     let server: Option<Server> = read_json(Some(&state), "server.json")?;
     match command {
         WorkspaceCommand::Start { dolt_bin, port } => {
@@ -87,13 +91,30 @@ pub(super) fn run(
                     "A pending request requires recovery before start.",
                 ));
             }
-            start(&state, &db, &noms, id, root, dolt_bin, parse_port(port)?)
+            start(
+                &state,
+                &store.db,
+                &store.noms,
+                id,
+                root,
+                dolt_bin,
+                parse_port(port)?,
+            )
         }
         WorkspaceCommand::Stop => {
             let server = server.ok_or_else(|| unverified("No owned server is recorded."))?;
             check_server(&server, id, root)?;
-            stop(&state, &noms, &server)
+            stop(&state, &store, &server, &check_selection)
         }
+        WorkspaceCommand::Recover { dolt_bin } => recovery::recover(
+            &state,
+            &store,
+            id,
+            root,
+            server.as_ref(),
+            dolt_bin,
+            &check_selection,
+        ),
         WorkspaceCommand::Status(_) => unreachable!(),
     }
 }
@@ -207,21 +228,7 @@ fn start(
                 database: DATABASE.to_owned(),
             },
         };
-        let deadline = Instant::now() + WAIT;
-        loop {
-            if exited(&handle, Duration::ZERO)? {
-                return Err(unavailable("Dolt exited before becoming ready."));
-            }
-            if owns_listener(&proc, port)? {
-                break;
-            }
-            if Instant::now() >= deadline {
-                return Err(unavailable(
-                    "Dolt did not acquire the requested loopback listener.",
-                ));
-            }
-            thread::sleep(RETRY);
-        }
+        wait_for_listener(&handle, &proc, port)?;
         let identity = verify(&server, state, &run, noms, &handle)?;
         let bytes = serde_json::to_vec(&server)
             .map_err(|_| unavailable("Could not encode the server record."))?;
@@ -261,8 +268,9 @@ fn start(
 
 fn stop(
     state: &ScopedDirectory,
-    noms: &ScopedDirectory,
+    store: &recovery::Store,
     server: &Server,
+    check_selection: &impl Fn() -> Result<(), HiveError>,
 ) -> Result<Value, HiveError> {
     if server.endpoint.database != DATABASE {
         return Err(unverified(
@@ -273,16 +281,30 @@ fn stop(
     require_private_dir(&run)?;
     // Acquire a kernel process handle before checking mutable procfs entries.
     let handle = pidfd(server.pid)?;
-    verify(server, state, &run, noms, &handle)?;
+    let capture = verify_with(server, state, &run, &store.noms, &handle, |_, check| {
+        let capture = recovery::capture(state, store, server, &run)?;
+        check_selection()?;
+        check()?;
+        Ok(capture)
+    })?;
     send_signal(&handle, libc::SIGTERM)?;
     if !exited(&handle, WAIT)? {
         return Err(unavailable(
             "Dolt exit was not confirmed; runtime state was preserved.",
         ));
     }
+    check_selection()?;
+    if read_json::<Server>(Some(state), "server.json")?.as_ref() != Some(server) {
+        return Err(unverified(
+            "The owned Dolt server record changed during stop.",
+        ));
+    }
+    if let Some(capture) = capture {
+        capture.record_exit(state, store, server)?;
+    }
+    remove_run(&run)?;
     fs::remove_file(at(state, "server.json")).map_err(io_error)?;
     sync(state)?;
-    remove_run(&run)?;
     Ok(json!({
         "state": "stopped",
         "workspace_id": server.workspace_id,
@@ -523,6 +545,8 @@ impl WriterRuntime<'_> {
 
 #[path = "workspace_runtime/pending.rs"]
 mod pending;
+#[path = "workspace_runtime/recovery.rs"]
+mod recovery;
 
 fn verify(
     server: &Server,
@@ -660,6 +684,24 @@ fn owns_listener(proc: &Path, port: NonZeroU16) -> Result<bool, HiveError> {
             && sockets.iter().any(|inode| inode == fields[6])
     });
     Ok(!unix_listener && listeners == [format!("0100007F:{:04X}", port.get())])
+}
+
+fn wait_for_listener(handle: &OwnedFd, process: &Path, port: NonZeroU16) -> Result<(), HiveError> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if exited(handle, Duration::ZERO)? {
+            return Err(unavailable("Dolt exited before becoming ready."));
+        }
+        if owns_listener(process, port)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(unavailable(
+                "Dolt did not acquire the requested loopback listener.",
+            ));
+        }
+        thread::sleep(RETRY);
+    }
 }
 
 fn pidfd(pid: i32) -> Result<OwnedFd, HiveError> {
@@ -914,6 +956,12 @@ fn create_run(state: &ScopedDirectory, nonce: &str) -> Result<ScopedDirectory, H
 fn regular(directory: &ScopedDirectory, name: &str) -> Result<File, HiveError> {
     crate::config_file::open_regular_child(directory.directory_file(), OsStr::new(name))?
         .ok_or_else(|| unverified("A required workspace or runtime file is missing."))
+}
+
+fn same_file(first: &File, second: &File) -> Result<bool, HiveError> {
+    let first = first.metadata().map_err(io_error)?;
+    let second = second.metadata().map_err(io_error)?;
+    Ok((first.dev(), first.ino()) == (second.dev(), second.ino()))
 }
 
 fn read_private(directory: &ScopedDirectory, name: &str) -> Result<String, HiveError> {

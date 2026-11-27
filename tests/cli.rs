@@ -3119,6 +3119,43 @@ fn workspace_recovers_output_flags_after_a_duplicate_target() {
 }
 
 #[test]
+fn workspace_recover_is_v2_only() {
+    let sandbox = Sandbox::new();
+    for selection in [&[][..], &["--contract", "1"][..]] {
+        for suffix in [&["--help"][..], &["--dolt-bin", "/fixture", "--json"][..]] {
+            let recover = sandbox.run(&[selection, &["workspace", "recover"], suffix].concat());
+            let legacy = sandbox.run(&[selection, &["workspace", "unknown"], suffix].concat());
+            assert_eq!(recover.status.code(), Some(2));
+            assert_eq!(recover.status, legacy.status);
+            assert_eq!(recover.stdout, legacy.stdout);
+            assert_eq!(recover.stderr, legacy.stderr);
+        }
+    }
+    let help = sandbox.run(&["workspace", "recover", "--help", "--contract", "2"]);
+    assert!(help.status.success());
+    assert!(
+        String::from_utf8(help.stdout)
+            .unwrap()
+            .contains("--dolt-bin")
+    );
+    let missing = sandbox.run(&[
+        "--contract",
+        "2",
+        "--json",
+        "workspace",
+        "recover",
+        "--dolt-bin",
+        "/fixture",
+    ]);
+    assert_eq!(missing.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["command"], "workspace recover");
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    sandbox.assert_empty();
+}
+
+#[test]
 fn conversation_export_preserves_v2_error_and_literal_boundaries() {
     let sandbox = Sandbox::new();
     let uuid = "01900000-0000-7000-8000-000000000001";
