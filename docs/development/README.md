@@ -255,6 +255,17 @@ hive --contract 2 --json resource show 01900000-0000-7000-8000-000000000014 \
 
 List pages contain Resource IDs, kinds, names, and revisions in ascending bytewise ID order, with 25 items by default and a maximum of 100. Pass `next_cursor` as `--cursor` with the same target, scope, and page size. A changed snapshot or query returns `STALE_CURSOR`. Exact-ID `resource show` adds the stored URI to the selected record. Both commands report the verified Dolt commit and leave URIs unopened.
 
+## Create a local workspace backup
+
+For the first Linux backup path, select a registered, stopped workspace with clean Dolt and Git revisions, quiesced asset editors, and no active claims or pending requests. Dolt 2.7.6 uses a clean `main` with an unconfigured local repository. Choose a new destination directory outside the workspace and runtime state.
+
+```sh
+hive --contract 2 --json backup create --workspace /example/hive-v2-userdata \
+  --destination /example/backups/snapshot
+```
+
+Hive verifies the staged Dolt history and Git asset bundle before publishing the directory. The manifest records both commits, the workspace and policy identities, and a SHA-256 digest for each payload file. The default manifest marks conversations omitted. See the [backup and restore contract](../architecture/dolt-mvp-contract.md#installation-lifecycle-and-recovery).
+
 ## Import a Queen conversation
 
 On Linux, explicitly import UTF-8 Markdown for an active registered Queen in a running, owned workspace. Use exactly one of `--file PATH` and `--stdin`. Each successful import returns a fresh conversation ID and preserves the original body bytes in private local storage.

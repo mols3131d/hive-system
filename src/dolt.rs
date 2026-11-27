@@ -23,7 +23,7 @@ mod issue_note_fingerprint;
 mod issue_note_receipt;
 mod issue_readiness;
 #[cfg(target_os = "linux")]
-mod issue_writer;
+pub(crate) mod issue_writer;
 pub(crate) mod label;
 pub(crate) mod operation;
 mod project;

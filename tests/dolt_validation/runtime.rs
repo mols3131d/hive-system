@@ -1017,23 +1017,30 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
     assert_eq!(still_confirmed["data"]["confirmed_commit"], note_commit);
     assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
 
-    let restart = |change: Option<&str>, baseline: Option<&std::ffi::OsStr>| {
+    let restart = |change: Option<OfflineFixtureEdit<'_>>, baseline: Option<&std::ffi::OsStr>| {
         let stopped = run(&["workspace", "stop"], 0);
         assert_eq!(stopped["data"]["process_exit"], "pidfd_verified");
         if let Some(change) = change {
             let fixture = cleanup.fixture.as_ref().expect("armed runtime fixture");
             let db = root.join("db");
-            fixture.local_at(&db, &["sql"], Some(change));
-            fixture.local_at(&db, &["add", "."], None);
-            fixture.local_at(
-                &db,
-                &[
-                    "commit",
-                    "-m",
-                    "Synthetic retained-history or ancestry change",
-                ],
-                None,
-            );
+            match change {
+                OfflineFixtureEdit::CommitSql(sql) => {
+                    fixture.local_at(&db, &["sql"], Some(sql));
+                    fixture.local_at(&db, &["add", "."], None);
+                    fixture.local_at(
+                        &db,
+                        &[
+                            "commit",
+                            "-m",
+                            "Synthetic retained-history or ancestry change",
+                        ],
+                        None,
+                    );
+                }
+                OfflineFixtureEdit::RestoreHead(commit) => {
+                    fixture.local_at(&db, &["reset", "--hard", commit], None);
+                }
+            }
         }
         let start = [
             "workspace",
@@ -1060,8 +1067,13 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
         &restart,
         &dolt,
     );
-    issue_create_writer_fixture(&state, &fixture_root, &port, &run, &restart);
+    issue_create_writer_fixture(&state, &fixture_root, &port, &dolt, &run, &restart);
     assert!(cleanup.finish(), "Verified runtime fixture stop failed");
+}
+
+enum OfflineFixtureEdit<'a> {
+    CommitSql(&'a str),
+    RestoreHead(&'a str),
 }
 
 fn issue_note_writer_fixture(
@@ -1070,7 +1082,7 @@ fn issue_note_writer_fixture(
     port: &str,
     revision: &str,
     run: &impl Fn(&[&str], i32) -> Value,
-    restart: &impl Fn(Option<&str>, Option<&std::ffi::OsStr>),
+    restart: &impl Fn(Option<OfflineFixtureEdit<'_>>, Option<&std::ffi::OsStr>),
     dolt: &Path,
 ) {
     use sha2::{Digest, Sha256};
@@ -1186,7 +1198,7 @@ fn issue_note_writer_fixture(
     let stale = note(&id(62), "fixture-holder", revision, body, 5);
     assert_eq!(stale["error"]["code"], "STALE_REVISION");
 
-    let connect = |role| connect_owned(state, port, role);
+    let connect = |role: &str| connect_owned(state, port, role);
     let mut reader = connect("reader");
     let head: String = reader
         .query_first("SELECT DOLT_HASHOF('HEAD')")
@@ -1245,15 +1257,31 @@ fn issue_note_writer_fixture(
     assert_eq!(recovered["data"], replayed["data"]);
     assert!(!marker.exists());
 
+    let receipt: (String, String, String, String, String, String, String, String) = reader
+        .exec_first(
+            "SELECT kind, actor_ref, fingerprint, authorization_ref, base_commit,
+                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'), workflow_evidence_json, result_json
+             FROM operation_receipts WHERE CAST(request_id AS BINARY) = ?",
+            (id(60),),
+        )
+        .unwrap()
+        .unwrap();
+    let mut committed: Value = serde_json::from_str(&pending).unwrap();
+    committed["request_id"] = serde_json::json!(id(60));
+    committed["base_commit"] = serde_json::json!(receipt.4);
+    committed["fingerprint"] = serde_json::json!(receipt.2);
+    committed["receipt_digest"] =
+        serde_json::json!(digest(serde_json::to_string(&receipt).unwrap().as_bytes()));
     drop(reader);
     drop(observer);
+    stopped_note_recovery_fixture(state, dolt, port, run, &connect, committed);
     let owner_parent = id(2);
     let archived_root = id(70);
-    restart(Some(&format!(
+    restart(Some(OfflineFixtureEdit::CommitSql(&format!(
         "INSERT INTO areas (id, slug, name, revision, archived_at)
             VALUES ('{archived_root}', 'archive-fixture', 'Archive fixture', '{}', UTC_TIMESTAMP(6));
          UPDATE areas SET parent_id = '{archived_root}' WHERE id = '{owner_parent}';", id(4)
-    )), None);
+    ))), None);
     let mut reader = connect("reader");
     let archived_base = storage_state(&mut reader);
     let current_revision = written["data"]["result"]["issue_revision"]
@@ -1270,11 +1298,11 @@ fn issue_note_writer_fixture(
 
     drop(reader);
     restart(
-        Some(&format!(
+        Some(OfflineFixtureEdit::CommitSql(&format!(
             "UPDATE areas SET archived_at = NULL WHERE id = '{archived_root}';
          DELETE FROM operation_receipts WHERE request_id = '{}';",
             id(60)
-        )),
+        ))),
         None,
     );
     let mut reader = connect("reader");
@@ -1339,6 +1367,238 @@ fn issue_note_writer_fixture(
         fs::remove_file(&marker).unwrap();
         run(&start, 0);
     }
+
+    let clean_before_receipt_probe = storage_state(&mut connect("reader"));
+    let receipt_ddl = include_str!("../../assets/schema/dolt/0001_initial.sql")
+        .split("CREATE TABLE operation_receipts")
+        .nth(1)
+        .unwrap()
+        .split_once(';')
+        .unwrap()
+        .0;
+    restart(
+        Some(OfflineFixtureEdit::CommitSql(&format!(
+            "DROP TABLE operation_receipts;
+             CALL DOLT_ADD('.');
+             CALL DOLT_COMMIT('-m', 'Synthetic receipt table removal');
+             CREATE TABLE operation_receipts{receipt_ddl};"
+        ))),
+        None,
+    );
+    let mut reader = connect("reader");
+    let new_base = storage_state(&mut reader);
+    let introduced = written["data"]["confirmed_commit"].as_str().unwrap();
+    let old_count: u64 = reader
+        .exec_first(
+            format!(
+                "SELECT COUNT(*) FROM operation_receipts AS OF '{introduced}' WHERE request_id = ?"
+            ),
+            (id(60),),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(old_count, 1);
+    let before = effect(&mut reader);
+    assert_eq!(before.0, 0);
+    let incomplete = note(&id(60), "fixture-holder", current_revision, body, 8);
+    assert_eq!(incomplete["error"]["code"], "COMMIT_UNCERTAIN");
+    assert_eq!(storage_state(&mut reader), new_base);
+    assert_eq!(effect(&mut reader), before);
+    assert!(!marker.exists());
+    drop(reader);
+
+    // Leave the deliberately truncated history behind in this disposable fixture.
+    // The following create tests need the original complete receipt history.
+    restart(
+        Some(OfflineFixtureEdit::RestoreHead(
+            &clean_before_receipt_probe.0,
+        )),
+        None,
+    );
+    assert_eq!(
+        storage_state(&mut connect("reader")),
+        clean_before_receipt_probe
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn stopped_note_recovery_fixture(
+    state: &Path,
+    dolt: &Path,
+    port: &str,
+    run: &impl Fn(&[&str], i32) -> Value,
+    connect: &impl Fn(&str) -> Conn,
+    committed: Value,
+) {
+    let server = state.join("server.json");
+    let marker = state.join("pending-request.json");
+    let proof = state.join("stopped-request.json");
+    let dolt_bin = dolt.to_str().unwrap();
+    let recover = ["workspace", "recover", "--dolt-bin", dolt_bin];
+    let start = ["workspace", "start", "--dolt-bin", dolt_bin, "--port", port];
+    let stop = ["workspace", "stop"];
+    let record = |marker_value: &Value| {
+        fs::write(&marker, marker_value.to_string()).unwrap();
+        fs::set_permissions(&marker, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    };
+    let refused = |args: &[&str], expected: &Value| {
+        let result = run(args, 8);
+        assert_eq!(result["error"]["code"], "COMMIT_UNCERTAIN");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), expected.to_string());
+        assert!(!result.to_string().contains("fixture-holder"));
+        assert!(!result.to_string().contains("receipt_digest"));
+    };
+    let resolved = |outcome| {
+        let report = run(&recover, 0);
+        assert_eq!(report["data"]["state"], "stopped");
+        assert_eq!(report["data"]["process_exit"], "pidfd_verified");
+        assert_eq!(report["data"]["outcome"], outcome);
+        assert!(!report.to_string().contains("fixture-holder"));
+        assert!(!marker.exists() && !proof.exists() && !server.exists());
+        assert!(fs::read_dir(state).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            !name.to_string_lossy().starts_with("run-")
+                && !name.to_string_lossy().starts_with(".recovery-")
+        }));
+    };
+
+    let server_record = fs::read(&server).unwrap();
+    record(&committed);
+    refused(&recover, &committed); // A current launch gives no stopped proof.
+    run(&stop, 0);
+    let saved = state.join("saved-proof");
+    fs::rename(&proof, &saved).unwrap();
+    refused(&recover, &committed);
+    assert_eq!(run(&start, 7)["error"]["code"], "AUTHORITY_UNVERIFIED");
+    fs::rename(&saved, &proof).unwrap();
+    let held = fs::File::open(state.join("lock")).unwrap();
+    // SAFETY: held owns the valid descriptor throughout the contention check.
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert_eq!(run(&recover, 5)["error"]["code"], "LOCK_BUSY");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), committed.to_string());
+    drop(held);
+    refused(
+        &[
+            "workspace",
+            "recover",
+            "--dolt-bin",
+            "/fixture-missing-dolt",
+        ],
+        &committed,
+    );
+
+    // Interruption after removing the launch directory and before unlinking
+    // server.json leaves the synced exit proof and exact marker usable.
+    fs::write(&server, &server_record).unwrap();
+    resolved("confirmed");
+    run(&start, 0);
+    let mut writer = connect("writer");
+    let (head, session, original_title): (String, u64, String) = writer
+        .exec_first(
+            "SELECT DOLT_HASHOF('HEAD'), CONNECTION_ID(), title FROM issues WHERE id = ?",
+            (id(11),),
+        )
+        .unwrap()
+        .unwrap();
+    let mut rollback = committed;
+    let launch = || serde_json::from_slice::<Value>(&fs::read(&server).unwrap()).unwrap();
+    rollback["launch_nonce"] = launch()["nonce"].clone();
+    rollback["session_id"] = serde_json::json!(session);
+    rollback["request_id"] = serde_json::json!(id(68));
+    rollback["base_commit"] = serde_json::json!(head);
+    writer.query_drop("START TRANSACTION").unwrap();
+    writer
+        .exec_drop(
+            "UPDATE issues SET title = 'Fixture rolled-back title' WHERE id = ?",
+            (id(11),),
+        )
+        .unwrap();
+    record(&rollback);
+    drop(writer);
+    let active = launch();
+    run(&stop, 0);
+
+    let root = Path::new(active["workspace_root"].as_str().unwrap());
+    let db = root.join("db");
+    let original = root.join("saved-db");
+    fs::rename(&db, &original).unwrap();
+    fs::create_dir(&db).unwrap();
+    fs::rename(original.join(".dolt"), db.join(".dolt")).unwrap();
+    refused(&recover, &rollback);
+    fs::rename(db.join(".dolt"), original.join(".dolt")).unwrap();
+    fs::remove_dir(&db).unwrap();
+    fs::rename(&original, &db).unwrap();
+    resolved("rolled_back");
+
+    run(&start, 0);
+    let mut reader = connect("reader");
+    let observed: (String, String) = reader
+        .exec_first(
+            "SELECT DOLT_HASHOF('HEAD'), title FROM issues WHERE id = ?",
+            (id(11),),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed, (head, original_title.clone()));
+    drop(reader);
+    let mut unsupported = rollback.clone();
+    unsupported["launch_nonce"] = launch()["nonce"].clone();
+    unsupported["version"] = serde_json::json!(3);
+    unsupported["kind"] = serde_json::json!("issue.create");
+    record(&unsupported);
+    run(&stop, 0);
+    assert!(proof.exists());
+    refused(&recover, &unsupported);
+    assert!(proof.exists());
+    assert_eq!(run(&start, 7)["error"]["code"], "AUTHORITY_UNVERIFIED");
+    // Only the fixture removes its deliberately unsupported marker.
+    fs::remove_file(&marker).unwrap();
+
+    run(&start, 0);
+    let mut writer = connect("writer");
+    writer
+        .exec_drop(
+            "UPDATE issues SET title = 'Fixture dirty title' WHERE id = ?",
+            (id(11),),
+        )
+        .unwrap();
+    let dirty: bool = writer
+        .query_first("SELECT EXISTS(SELECT 1 FROM dolt_status)")
+        .unwrap()
+        .unwrap();
+    assert!(dirty);
+    rollback["launch_nonce"] = launch()["nonce"].clone();
+    rollback["session_id"] = serde_json::json!(
+        writer
+            .query_first::<u64, _>("SELECT CONNECTION_ID()")
+            .unwrap()
+            .unwrap()
+    );
+    record(&rollback);
+    drop(writer);
+    run(&stop, 0);
+    assert!(proof.exists());
+    refused(&recover, &rollback);
+    assert!(proof.exists());
+    assert_eq!(run(&start, 7)["error"]["code"], "AUTHORITY_UNVERIFIED");
+    // Restore only the deliberately fabricated fixture state for later tests.
+    fs::remove_file(&marker).unwrap();
+    run(&start, 0);
+    let mut writer = connect("writer");
+    writer
+        .exec_drop(
+            "UPDATE issues SET title = ? WHERE id = ?",
+            (original_title, id(11)),
+        )
+        .unwrap();
+    let dirty: bool = writer
+        .query_first("SELECT EXISTS(SELECT 1 FROM dolt_status)")
+        .unwrap()
+        .unwrap();
+    assert!(!dirty);
 }
 
 fn write_note_pending_fixture(state: &Path, request: &str, base: &str, session: u64) -> String {
@@ -1416,8 +1676,9 @@ fn issue_create_writer_fixture(
     state: &Path,
     root: &Path,
     port: &str,
+    dolt: &Path,
     run: &impl Fn(&[&str], i32) -> Value,
-    restart: &impl Fn(Option<&str>, Option<&std::ffi::OsStr>),
+    restart: &impl Fn(Option<OfflineFixtureEdit<'_>>, Option<&std::ffi::OsStr>),
 ) {
     let workspace = id(1);
     let area = id(3);
@@ -1489,7 +1750,7 @@ fn issue_create_writer_fixture(
     let title = "Fixture café";
     let body = "Synthetic Issue body\r\nλ\n";
     let request = id(80);
-    let connect = |role| connect_owned(state, port, role);
+    let connect = |role: &str| connect_owned(state, port, role);
     if let Some(baseline) = std::env::var_os("HIVE_ISSUE_CREATE_BASELINE_BIN") {
         restart(None, Some(&baseline));
         let mut reader = connect("reader");
@@ -1625,6 +1886,14 @@ fn issue_create_writer_fixture(
     );
     assert!(!marker.exists());
 
+    drop(current);
+    drop(reader);
+    let committed_intent: Value = serde_json::from_str(&intent).unwrap();
+    stopped_create_recovery_fixture(state, dolt, port, run, committed_intent);
+    let mut reader = connect("reader");
+    let mut current = connect("writer");
+    assert_eq!(storage_state(&mut reader), after);
+
     current
         .query_drop("UPDATE workspace_counters SET next_value = 7 WHERE name = 'issue_number'")
         .unwrap();
@@ -1747,7 +2016,7 @@ fn issue_create_writer_fixture(
             "COMMIT_UNCERTAIN",
         ),
     ] {
-        restart(Some(&sql), None);
+        restart(Some(OfflineFixtureEdit::CommitSql(&sql)), None);
         let mut reader = connect("reader");
         let unchanged = storage_state(&mut reader);
         let exit = if error == "COMMIT_UNCERTAIN" { 8 } else { 4 };
@@ -1784,13 +2053,13 @@ fn issue_create_writer_fixture(
         .collect::<Vec<_>>();
     assert_eq!(definitions.len(), tables.len());
     restart(
-        Some(&format!(
+        Some(OfflineFixtureEdit::CommitSql(&format!(
             "{drops}
          CALL DOLT_COMMIT('-Am', 'Synthetic Issue table drop');
          {}
          UPDATE workspace_counters SET next_value = 6 WHERE name = 'issue_number';",
             definitions.join("\n")
-        )),
+        ))),
         None,
     );
     let mut reader = connect("reader");
@@ -1831,4 +2100,125 @@ fn issue_create_writer_fixture(
     );
     assert_eq!(storage_state(&mut reader), recreated);
     assert!(!marker.exists());
+}
+
+fn stopped_create_recovery_fixture(
+    state: &Path,
+    dolt: &Path,
+    port: &str,
+    run: &impl Fn(&[&str], i32) -> Value,
+    committed: Value,
+) {
+    let marker = state.join("pending-request.json");
+    let proof = state.join("stopped-request.json");
+    let dolt_bin = dolt.to_str().unwrap();
+    let recover = ["workspace", "recover", "--dolt-bin", dolt_bin];
+    let start = ["workspace", "start", "--dolt-bin", dolt_bin, "--port", port];
+    let stop = || {
+        let result = run(&["workspace", "stop"], 0);
+        assert_eq!(result["data"]["process_exit"], "pidfd_verified");
+        assert_eq!(result["data"]["pending_request"], "recorded");
+        assert!(proof.exists());
+    };
+    let record = |intent: &Value| {
+        fs::write(&marker, intent.to_string()).unwrap();
+        fs::set_permissions(&marker, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    };
+    let resolve = |outcome| {
+        let result = run(&recover, 0);
+        assert_eq!(result["data"]["state"], "stopped");
+        assert_eq!(result["data"]["process_exit"], "pidfd_verified");
+        assert_eq!(result["data"]["outcome"], outcome);
+        assert!(!marker.exists() && !proof.exists() && !state.join("server.json").exists());
+    };
+    let connect = |role: &str| connect_owned(state, port, role);
+    let mut reader = connect("reader");
+    let committed_db = storage_state(&mut reader);
+    drop(reader);
+
+    record(&committed);
+    stop();
+    assert_eq!(fs::read_to_string(&marker).unwrap(), committed.to_string());
+    resolve("confirmed");
+    run(&start, 0);
+
+    let mut writer = connect("writer");
+    let (head, session, next): (String, u64, u64) = writer
+        .query_first(
+            "SELECT DOLT_HASHOF('HEAD'), CONNECTION_ID(), next_value FROM workspace_counters
+             WHERE name = 'issue_number'",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(head, committed_db.0);
+    assert_eq!(next, 6);
+    let committed_request = committed["request_id"].as_str().unwrap().to_owned();
+    let mut rollback = committed;
+    let issue = id(89);
+    let request = id(90);
+    rollback["launch_nonce"] = launch_nonce(state).into();
+    rollback["session_id"] = session.into();
+    rollback["request_id"] = request.clone().into();
+    rollback["issue_id"] = issue.clone().into();
+    rollback["base_commit"] = head.into();
+    writer.query_drop("START TRANSACTION").unwrap();
+    writer.exec_drop(
+        "UPDATE workspace_counters SET next_value = ? WHERE name = 'issue_number' AND next_value = ?",
+        (next + 1, next),
+    ).unwrap();
+    assert_eq!(writer.affected_rows(), 1);
+    writer.exec_drop(
+        "INSERT INTO issues (id, number, area_id, title, type, status, revision, created_at, updated_at)
+         VALUES (?, ?, ?, 'Synthetic rolled-back Issue', 'task', 'backlog', ?, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))",
+        (&issue, next, id(3), id(91)),
+    ).unwrap();
+    writer
+        .exec_drop(
+            "INSERT INTO operation_receipts
+         SELECT ?, kind, fingerprint, actor_ref, authorization_ref, workflow_evidence_json,
+                base_commit, result_json, created_at
+         FROM operation_receipts WHERE request_id = ?",
+            (&request, &committed_request),
+        )
+        .unwrap();
+    assert_eq!(writer.affected_rows(), 1);
+    record(&rollback);
+    drop(writer);
+    stop();
+    resolve("rolled_back");
+    run(&start, 0);
+
+    let mut reader = connect("reader");
+    assert_eq!(storage_state(&mut reader), committed_db);
+    let effects: (u64, u64, u64) = reader
+        .exec_first(
+            "SELECT next_value, (SELECT COUNT(*) FROM issues WHERE id = ?),
+                    (SELECT COUNT(*) FROM operation_receipts WHERE request_id = ?)
+             FROM workspace_counters WHERE name = 'issue_number'",
+            (&issue, &request),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(effects, (next, 0, 0));
+    let session: u64 = reader
+        .query_first("SELECT CONNECTION_ID()")
+        .unwrap()
+        .unwrap();
+    rollback["launch_nonce"] = launch_nonce(state).into();
+    rollback["session_id"] = session.into();
+    drop(reader);
+
+    record(&rollback);
+    stop();
+    let proof_bytes = fs::read(&proof).unwrap();
+    rollback["receipt_digest"] = "c".repeat(64).into();
+    record(&rollback);
+    let rejected = run(&recover, 8);
+    assert_eq!(rejected["error"]["code"], "COMMIT_UNCERTAIN");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), rollback.to_string());
+    assert_eq!(fs::read(&proof).unwrap(), proof_bytes);
+    assert_eq!(run(&start, 7)["error"]["code"], "AUTHORITY_UNVERIFIED");
+    // Continuing the test requires removing the fixture's deliberately altered marker.
+    fs::remove_file(&marker).unwrap();
+    run(&start, 0);
 }

@@ -128,7 +128,7 @@ pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
 // requires an explicit kind. Keep the note's wire format and digest intact.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Pending {
+pub(crate) struct Pending {
     version: u8,
     #[serde(
         default,
@@ -154,6 +154,28 @@ fn present_kind<'de, D: serde::Deserializer<'de>>(
 }
 
 impl Pending {
+    pub(crate) fn read(bytes: &[u8], workspace: &str, nonce: &str) -> Result<Self, HiveError> {
+        let marker: Self = workflow::parse_json_object::<_, serde_json::Error>(
+            serde_json::from_slice(bytes).map_err(|_| uncertain())?,
+        )
+        .map_err(|_| uncertain())?;
+        marker.validate(workspace, nonce)?;
+        Ok(marker)
+    }
+
+    /// The caller must establish prior-session termination and open a fresh,
+    /// verified snapshot before resolving the marker.
+    pub(crate) fn resolve(&self, snapshot: &mut Snapshot) -> Result<&'static str, HiveError> {
+        if confirm(snapshot, self)?.is_some() {
+            return Ok("confirmed");
+        }
+        if snapshot.commit != self.base_commit || has_receipt_history(snapshot, &self.request_id)? {
+            return Err(uncertain());
+        }
+        require_clean(&mut snapshot.connection, &self.base_commit)?;
+        Ok("rolled_back")
+    }
+
     fn operation(&self) -> Result<Kind, HiveError> {
         match (self.version, self.kind) {
             (1, None) => Ok(Kind::Note),
@@ -162,8 +184,8 @@ impl Pending {
         }
     }
 
-    fn validate(&self, workspace: &str, nonce: &str) -> Result<Kind, HiveError> {
-        let kind = self.operation()?;
+    fn validate(&self, workspace: &str, nonce: &str) -> Result<(), HiveError> {
+        self.operation()?;
         if self.workspace_id != workspace
             || self.launch_nonce != nonce
             || self.session_id == 0
@@ -176,7 +198,7 @@ impl Pending {
         {
             return Err(uncertain());
         }
-        Ok(kind)
+        Ok(())
     }
 }
 
@@ -358,27 +380,13 @@ fn reconcile(runtime: &WriterRuntime<'_>, workspace: &str) -> Result<Option<Snap
         .pending()
         .map_err(|_| uncertain())?
         .ok_or_else(uncertain)?;
-    let marker: Pending = workflow::parse_json_object::<_, serde_json::Error>(
-        serde_json::from_slice(&entry.bytes).map_err(|_| uncertain())?,
-    )
-    .map_err(|_| uncertain())?;
-    let kind = marker.validate(workspace, runtime.launch_nonce())?;
-    let mut observer = open_verified_writer(runtime, kind, true)?;
+    let marker = Pending::read(&entry.bytes, workspace, runtime.launch_nonce())?;
+    let mut observer = open_verified_writer(runtime, marker.operation()?, true)?;
     visible_session(&mut observer.connection, Some(marker.session_id)).map_err(|_| uncertain())?;
 
     // Take a fresh committed snapshot after positive same-launch session evidence.
     let mut snapshot = runtime.open(false).map_err(|_| uncertain())?;
-    if confirm(&mut snapshot, &marker)
-        .map_err(|_| uncertain())?
-        .is_none()
-    {
-        if snapshot.commit != marker.base_commit
-            || has_receipt_history(&mut snapshot, &marker.request_id).map_err(|_| uncertain())?
-        {
-            return Err(uncertain());
-        }
-        require_clean(&mut snapshot.connection, &marker.base_commit).map_err(|_| uncertain())?;
-    }
+    marker.resolve(&mut snapshot).map_err(|_| uncertain())?;
     runtime.clear_pending(entry).map_err(|_| uncertain())?;
     Ok(Some(snapshot))
 }
@@ -531,7 +539,7 @@ fn conflict(kind: Kind) -> HiveError {
     )
 }
 
-fn uncertain() -> HiveError {
+pub(crate) fn uncertain() -> HiveError {
     HiveError::new(
         ErrorCode::CommitUncertain,
         "The pending Issue write outcome could not be established.",
@@ -627,27 +635,30 @@ mod tests {
             "issue_id": "01900000-0000-7000-8000-000000000003",
             "receipt_digest": "c".repeat(64),
         });
-        let read = |value: &Value| serde_json::from_value::<Pending>(value.clone());
+        let read =
+            |value: &Value| Pending::read(value.to_string().as_bytes(), "workspace", "launch");
         let legacy = read(&value).unwrap();
-        assert!(matches!(
-            legacy.validate("workspace", "launch"),
-            Ok(Kind::Note)
-        ));
+        assert!(matches!(legacy.operation(), Ok(Kind::Note)));
         assert_eq!(json!(legacy), value);
 
         value["version"] = json!(2);
-        assert!(read(&value).unwrap().operation().is_err());
+        assert!(read(&value).is_err());
         value["kind"] = json!("issue.create");
         let create = read(&value).unwrap();
-        assert!(matches!(
-            create.validate("workspace", "launch"),
-            Ok(Kind::Create)
-        ));
+        assert!(matches!(create.operation(), Ok(Kind::Create)));
         assert_eq!(json!(create), value);
+        value["extra"] = json!(true);
+        assert!(read(&value).is_err());
+        value.as_object_mut().unwrap().remove("extra");
+        value["version"] = json!(3);
+        assert!(read(&value).is_err());
 
         value["version"] = json!(1);
-        assert!(read(&value).unwrap().operation().is_err());
+        assert!(read(&value).is_err());
         value["kind"] = Value::Null;
         assert!(read(&value).is_err());
+        let legacy_bytes = serde_json::to_string(&legacy).unwrap();
+        let duplicate = legacy_bytes.replacen(r#""version":1"#, r#""version":1,"version":1"#, 1);
+        assert!(Pending::read(duplicate.as_bytes(), "workspace", "launch").is_err());
     }
 }
