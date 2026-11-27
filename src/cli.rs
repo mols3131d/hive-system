@@ -1263,8 +1263,10 @@ fn recover_unknown_long(
         return None;
     }
 
-    // Let Clap replay the original tokens. The temporary option can take an
-    // attached value, and the original parse error still determines the result.
+    // Let Clap replay the original tokens. Label list has no positionals, so
+    // its temporary option can also take one plain separated value. The
+    // original parse error still determines the result.
+    let allow_separated_value = domain == "label" && action == "list";
     const UNKNOWN_LONG: &str = "recovered_unknown_long";
     let retry = cli.clone().mut_subcommand(domain, |command| {
         command.mut_subcommand(action, |leaf| {
@@ -1272,7 +1274,7 @@ fn recover_unknown_long(
                 Arg::new(UNKNOWN_LONG)
                     .long(long.to_owned())
                     .num_args(0..=1)
-                    .require_equals(true)
+                    .require_equals(!allow_separated_value)
                     .value_parser(OsStringValueParser::new())
                     .hide(true),
             )

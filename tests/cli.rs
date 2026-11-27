@@ -2623,6 +2623,9 @@ fn dolt_label_list_keeps_legacy_and_late_json_boundaries() {
         (&["--all", "--limit"][..], "INVALID_ARGUMENT"),
         (&["--all", "--json=false"][..], "INVALID_ARGUMENT"),
         (&["--all", "--unknown=--json"][..], "INVALID_ARGUMENT"),
+        (&["--all", "--status", "active"][..], "INVALID_ARGUMENT"),
+        (&["--status", "active", "--all"][..], "INVALID_ARGUMENT"),
+        (&["--all", "--status"][..], "INVALID_ARGUMENT"),
     ] {
         let args = [&command[..], &target, options].concat();
         let late = sandbox.run(&[&args[..], &selectors].concat());
@@ -2632,6 +2635,12 @@ fn dolt_label_list_keeps_legacy_and_late_json_boundaries() {
         assert_eq!(report["schema_version"], 2);
         assert_eq!(report["command"], "label list");
         assert_eq!(report["error"]["code"], code, "{args:?}");
+        if options.contains(&"--status") {
+            assert_eq!(
+                report["error"]["message"],
+                "An argument or command is not recognized."
+            );
+        }
         assert!(late.stderr.is_empty());
         assert_eq!(late.stdout, early.stdout, "{args:?}: {early:?}");
         assert_eq!(late.status.code(), Some(2));
@@ -2645,6 +2654,7 @@ fn dolt_label_list_keeps_legacy_and_late_json_boundaries() {
         &["--issue=--json", "--contract", "2"][..],
         &["--all", "--unknown=--json", "--contract", "2"][..],
         &["--contract", "2", "--", "--json"][..],
+        &["--contract", "2", "--status", "active", "--", "--json"][..],
     ] {
         let output = sandbox.run(&[&command[..], options].concat());
         assert_eq!(output.status.code(), Some(2));
@@ -2652,7 +2662,15 @@ fn dolt_label_list_keeps_legacy_and_late_json_boundaries() {
         assert!(!output.stderr.is_empty(), "{output:?}");
     }
 
-    for options in [&[][..], &["--issue=--contract=2"][..]] {
+    for options in [
+        &[][..],
+        &["--issue=--contract=2"][..],
+        &["--all", "--status=--contract=2"][..],
+        &["--all", "--status=active", "stray", "--contract", "2"][..],
+        &["--all", "--status", "active", "stray", "--contract", "2"][..],
+        &["--all", "--status", "active", "--", "--contract", "2"][..],
+        &["--all", "--status", "active"][..],
+    ] {
         let v1 = sandbox.run(&[&["--json", "label", "list"], options].concat());
         let unknown = sandbox.run(&[&["--json", "unrecognized", "list"], options].concat());
         assert_eq!(v1.status, unknown.status);
