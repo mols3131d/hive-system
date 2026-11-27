@@ -2432,13 +2432,14 @@ fn unknown_project_long_option_keeps_original_error_with_late_v2_json() {
 }
 
 #[test]
-fn unknown_dependency_options_keep_the_late_v2_envelope() {
+fn malformed_dependency_options_keep_the_late_v2_envelope() {
     let sandbox = Sandbox::new();
     let issue = "01900000-0000-7000-8000-000000000003";
     let prerequisite = "01900000-0000-7000-8000-000000000004";
     for (action, unknown) in [
         ("add-dependency", &["--unknown=--contract=1"][..]),
         ("remove-dependency", &["--unknown", "fixture-value"]),
+        ("add-dependency", &["unexpected-position"]),
     ] {
         let args = [
             &["issue", action][..],
@@ -2475,6 +2476,31 @@ fn unknown_dependency_options_keep_the_late_v2_envelope() {
     assert_eq!(literal.status.code(), Some(2));
     assert!(literal.stdout.is_empty());
     assert!(!literal.stderr.is_empty());
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let mut args: Vec<_> = [
+            "issue",
+            "add-dependency",
+            issue,
+            prerequisite,
+            "--contract",
+            "2",
+            "--json",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        args[3] = OsString::from_vec(vec![255]);
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "issue add-dependency");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    }
     sandbox.assert_empty();
 }
 
@@ -2544,6 +2570,129 @@ fn unknown_project_write_options_keep_the_late_v2_envelope() {
         );
     }
     let literal = sandbox.run(&["project", "create", "--unknown=--json", "--contract", "2"]);
+    assert_eq!(literal.status.code(), Some(2));
+    assert!(literal.stdout.is_empty());
+    assert!(!literal.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
+fn malformed_project_write_values_keep_the_v2_envelope() {
+    let sandbox = Sandbox::new();
+    let workspace = "01900000-0000-7000-8000-000000000001";
+    let project = "01900000-0000-7000-8000-000000000002";
+    let issue = "01900000-0000-7000-8000-000000000003";
+    let binding = [
+        "--workspace",
+        ".",
+        "--workspace-id",
+        workspace,
+        "--database",
+        "fixture",
+        "--port",
+        "3307",
+        "--actor",
+        "fixture",
+        "--request-id",
+        issue,
+        "--evidence-file",
+        "fixture.json",
+    ];
+    let create = [&["project", "create", "--name", "Fixture"][..], &binding].concat();
+    let add = [
+        &[
+            "project",
+            "add-issue",
+            project,
+            issue,
+            "--area",
+            workspace,
+            "--if-match",
+            "fixture",
+        ][..],
+        &binding,
+    ]
+    .concat();
+    for (command, invalid) in [
+        (&create, &["--project", "BAD!"][..]),
+        (&create, &["--name", "fixture-copy"]),
+        (&create, &["unexpected-position"]),
+        (&add, &["--area", workspace]),
+        (&add, &["unexpected-position"]),
+    ] {
+        for args in [
+            [&["--contract", "2", "--json"][..], command, invalid].concat(),
+            [&command[..], invalid, &["--contract", "2", "--json"]].concat(),
+        ] {
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+            assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2, "{args:?}");
+            assert_eq!(report["command"], format!("project {}", command[1]));
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        for (command, index) in [(&create, 3), (&add, 2)] {
+            let mut invalid: Vec<_> = command.iter().map(OsString::from).collect();
+            invalid[index] = OsString::from_vec(vec![255]);
+            invalid.extend(
+                ["--contract", "2", "--json"]
+                    .into_iter()
+                    .map(OsString::from),
+            );
+            let output = sandbox.run(&invalid);
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], format!("project {}", command[1]));
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        }
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn malformed_bot_register_keeps_the_late_v2_envelope() {
+    let sandbox = Sandbox::new();
+    for selection in [&[][..], &["--contract", "1"][..]] {
+        let actual = sandbox.run(&[selection, &["bot", "register", "--help"]].concat());
+        let unknown = sandbox.run(&[selection, &["bot", "unknown-leaf", "--help"]].concat());
+        assert_eq!(actual.status.code(), Some(2));
+        assert_eq!(actual.stdout, unknown.stdout);
+        assert_eq!(actual.stderr, unknown.stderr);
+    }
+    for args in [
+        ["--contract", "2", "bot", "register", "--help"],
+        ["bot", "register", "--help", "--contract", "2"],
+    ] {
+        let help = sandbox.run(&args);
+        assert!(help.status.success(), "{args:?}: {help:?}");
+        assert!(String::from_utf8_lossy(&help.stdout).contains("--asset-revision"));
+        assert!(help.stderr.is_empty());
+    }
+    let command = ["bot", "register", "--slug", "fixture"];
+    let selectors = ["--contract", "2", "--json"];
+    for invalid in [
+        &["--unknown=--contract=1"][..],
+        &["--slug", "duplicate-slug"],
+        &["unexpected-position"],
+    ] {
+        let args = [&command[..], invalid, &selectors].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "bot register");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    }
+    let literal = sandbox.run(&["bot", "register", "--unknown=--json", "--contract", "2"]);
     assert_eq!(literal.status.code(), Some(2));
     assert!(literal.stdout.is_empty());
     assert!(!literal.stderr.is_empty());
@@ -3886,6 +4035,25 @@ fn issue_transitions_are_scoped_to_v2_issue_commands() {
         assert!(text.contains("--if-match") && text.contains("--evidence-file"));
         assert_eq!(text.contains("--holder"), holder);
 
+        for invalid in ["unexpected-position", "--unknown=--json"] {
+            let args = [
+                "issue",
+                action,
+                "01900000-0000-7000-8000-000000000001",
+                invalid,
+                "--contract",
+                "2",
+                "--json",
+            ];
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+            assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], format!("issue {action}"));
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        }
+
         let root_help = sandbox.run(&["--contract", "2", "--help"]);
         let text = String::from_utf8(root_help.stdout).unwrap();
         assert!(!text.contains(&format!("issue-{action}")));
@@ -3999,5 +4167,130 @@ fn stopped_issue_transitions_keep_output_options_and_literal_boundaries() {
             assert!(!report.stderr.is_empty(), "{literal:?}");
         }
     }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn issue_set_parent_keeps_late_v2_errors_and_literal_argument_boundaries() {
+    let sandbox = Sandbox::new();
+    let issue = "01900000-0000-7000-8000-000000000001";
+    let parent = "01900000-0000-7000-8000-000000000002";
+    let command = [
+        "issue",
+        "set-parent",
+        issue,
+        "--area",
+        issue,
+        "--actor",
+        "fixture",
+        "--request-id",
+        issue,
+        "--if-match",
+        "synthetic-invalid",
+        "--workspace",
+        ".",
+        "--workspace-id",
+        issue,
+        "--database",
+        "db",
+        "--port",
+        "3306",
+    ];
+    for suffix in [
+        &["--clear", "--evidence-file", "fixture.json"][..],
+        &["--parent", parent, "--evidence-file", "fixture.json"],
+        &[
+            "--parent",
+            parent,
+            "--parent-area",
+            issue,
+            "--clear",
+            "--evidence-file",
+            "fixture.json",
+        ],
+        &["--parent", "--evidence-file", "fixture.json"],
+        &[
+            "--parent",
+            parent,
+            "--parent-area",
+            issue,
+            "--evidence-file=--contract",
+        ],
+        &[
+            "--parent",
+            parent,
+            "--parent",
+            parent,
+            "--parent-area",
+            issue,
+            "--evidence-file=--json",
+        ],
+        &[
+            "--parent",
+            parent,
+            "--parent-area",
+            issue,
+            "--unknown",
+            "synthetic-value",
+            "--evidence-file",
+            "fixture.json",
+        ],
+    ] {
+        let args = [&command[..], suffix, &["--contract", "2", "--json"]].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?} {output:?}");
+        assert!(output.stderr.is_empty(), "{args:?} {output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{args:?}: {error} {output:?}"));
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], "issue set-parent");
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(report.get("data").is_none());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("synthetic-"));
+    }
+    for suffix in [
+        &[
+            "--parent",
+            parent,
+            "--parent-area",
+            issue,
+            "--evidence-file=--json",
+            "--contract",
+            "2",
+        ][..],
+        &[
+            "--parent",
+            parent,
+            "--parent-area",
+            issue,
+            "--evidence-file=--json",
+            "--",
+            "--contract",
+            "2",
+            "--json",
+        ],
+    ] {
+        let output = sandbox.run(&[&command[..], suffix].concat());
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+    let args = [
+        &["--json"][..],
+        &command[..],
+        &[
+            "--parent",
+            parent,
+            "--parent-area",
+            issue,
+            "--evidence-file=--contract=2",
+        ],
+    ]
+    .concat();
+    let output = sandbox.run(&args);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
     sandbox.assert_empty();
 }

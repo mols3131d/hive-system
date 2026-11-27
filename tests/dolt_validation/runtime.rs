@@ -13,6 +13,8 @@ mod artifact_update;
 mod bot_register;
 #[path = "runtime/issue_dependency.rs"]
 mod issue_dependency;
+#[path = "runtime/issue_parent.rs"]
+mod issue_parent;
 #[path = "runtime/issue_transition.rs"]
 mod issue_transition;
 #[path = "runtime/issue_update.rs"]
@@ -1312,6 +1314,7 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
         &dolt,
     );
     issue_dependency::exercise(&state, &fixture_root, &port, &dolt, &invoke, &restart);
+    issue_parent::exercise(&state, &fixture_root, &port, &dolt, &invoke, &restart);
     issue_update::exercise(&state, &fixture_root, &port, &dolt, &run, &restart);
     issue_transition::exercise(&state, &fixture_root, &port, &dolt, &invoke, &restart);
     issue_create_writer_fixture(&state, &fixture_root, &port, &dolt, &run, &restart);
