@@ -33,6 +33,8 @@ const THIRD_ARTIFACT: &str = "01900000-0000-7000-8000-000000000056";
 const LATE_RECEIPT: &str = "01900000-0000-7000-8000-000000000083";
 const INVALID_BASE_RECEIPT: &str = "01900000-0000-7000-8000-000000000084";
 const WRONG_BASE_RECEIPT: &str = "01900000-0000-7000-8000-000000000085";
+const MODIFIED_RECEIPT: &str = "01900000-0000-7000-8000-000000000086";
+const REINTRODUCED_RECEIPT: &str = "01900000-0000-7000-8000-000000000087";
 const INVOCATION: &str = "01900000-0000-7000-8000-000000000061";
 const DIRECTIVE: &str = "01900000-0000-7000-8000-000000000071";
 const RECEIPT: &str = "01900000-0000-7000-8000-000000000081";
@@ -230,6 +232,14 @@ fn committed_scope_and_resume() {
         writeln!(activation, "UPDATE directives SET status = 'active', revision = 'r1', approval_ref = 'approval' WHERE id = '{id}';").unwrap();
         activation.push_str(&activation_receipt_sql(id, &request_id, scope, &base));
     }
+    for request_id in [MODIFIED_RECEIPT, REINTRODUCED_RECEIPT] {
+        activation.push_str(&activation_receipt_sql(
+            DIRECTIVE.to_owned(),
+            request_id,
+            activation_receipt::DirectiveScope::Workspace,
+            &base,
+        ));
+    }
     sql(&activation);
     run(&["add", "."]);
     run(&["commit", "-m", "Synthetic atomic activation"]);
@@ -249,8 +259,31 @@ fn committed_scope_and_resume() {
             declared_base,
         ));
     }
+    sql(&format!(
+        "UPDATE operation_receipts SET created_at = '2026-01-02'
+         WHERE request_id = '{MODIFIED_RECEIPT}';
+         DELETE FROM operation_receipts WHERE request_id = '{REINTRODUCED_RECEIPT}';"
+    ));
     run(&["add", "."]);
-    run(&["commit", "-m", "Synthetic late receipt rows"]);
+    run(&["commit", "-m", "Synthetic conflicting receipt changes"]);
+    sql(&activation_receipt_sql(
+        DIRECTIVE.to_owned(),
+        REINTRODUCED_RECEIPT,
+        activation_receipt::DirectiveScope::Workspace,
+        &base,
+    ));
+    run(&["add", "."]);
+    run(&["commit", "-m", "Synthetic receipt reintroduction"]);
+
+    let unrelated_commits = (0..130)
+        .map(|index| {
+            format!(
+                "UPDATE workspace_counters SET next_value = next_value + 1 WHERE name = 'issue_number';
+                 CALL DOLT_COMMIT('-am', 'Unrelated fixture commit {index}');\n"
+            )
+        })
+        .collect::<String>();
+    sql(&unrelated_commits);
     // A dirty Issue edit must remain outside the captured committed state.
     run(&[
         "sql",
@@ -460,6 +493,8 @@ fn read_synthetic_snapshot() {
         (LATE_RECEIPT, ErrorCode::AuthorityUnverified),
         (INVALID_BASE_RECEIPT, ErrorCode::InvalidRecord),
         (WRONG_BASE_RECEIPT, ErrorCode::AuthorityUnverified),
+        (MODIFIED_RECEIPT, ErrorCode::AuthorityUnverified),
+        (REINTRODUCED_RECEIPT, ErrorCode::AuthorityUnverified),
     ] {
         let error = directives::read_approved(&mut snapshot, &candidates[0], id, 128).unwrap_err();
         assert_eq!(error.code as u8, expected as u8, "{id}");

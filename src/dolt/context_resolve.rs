@@ -1,5 +1,4 @@
-//! Entry point for explicit current context resolveion. Policy preflight can
-//! complete independently of the workspace runtime's snapshot pairing check.
+//! Resolve explicit current context through the owned workspace runtime.
 
 use crate::cli::{CommonOptions, ContextResolveArgs, ContextRole};
 use crate::error::{ErrorCode, HiveError};
@@ -164,36 +163,38 @@ fn preflight(
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        use super::context_evidence::{CheckedEvidence, EvidenceFile, Selection};
+        use super::context_evidence::{EvidenceFile, Selection};
 
-        let observed_at =
-            observe_time().map_err(|error| DoltFailure::with_context(context.clone(), error))?;
         let evidence = args
             .evidence_file
             .as_deref()
             .map(EvidenceFile::read)
             .transpose()
             .map_err(|error| DoltFailure::with_context(context.clone(), error))?;
-        let checked = match evidence.as_ref() {
-            Some(file) => file
-                .validate(
-                    &Selection {
-                        workspace_id: workspace.workspace_id(),
-                        actor_ref: args.actor.as_deref().expect("validated actor"),
-                        bot_id: args.bot.as_deref(),
-                        invocation_id: args.invocation_id.as_deref(),
-                        issue: args.issue.as_deref(),
-                        area: args.area.as_deref(),
-                        artifacts: &args.include_artifact,
-                    },
-                    observed_at,
-                )
-                .map_err(|error| DoltFailure::with_context(context.clone(), error))?,
-            None => CheckedEvidence::default(),
+        let selection = Selection {
+            workspace_id: workspace.workspace_id(),
+            actor_ref: args.actor.as_deref().expect("validated actor"),
+            bot_id: args.bot.as_deref(),
+            invocation_id: args.invocation_id.as_deref(),
+            issue: args.issue.as_deref(),
+            area: args.area.as_deref(),
+            artifacts: &args.include_artifact,
         };
+        if let Some(file) = &evidence {
+            file.preflight(&selection)
+                .map_err(|error| DoltFailure::with_context(context.clone(), error))?;
+        }
         #[cfg(target_os = "linux")]
         if let Some(asset_commit) = args.asset_commit.as_deref() {
             return crate::workspace_status::with_owned_snapshot(&workspace, target, |snapshot| {
+                // Capture freshness only after the runtime lock, ownership
+                // checks and authenticated snapshot acquisition have succeeded.
+                let observed_at = observe_time()?;
+                let checked = evidence
+                    .as_ref()
+                    .map(|file| file.validate(&selection, observed_at))
+                    .transpose()?
+                    .unwrap_or_default();
                 super::issue::context::resolve_snapshot(
                     snapshot,
                     &workspace,
@@ -211,8 +212,6 @@ fn preflight(
             })
             .map_err(|error| DoltFailure::with_context(context, error));
         }
-        #[cfg(target_os = "macos")]
-        let _ = checked;
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if args.evidence_file.is_some() {
@@ -233,7 +232,7 @@ fn preflight(
     ))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn observe_time() -> Result<time::OffsetDateTime, HiveError> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

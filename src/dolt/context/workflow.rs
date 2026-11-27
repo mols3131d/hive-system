@@ -125,12 +125,12 @@ pub(super) fn verify(request: &Request<'_>, expected: &Expected<'_>) -> Result<(
         CurrentInput::ResolvedSource { bytes, .. } => *bytes,
     };
     let evidence = Declaration::parse(bytes)?;
-    evidence.check_current(&CurrentBinding {
+    evidence.check_valid_at(request.observed_at)?;
+    evidence.check_binding(&CurrentBinding {
         workspace_id: expected.workspace_id,
         actor_ref: request.actor_ref,
         bot_id: request.bot_id,
         invocation_id: request.invocation_id,
-        observed_at: request.observed_at,
     })?;
     #[cfg(test)]
     if let CurrentInput::ResolvedSource {
@@ -163,7 +163,6 @@ pub(super) struct CurrentBinding<'a> {
     pub(super) actor_ref: &'a str,
     pub(super) bot_id: Option<&'a str>,
     pub(super) invocation_id: &'a str,
-    pub(super) observed_at: OffsetDateTime,
 }
 
 impl Declaration {
@@ -214,12 +213,16 @@ impl Declaration {
         Ok(evidence)
     }
 
-    pub(super) fn check_current(&self, request: &CurrentBinding<'_>) -> Result<(), HiveError> {
+    pub(super) fn check_valid_at(&self, observed_at: OffsetDateTime) -> Result<(), HiveError> {
         let starts = parse_time(&self.valid_from).ok_or_else(malformed)?;
         let expires = parse_time(&self.expires_at).ok_or_else(malformed)?;
-        if self.withdrawn || request.observed_at < starts || request.observed_at >= expires {
+        if self.withdrawn || observed_at < starts || observed_at >= expires {
             return Err(unverified());
         }
+        Ok(())
+    }
+
+    pub(super) fn check_binding(&self, request: &CurrentBinding<'_>) -> Result<(), HiveError> {
         if self.workspace_id != request.workspace_id
             || self.actor_ref != request.actor_ref
             || self.bot_id.as_deref() != request.bot_id

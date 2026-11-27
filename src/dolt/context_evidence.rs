@@ -122,10 +122,23 @@ impl EvidenceFile {
             .map_err(|_| invalid("The context evidence file is not a valid versioned JSON object."))
     }
 
+    pub(super) fn preflight(&self, selection: &Selection<'_>) -> Result<(), HiveError> {
+        self.validate_inner(selection, None).map(|_| ())
+    }
+
+    #[cfg(any(test, target_os = "linux"))]
     pub(super) fn validate(
         &self,
         selection: &Selection<'_>,
         observed_at: time::OffsetDateTime,
+    ) -> Result<CheckedEvidence<'_>, HiveError> {
+        self.validate_inner(selection, Some(observed_at))
+    }
+
+    fn validate_inner(
+        &self,
+        selection: &Selection<'_>,
+        observed_at: Option<time::OffsetDateTime>,
     ) -> Result<CheckedEvidence<'_>, HiveError> {
         if self.version != 1 {
             return Err(invalid("The context evidence file version must be 1."));
@@ -168,7 +181,6 @@ impl EvidenceFile {
             actor_ref: selection.actor_ref,
             bot_id: selection.bot_id,
             invocation_id,
-            observed_at,
         };
         let mut exact_scope = None;
         for (body, handoff) in self
@@ -178,7 +190,10 @@ impl EvidenceFile {
             .chain(self.artifacts.iter().map(|body| (body, false)))
         {
             let declaration = Declaration::parse(body.get().as_bytes())?;
-            declaration.check_current(&binding)?;
+            if let Some(observed_at) = observed_at {
+                declaration.check_valid_at(observed_at)?;
+            }
+            declaration.check_binding(&binding)?;
             let area = declaration.area_id.as_str();
             let owner = declaration.issue_id.as_str();
             if selection
@@ -258,4 +273,66 @@ fn unauthorized(message: &str) -> HiveError {
 
 fn limit(message: &str) -> HiveError {
     HiveError::new(ErrorCode::ContextLimit, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_a_declaration_expiring_at_snapshot_acquisition() {
+        let workspace = "01900000-0000-7000-8000-000000000001";
+        let area = "01900000-0000-7000-8000-000000000002";
+        let issue = "01900000-0000-7000-8000-000000000003";
+        let invocation = "01900000-0000-7000-8000-000000000004";
+        let start = "2026-01-01T00:00:00Z";
+        let expires = "2026-01-01T00:00:01Z";
+        let file: EvidenceFile = serde_json::from_str(
+            &serde_json::json!({
+                "version": 1,
+                "handoff": {
+                    "version": 1,
+                    "evidence_id": "fixture-evidence",
+                    "revision": "r1",
+                    "source_ref": "fixture-source",
+                    "issuer_ref": "fixture-issuer",
+                    "workspace_id": workspace,
+                    "actor_ref": "fixture-actor",
+                    "area_id": area,
+                    "issue_id": issue,
+                    "invocation_id": invocation,
+                    "db_commit": "a".repeat(32),
+                    "operations": ["read_handoff_body"],
+                    "record": {
+                        "kind": "issue_update",
+                        "id": "01900000-0000-7000-8000-000000000005",
+                        "revision": "a".repeat(32)
+                    },
+                    "valid_from": start,
+                    "expires_at": expires,
+                    "withdrawn": false
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let selection = Selection {
+            workspace_id: workspace,
+            actor_ref: "fixture-actor",
+            bot_id: None,
+            invocation_id: Some(invocation),
+            issue: Some(issue),
+            area: Some(area),
+            artifacts: &[],
+        };
+        assert!(file.preflight(&selection).is_ok());
+        assert!(
+            file.validate(&selection, workflow::parse_time(start).unwrap())
+                .is_ok()
+        );
+        assert!(matches!(
+            file.validate(&selection, workflow::parse_time(expires).unwrap()),
+            Err(error) if matches!(error.code, ErrorCode::AuthorityUnverified)
+        ));
+    }
 }

@@ -20,7 +20,6 @@ use crate::error::{ErrorCode, HiveError};
 
 pub(super) const MAX_DIRECTIVES: usize = 100;
 const MAX_RECEIPT_BYTES: usize = 256 * 1024;
-const MAX_RECEIPT_HISTORY: usize = 128;
 
 pub(super) struct Candidate {
     db_commit: String,
@@ -281,8 +280,7 @@ fn receipt_at(
     }))
 }
 
-/// Follow the retained linear history of the authenticated main snapshot. A
-/// receipt must be identical across the suffix and absent at its declared base.
+/// Inspect changes to the exact receipt in the retained, committed view.
 fn receipt_introduction(
     snapshot: &mut Snapshot,
     candidate: &Candidate,
@@ -292,30 +290,50 @@ fn receipt_introduction(
     if !is_commit_hash(&receipt.base_commit) {
         return Err(invalid_record("The receipt has a malformed base commit."));
     }
-    let mut commit = snapshot.commit.clone();
-    for _ in 0..MAX_RECEIPT_HISTORY {
-        if commit == receipt.base_commit {
-            return Err(workflow::unverified());
-        }
-        let parents: Vec<String> = snapshot.exec_rows(
-            |_| {
-                "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? LIMIT 2"
-                    .to_owned()
-            },
-            (&commit,),
-        )?;
-        let [parent] = parents.as_slice() else {
-            return Err(workflow::unverified());
-        };
-        match receipt_at(snapshot, candidate, request_id, parent)? {
-            Some(previous) if previous == *receipt => commit.clone_from(parent),
-            None if parent == &receipt.base_commit => return Ok(commit),
-            _ => return Err(workflow::unverified()),
-        }
+    let observed = snapshot.commit.clone();
+    type Delta = (String, String, String, Option<String>, Option<String>);
+    let changes: Vec<Delta> = snapshot.exec_rows(
+        |commit| {
+            format!(
+                "SELECT from_commit, to_commit, diff_type, from_request_id, to_request_id
+                 FROM dolt_diff_operation_receipts AS OF '{commit}'
+                 WHERE from_request_id = ? OR to_request_id = ? LIMIT 2"
+            )
+        },
+        (request_id, request_id),
+    )?;
+    let [(base, introduced, kind, None, Some(added_request))] = changes.as_slice() else {
+        return Err(workflow::unverified());
+    };
+    if kind != "added"
+        || added_request != request_id
+        || base != &receipt.base_commit
+        || !is_commit_hash(introduced)
+        || introduced == base
+    {
+        return Err(workflow::unverified());
     }
-    Err(limit(
-        "The retained activation receipt history exceeds 128 revisions.",
-    ))
+
+    // Anchor the edge to the paired Snapshot and require the receipt's base
+    // to be the introducing commit's sole parent.
+    let merger: Vec<Option<String>> = snapshot.exec_rows(
+        |_| "SELECT DOLT_MERGE_BASE(?, ?)".to_owned(),
+        (introduced, &observed),
+    )?;
+    let parents: Vec<String> = snapshot.exec_rows(
+        |_| {
+            "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? LIMIT 2".to_owned()
+        },
+        (introduced,),
+    )?;
+    if !matches!(merger.as_slice(), [Some(ancestor)] if ancestor == introduced)
+        || !matches!(parents.as_slice(), [parent] if parent == base)
+        || receipt_at(snapshot, candidate, request_id, base)?.is_some()
+        || receipt_at(snapshot, candidate, request_id, introduced)?.as_ref() != Some(receipt)
+    {
+        return Err(workflow::unverified());
+    }
+    Ok(introduced.clone())
 }
 
 type DirectiveVersion = (
