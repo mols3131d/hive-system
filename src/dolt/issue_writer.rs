@@ -91,6 +91,7 @@ impl Kind {
             Self::Transition(issue_transition::Operation::Select) => "Issue select",
             Self::Transition(issue_transition::Operation::Claim) => "Issue claim",
             Self::SetParent => "Issue set-parent",
+            Self::Transition(operation) => operation.name(),
         }
     }
 
@@ -109,6 +110,12 @@ impl Kind {
             Self::Note | Self::Transition(issue_transition::Operation::Select) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
+                ("operation_receipts", "INSERT"),
+            ],
+            Self::Transition(_) => &[
+                ("issues", "UPDATE"),
+                ("issue_updates", "INSERT"),
+                ("issue_claims", "DELETE"),
                 ("operation_receipts", "INSERT"),
             ],
             Self::Update | Self::SetParent => {
@@ -1136,13 +1143,16 @@ mod tests {
         for (name, operation) in [
             ("issue.select", issue_transition::Operation::Select),
             ("issue.claim", issue_transition::Operation::Claim),
+            ("issue.release", issue_transition::Operation::Release),
+            ("issue.recover", issue_transition::Operation::Recover),
+            ("issue.submit", issue_transition::Operation::Submit),
         ] {
             transition["kind"] = json!(name);
             let marker = read(&transition).unwrap();
             assert!(matches!(marker.operation(), Ok(Kind::Transition(kind)) if kind == operation));
             assert_eq!(json!(marker), transition);
         }
-        transition["kind"] = json!("issue.release");
+        transition["kind"] = json!("issue.submit-epic");
         assert!(read(&transition).is_err());
 
         let legacy_bytes = serde_json::to_string(&legacy).unwrap();

@@ -274,6 +274,10 @@ pub(crate) enum Command {
     #[command(skip)]
     IssueClaim(IssueClaimArgs),
     #[command(skip)]
+    IssueRelease(IssueReleaseArgs, bool),
+    #[command(skip)]
+    IssueSubmit(IssueSubmitArgs),
+    #[command(skip)]
     IssueDependency(IssueDependencyArgs, bool),
     #[command(skip)]
     IssueParent(IssueParentArgs),
@@ -1341,6 +1345,39 @@ pub(crate) struct IssueClaimArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueStopArgs {
+    #[command(flatten)]
+    pub(crate) claim_args: IssueClaimArgs,
+    /// Exact current Claim UUIDv7.
+    #[arg(long)]
+    pub(crate) claim: String,
+    /// Reference selecting the stop attestation in the decision file.
+    #[arg(long)]
+    pub(crate) stop_evidence: String,
+}
+
+#[derive(Args)]
+pub(crate) struct IssueReleaseArgs {
+    #[command(flatten)]
+    pub(crate) stopped: IssueStopArgs,
+    /// Reason for ending execution responsibility.
+    #[arg(long)]
+    pub(crate) reason: String,
+}
+
+#[derive(Args)]
+pub(crate) struct IssueSubmitArgs {
+    #[command(flatten)]
+    pub(crate) stopped: IssueStopArgs,
+    /// Reference to the submitted result evidence.
+    #[arg(long)]
+    pub(crate) evidence: String,
+    /// UTF-8 Markdown submission.
+    #[arg(long)]
+    pub(crate) file: PathBuf,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueListArgs {
     /// Select Issues across the workspace.
     #[arg(long)]
@@ -1591,6 +1628,21 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             Some(("issue", issue)) if issue.subcommand_name() == Some("set-parent") => {
                 Command::IssueParent(
                     IssueParentArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue))
+                if matches!(issue.subcommand_name(), Some("release" | "recover")) =>
+            {
+                Command::IssueRelease(
+                    IssueReleaseArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                    issue.subcommand_name() == Some("recover"),
+                )
+            }
+            Some(("issue", issue)) if issue.subcommand_name() == Some("submit") => {
+                Command::IssueSubmit(
+                    IssueSubmitArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
                 )
             }
@@ -2114,7 +2166,10 @@ fn recover_unknown_long(
         return None;
     }
     let (action, _) = matched.subcommand()?;
-    if (domain, action) == ("issue", "set-parent") {
+    if matches!(
+        (domain, action),
+        ("issue", "set-parent" | "release" | "recover" | "submit")
+    ) {
         return [true, false].into_iter().find_map(|equals| {
             replay_unknown_options(cli, args, error, (domain, action), equals, true)
         });
@@ -2128,7 +2183,14 @@ fn recover_unknown_long(
         ("project", "add-issue")
             | (
                 "issue",
-                "add-dependency" | "remove-dependency" | "select" | "claim" | "set-parent"
+                "add-dependency"
+                    | "remove-dependency"
+                    | "select"
+                    | "claim"
+                    | "release"
+                    | "recover"
+                    | "submit"
+                    | "set-parent"
             )
     );
     if !(named_write
@@ -2148,7 +2210,8 @@ fn recover_unknown_long(
         return None;
     };
     let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
-    let long = unknown_long_name(leaf, invalid)?;
+    const UNKNOWN_OPTION: &str = "recovered_unknown_long";
+    let recovered = Arg::new(UNKNOWN_OPTION).long(unknown_long_name(leaf, invalid)?.to_owned());
 
     let workspace_init = (domain, action) == ("workspace", "init");
     let allow_incomplete = named_write || positional_write;
@@ -2162,7 +2225,6 @@ fn recover_unknown_long(
     } else {
         &[accept_value]
     };
-    const UNKNOWN_LONG: &str = "recovered_unknown_long";
     let build_retry = |accept_value: bool| {
         cli.clone().mut_subcommand(domain, |command| {
             command.mut_subcommand(action, |leaf| {
@@ -2172,8 +2234,8 @@ fn recover_unknown_long(
                     leaf
                 };
                 leaf.arg(
-                    Arg::new(UNKNOWN_LONG)
-                        .long(long.to_owned())
+                    recovered
+                        .clone()
                         .num_args(0..=1)
                         .require_equals(!accept_value)
                         .value_parser(OsStringValueParser::new())
@@ -2195,7 +2257,7 @@ fn recover_unknown_long(
         matches
             .subcommand_matches(domain)
             .and_then(|command| command.subcommand_matches(action))
-            .is_some_and(|leaf| leaf.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine))
+            .is_some_and(|leaf| leaf.value_source(UNKNOWN_OPTION) == Some(ValueSource::CommandLine))
     };
     let mut missing = None;
     for &accept_value in modes {
@@ -2250,6 +2312,16 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             .subcommand(add_leaf_options(IssueClaimArgs::augment_args(
                 clap::Command::new("claim").about("Record an exclusive Claim for a ready Issue."),
             )))
+            .subcommand(add_leaf_options(IssueReleaseArgs::augment_args(
+                clap::Command::new("release").about("Release the exact stopped execution Claim."),
+            )))
+            .subcommand(add_leaf_options(IssueReleaseArgs::augment_args(
+                clap::Command::new("recover")
+                    .about("Recover the exact stopped Claim with a reviewed decision."),
+            )))
+            .subcommand(add_leaf_options(IssueSubmitArgs::augment_args(
+                clap::Command::new("submit").about("Submit a stopped execution for review."),
+            )))
             .subcommand(add_leaf_options(IssueParentArgs::augment_args(
                 clap::Command::new("set-parent")
                     .about("Attach, move or clear an exact Issue parent."),
@@ -2272,6 +2344,9 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             "select",
             "claim",
             "set-parent",
+            "release",
+            "recover",
+            "submit",
             "add-dependency",
             "remove-dependency",
         ]
@@ -2289,6 +2364,9 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .mut_subcommand("select", extended_error_options)
                 .mut_subcommand("claim", extended_error_options)
                 .mut_subcommand("set-parent", extended_error_options)
+                .mut_subcommand("release", extended_error_options)
+                .mut_subcommand("recover", extended_error_options)
+                .mut_subcommand("submit", extended_error_options)
                 .mut_subcommand("add-dependency", extended_error_options)
                 .mut_subcommand("remove-dependency", extended_error_options)
                 .subcommand(issue_help("help"))
@@ -2313,6 +2391,9 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                     "select",
                     "claim",
                     "set-parent",
+                    "release",
+                    "recover",
+                    "submit",
                 ],
             )
             .or_else(|| recover_unknown_long(&recovery, args, &partial, &error, "issue"))
@@ -2331,8 +2412,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
         }
         Some(("issue", issue)) => match issue.subcommand() {
             Some((
-                "note" | "create" | "update" | "select" | "claim" | "add-dependency"
-                | "remove-dependency" | "set-parent",
+                "note" | "create" | "update" | "select" | "claim" | "release" | "recover"
+                | "submit" | "add-dependency" | "remove-dependency" | "set-parent",
                 leaf,
             )) => Some(leaf),
             Some(("help", _)) => help_leaf.map(|(_, leaf)| leaf),
@@ -3340,6 +3421,31 @@ impl Command {
                 Self::IssueSelect(args)
                 | Self::IssueClaim(IssueClaimArgs {
                     transition: args, ..
+                })
+                | Self::IssueRelease(
+                    IssueReleaseArgs {
+                        stopped:
+                            IssueStopArgs {
+                                claim_args:
+                                    IssueClaimArgs {
+                                        transition: args, ..
+                                    },
+                                ..
+                            },
+                        ..
+                    },
+                    _,
+                )
+                | Self::IssueSubmit(IssueSubmitArgs {
+                    stopped:
+                        IssueStopArgs {
+                            claim_args:
+                                IssueClaimArgs {
+                                    transition: args, ..
+                                },
+                            ..
+                        },
+                    ..
                 }) => {
                     if common.workspace.is_none() || !args.target.has_all() {
                         return Err(
@@ -3488,6 +3594,8 @@ impl Command {
             | Self::IssueSelect(_)
             | Self::IssueClaim(_)
             | Self::IssueParent(_)
+            | Self::IssueRelease(_, _)
+            | Self::IssueSubmit(_)
             | Self::IssueDependency(_, _) => Err("Issue commands require --contract 2."),
             Self::Backup(_) => Err("Backup commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),

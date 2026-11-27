@@ -4145,6 +4145,60 @@ fn dolt_artifact_update_requires_one_explicit_body_and_revision() {
 }
 
 #[test]
+fn stopped_issue_transitions_keep_output_options_and_literal_boundaries() {
+    let sandbox = Sandbox::new();
+    let issue = "01900000-0000-7000-8000-000000000003";
+    let output = ["--contract", "2", "--json"];
+    for action in ["release", "recover", "submit"] {
+        let command = ["issue", action];
+        for help in [
+            ["help", "issue", action, "--contract", "2"],
+            ["issue", "help", action, "--contract", "2"],
+        ] {
+            let report = sandbox.run(&help);
+            assert!(report.status.success(), "{help:?} {report:?}");
+            assert!(report.stderr.is_empty());
+            assert!(String::from_utf8_lossy(&report.stdout).contains("--stop-evidence"));
+        }
+        for invalid in [
+            &["--unknown=--contract=1", issue][..],
+            &["-Z", issue],
+            &[issue, "--unknown", "--another"],
+            &["--unknown=--json", issue, "-Z", "--another=--contract=1"],
+            &[issue, "--claim"],
+            &[issue, "--holder", "a", "--holder", "b"],
+        ] {
+            let early = [&output[..], &command, invalid].concat();
+            let late = [&command[..], invalid, &output].concat();
+            let early = sandbox.run(&early);
+            let late = sandbox.run(&late);
+            for report in [&early, &late] {
+                assert_eq!(report.status.code(), Some(2), "{invalid:?}");
+                assert!(report.stderr.is_empty(), "{invalid:?}");
+                let envelope: Value = serde_json::from_slice(&report.stdout).unwrap();
+                assert_eq!(envelope["schema_version"], 2);
+                assert_eq!(envelope["ok"], false);
+                assert_eq!(envelope["command"], format!("issue {action}"));
+                assert_eq!(envelope["error"]["code"], "INVALID_ARGUMENT");
+            }
+            assert_eq!(early.stdout, late.stdout);
+        }
+        for literal in [
+            &["--contract", "2", "--stop-evidence=--json", issue][..],
+            &["--contract", "2", "--unknown=--json", issue],
+            &["--contract", "2", "--unknown=--json", issue, "--another"],
+            &["--contract", "2", "--", "--json"],
+        ] {
+            let report = sandbox.run(&[&command[..], literal].concat());
+            assert_eq!(report.status.code(), Some(2));
+            assert!(report.stdout.is_empty(), "{literal:?}");
+            assert!(!report.stderr.is_empty(), "{literal:?}");
+        }
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn issue_set_parent_keeps_late_v2_errors_and_literal_argument_boundaries() {
     let sandbox = Sandbox::new();
     let issue = "01900000-0000-7000-8000-000000000001";
