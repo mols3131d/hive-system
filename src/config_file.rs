@@ -417,6 +417,98 @@ mod filesystem {
         }
 
         #[cfg(target_os = "linux")]
+        pub(crate) fn require_child_directory(&self, name: &OsStr) -> Result<Self, HiveError> {
+            self.open_child_directory(name)?.ok_or_else(|| {
+                HiveError::new(
+                    ErrorCode::NotFound,
+                    "A required scoped directory is missing",
+                )
+            })
+        }
+
+        #[cfg(target_os = "linux")]
+        pub(crate) fn verify_git_objects(&self) -> Result<(), HiveError> {
+            // Git stores objects in loose-object fanout directories and pack files.
+            // Its info directory may also have a split commit-graph chain.
+            self.check_object_entries(0)
+        }
+
+        #[cfg(target_os = "linux")]
+        fn check_object_entries(&self, depth: usize) -> Result<(), HiveError> {
+            use rustix::fs::{AtFlags, Dir, FileType, statat};
+
+            let unsafe_store =
+                || invalid("The assets Git object store must use local regular files");
+            if depth > 2 {
+                return Err(unsafe_store());
+            }
+            let entries = Dir::read_from(&self.file).map_err(|_| unsafe_store())?;
+            for entry in entries {
+                let entry = entry.map_err(|_| unsafe_store())?;
+                let name = entry.file_name();
+                match name.to_bytes() {
+                    b"." | b".." => continue,
+                    b"alternates" | b"http-alternates" => return Err(unsafe_store()),
+                    _ => {}
+                }
+                let metadata = statat(&self.file, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|_| unsafe_store())?;
+                match FileType::from_raw_mode(metadata.st_mode) {
+                    FileType::RegularFile => {}
+                    FileType::Directory => self
+                        .require_child_directory(OsStr::from_bytes(name.to_bytes()))?
+                        .check_object_entries(depth + 1)?,
+                    _ => return Err(unsafe_store()),
+                }
+            }
+            Ok(())
+        }
+
+        #[cfg(target_os = "linux")]
+        pub(crate) fn same_directory(&self, other: &Self) -> Result<bool, HiveError> {
+            Ok(Self::same_inode(
+                &self.file.metadata().map_err(read_error)?,
+                &other.file.metadata().map_err(read_error)?,
+            ))
+        }
+
+        #[cfg(target_os = "linux")]
+        fn same_inode(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+            use std::os::unix::fs::MetadataExt;
+            first.dev() == second.dev() && first.ino() == second.ino()
+        }
+
+        /// The caller must keep this directory open until the command is spawned.
+        #[cfg(target_os = "linux")]
+        pub(crate) unsafe fn inherit_directory(
+            &self,
+            command: &mut std::process::Command,
+        ) -> Result<PathBuf, HiveError> {
+            use std::os::unix::process::CommandExt;
+
+            let fd = self.file.as_raw_fd();
+            let path = PathBuf::from(format!("/proc/self/fd/{fd}"));
+            let metadata = self.file.metadata().map_err(read_error)?;
+            if !fs::metadata(&path).is_ok_and(|linked| Self::same_inode(&metadata, &linked)) {
+                return Err(HiveError::new(
+                    ErrorCode::NotImplemented,
+                    "Soul inspection requires access to Linux /proc/self/fd.",
+                ));
+            }
+            // SAFETY: The caller keeps the descriptor alive. fcntl changes only
+            // the child descriptor so it remains available after exec.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            Ok(path)
+        }
+
+        #[cfg(target_os = "linux")]
         pub(crate) fn handle(&self) -> &File {
             &self.file
         }
