@@ -1287,6 +1287,7 @@ fn backup_help_and_conversation_flag_are_contract_two_only() {
         &["--help"][..],
         &["backup", "--help"],
         &["--contract", "1", "backup", "create", "--help"],
+        &["--contract", "1", "backup", "restore", "--help"],
     ] {
         let result = run(args);
         assert!(!String::from_utf8_lossy(&result.stdout).contains("Create a local"));
@@ -1316,11 +1317,31 @@ fn backup_help_and_conversation_flag_are_contract_two_only() {
     );
     assert_eq!(refused["error"]["code"], "NOT_IMPLEMENTED");
     assert!(!fixture.0.join("backup").exists());
+    let help = run(&["backup", "restore", "--help", "--contract", "2"]);
+    assert!(help.status.success(), "{help:?}");
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--source <SNAPSHOT>"));
+    let refused = response(
+        run(&[
+            "--contract",
+            "2",
+            "--json",
+            "backup",
+            "restore",
+            "--source",
+            "missing",
+            "--target",
+            "restored",
+            "--include-conversations",
+        ]),
+        7,
+    );
+    assert_eq!(refused["error"]["code"], "NOT_IMPLEMENTED");
+    assert!(!fixture.0.join("restored").exists());
 }
 
 #[test]
 #[ignore = "requires installed Dolt 2.7.6 and Git"]
-fn creates_exact_local_backup_and_refuses_unverified_sources() {
+fn creates_and_restores_exact_local_backup_and_refuses_unverified_inputs() {
     use sha2::{Digest, Sha256};
 
     let fixture = Fixture::new();
@@ -1382,11 +1403,27 @@ fn creates_exact_local_backup_and_refuses_unverified_sources() {
 
 Two lines.
 ";
-    fs::write(asset_root.join("SOUL.md"), source_soul).unwrap();
-    execute(assets(&asset_root).args(["add", "SOUL.md"]));
-    execute(assets(&asset_root).args(["commit", "-m", "Add synthetic Soul"]));
-    let update = "UPDATE workspace_counters SET next_value = 42 WHERE name = 'issue_number'";
-    execute(database(&db).args(["sql", "-q", update]));
+    let soul = "bots/synthetic/SOUL.md";
+    fs::create_dir_all(asset_root.join("bots/synthetic")).unwrap();
+    let prior_soul = b"# Earlier Synthetic Soul\n";
+    fs::write(asset_root.join(soul), prior_soul).unwrap();
+    execute(assets(&asset_root).args(["add", soul]));
+    execute(assets(&asset_root).args(["commit", "-m", "Add earlier synthetic Soul"]));
+    fs::write(asset_root.join(soul), source_soul).unwrap();
+    execute(assets(&asset_root).args(["add", soul]));
+    execute(assets(&asset_root).args(["commit", "-m", "Revise synthetic Soul"]));
+    let previous = initial["db_commit"].as_str().unwrap();
+    let changes = format!(
+        "UPDATE workspace_counters SET next_value = 42 WHERE name = 'issue_number';
+         INSERT INTO bots VALUES ('01900000-0000-7000-8000-000000000001', 'synthetic',
+           'Synthetic Queen', '01900000-0000-7000-8000-000000000002', NULL);
+         INSERT INTO resources VALUES ('01900000-0000-7000-8000-000000000003', 'reference',
+           'Synthetic reference', NULL, '01900000-0000-7000-8000-000000000004');
+         INSERT INTO operation_receipts VALUES ('01900000-0000-7000-8000-000000000005',
+           'fixture', REPEAT('a', 64), 'synthetic', 'fixture', '{{}}', '{previous}', '{{}}',
+           '2026-01-01 00:00:00');"
+    );
+    execute(database(&db).args(["sql", "-q", &changes]));
     execute(database(&db).args(["add", "."]));
     execute(database(&db).args([
         "commit",
@@ -1394,6 +1431,29 @@ Two lines.
         "Synthetic <test@example.invalid>",
         "-m",
         "Advance counter",
+    ]));
+    let history: Value = serde_json::from_slice(&execute(database(&db).args([
+        "sql",
+        "-r",
+        "json",
+        "-q",
+        "SELECT DOLT_HASHOF('HEAD') AS revision",
+    ])))
+    .unwrap();
+    let receipt_commit = history["rows"][0]["revision"].as_str().unwrap();
+    execute(database(&db).args([
+        "sql",
+        "-q",
+        "UPDATE operation_receipts
+         SET request_id = '01900000-0000-7000-8000-000000000006'",
+    ]));
+    execute(database(&db).args(["add", "."]));
+    execute(database(&db).args([
+        "commit",
+        "--author",
+        "Synthetic <test@example.invalid>",
+        "-m",
+        "Remove synthetic receipt from current view",
     ]));
     fs::write(
         root.join("conversations/private.md"),
@@ -1512,9 +1572,9 @@ Two lines.
     expect_failure("failed", 5, "LOCK_BUSY");
     drop(lock);
 
-    fs::write(asset_root.join("SOUL.md"), "dirty").unwrap();
+    fs::write(asset_root.join(soul), "dirty").unwrap();
     expect_failure("failed", 5, "DIRTY_CONFLICT");
-    fs::write(asset_root.join("SOUL.md"), source_soul).unwrap();
+    fs::write(asset_root.join(soul), source_soul).unwrap();
     execute(database(&db).args(["sql", "-q", "UPDATE workspace_counters SET next_value = 43"]));
     expect_failure("failed", 5, "DIRTY_CONFLICT");
     execute(database(&db).args(["checkout", "--", "workspace_counters"]));
@@ -1586,24 +1646,178 @@ Two lines.
         "ALREADY_EXISTS"
     );
 
-    execute(database(&home).args(["config", "--global", "--add", "user.name", "Synthetic"]));
-    execute(database(&home).args([
-        "config",
-        "--global",
-        "--add",
-        "user.email",
-        "test@example.invalid",
-    ]));
+    let run_restore = |source: &Path, target: &str| {
+        fixture
+            .hive()
+            .env("XDG_STATE_HOME", fixture.0.join("unused-restore-state"))
+            .env("XDG_CONFIG_HOME", fixture.0.join("unused-restore-config"))
+            .args(["--contract", "2", "--json", "backup", "restore", "--source"])
+            .arg(source)
+            .args(["--target", target])
+            .output()
+            .unwrap()
+    };
     let restored = fixture.dir("restored");
-    execute(
-        database(&restored)
-            .args(["backup", "restore"])
-            .arg(format!("file://{}", backup.join("dolt").display()))
-            .arg("db"),
+    let result = response(run_restore(&backup, "restored"), 0);
+    assert_eq!(result["data"]["active_root"], "inactive");
+    assert_eq!(result["data"]["workspace_id"], manifest["workspace_id"]);
+    assert_eq!(result["data"]["db_commit"], manifest["dolt_commit"]);
+    assert_eq!(result["data"]["asset_commit"], manifest["asset_git_commit"]);
+    assert_eq!(result["data"]["conversations_restored"], false);
+    assert_eq!(restored.metadata().unwrap().mode() & 0o777, 0o700);
+    assert_eq!(
+        fs::read_dir(restored.join("conversations"))
+            .unwrap()
+            .count(),
+        0
     );
+    assert!(!restored.join("db/config.yaml").exists());
+    assert!(!restored.join("db/.doltcfg").exists());
+    assert!(!fixture.0.join("unused-restore-state").exists());
+    assert!(!fixture.0.join("unused-restore-config").exists());
+    let repo_state: Value =
+        serde_json::from_slice(&fs::read(restored.join("db/.dolt/repo_state.json")).unwrap())
+            .unwrap();
+    assert_eq!(repo_state["remotes"], serde_json::json!({}));
+    assert_eq!(repo_state["backups"], serde_json::json!({}));
+    assert_eq!(
+        response(run_restore(&backup, "new restored"), 0)["data"]["active_root"],
+        "inactive"
+    );
+    let stale_target = fixture.0.join("stale-active-root");
+    let stale_state = fixture
+        .0
+        .join("unused-restore-state/hive/v2/workspaces")
+        .join(manifest["workspace_id"].as_str().unwrap());
+    fs::create_dir_all(&stale_state).unwrap();
+    let registration = serde_json::to_vec(&serde_json::json!({
+        "version": 2,
+        "workspace_id": manifest["workspace_id"],
+        "workspace_root": stale_target,
+    }))
+    .unwrap();
+    let registration_file = stale_state.join("active-root.json");
+    fs::write(&registration_file, &registration).unwrap();
+    let refused = response(run_restore(&backup, "stale-active-root"), 7);
+    assert_eq!(refused["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert!(!stale_target.exists());
+    assert_eq!(fs::read(&registration_file).unwrap(), registration);
+
+    // A failed check leaves a selected empty target untouched and no target
+    // is published for invalid inputs when the target was absent.
+    let manifest_path = backup.join("manifest.json");
+    let empty = fixture.dir("still-empty");
+    let original = fs::read(&manifest_path).unwrap();
+    let mut invalid = manifest.clone();
+    for (field, value) in [
+        ("format_version", serde_json::json!(2)),
+        ("conversations_included", serde_json::json!(true)),
+        (
+            "dolt_commit",
+            serde_json::json!("00000000000000000000000000000000"),
+        ),
+        (
+            "asset_git_commit",
+            serde_json::json!("0000000000000000000000000000000000000001"),
+        ),
+    ] {
+        invalid[field] = value;
+        fs::write(&manifest_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert_eq!(
+            response(run_restore(&backup, "still-empty"), 7)["ok"],
+            false
+        );
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+        invalid[field] = manifest[field].clone();
+    }
+    invalid["files"][0]["path"] = serde_json::json!("../assets.bundle");
+    fs::write(&manifest_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+    assert_eq!(
+        response(run_restore(&backup, "bad-restore"), 7)["ok"],
+        false
+    );
+    fs::write(&manifest_path, &original).unwrap();
+    let bundle = backup.join("assets.bundle");
+    let bundle_bytes = fs::read(&bundle).unwrap();
+    let mut corrupt = bundle_bytes.clone();
+    corrupt[0] ^= 1;
+    fs::write(&bundle, corrupt).unwrap();
+    assert_eq!(
+        response(run_restore(&backup, "bad-restore"), 7)["ok"],
+        false
+    );
+    fs::remove_file(&bundle).unwrap();
+    let outside = fixture.0.join("external-bundle");
+    fs::write(&outside, &bundle_bytes).unwrap();
+    symlink(&outside, &bundle).unwrap();
+    assert!(!run_restore(&backup, "bad-restore").status.success());
+    fs::remove_file(&bundle).unwrap();
+    fs::hard_link(&outside, &bundle).unwrap();
+    assert!(!run_restore(&backup, "bad-restore").status.success());
+    fs::remove_file(&bundle).unwrap();
+    fs::write(&bundle, bundle_bytes).unwrap();
+
+    // A prerequisite bundle must fail even when the manifest digest matches.
+    let incomplete = fixture.0.join("incomplete.bundle");
+    execute(
+        assets(&asset_root)
+            .args(["bundle", "create"])
+            .arg(&incomplete)
+            .arg("HEAD^..HEAD"),
+    );
+    let incomplete = fs::read(incomplete).unwrap();
+    fs::write(&bundle, &incomplete).unwrap();
+    let mut incomplete_manifest = manifest.clone();
+    let entry = incomplete_manifest["files"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["path"] == "assets.bundle")
+        .unwrap();
+    entry["bytes"] = serde_json::json!(incomplete.len());
+    entry["sha256"] = serde_json::json!(format!("{:x}", Sha256::digest(incomplete)));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec(&incomplete_manifest).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        response(run_restore(&backup, "bad-restore"), 7)["error"]["code"],
+        "IO_ERROR"
+    );
+    fs::write(&manifest_path, original).unwrap();
+    fs::copy(&outside, &bundle).unwrap();
+
+    // A competing write into an initially empty directory must survive and
+    // prevent the validated payload from replacing the directory.
+    let sentinel = empty.join("sentinel");
+    fs::remove_file(&wrapper).unwrap();
+    fs::write(&wrapper, format!(
+        "#!/bin/sh\nif [ \"$1\" = fsck ]; then printf competing > '{}'; fi\nexec \"{}\" \"$@\"\n",
+        sentinel.display(), dolt.display()
+    )).unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!run_restore(&backup, "still-empty").status.success());
+    assert_eq!(fs::read(&sentinel).unwrap(), b"competing");
+    assert_eq!(fs::read_dir(&empty).unwrap().count(), 1);
+    fs::remove_file(&wrapper).unwrap();
+    symlink(&dolt, &wrapper).unwrap();
+    assert!(!fixture.0.join("bad-restore").exists());
+    assert!(!run_restore(&backup, "restored").status.success());
+    assert!(
+        !run_restore(&backup, "backup with spaces/nested")
+            .status
+            .success()
+    );
+    assert!(!run_restore(&backup, "workspace/nested").status.success());
+    assert!(fixture.stages().is_empty());
+
     let verify = format!(
-        "SELECT DOLT_HASHOF('HEAD') AS revision,          (SELECT next_value FROM workspace_counters) AS current_value,          (SELECT next_value FROM workspace_counters AS OF '{}') AS prior_value",
-        initial["db_commit"].as_str().unwrap()
+        "SELECT DOLT_HASHOF('HEAD') AS revision,
+           (SELECT next_value FROM workspace_counters) AS current_value,
+           (SELECT next_value FROM workspace_counters AS OF '{previous}') AS prior_value,
+           (SELECT request_id FROM operation_receipts) AS current_receipt,
+           (SELECT request_id FROM operation_receipts AS OF '{receipt_commit}') AS past_receipt"
     );
     let rows: Value = serde_json::from_slice(&execute(
         database(&restored.join("db")).args(["sql", "-r", "json", "-q", &verify]),
@@ -1612,21 +1826,27 @@ Two lines.
     assert_eq!(rows["rows"][0]["revision"], manifest["dolt_commit"]);
     assert_eq!(rows["rows"][0]["current_value"], 42);
     assert_eq!(rows["rows"][0]["prior_value"], 1);
-
-    let checked = fixture.dir("checked-assets");
-    execute(assets(&checked).args(["init", "--template="]));
-    execute(
-        assets(&checked)
-            .args(["bundle", "unbundle"])
-            .arg(backup.join("assets.bundle")),
+    assert_eq!(
+        rows["rows"][0]["current_receipt"],
+        "01900000-0000-7000-8000-000000000006"
     );
+    assert_eq!(
+        rows["rows"][0]["past_receipt"],
+        "01900000-0000-7000-8000-000000000005"
+    );
+
+    let checked = restored.join("assets");
     let revision = manifest["asset_git_commit"].as_str().unwrap();
     assert_eq!(
-        execute(assets(&checked).args(["show", &format!("{revision}:SOUL.md")])),
+        execute(assets(&checked).args(["show", &format!("{revision}:{soul}")])),
         source_soul
     );
     assert_eq!(
-        execute(assets(&checked).args(["rev-parse", &format!("{revision}^")])),
+        execute(assets(&checked).args(["show", &format!("{revision}^:{soul}")])),
+        prior_soul
+    );
+    assert_eq!(
+        execute(assets(&checked).args(["rev-parse", &format!("{revision}^^")])),
         format!(
             "{}
 ",

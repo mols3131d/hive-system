@@ -10,6 +10,7 @@ mod output;
 mod workspace_backup;
 mod workspace_doctor;
 mod workspace_init;
+mod workspace_restore;
 mod workspace_status;
 
 use std::io::Write;
@@ -103,9 +104,13 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
             Ok(data) => {
                 let status = output::success(Contract::V2, format, name, None, &data);
                 if status != ExitCode::SUCCESS {
+                    let published = match command {
+                        cli::BackupCommand::Create { .. } => "backup",
+                        cli::BackupCommand::Restore { .. } => "restored workspace",
+                    };
                     let _ = writeln!(
                         std::io::stderr().lock(),
-                        "error: The backup was published, but its success response could not be written."
+                        "error: The {published} was published, but its success response could not be written."
                     );
                 }
                 status

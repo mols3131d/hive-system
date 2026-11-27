@@ -178,7 +178,8 @@ fn conversation_selector<'a>(
 pub(crate) fn validate(args: &ValidateArgs) -> Result<DoltSuccess, Box<DoltFailure>> {
     let (mut snapshot, workspace_id) =
         Snapshot::open(&args.target).map_err(DoltFailure::without_context)?;
-    let diagnostics = records::validate(&mut snapshot).map_err(DoltFailure::without_context)?;
+    let diagnostics = records::validate(&mut records::RecordReader::Online(&mut snapshot))
+        .map_err(DoltFailure::without_context)?;
     let context = json!({
         "workspace_id": workspace_id,
         "db_commit": snapshot.commit,
@@ -197,6 +198,29 @@ pub(crate) fn validate(args: &ValidateArgs) -> Result<DoltSuccess, Box<DoltFailu
             "diagnostics": diagnostics.items,
         }),
     })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_restored_records(
+    installed: &crate::workspace_init::Installed<'_>,
+    db: &std::path::Path,
+    commit: &str,
+    workspace_id: &str,
+    read_soul_blob: impl FnMut(&str) -> Result<String, HiveError>,
+) -> Result<(), HiveError> {
+    let mut reader = records::RecordReader::Offline {
+        installed,
+        db,
+        commit,
+    };
+    let diagnostics = records::validate(&mut reader)?;
+    if !diagnostics.items.is_empty() {
+        return Err(HiveError::record_violations(
+            diagnostics.items,
+            diagnostics.truncated,
+        ));
+    }
+    bot::validate_restored_souls(&mut reader, workspace_id, read_soul_blob)
 }
 
 fn encode_id_cursor(id: &str, binding: &Value) -> String {

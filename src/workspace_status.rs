@@ -22,6 +22,9 @@ pub(crate) use runtime::{
     with_operation_snapshot, with_owned_snapshot, with_writer_runtime,
 };
 
+#[cfg(target_os = "linux")]
+pub(crate) use unix::require_inactive_target;
+
 pub(crate) fn run(
     options: &CommonOptions,
     command: &WorkspaceCommand,
@@ -46,11 +49,32 @@ pub(crate) fn backup(
 ) -> (Format, Result<Value, HiveError>) {
     use crate::error::ErrorCode;
 
-    let crate::cli::BackupCommand::Create {
+    use crate::cli::BackupCommand;
+
+    let format = options.format.unwrap_or_default();
+    if let BackupCommand::Restore {
+        source,
+        target,
+        include_conversations,
+    } = command
+    {
+        let result = if *include_conversations {
+            Err(HiveError::new(
+                ErrorCode::NotImplemented,
+                "Conversation restoration requires a later contract-2 implementation.",
+            ))
+        } else {
+            crate::workspace_restore::run(source, target)
+        };
+        return (format, result);
+    }
+    let BackupCommand::Create {
         destination,
         include_conversations,
-    } = command;
-    let format = options.format.unwrap_or_default();
+    } = command
+    else {
+        unreachable!("restore returned above");
+    };
     if *include_conversations {
         return (
             format,
@@ -315,6 +339,32 @@ mod unix {
             Some(workspaces) => workspaces.open_child_directory(OsStr::new(workspace_id)),
             None => Ok(None),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn require_inactive_target(
+        workspace_id: &str,
+        target: &std::path::Path,
+    ) -> Result<(), HiveError> {
+        let Some(state) = find_state(workspace_id, target)? else {
+            return Ok(());
+        };
+        if target.starts_with(&state.path) {
+            return Err(invalid(
+                "The restore target must be outside workspace runtime state.",
+            ));
+        }
+        // A stale registration can still match an absent or empty path.
+        // Runtime compares the exact canonical path from the descriptor.
+        let path = json_path(target)?;
+        if read_json::<Registration>(Some(&state), "active-root.json")?
+            .is_some_and(|record| record.workspace_root == path)
+        {
+            return Err(unverified(
+                "The restore target is the registered active root.",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn check_server(server: &Server, id: &str, root: &str) -> Result<(), HiveError> {

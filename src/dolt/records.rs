@@ -9,6 +9,9 @@ pub(super) use relations::is_canonical_label_name;
 
 use std::collections::{BTreeSet, HashMap, VecDeque, hash_map::Entry};
 
+use mysql::prelude::FromRow;
+use serde::de::DeserializeOwned;
+
 use crate::cli::is_slug;
 use crate::error::{HiveError, RecordDiagnostic};
 
@@ -148,7 +151,72 @@ impl Diagnostics {
     }
 }
 
-pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError> {
+pub(super) enum RecordReader<'a> {
+    Online(&'a mut Snapshot),
+    #[cfg(target_os = "linux")]
+    Offline {
+        installed: &'a crate::workspace_init::Installed<'a>,
+        db: &'a std::path::Path,
+        commit: &'a str,
+    },
+}
+
+impl RecordReader<'_> {
+    pub(super) fn records<T: FromRow + DeserializeOwned>(
+        &mut self,
+        table: &'static str,
+        columns: &'static str,
+        order: &'static str,
+    ) -> Result<Vec<T>, HiveError> {
+        match self {
+            Self::Online(snapshot) => snapshot.records(table, columns, order),
+            #[cfg(target_os = "linux")]
+            Self::Offline { .. } => {
+                let limit = super::MAX_ROWS_PER_TABLE;
+                let rows = self.rows(
+                    table,
+                    columns,
+                    &format!("ORDER BY {order} LIMIT {}", limit + 1),
+                )?;
+                if rows.len() > limit {
+                    return Err(HiveError::new(
+                        crate::error::ErrorCode::ContextLimit,
+                        format!("Validation exceeds the limit of {limit} rows in {table}."),
+                    ));
+                }
+                Ok(rows)
+            }
+        }
+    }
+
+    fn rows<T: FromRow + DeserializeOwned>(
+        &mut self,
+        table: &'static str,
+        columns: &'static str,
+        suffix: &str,
+    ) -> Result<Vec<T>, HiveError> {
+        match self {
+            Self::Online(snapshot) => snapshot.rows(table, columns, suffix),
+            #[cfg(target_os = "linux")]
+            Self::Offline { installed, db, commit } => installed
+                .query(
+                    db,
+                    &format!("SELECT JSON_ARRAY({columns}) AS record FROM {table} AS OF '{commit}' {suffix}"),
+                )?
+                .into_iter()
+                .map(|mut row| {
+                    serde_json::from_value(row["record"].take()).map_err(|_| {
+                        super::incompatible_schema(format!(
+                            "The restored {table} table returned unexpected column types."
+                        ))
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
+pub(super) fn validate(snapshot: &mut RecordReader<'_>) -> Result<Diagnostics, HiveError> {
     let areas: Vec<_> = snapshot
         .records::<(String, Option<String>, String, bool)>(
             "areas",

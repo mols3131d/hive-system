@@ -6,7 +6,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Component, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -18,15 +18,17 @@ use crate::error::{ErrorCode, HiveError};
 use crate::workspace_init::{Installed, fd_path, sync_tree};
 use crate::workspace_status::require_local_filesystem;
 
-const MAX_FILES: usize = 2048;
-const MAX_MANIFEST_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_FILES: usize = 2048;
+pub(crate) const MAX_MANIFEST_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_SERVER_CONFIG_BYTES: usize = 64 * 1024;
 
-#[derive(Serialize, Eq, PartialEq)]
-struct DigestEntry {
-    path: String,
-    bytes: u64,
-    sha256: String,
+#[derive(Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DigestEntry {
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+    pub(crate) sha256: String,
 }
 
 pub(crate) fn create(
@@ -90,9 +92,7 @@ pub(crate) fn create(
     let installed = Installed::check(scratch_dir.directory_file())?;
     // Native verification restores into a new repo and needs an identity for
     // its temporary initialization. The published store keeps source history.
-    for (key, value) in [("user.name", "Hive"), ("user.email", "backup@hive.invalid")] {
-        installed.dolt(&scratch, &["config", "--global", "--add", key, value], None)?;
-    }
+    installed.prepare_dolt_restore()?;
     let source = fd_path(db.directory_file());
     // The parent process owns these descriptors for the duration of all native
     // commands. The URL contains fixed ASCII components even for unusual paths.
@@ -353,7 +353,7 @@ fn native_filename(name: &str) -> bool {
         || is_commit_hash(name.strip_suffix(".darc").unwrap_or(name))
 }
 
-fn verify_db(
+pub(crate) fn verify_db(
     installed: &Installed<'_>,
     db: &Path,
     workspace_id: &str,
@@ -434,7 +434,10 @@ fn verify_db(
     Ok(revision.to_owned())
 }
 
-fn digest_payload(payload: &ScopedDirectory) -> Result<Vec<DigestEntry>, HiveError> {
+pub(crate) fn visit_payload(
+    payload: &ScopedDirectory,
+    mut visit: impl FnMut(&ScopedDirectory, &str, String) -> Result<(), HiveError>,
+) -> Result<(), HiveError> {
     let unsupported = || unverified("The native backup produced an unsupported file.");
     for entry in fs::read_dir(fd_path(payload.directory_file())).map_err(io_error)? {
         if !matches!(
@@ -446,7 +449,7 @@ fn digest_payload(payload: &ScopedDirectory) -> Result<Vec<DigestEntry>, HiveErr
     }
     let store = payload.require_child_directory(OsStr::new("dolt"))?;
     let oldgen = store.require_child_directory(OsStr::new("oldgen"))?;
-    let mut files = Vec::new();
+    let mut count = 1; // The asset bundle also counts toward the limit.
     for (prefix, directory) in [("dolt", &store), ("dolt/oldgen", &oldgen)] {
         for entry in fs::read_dir(fd_path(directory.directory_file())).map_err(io_error)? {
             let entry = entry.map_err(io_error)?;
@@ -461,36 +464,53 @@ fn digest_payload(payload: &ScopedDirectory) -> Result<Vec<DigestEntry>, HiveErr
                 .to_str()
                 .filter(|name| !matches!(*name, "LOCK" | "journal.idx") && native_filename(name))
                 .ok_or_else(unsupported)?;
-            if files.len() >= MAX_FILES - 1 {
+            if count >= MAX_FILES {
                 return Err(unverified("The backup contains too many files."));
             }
-            files.push(digest_file(directory, name, format!("{prefix}/{name}"))?);
+            count += 1;
+            visit(directory, name, format!("{prefix}/{name}"))?;
         }
     }
-    files.push(digest_file(
-        payload,
-        "assets.bundle",
-        "assets.bundle".to_owned(),
-    )?);
+    visit(payload, "assets.bundle", "assets.bundle".to_owned())
+}
+
+fn digest_payload(payload: &ScopedDirectory) -> Result<Vec<DigestEntry>, HiveError> {
+    let mut files = Vec::new();
+    let mut remaining = MAX_PAYLOAD_BYTES;
+    visit_payload(payload, |directory, name, path| {
+        let file = digest_file(directory, name, path, remaining, io::sink())?;
+        remaining -= file.bytes;
+        files.push(file);
+        Ok(())
+    })?;
     files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
 }
 
-fn digest_file(
+pub(crate) fn digest_file(
     directory: &ScopedDirectory,
     name: &str,
     path: String,
+    limit: u64,
+    mut output: impl Write,
 ) -> Result<DigestEntry, HiveError> {
     let mut file = directory
         .open_regular(OsStr::new(name))?
         .ok_or_else(|| unverified("A staged backup file disappeared."))?;
     let meta = file.metadata().map_err(io_error)?;
-    if !meta.is_file() || meta.nlink() != 1 {
+    if !meta.is_file() || meta.nlink() != 1 || meta.len() > limit {
         return Err(unverified("The backup contains an unsupported file."));
     }
     let mut hash = Sha256::new();
-    let bytes = io::copy(&mut file, &mut hash).map_err(io_error)?;
-    if bytes != meta.len() {
+    let bytes = io::copy(
+        &mut std::io::Read::take(&mut file, meta.len()),
+        &mut HashWriter {
+            hash: &mut hash,
+            output: &mut output,
+        },
+    )
+    .map_err(io_error)?;
+    if bytes != meta.len() || std::io::Read::read(&mut file, &mut [0]).map_err(io_error)? != 0 {
         return Err(unverified("A backup file changed while being read."));
     }
     Ok(DigestEntry {
@@ -498,6 +518,23 @@ fn digest_file(
         bytes,
         sha256: format!("{:x}", hash.finalize()),
     })
+}
+
+struct HashWriter<'a, W> {
+    hash: &'a mut Sha256,
+    output: W,
+}
+
+impl<W: Write> Write for HashWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.output.write(bytes)?;
+        self.hash.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
 }
 
 fn destination_exists() -> HiveError {

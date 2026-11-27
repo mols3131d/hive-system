@@ -6,7 +6,7 @@ use std::process::{Command, Output, Stdio};
 
 use crate::error::{ErrorCode, HiveError};
 
-const MAX_BLOB_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_BLOB_BYTES: usize = 128 * 1024;
 
 pub(crate) struct GitWorkspace {
     pub(crate) root: PathBuf,
@@ -429,6 +429,9 @@ impl<'a> PinnedAssets<'a> {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) const ASSET_BACKUP_REF: &str = "refs/heads/inspection";
+
+#[cfg(target_os = "linux")]
 pub(crate) fn with_asset_bundle<T>(
     root: &crate::config_file::ScopedDirectory,
     scratch: &Path,
@@ -464,7 +467,7 @@ pub(crate) fn with_asset_bundle<T>(
         .unwrap_or_default();
     let reader =
         AssetObjectReader::new_in(&pinned.repository.objects, &config, revision.len(), scratch)?;
-    let head_ref = "refs/heads/inspection";
+    let head_ref = ASSET_BACKUP_REF;
     let check = |command: &mut Command| {
         let result = execute_asset(command, 64 * 1024, None)?;
         if !result.status.success() {
