@@ -3,6 +3,8 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
+#[path = "runtime/artifact_create.rs"]
+mod artifact_create;
 #[path = "runtime/issue_update.rs"]
 mod issue_update;
 

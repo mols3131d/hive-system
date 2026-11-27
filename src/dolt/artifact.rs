@@ -2,7 +2,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::cli::{ArtifactListArgs, ArtifactShowArgs, DoltTargetArgs};
+use crate::cli::{
+    ArtifactCreateArgs, ArtifactListArgs, ArtifactShowArgs, CommonOptions, DoltTargetArgs,
+};
 use crate::error::{ErrorCode, HiveError};
 
 use super::{DoltFailure, DoltSuccess, Snapshot, is_uuid_v7};
@@ -12,6 +14,27 @@ pub(super) const SUMMARY_COLUMNS: &str = "a.id, a.kind, a.title, a.revision";
 const MAX_LIMIT: u32 = 100;
 const MAX_SCOPES: usize = 100;
 const MAX_BODY_BYTES: u32 = 64 * 1024;
+
+#[cfg(target_os = "linux")]
+pub(super) mod create;
+
+pub(crate) fn create(
+    common: &CommonOptions,
+    args: &ArtifactCreateArgs,
+) -> Result<DoltSuccess, Box<DoltFailure>> {
+    #[cfg(target_os = "linux")]
+    {
+        create::write(common, args).map_err(DoltFailure::without_context)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (common, args);
+        Err(DoltFailure::without_context(HiveError::new(
+            ErrorCode::NotImplemented,
+            "Artifact create requires a verified Linux workspace runtime.",
+        )))
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScopeKind {

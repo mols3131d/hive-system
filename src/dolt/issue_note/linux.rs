@@ -9,7 +9,7 @@ use crate::dolt::{
     issue_note_fingerprint::{KIND, MAX_BODY_BYTES, NoteFingerprint},
     issue_note_receipt::{NoteEvidence, NoteResult},
     issue_writer::{
-        self, Decision, Kind, Mutation, StagedIssue, WriteIdentity, digest, invalid, new_uuid_v7,
+        self, Decision, Kind, Mutation, StagedMutation, WriteIdentity, digest, invalid, new_uuid_v7,
     },
     read_error,
     scope::require_active_area,
@@ -209,8 +209,8 @@ impl Mutation for Progress<'_> {
         WriteIdentity {
             kind: Kind::Note,
             request_id: &args.request_id,
-            area_id: &args.area,
-            issue_id: Some(&args.issue),
+            area_id: Some(&args.area),
+            record_id: Some(&args.issue),
             actor: &args.actor,
             fingerprint: &self.request.fingerprint,
             authorization_ref: &self.decision.evidence.authorization_ref,
@@ -239,7 +239,7 @@ impl Mutation for Progress<'_> {
         _: (),
         now: OffsetDateTime,
         sql_time: &str,
-    ) -> Result<StagedIssue, HiveError> {
+    ) -> Result<StagedMutation, HiveError> {
         let request = &self.request;
         let args = request.args;
         let result = NoteResult {
@@ -281,8 +281,8 @@ impl Mutation for Progress<'_> {
         )
         .map_err(read_error)?;
 
-        Ok(StagedIssue {
-            issue_id: args.issue.clone(),
+        Ok(StagedMutation {
+            record_id: args.issue.clone(),
             result: issue_writer::encode(&result, Kind::Note)?,
         })
     }

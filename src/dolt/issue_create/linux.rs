@@ -9,7 +9,8 @@ use crate::dolt::{
     context_evidence::read_evidence_bytes,
     context_workflow as workflow, is_uuid, is_uuid_v7,
     issue_writer::{
-        self, Decision, Kind, Mutation, StagedIssue, WriteIdentity, digest, invalid, new_uuid_v7,
+        self, Decision, Kind, Mutation, StagedMutation, WriteIdentity, digest, invalid,
+        new_uuid_v7, valid_title,
     },
     read_error,
     receipt_history::{HistoricalReceipt, valid_sha256},
@@ -145,10 +146,6 @@ pub(super) fn write(
     issue_writer::execute(&workspace, target, &create)
 }
 
-fn valid_title(title: &str) -> bool {
-    !title.trim().is_empty() && title.chars().count() <= 255 && !title.chars().any(char::is_control)
-}
-
 fn fingerprint(
     workspace: &str,
     area: &str,
@@ -171,8 +168,8 @@ impl Mutation for Create<'_> {
         WriteIdentity {
             kind: Kind::Create,
             request_id: &self.args.request_id,
-            area_id: &self.args.area,
-            issue_id: None,
+            area_id: Some(&self.args.area),
+            record_id: None,
             actor: &self.args.actor,
             fingerprint: &self.fingerprint,
             authorization_ref: &self.decision.evidence.authorization_ref,
@@ -280,7 +277,7 @@ impl Mutation for Create<'_> {
         number: u64,
         now: OffsetDateTime,
         sql_time: &str,
-    ) -> Result<StagedIssue, HiveError> {
+    ) -> Result<StagedMutation, HiveError> {
         let args = self.args;
         let result = CreateResult {
             version: 1,
@@ -304,8 +301,8 @@ impl Mutation for Create<'_> {
             (&result.issue_id, number, &args.area, &args.title, &self.body, &args.kind, &result.issue_revision, sql_time, sql_time),
         ).map_err(read_error)?;
         let encoded = issue_writer::encode(&result, Kind::Create)?;
-        Ok(StagedIssue {
-            issue_id: result.issue_id,
+        Ok(StagedMutation {
+            record_id: result.issue_id,
             result: encoded,
         })
     }

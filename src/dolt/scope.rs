@@ -141,7 +141,7 @@ pub(super) fn require_active_area(
 }
 
 #[cfg(target_os = "linux")]
-fn verify_area_ancestry(
+pub(super) fn verify_area_ancestry(
     area: &str,
     archived_message: &'static str,
     mut read: impl FnMut(&str) -> Result<Option<(Option<String>, String, bool)>, HiveError>,
