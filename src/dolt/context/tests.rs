@@ -39,6 +39,11 @@ const INVOCATION: &str = "01900000-0000-7000-8000-000000000061";
 const DIRECTIVE: &str = "01900000-0000-7000-8000-000000000071";
 const RECEIPT: &str = "01900000-0000-7000-8000-000000000081";
 const MALFORMED_RECEIPT: &str = "01900000-0000-7000-8000-000000000082";
+const WRONG_KIND_MALFORMED: &str = "01900000-0000-7000-8000-0000000000b0";
+const WRONG_APPROVAL_MALFORMED: &str = "01900000-0000-7000-8000-0000000000b1";
+const WRONG_KIND_OVERSIZED: &str = "01900000-0000-7000-8000-0000000000b2";
+const WRONG_APPROVAL_OVERSIZED: &str = "01900000-0000-7000-8000-0000000000b3";
+const OVERSIZED_RECEIPT: &str = "01900000-0000-7000-8000-0000000000b4";
 const RESOURCE: &str = "01900000-0000-7000-8000-000000000055";
 const SIBLING_RESOURCE: &str = "01900000-0000-7000-8000-000000000057";
 const SIBLING_REPORT: &str = "01900000-0000-7000-8000-000000000058";
@@ -168,7 +173,12 @@ fn committed_scope_and_resume() {
               workflow_evidence_json, base_commit, result_json, created_at)
          VALUES
          ('{RECEIPT}', 'directive.activate', REPEAT('a', 64), 'fixture-reviewer', 'approval', '{{}}', REPEAT('a', 32), '{{}}', '{AT}'),
-         ('{MALFORMED_RECEIPT}', 'directive.activate', REPEAT('a', 64), 'fixture-reviewer', 'approval', '{{}}', REPEAT('a', 32), '[]', '{AT}');
+         ('{MALFORMED_RECEIPT}', 'directive.activate', REPEAT('a', 64), 'fixture-reviewer', 'approval', '{{}}', REPEAT('a', 32), '[]', '{AT}'),
+         ('{WRONG_KIND_MALFORMED}', 'issue.note', REPEAT('a', 64), 'fixture-reviewer', 'approval', '[]', REPEAT('a', 32), '{{}}', '{AT}'),
+         ('{WRONG_APPROVAL_MALFORMED}', 'directive.activate', REPEAT('a', 64), 'fixture-reviewer', 'Approval', '[]', REPEAT('a', 32), '{{}}', '{AT}'),
+         ('{WRONG_KIND_OVERSIZED}', 'issue.note', REPEAT('a', 64), 'fixture-reviewer', 'approval', REPEAT('x', 262145), REPEAT('a', 32), '{{}}', '{AT}'),
+         ('{WRONG_APPROVAL_OVERSIZED}', 'directive.activate', REPEAT('a', 64), 'fixture-reviewer', 'Approval', REPEAT('x', 262145), REPEAT('a', 32), '{{}}', '{AT}'),
+         ('{OVERSIZED_RECEIPT}', 'directive.activate', REPEAT('a', 64), 'fixture-reviewer', 'approval', REPEAT('x', 262145), REPEAT('a', 32), '{{}}', '{AT}');
          CREATE USER 'fixture_reader'@'127.0.0.1' IDENTIFIED BY 'synthetic-password';
          GRANT SELECT ON {DATABASE}.* TO 'fixture_reader'@'127.0.0.1';"
     );
@@ -482,6 +492,25 @@ fn read_synthetic_snapshot() {
     assert!(matches!(
         directives::lookup_activation_receipt(&mut snapshot, &candidates[0], MALFORMED_RECEIPT),
         Err(error) if matches!(error.code, ErrorCode::InvalidRecord)
+    ));
+
+    for id in [
+        WRONG_KIND_MALFORMED,
+        WRONG_APPROVAL_MALFORMED,
+        WRONG_KIND_OVERSIZED,
+        WRONG_APPROVAL_OVERSIZED,
+    ] {
+        assert!(
+            matches!(
+                directives::lookup_activation_receipt(&mut snapshot, &candidates[0], id),
+                Err(error) if matches!(error.code, ErrorCode::AuthorityUnverified)
+            ),
+            "{id}"
+        );
+    }
+    assert!(matches!(
+        directives::lookup_activation_receipt(&mut snapshot, &candidates[0], OVERSIZED_RECEIPT),
+        Err(error) if matches!(error.code, ErrorCode::ContextLimit)
     ));
 
     let first_activation = approval_ids(0).1;

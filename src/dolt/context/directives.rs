@@ -199,13 +199,13 @@ pub(super) fn lookup_activation_receipt(
         ));
     }
     let observed = snapshot.commit.clone();
-    let receipt = receipt_at(snapshot, request_id, &observed)?.ok_or_else(workflow::unverified)?;
-    if receipt.kind != activation_receipt::KIND
-        || receipt.authorization_ref != candidate.approval_ref
-    {
-        return Err(workflow::unverified());
-    }
-    Ok(receipt)
+    receipt_at(
+        snapshot,
+        request_id,
+        &observed,
+        Some((activation_receipt::KIND, &candidate.approval_ref)),
+    )?
+    .ok_or_else(workflow::unverified)
 }
 
 type DirectiveVersion = (

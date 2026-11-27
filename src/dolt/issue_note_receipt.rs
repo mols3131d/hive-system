@@ -6,11 +6,11 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Snapshot, context_workflow as workflow, is_uuid_v7, receipt_history::HistoricalReceipt,
+    Snapshot, context_workflow as workflow, is_uuid_v7,
+    issue_note_fingerprint::{KIND, MAX_BODY_BYTES, NoteFingerprint},
+    receipt_history::{HistoricalReceipt, valid_sha256},
 };
 use crate::error::HiveError;
-
-use super::issue_note_fingerprint::KIND;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -134,24 +134,45 @@ pub(super) fn verify_effect(
         },
         (&result.note_id,),
     )?;
-    let notes: Vec<(String, String, String, bool)> = snapshot.exec_rows(
+    type NoteRow = (String, String, String, bool, Option<String>);
+    let notes: Vec<NoteRow> = snapshot.exec_rows(
         |_| {
             format!(
-                "SELECT issue_id, kind, author_ref, transition_json IS NULL
+                "SELECT issue_id, kind, author_ref, transition_json IS NULL,
+                     CASE WHEN OCTET_LENGTH(body) <= ? THEN LOWER(SHA2(CAST(body AS BINARY), 256)) END
                      FROM issue_updates AS OF '{introduced}' WHERE CAST(id AS BINARY) = ? LIMIT 2"
             )
         },
-        (&result.note_id,),
+        (MAX_BODY_BYTES, &result.note_id),
     )?;
+    let [(issue, kind, author, true, Some(body_sha256))] = notes.as_slice() else {
+        return Err(workflow::unverified());
+    };
     if !matches!(before.as_slice(), [(area, revision)]
         if area == &result.area_id && revision == &note.evidence.expected_issue_revision)
         || !matches!(after.as_slice(), [(area, revision)]
             if area == &result.area_id && revision == &result.issue_revision)
         || !base_notes.is_empty()
-        || !matches!(notes.as_slice(), [(issue, kind, author, true)]
-            if issue == &result.issue_id && author == &receipt.actor_ref
-                && matches!(kind.as_str(), "progress" | "review" | "handoff" | "evidence" | "comment"))
+        || issue != &result.issue_id
+        || author != &receipt.actor_ref
+        || !matches!(
+            kind.as_str(),
+            "progress" | "review" | "handoff" | "evidence" | "comment"
+        )
+        || !valid_sha256(body_sha256)
     {
+        return Err(workflow::unverified());
+    }
+    let fingerprint = NoteFingerprint {
+        workspace_id: &note.evidence.workspace_id,
+        area_id: &result.area_id,
+        issue_id: issue,
+        actor_ref: author,
+        claim_id: note.evidence.claim_id.as_deref(),
+        expected_issue_revision: &note.evidence.expected_issue_revision,
+        note_kind: kind,
+    };
+    if fingerprint.with_body_digest(body_sha256) != receipt.fingerprint {
         return Err(workflow::unverified());
     }
     if let Some(claim) = &note.evidence.claim_id {

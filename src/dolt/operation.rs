@@ -149,7 +149,7 @@ fn inspect(
         return Err(workflow::unverified());
     }
 
-    let Some(receipt) = receipt_history::receipt_at(snapshot, selected.request, &commit)
+    let Some(receipt) = receipt_history::receipt_at(snapshot, selected.request, &commit, None)
         .map_err(|_| uncertain())?
     else {
         return Err(if pending {

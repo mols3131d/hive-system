@@ -32,6 +32,7 @@ pub(super) fn receipt_at(
     snapshot: &mut Snapshot,
     request_id: &str,
     commit: &str,
+    expected: Option<(&str, &str)>,
 ) -> Result<Option<HistoricalReceipt>, HiveError> {
     // Dolt requires a literal AS OF revision. Never interpolate unvalidated history.
     if !is_commit_hash(commit) || !is_uuid(request_id) {
@@ -64,11 +65,11 @@ pub(super) fn receipt_at(
     else {
         return Err(workflow::unverified());
     };
-    if !workflow::valid_ref(actor)
-        || fingerprint.len() != 64
-        || !fingerprint
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    // Refuse a wrong Directive receipt header before decoding its payload.
+    if expected.is_some_and(|(expected_kind, approval)| {
+        kind != expected_kind || authorization_ref.as_deref() != Some(approval)
+    }) || !workflow::valid_ref(actor)
+        || !valid_sha256(fingerprint)
     {
         return Err(workflow::unverified());
     }
@@ -129,14 +130,22 @@ pub(super) fn receipt_introduction(
         },
         (introduced,),
     )?;
+    let expected = Some((receipt.kind.as_str(), receipt.authorization_ref.as_str()));
     if !matches!(merger.as_slice(), [Some(ancestor)] if ancestor == introduced)
         || !matches!(parents.as_slice(), [parent] if parent == base)
-        || receipt_at(snapshot, request_id, base)?.is_some()
-        || receipt_at(snapshot, request_id, introduced)?.as_ref() != Some(receipt)
+        || receipt_at(snapshot, request_id, base, expected)?.is_some()
+        || receipt_at(snapshot, request_id, introduced, expected)?.as_ref() != Some(receipt)
     {
         return Err(workflow::unverified());
     }
     Ok(introduced.clone())
+}
+
+pub(super) fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn receipt_object(value: Option<&str>) -> Result<&str, HiveError> {

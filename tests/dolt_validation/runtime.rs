@@ -522,7 +522,26 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
     let request = id(46);
     let note = id(47);
     let revision = id(48);
-    let note_fingerprint = "b".repeat(64);
+    let note_body = "Synthetic receipt note body café\r\n";
+    let note_hex: String = note_body
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let body_sha256 = format!("{:x}", Sha256::digest(note_body));
+    let fingerprint_input = serde_json::json!([
+        1,
+        "issue.note",
+        workspace,
+        area,
+        issue,
+        "fixture-holder",
+        id(14),
+        id(4),
+        "progress",
+        body_sha256
+    ]);
+    let note_fingerprint = format!("{:x}", Sha256::digest(fingerprint_input.to_string()));
     let note_evidence = serde_json::json!({
         "version": 1, "operation": "issue.note", "workspace_id": workspace,
         "request_id": request, "fingerprint": note_fingerprint, "actor_ref": "fixture-holder",
@@ -540,15 +559,36 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
         "version": 1, "area_id": area, "issue_id": issue, "note_id": note,
         "issue_revision": revision,
     });
+    let mismatches = [
+        (id(51), id(52), "progress", "00"),
+        (id(53), id(54), "comment", note_hex.as_str()),
+    ];
+    let mut mismatched_rows = String::new();
+    for (request_id, note_id, kind, body_hex) in &mismatches {
+        use std::fmt::Write as _;
+        let mut evidence = note_evidence.clone();
+        evidence["request_id"] = request_id.clone().into();
+        let mut result = note_result.clone();
+        result["note_id"] = note_id.clone().into();
+        writeln!(
+            mismatched_rows,
+            "INSERT INTO issue_updates VALUES
+                ('{note_id}', '{issue}', '{kind}', CONVERT(UNHEX('{body_hex}') USING utf8mb4), 'fixture-holder', '2026-01-01', NULL);
+             INSERT INTO operation_receipts VALUES
+                ('{request_id}', 'issue.note', '{note_fingerprint}', 'fixture-holder', 'fixture-note-auth',
+                 '{evidence}', '{note_base}', '{result}', '2026-01-01');"
+        ).unwrap();
+    }
     fixture.local(&["sql"], Some(&format!(
         "INSERT INTO issue_updates VALUES
-             ('{note}', '{issue}', 'progress', 'Synthetic receipt note body', 'fixture-holder', '2026-01-01', NULL);
+             ('{note}', '{issue}', 'progress', CONVERT(UNHEX('{note_hex}') USING utf8mb4), 'fixture-holder', '2026-01-01', NULL);
          UPDATE issues SET revision = '{revision}' WHERE id = '{issue}';
          INSERT INTO operation_receipts VALUES
              ('{request}', 'issue.note', '{note_fingerprint}', 'fixture-holder', 'fixture-note-auth',
               '{note_evidence}', '{note_base}', '{note_result}', '2026-01-01'),
              ('{unverified_request}', 'issue.note', '{note_fingerprint}', 'fixture-holder', 'fixture-note-auth',
-              '{unverified_evidence}', '{base}', '{note_result}', '2026-01-01');"
+              '{unverified_evidence}', '{base}', '{note_result}', '2026-01-01');
+         {mismatched_rows}"
     )));
     fixture.local(&["add", "."], None);
     fixture.local(&["commit", "-m", "Synthetic atomic Issue note"], None);
@@ -934,6 +974,20 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
     );
     assert_eq!(unverified_history["error"]["code"], "COMMIT_UNCERTAIN");
     assert!(unverified_history.get("data").is_none());
+
+    for (request_id, _, _, _) in &mismatches {
+        let mismatch = operation(
+            request_id,
+            &area,
+            &issue,
+            "fixture-holder",
+            Some(&operation_proof(request_id)),
+            8,
+        );
+        assert_eq!(mismatch["error"]["code"], "COMMIT_UNCERTAIN");
+        assert!(mismatch.get("data").is_none());
+        assert!(!mismatch.to_string().contains(&body_sha256));
+    }
 
     let missing = id(49);
     let missing_proof = operation_proof(&missing);
