@@ -17,7 +17,7 @@ pub(crate) struct Registration {
 mod runtime;
 
 #[cfg(target_os = "linux")]
-pub(crate) use runtime::with_owned_snapshot;
+pub(crate) use runtime::{with_operation_snapshot, with_owned_snapshot};
 
 pub(crate) fn run(
     options: &CommonOptions,

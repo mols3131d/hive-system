@@ -15,9 +15,16 @@ mod directive_receipt;
 mod graph;
 mod issue;
 mod issue_list;
+#[cfg(any(test, target_os = "linux"))]
+mod issue_note_fingerprint;
+#[cfg(target_os = "linux")]
+mod issue_note_receipt;
 mod issue_readiness;
 pub(crate) mod label;
+pub(crate) mod operation;
 mod project;
+#[cfg(any(test, target_os = "linux"))]
+mod receipt_history;
 mod records;
 pub(crate) mod resource;
 #[cfg(unix)]

@@ -272,10 +272,36 @@ pub(crate) enum Command {
     Conversation(ConversationCommand),
     #[command(skip)]
     ConversationList(ConversationListArgs),
+    #[command(skip)]
+    Operation(OperationCommand),
     /// Validate workspace records.
     Validate(ValidateArgs),
     /// Check the local environment and workspace.
     Doctor,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum OperationCommand {
+    /// Inspect the durable outcome of one request.
+    Show(OperationShowArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct OperationShowArgs {
+    #[arg(value_name = "REQUEST_ID")]
+    pub(crate) request_id: Option<String>,
+    #[arg(long)]
+    pub(crate) area: Option<String>,
+    #[arg(long)]
+    pub(crate) issue: Option<String>,
+    #[arg(long)]
+    pub(crate) actor: Option<String>,
+    #[arg(long)]
+    pub(crate) invocation_id: Option<String>,
+    #[arg(long)]
+    pub(crate) evidence_file: Option<PathBuf>,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Args)]
@@ -1061,7 +1087,9 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
         });
     }
     let mut config_error_matches = None;
-    let extension = resource_parser(&cli, &args).or_else(|| label_parser(&cli, &args));
+    let extension = resource_parser(&cli, &args)
+        .or_else(|| label_parser(&cli, &args))
+        .or_else(|| operation_parser(&cli, &args));
     let (parsed, extension_matches) = if let Some(extension) = extension {
         cli = extension.cli;
         (extension.parsed, extension.partial)
@@ -1181,6 +1209,10 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             ),
             Some(("workspace", workspace)) => Command::Workspace(
                 WorkspaceAction::from_arg_matches(workspace)
+                    .map_err(|error| safe_parse_message(error.kind()))?,
+            ),
+            Some(("operation", operation)) => Command::Operation(
+                OperationCommand::from_arg_matches(operation)
                     .map_err(|error| safe_parse_message(error.kind()))?,
             ),
             Some(("label", label)) => Command::Label(
@@ -1637,6 +1669,54 @@ struct ExtendedParse {
     cli: clap::Command,
     parsed: Result<ArgMatches, clap::Error>,
     partial: Option<ArgMatches>,
+}
+
+fn operation_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedParse> {
+    if !args
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "operation" || arg == "help" || arg == "--help" || arg == "-h")
+    {
+        return None;
+    }
+    let extended = cli
+        .clone()
+        .subcommand(add_leaf_options(OperationCommand::augment_subcommands(
+            clap::Command::new("operation")
+                .about("Inspect committed operation receipts.")
+                .subcommand_required(true),
+        )));
+    // Observe the contract through Clap's option and positional boundaries,
+    // including when help or malformed arguments interrupt the normal parse.
+    let recovery = extended_error_options(extended.clone().disable_help_subcommand(true))
+        .mut_subcommand("operation", |domain| {
+            extended_help_probe(domain).mut_subcommand("show", extended_error_options)
+        });
+    let probed = recovery.clone().try_get_matches_from(args);
+    let partial = match probed {
+        Ok(matches) => matches,
+        Err(error) => {
+            let partial = recovery
+                .clone()
+                .ignore_errors(true)
+                .try_get_matches_from(args)
+                .ok()?;
+            recover_unknown_long(&recovery, args, &partial, &error, "operation").unwrap_or(partial)
+        }
+    };
+    let leaf = match partial.subcommand() {
+        Some(("operation", domain)) => domain.subcommand().map(|(_, leaf)| leaf),
+        None => None,
+        _ => return None,
+    };
+    if requested_contract(Some(&partial), leaf) != Contract::V2 {
+        return None;
+    }
+    Some(ExtendedParse {
+        parsed: extended.clone().try_get_matches_from(args),
+        cli: extended,
+        partial: Some(partial),
+    })
 }
 
 fn resource_parser(cli: &clap::Command, args: &[OsString]) -> Option<ExtendedParse> {
@@ -2265,6 +2345,20 @@ impl Command {
                     Ok(())
                 }
                 Self::Validate(args) => args.validate_dolt_selection(common),
+                Self::Operation(OperationCommand::Show(args)) => {
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Operation show requires --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err("Operation show requires exact current Area and Issue scope.");
+                    }
+                    Ok(())
+                }
                 Self::Context(ContextArgs {
                     command: Some(ContextCommand::Resolve(args)),
                 }) => {
@@ -2422,6 +2516,7 @@ impl Command {
             Self::Project(ProjectCommand::Show { project_id }) => {
                 common.check_project(project_id.as_ref())
             }
+            Self::Operation(_) => Err("Operation show requires --contract 2."),
             Self::Area(_) => Err("Area commands require --contract 2."),
             Self::Issue(_) => Err("Issue commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),

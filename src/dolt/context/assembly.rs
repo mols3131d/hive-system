@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use time::UtcOffset;
 
 use super::{
     DEFAULT_INLINE_BYTES, MAX_INLINE_BYTES, Scope, Snapshot, collect_work, directives, is_uuid_v7,
@@ -141,6 +140,7 @@ pub(super) fn assemble(
             let source_kind = match handoff.kind {
                 workflow::RecordKind::IssueUpdate => "issue_update",
                 workflow::RecordKind::Artifact => "artifact",
+                workflow::RecordKind::OperationReceipt => return Err(workflow::unverified()),
             };
             charge(&mut remaining, handoff.inline_bytes)
                 .map_err(|error| error.context_limit_ref(source_kind, &handoff.id))?;
@@ -201,17 +201,7 @@ pub(super) fn assemble(
     })
     .collect();
     let data = json!({"inline_bytes": max - remaining, "sections": sections});
-    let observed = inputs.request.observed_at.to_offset(UtcOffset::UTC);
-    let observed_at = format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
-        observed.year(),
-        u8::from(observed.month()),
-        observed.day(),
-        observed.hour(),
-        observed.minute(),
-        observed.second(),
-        observed.nanosecond()
-    );
+    let observed_at = workflow::format_observed_at(inputs.request.observed_at);
     let context = json!({
         "workspace_id": snapshot.workspace_id, "db_commit": snapshot.commit,
         "asset_commit": inputs.asset_commit, "policy_revision": inputs.policy_revision, "observed_at": observed_at,

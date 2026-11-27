@@ -9,13 +9,15 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::dolt::{is_commit_hash, is_uuid, is_uuid_v7};
 use crate::error::{ErrorCode, HiveError};
 
-const MAX_DECLARATION_BYTES: usize = 16 * 1024;
+pub(super) const MAX_DECLARATION_BYTES: usize = 16 * 1024;
 const MAX_REF_BYTES: usize = 255;
 const MAX_OPERATIONS: usize = 2;
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Operation {
+    #[cfg(any(test, target_os = "linux"))]
+    InspectOperationReceipt,
     ReadHandoffBody,
     DiscloseArtifactBody,
 }
@@ -23,6 +25,8 @@ pub(super) enum Operation {
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum RecordKind {
+    #[cfg(any(test, target_os = "linux"))]
+    OperationReceipt,
     IssueUpdate,
     Artifact,
 }
@@ -152,7 +156,7 @@ pub(super) fn verify(request: &Request<'_>, expected: &Expected<'_>) -> Result<(
     {
         return Err(HiveError::new(
             ErrorCode::Unauthorized,
-            "The current workflow declaration does not cover this exact body read.",
+            "The current workflow declaration does not cover this exact read.",
         ));
     }
     Ok(())
@@ -190,7 +194,11 @@ impl Declaration {
             || !is_commit_hash(&evidence.db_commit)
             || !is_uuid_v7(&evidence.area_id)
             || !is_uuid_v7(&evidence.issue_id)
-            || !is_uuid_v7(&evidence.record.id)
+            || !match evidence.record.kind {
+                #[cfg(any(test, target_os = "linux"))]
+                RecordKind::OperationReceipt => is_uuid(&evidence.record.id),
+                _ => is_uuid_v7(&evidence.record.id),
+            }
             || evidence.bot_id.as_deref().is_some_and(|id| !is_uuid_v7(id))
             || ![
                 &evidence.evidence_id,
@@ -239,6 +247,21 @@ impl Declaration {
     pub(super) fn covers(&self, kind: RecordKind, operation: Operation) -> bool {
         self.record.kind == kind && self.operations.contains(&operation)
     }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+pub(super) fn format_observed_at(observed: OffsetDateTime) -> String {
+    let observed = observed.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+        observed.year(),
+        u8::from(observed.month()),
+        observed.day(),
+        observed.hour(),
+        observed.minute(),
+        observed.second(),
+        observed.nanosecond()
+    )
 }
 
 pub(super) fn parse_time(value: &str) -> Option<OffsetDateTime> {

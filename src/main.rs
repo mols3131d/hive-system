@@ -127,6 +127,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::DoltArtifact(DoltArtifactCommand::List(args)) => dolt::artifact::list(&args),
         Command::DoltArtifact(DoltArtifactCommand::Show(args)) => dolt::artifact::show(&args),
         Command::Validate(args) => dolt::validate(&args),
+        Command::Operation(cli::OperationCommand::Show(args)) => {
+            dolt::operation::show(&invocation.common, &args)
+        }
         Command::Context(ContextArgs {
             command: Some(ContextCommand::Resolve(args)),
         }) => dolt::context_resolve::resolve(&invocation.common, &args),
