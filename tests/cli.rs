@@ -1437,3 +1437,57 @@ fn dolt_area_option_recovery_preserves_literals_and_v1_errors() {
     }
     sandbox.assert_empty();
 }
+
+#[test]
+fn artifact_contract_selection_preserves_legacy_help_and_v2_error_boundaries() {
+    let sandbox = Sandbox::new();
+    let legacy = sandbox.run(&["artifact", "list", "--help"]);
+    assert!(legacy.status.success());
+    let help = String::from_utf8(legacy.stdout).unwrap();
+    assert!(help.contains("--task"));
+    assert!(help.contains("--standalone"));
+    assert!(!help.contains("--scope"));
+    let v2 = sandbox.run(&["artifact", "list", "--contract", "2", "--help"]);
+    assert!(v2.status.success());
+    assert!(String::from_utf8(v2.stdout).unwrap().contains("--scope"));
+
+    for (leaf, options) in [
+        ("list", &["--limit", "-7"][..]),
+        ("list", &["--scope", "unknown:bad"][..]),
+        ("list", &["--scope", "one", "--scope", "two"][..]),
+        ("list", &["--standalone"][..]),
+        ("list", &["--scope"][..]),
+        ("show", &["bad", "--authority"][..]),
+        ("show", &["bad", "--approval", "fixture"][..]),
+        ("show", &["--workspace", "fixture"][..]),
+        ("show", &["not-a-uuid", "--file", "fixture"][..]),
+    ] {
+        let selectors = ["--contract", "2", "--json"];
+        let command = [&["artifact", leaf][..], options].concat();
+        let early = sandbox.run(&[&selectors[..], &command].concat());
+        let late = sandbox.run(&[&command[..], &selectors].concat());
+        assert_eq!(early.status.code(), Some(2), "{command:?}");
+        assert_eq!(early.status.code(), late.status.code(), "{command:?}");
+        assert_eq!(early.stdout, late.stdout, "{command:?}");
+        assert!(
+            early.stderr.is_empty() && late.stderr.is_empty(),
+            "{command:?}"
+        );
+        let report: Value = serde_json::from_slice(&early.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], format!("artifact {leaf}"));
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    }
+
+    for args in [
+        &["artifact", "list", "--scope=--json", "--contract", "2"][..],
+        &["artifact", "show", "--project=--json", "--contract", "2"][..],
+        &["artifact", "show", "--contract", "2", "--", "--json"][..],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+    sandbox.assert_empty();
+}

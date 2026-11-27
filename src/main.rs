@@ -10,8 +10,8 @@ mod output;
 use std::process::ExitCode;
 
 use cli::{
-    AreaCommand, BotCommand, Command, ConfigCommand, Contract, Invocation, IssueCommand,
-    ParseFailure,
+    AreaCommand, BotCommand, Command, ConfigCommand, Contract, DoltArtifactCommand, Invocation,
+    IssueCommand, ParseFailure,
 };
 use error::{ErrorCode, HiveError};
 
@@ -104,6 +104,8 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         };
     }
     let result = match invocation.command {
+        Command::DoltArtifact(DoltArtifactCommand::List(args)) => dolt::artifact::list(&args),
+        Command::DoltArtifact(DoltArtifactCommand::Show(args)) => dolt::artifact::show(&args),
         Command::Validate(args) => dolt::validate(&args),
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),

@@ -27,21 +27,7 @@ fn validate_shape(
     diagnostics: &mut Diagnostics,
 ) {
     diagnostics.check_id(TABLE, id, &[]);
-    // The workspace frontmatter contract also classifies message, checkpoint, and manifest.
-    if !matches!(
-        kind,
-        "research"
-            | "design"
-            | "decision"
-            | "report"
-            | "review"
-            | "handoff"
-            | "evidence"
-            | "work-note"
-            | "message"
-            | "checkpoint"
-            | "manifest"
-    ) {
+    if !is_kind(kind) {
         diagnostics.add(
             "INVALID_ARTIFACT_KIND",
             TABLE,
@@ -57,6 +43,24 @@ fn validate_shape(
             "The Artifact archive timestamp and reason must both be set or both be absent.",
         );
     }
+}
+
+pub(in crate::dolt) fn is_kind(kind: &str) -> bool {
+    // The workspace frontmatter contract also classifies message, checkpoint, and manifest.
+    matches!(
+        kind,
+        "research"
+            | "design"
+            | "decision"
+            | "report"
+            | "review"
+            | "handoff"
+            | "evidence"
+            | "work-note"
+            | "message"
+            | "checkpoint"
+            | "manifest"
+    )
 }
 
 #[cfg(test)]
