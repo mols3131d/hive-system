@@ -81,6 +81,11 @@ pub(crate) fn create(
         .map_err(io_error)?;
     let stage_name = stage.path().file_name().expect("staging child name");
     let stage_dir = parent.require_child_directory(stage_name)?;
+    // A setgid parent can propagate the bit even with an explicit creation mode.
+    stage_dir
+        .directory_file()
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(io_error)?;
     let stage_fd = fd_path(stage_dir.directory_file());
     let scratch = stage_fd.join("scratch");
     let payload = stage_fd.join("snapshot");

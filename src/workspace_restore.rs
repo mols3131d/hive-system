@@ -118,6 +118,9 @@ mod linux {
             .tempdir_in(fd_path(&parent))
             .map_err(io_error)?;
         let stage_dir = open_target(stage.path())?.ok_or_else(changed_target)?;
+        stage_dir
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(io_error)?;
         let stage_path = fd_path(&stage_dir);
         let snapshot = stage_path.join("snapshot");
         let scratch = stage_path.join("scratch");

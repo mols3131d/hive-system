@@ -34,6 +34,12 @@ fn conversation_archives_restore_only_explicit_verified_queen_history() {
     let state = fixture.dir("state");
     let home = fixture.dir("offline-home");
     let bin = fixture.dir("bin");
+    let shared = fixture.dir("shared");
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o2700)).unwrap();
+    assert_eq!(fs::metadata(&shared).unwrap().mode() & 0o7777, 0o2700);
+    let empty_archive = "shared/empty-archive";
+    let included_archive = "shared/archive";
+    let restored_history = "shared/history";
     let dolt = PathBuf::from(std::env::var_os("HIVE_DOLT_BIN").unwrap());
     let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .filter(|dir| dir.is_absolute())
@@ -91,14 +97,14 @@ fn conversation_archives_restore_only_explicit_verified_queen_history() {
             0
         );
     };
-    let empty = response(backup("empty-archive", true), 0);
+    let empty = response(backup(empty_archive, true), 0);
     assert_eq!(empty["data"]["manifest"]["format_version"], 2);
     assert_eq!(empty["data"]["manifest"]["conversations_included"], true);
     assert_eq!(
         empty["data"]["manifest"]["conversations"]["files"],
         json!([])
     );
-    let empty_restore = response(restore("empty-archive", "empty-history", true), 0);
+    let empty_restore = response(restore(empty_archive, "empty-history", true), 0);
     assert_eq!(empty_restore["data"]["active_root"], "inactive");
     assert_eq!(empty_restore["data"]["conversations_restored"], true);
     assert_empty("empty-history");
@@ -205,7 +211,7 @@ fn conversation_archives_restore_only_explicit_verified_queen_history() {
     response(restore("paired", "paired-restored", false), 0);
     assert_empty("paired-restored");
 
-    let captured = response(backup("archive", true), 0);
+    let captured = response(backup(included_archive, true), 0);
     let manifest = &captured["data"]["manifest"];
     assert_eq!(manifest["format_version"], 2);
     assert_eq!(manifest["conversations_included"], true);
@@ -213,7 +219,12 @@ fn conversation_archives_restore_only_explicit_verified_queen_history() {
     assert_eq!(manifest["asset_git_commit"], paired["asset_git_commit"]);
     assert!(!captured.to_string().contains(BODY_MARKER));
     assert!(!captured.to_string().contains(SESSION));
-    let archive = fixture.0.join("archive");
+    let archive = fixture.0.join(included_archive);
+    assert_eq!(fs::metadata(&archive).unwrap().mode() & 0o7777, 0o700);
+    assert_eq!(
+        fs::metadata(archive.join("conversations")).unwrap().mode() & 0o7777,
+        0o700
+    );
     let manifest_path = archive.join("manifest.json");
     let original_manifest = fs::read(&manifest_path).unwrap();
     assert_eq!(
@@ -249,11 +260,18 @@ fn conversation_archives_restore_only_explicit_verified_queen_history() {
             .exists()
     );
 
-    let restored = response(restore("archive", "history", true), 0);
+    let restored = response(restore(included_archive, restored_history, true), 0);
     assert_eq!(restored["data"]["active_root"], "inactive");
     assert_eq!(restored["data"]["conversations_restored"], true);
+    assert_eq!(
+        fs::metadata(fixture.0.join(restored_history))
+            .unwrap()
+            .mode()
+            & 0o7777,
+        0o700
+    );
     for (relative, _, _, _, bytes) in &histories {
-        let restored_file = fixture.0.join("history").join(relative);
+        let restored_file = fixture.0.join(restored_history).join(relative);
         assert_eq!(fs::read(&restored_file).unwrap(), *bytes);
         assert_eq!(restored_file.metadata().unwrap().mode() & 0o777, 0o600);
         assert_eq!(
@@ -264,7 +282,7 @@ fn conversation_archives_restore_only_explicit_verified_queen_history() {
 
     let target = fixture.dir("rejected");
     let rejected = |status| {
-        let result = response(restore("archive", "rejected", true), status);
+        let result = response(restore(included_archive, "rejected", true), status);
         assert!(!result.to_string().contains(BODY_MARKER));
         assert!(!result.to_string().contains(SESSION));
         assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
@@ -310,7 +328,7 @@ fn conversation_archives_restore_only_explicit_verified_queen_history() {
     fs::remove_file(&archived_file).unwrap();
     rejected(7);
     symlink(&first_source, &archived_file).unwrap();
-    let symlink_error = restore("archive", "rejected", true);
+    let symlink_error = restore(included_archive, "rejected", true);
     assert!(!symlink_error.status.success(), "{symlink_error:?}");
     assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
     fs::remove_file(&archived_file).unwrap();
@@ -335,7 +353,7 @@ fn conversation_archives_restore_only_explicit_verified_queen_history() {
     changed["conversations"]["files"] = json!("invalid entries");
     fs::write(&manifest_path, serde_json::to_vec(&changed).unwrap()).unwrap();
     rejected(7);
-    let omitted = response(restore("archive", "omitted", false), 0);
+    let omitted = response(restore(included_archive, "omitted", false), 0);
     assert_eq!(omitted["data"]["conversations_restored"], false);
     assert_empty("omitted");
     fs::remove_file(&conversation_root).unwrap();
