@@ -829,6 +829,227 @@ fn row_count(admin: &mut Conn, table: &str) -> u64 {
         .unwrap()
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflights_only_a_clean_pinned_v1_source() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("xdg-config");
+    let source = root.path().join("legacy-v1");
+    let commit = init_source(&source, &home);
+    let path = source.to_str().unwrap();
+    let cli = |args: &[&str], status| {
+        let result = Command::new(env!("CARGO_BIN_EXE_hive"))
+            .current_dir(&home)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            // An inherited repository selection must not replace the explicit one.
+            .env("GIT_DIR", home.join("unrelated.git"))
+            .args([
+                "--contract",
+                "2",
+                "--json",
+                "workspace",
+                "migration-preflight",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(status), "{result:?}");
+        assert!(result.stderr.is_empty(), "{result:?}");
+        let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "workspace migration-preflight");
+        assert_eq!(report["ok"], status == 0);
+        assert!(!String::from_utf8_lossy(&result.stdout).contains(path));
+        report
+    };
+    let args = ["--source", path, "--source-commit", &commit];
+    let original_git_files = [
+        ".git/HEAD",
+        ".git/index",
+        ".git/config",
+        ".git/refs/heads/main",
+    ]
+    .map(|name| fs::read(source.join(name)).unwrap());
+    let report = cli(&args, 0);
+    assert_eq!(report, cli(&args, 0));
+    let data = &report["data"];
+    assert_eq!(data["mode"], "source_preflight");
+    assert_eq!(data["source"]["source_commit"], commit);
+    assert_eq!(data["source"]["source_clean"], true);
+    assert_eq!(data["source"]["policy_pin"], POLICY_PIN);
+    assert_eq!(
+        data["source"]["hive_yml"],
+        json!({"version": 1, "mode": "local"})
+    );
+    assert_eq!(data["inventory"]["file_count"], SYNTHETIC_V1_FILES.len());
+    assert_eq!(
+        data["inventory"]["blob_bytes"],
+        SYNTHETIC_V1_FILES
+            .iter()
+            .map(|(_, content)| content.len())
+            .sum::<usize>()
+    );
+    assert_eq!(data["inventory"]["rulesync_directory"], false);
+    assert_eq!(
+        data["source"]["root_tree_sha256"],
+        sha256_hex(&git(&source, &home, &["cat-file", "tree", "HEAD^{tree}"]))
+    );
+    let encoded = report.to_string();
+    assert!(!encoded.contains("tasks/synth-app/"));
+    assert!(!encoded.contains("Synthetic persona bytes."));
+    assert!(!config.exists());
+    assert_eq!(
+        [
+            ".git/HEAD",
+            ".git/index",
+            ".git/config",
+            ".git/refs/heads/main"
+        ]
+        .map(|name| fs::read(source.join(name)).unwrap()),
+        original_git_files
+    );
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+
+    let refuse =
+        |args: &[&str], status, code: &str| assert_eq!(cli(args, status)["error"]["code"], code);
+    refuse(&["--source", path], 2, "INVALID_ARGUMENT");
+    refuse(
+        &["--source", path, "--source-commit", "HEAD"],
+        2,
+        "INVALID_ARGUMENT",
+    );
+    refuse(
+        &["--source", "legacy-v1", "--source-commit", &commit],
+        2,
+        "INVALID_ARGUMENT",
+    );
+    let duplicate = [args.as_slice(), &["--source", path]].concat();
+    refuse(&duplicate, 2, "INVALID_ARGUMENT");
+    let blob = git_text(
+        &source,
+        &home,
+        &["rev-parse", "HEAD:bots/queen-synth/SOUL.md"],
+    );
+    let object = source
+        .join(".git/objects")
+        .join(&blob[..2])
+        .join(&blob[2..]);
+    let hidden_object = home.join("missing-object");
+    fs::rename(&object, &hidden_object).unwrap();
+    refuse(&args, 7, "OBJECT_UNAVAILABLE");
+    fs::rename(hidden_object, object).unwrap();
+    let nested = source.join("tasks");
+    refuse(
+        &[
+            "--source",
+            nested.to_str().unwrap(),
+            "--source-commit",
+            &commit,
+        ],
+        3,
+        "NOT_FOUND",
+    );
+    let untracked = source.join("untracked");
+    fs::write(&untracked, "dirty").unwrap();
+    refuse(&args, 5, "DIRTY_CONFLICT");
+    fs::remove_file(untracked).unwrap();
+    git(
+        &source,
+        &home,
+        &["update-index", "--assume-unchanged", "hive.yml"],
+    );
+    refuse(&args, 7, "AUTHORITY_UNVERIFIED");
+    git(
+        &source,
+        &home,
+        &["update-index", "--no-assume-unchanged", "hive.yml"],
+    );
+
+    let yaml = source.join("hive.yml");
+    fs::write(
+        &yaml,
+        "version: 1\ncoordination:\n  mode: remote\n  remote: synthetic-private-alias\n",
+    )
+    .unwrap();
+    refuse(&args, 5, "DIRTY_CONFLICT");
+    git(&source, &home, &["add", "hive.yml"]);
+    refuse(&args, 5, "DIRTY_CONFLICT");
+    let commit_all = || {
+        git(&source, &home, &["add", "-A"]);
+        git(&source, &home, &["commit", "-qm", "Synthetic variation"]);
+        git_text(&source, &home, &["rev-parse", "HEAD"])
+    };
+    fs::create_dir(source.join(".rulesync")).unwrap();
+    fs::write(source.join(".rulesync/rule.md"), "Synthetic rule").unwrap();
+    fs::write(source.join("rulesync.jsonc"), "{}").unwrap();
+    fs::write(source.join(".git/info/exclude"), "/ignored-scratch\n").unwrap();
+    fs::write(source.join("ignored-scratch"), "Ignored local bytes").unwrap();
+    let current = commit_all();
+    refuse(&args, 5, "STALE_REVISION");
+    let current_report = cli(&["--source", path, "--source-commit", &current], 0);
+    assert_eq!(
+        current_report["data"]["source"]["hive_yml"]["mode"],
+        "remote"
+    );
+    assert_eq!(
+        current_report["data"]["inventory"]["rulesync_directory"],
+        true
+    );
+    assert_eq!(current_report["data"]["inventory"]["rulesync_config"], true);
+    assert_eq!(
+        current_report["data"]["inventory"]["file_count"],
+        SYNTHETIC_V1_FILES.len() + 2
+    );
+    assert_ne!(
+        current_report["data"]["inventory"]["catalog_sha256"],
+        data["inventory"]["catalog_sha256"]
+    );
+    assert!(
+        !current_report
+            .to_string()
+            .contains("synthetic-private-alias")
+    );
+
+    fs::write(&yaml, "version: 2\ncoordination:\n  mode: local\n").unwrap();
+    let current = commit_all();
+    refuse(
+        &["--source", path, "--source-commit", &current],
+        4,
+        "INCOMPATIBLE_POLICY",
+    );
+    fs::remove_file(yaml).unwrap();
+    let current = commit_all();
+    refuse(
+        &["--source", path, "--source-commit", &current],
+        2,
+        "INVALID_CONFIG",
+    );
+    let policy = source.join("AGENTS.md");
+    fs::write(
+        &policy,
+        format!("hive-system@{POLICY_PIN}\nhive-system@1111111111111111111111111111111111111111\n"),
+    )
+    .unwrap();
+    let current = commit_all();
+    refuse(
+        &["--source", path, "--source-commit", &current],
+        4,
+        "INCOMPATIBLE_POLICY",
+    );
+    fs::remove_file(policy).unwrap();
+    let current = commit_all();
+    refuse(
+        &["--source", path, "--source-commit", &current],
+        7,
+        "POLICY_UNAVAILABLE",
+    );
+}
+
 #[test]
 #[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
 fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {

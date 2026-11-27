@@ -6,6 +6,9 @@ use std::process::{Command, Output, Stdio};
 
 use crate::error::{ErrorCode, HiveError};
 
+#[cfg(target_os = "linux")]
+pub(crate) mod migration;
+
 pub(crate) const MAX_BLOB_BYTES: usize = 128 * 1024;
 
 pub(crate) struct GitWorkspace {
@@ -368,10 +371,24 @@ impl<'a> PinnedAssets<'a> {
 
     fn check_status(&self, include_ignored: bool) -> Result<(), HiveError> {
         self.repository.verify_selection(self.root)?;
-        let command = || self.repository.status_command();
+        self.repository
+            .check_clean(self.revision, include_ignored, true)?;
+        self.repository.verify_selection(self.root)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AssetRepository {
+    fn check_clean(
+        &self,
+        revision: &str,
+        include_ignored: bool,
+        allow_submodules: bool,
+    ) -> Result<(), HiveError> {
+        let command = || self.status_command();
         let check_head = || {
             let head = execute_asset(command()?.args(["rev-parse", "--verify", "HEAD"]), 65, None)?;
-            if !head.status.success() || git_line(&head.stdout) != Some(self.revision.as_bytes()) {
+            if !head.status.success() || git_line(&head.stdout) != Some(revision.as_bytes()) {
                 return Err(HiveError::new(
                     ErrorCode::StaleRevision,
                     "The asset tree HEAD differs from the selected commit.",
@@ -381,18 +398,22 @@ impl<'a> PinnedAssets<'a> {
             Ok(())
         };
         check_head()?;
-        let index = execute_asset(
-            command()?.args(["ls-files", "-v", "-z"]),
-            4 * 1024 * 1024,
-            None,
-        )?;
+        let mut index = command()?;
+        index.args(["ls-files", "-v", "-z"]);
+        if !allow_submodules {
+            index.arg("--stage");
+        }
+        let index = execute_asset(&mut index, 4 * 1024 * 1024, None)?;
         // Lowercase tags mark assume-unchanged entries, and S marks skip-worktree.
         if !index.status.success()
             || index
                 .stdout
                 .split(|byte| *byte == 0)
                 .filter(|entry| !entry.is_empty())
-                .any(|entry| !entry.starts_with(b"H "))
+                .any(|entry| {
+                    !entry.starts_with(b"H ")
+                        || (!allow_submodules && entry.starts_with(b"H 160000 "))
+                })
         {
             return Err(HiveError::new(
                 ErrorCode::AuthorityUnverified,
@@ -411,7 +432,11 @@ impl<'a> PinnedAssets<'a> {
                 "--porcelain=v1",
                 "-z",
                 "--untracked-files=normal",
-                "--ignore-submodules=none",
+                if allow_submodules {
+                    "--ignore-submodules=none"
+                } else {
+                    "--ignore-submodules=all"
+                },
             ]),
             4 * 1024 * 1024,
             None,
@@ -428,8 +453,7 @@ impl<'a> PinnedAssets<'a> {
                 "The selected asset worktree has staged, modified, or untracked entries.",
             ));
         }
-        check_head()?;
-        self.repository.verify_selection(self.root)
+        check_head()
     }
 }
 
@@ -643,6 +667,10 @@ impl AssetRepository {
 
     fn select_directories(root: &crate::config_file::ScopedDirectory) -> Result<Self, HiveError> {
         let assets = root.require_child_directory(OsStr::new("assets"))?;
+        Self::select_worktree(assets)
+    }
+
+    fn select_worktree(assets: crate::config_file::ScopedDirectory) -> Result<Self, HiveError> {
         let git_dir = assets.require_child_directory(OsStr::new(".git"))?;
         let objects = git_dir.require_child_directory(OsStr::new("objects"))?;
         Ok(Self {
@@ -694,14 +722,16 @@ impl AssetRepository {
         self.verify_layout().map_err(|_| changed())?;
         let current_root = ScopedDirectory::open_absolute(&root.path).map_err(|_| changed())?;
         let current = Self::select_directories(&current_root).map_err(|_| changed())?;
-        if !root.same_directory(&current_root)?
-            || !self.assets.same_directory(&current.assets)?
-            || !self.git_dir.same_directory(&current.git_dir)?
-            || !self.objects.same_directory(&current.objects)?
-        {
+        if !root.same_directory(&current_root)? || !self.same_worktree(&current)? {
             return Err(changed());
         }
         Ok(())
+    }
+
+    fn same_worktree(&self, current: &Self) -> Result<bool, HiveError> {
+        Ok(self.assets.same_directory(&current.assets)?
+            && self.git_dir.same_directory(&current.git_dir)?
+            && self.objects.same_directory(&current.objects)?)
     }
 
     fn read(&self, revision: &str, relative: &Path) -> Result<Option<Vec<u8>>, HiveError> {
