@@ -1165,7 +1165,7 @@ pub(crate) enum IssueCommand {
 pub(crate) struct IssueNoteArgs {
     /// Exact Issue UUIDv7.
     pub(crate) issue: String,
-    /// Note kind. This writer supports progress.
+    /// Choose progress, evidence or handoff.
     #[arg(long)]
     pub(crate) kind: String,
     /// Exact Area UUIDv7.
@@ -1182,7 +1182,7 @@ pub(crate) struct IssueNoteArgs {
     pub(crate) if_match: String,
     #[arg(long)]
     pub(crate) request_id: String,
-    /// UTF-8 progress note file.
+    /// UTF-8 Issue note file.
     #[arg(long)]
     pub(crate) file: PathBuf,
     /// Fresh, request-bound operator decision file.
@@ -2537,7 +2537,9 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
         None
     };
     let leaf = match partial.subcommand() {
-        Some(("help", _)) => help_leaf.map(|(_, leaf)| leaf),
+        Some(("help", _)) if writer_help_domain(&partial, "issue").is_some() => {
+            help_leaf.map(|(_, leaf)| leaf)
+        }
         Some(("issue", issue)) => match issue.subcommand() {
             Some((
                 "note" | "create" | "update" | "select" | "claim" | "release" | "recover"

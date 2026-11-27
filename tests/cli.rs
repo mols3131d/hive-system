@@ -2684,6 +2684,7 @@ fn malformed_bot_register_keeps_the_late_v2_envelope() {
         for args in [
             [&["--contract", "2"][..], &command].concat(),
             [&command[..], &["--contract", "2"]].concat(),
+            [&["--contract", "2", "--workspace", "issue"][..], &command].concat(),
         ] {
             let help = sandbox.run(&args);
             assert!(help.status.success(), "{args:?}: {help:?}");
@@ -3871,7 +3872,7 @@ fn issue_note_is_registered_only_in_v2_grammar() {
         ),
         (
             &["issue", "note", "--contract", "2", "--help"][..],
-            "hive issue note",
+            "Choose progress, evidence or handoff",
         ),
         (
             &["issue", "note", "--help", "--contract", "2"][..],
