@@ -204,7 +204,7 @@ Command arguments below are required unless in brackets. Common flags above appl
 | issue submit | ISSUE --claim ID --holder REF --stop-evidence REF --evidence REF --file PATH | review; append result note, clear claim |
 | issue submit-epic | ISSUE --evidence REF --file PATH | review; children resolved, no claim |
 | issue request-changes / accept | ISSUE --submission ID --file PATH --approval REF | todo/done; review binds current submission and revision |
-| issue cancel / reopen | ISSUE --reason TEXT --approval REF | terminal/todo; cancel running only after explicit release, reopen checks dependents |
+| issue cancel / reopen | ISSUE --reason TEXT --evidence-file PATH | terminal/todo; cancel running only after explicit release, reopen checks dependents |
 | issue note | ISSUE --kind progress\|evidence\|handoff --file PATH --claim ID | note ID and Issue revision; exact current holder and request-bound decision |
 | issue set-parent | ISSUE --parent ID or --clear | relation receipt |
 | issue add-dependency / remove-dependency | ISSUE PREREQUISITE | relation receipt, DAG validation |
