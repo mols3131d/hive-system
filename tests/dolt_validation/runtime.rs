@@ -9,6 +9,8 @@ mod area_create;
 mod artifact_create;
 #[path = "runtime/artifact_update.rs"]
 mod artifact_update;
+#[path = "runtime/bot_register.rs"]
+mod bot_register;
 #[path = "runtime/issue_dependency.rs"]
 mod issue_dependency;
 #[path = "runtime/issue_update.rs"]
@@ -2078,6 +2080,7 @@ fn issue_create_writer_fixture(
             "areas",
             "artifact_areas",
             "artifacts",
+            "bots",
             "issue_dependencies",
             "issue_updates",
             "issues",
