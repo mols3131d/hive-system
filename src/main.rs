@@ -9,8 +9,10 @@ mod output;
 
 use std::process::ExitCode;
 
-use cli::{AreaCommand, ResourceCommand};
-use cli::{Command, ConfigCommand, Contract, Invocation, IssueCommand, ParseFailure};
+use cli::{
+    AreaCommand, BotCommand, Command, ConfigCommand, Contract, Invocation, IssueCommand,
+    ParseFailure, ResourceCommand,
+};
 use error::{ErrorCode, HiveError};
 
 fn main() -> ExitCode {
@@ -104,9 +106,18 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let result = match invocation.command {
         Command::Validate(args) => dolt::validate(&args),
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
+        Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
         Command::Resource(ResourceCommand::List(args)) => dolt::resource::list(&args),
         Command::Resource(ResourceCommand::Show(args)) => dolt::resource::show(&args),
+        Command::Bot(BotCommand::List {
+            target,
+            status,
+            page,
+            cursor,
+            ..
+        }) => dolt::bot::list(&target, status.as_deref(), page.limit, cursor.as_deref()),
+        Command::Bot(BotCommand::Show { target, bot_id }) => dolt::bot::show(&target, &bot_id),
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
         Command::Issue(IssueCommand::List(args)) => dolt::issue_list(
             &args,

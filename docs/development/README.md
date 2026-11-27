@@ -110,7 +110,50 @@ A selected Issue with malformed summary fields returns `INVALID_RECORD` at the v
 
 `issue ready` and `issue blocked` accept the same target, scopes, filters, and pagination options. Both select executable todo Issues. Ready Issues have no hold, current Claim, unmet prerequisite, or archived Area in their ancestry. Missing prerequisites, invalid readiness metadata, and uncertain Area chains also block readiness. Blocked summaries include a `reasons` array of stable codes. The query reports prerequisite and Area blockers without exposing related records. Each cursor is specific to its view. Readiness describes the observed commit and grants no execution permission.
 
-Recursive Area listing, global discovery, and context resolution are follow-up work.
+Global discovery and context resolution are follow-up work.
+
+## Committed Area trees
+
+Use the same synthetic Dolt target and SELECT-only account for `area tree`. Omit `--root` to read the forest of committed root Areas, or select one subtree by its canonical lowercase UUIDv7.
+
+```sh
+hive --contract 2 --json area tree \
+  --root 01900000-0000-7000-8000-000000000002 \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+The result contains an array of root summaries, including archived Areas, and a `children` array at each node. Roots and siblings sort by bytewise slug, then ID. A known leaf has empty children, while an unknown root returns `NOT_FOUND`. The limit is 100 nodes across the entire result and 32 levels, with each returned root at level 1. Larger selections return `CONTEXT_LIMIT`. Cycles encountered during traversal return `INVALID_RECORD`.
+
+## Committed Bot metadata
+
+Use the same explicit Dolt target and SELECT-only account for contract 2 Bot reads.
+
+```sh
+hive --contract 2 --json bot list --status retired --limit 10 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+hive --contract 2 --json bot show 01900000-0000-7000-8000-00000000000a \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+`bot list` defaults to `--status active` and accepts `retired` or `all`. It orders entries by ascending Bot UUID, with 25 results per page by default and a maximum of 100. Pass `next_cursor` as `--cursor` with the same target, status and page size. Changes to the committed snapshot or query return `STALE_CURSOR`.
+
+`bot show` takes an exact lowercase UUIDv7 and can inspect retired Queens. Both commands return registry metadata and the verified Dolt commit. Registry status describes retirement. Committed Soul inspection requires the workspace and asset repository pairing from [#18](https://github.com/mols3131d/hive-system/issues/18).
+
+## Committed Resource reads
+
+Use the same explicit Dolt target and SELECT-only account for contract 2 Resource reads.
+
+```sh
+hive --contract 2 --json resource list --area 01900000-0000-7000-8000-000000000002 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+hive --contract 2 --json resource show 01900000-0000-7000-8000-000000000014 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+`resource list` requires exactly one of `--all`, `--area UUID`, or `--issue UUID`. Scope and Resource selectors use canonical lowercase UUIDv7 IDs. Area and Issue scopes include only directly linked Resources. A known scope with no links returns an empty page, and an unknown scope returns `NOT_FOUND`.
+
+List pages contain Resource IDs, kinds, names, and revisions in ascending bytewise ID order, with 25 items by default and a maximum of 100. Pass `next_cursor` as `--cursor` with the same target, scope, and page size. A changed snapshot or query returns `STALE_CURSOR`. Exact-ID `resource show` adds the stored URI to the selected record. Both commands report the verified Dolt commit and leave URIs unopened.
 
 ## Agent-assisted development
 

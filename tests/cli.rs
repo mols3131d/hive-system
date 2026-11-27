@@ -922,6 +922,304 @@ fn malformed_dolt_list_project_preserves_late_v2_and_json_options() {
 }
 
 #[test]
+fn bot_metadata_has_explicit_v2_selection_and_preserves_v1_parsing() {
+    let sandbox = Sandbox::new();
+    for (command, args) in [
+        ("bot list", &["bot", "list"][..]),
+        (
+            "bot list",
+            &["bot", "list", "--limit", "500", "--after", "legacy-key"][..],
+        ),
+        ("bot show", &["bot", "show", BOT]),
+        ("memory show", &["memory", "show", BOT]),
+    ] {
+        let mut flags = vec!["--json"];
+        flags.extend(args);
+        assert_json_failure(&sandbox.run(&flags), &flags, command, "NOT_IMPLEMENTED", 7);
+    }
+
+    for (command, args) in [
+        ("bot list", &["bot", "list", "--limit", "501"][..]),
+        ("bot list", &["bot", "list", "--after="]),
+        ("bot show", &["bot", "show", "Invalid_Bot"]),
+    ] {
+        let mut flags = vec!["--contract", "1", "--json"];
+        flags.extend(args);
+        assert_json_failure(&sandbox.run(&flags), &flags, command, "INVALID_ARGUMENT", 2);
+    }
+
+    for (command, args) in [
+        ("bot list", &["bot", "list", "--status", "retired"][..]),
+        (
+            "bot show",
+            &["bot", "show", BOT, "--database", "fixture_db"],
+        ),
+    ] {
+        let mut flags = vec!["--json"];
+        flags.extend(args);
+        assert_json_failure(&sandbox.run(&flags), &flags, command, "INVALID_ARGUMENT", 2);
+    }
+
+    let target = [
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+    ];
+    for (args, explicit_target) in [
+        (&["list"][..], false),
+        (&["list", "--status", "Active"], true),
+        (&["list", "--limit", "0"], true),
+        (&["list", "--limit", "101"], true),
+        (&["list", "--after", "legacy-key"], true),
+        (&["list", "--workspace", "fixture"], true),
+        (&["list", "--project", "project-fixture"], true),
+        (&["list", "--at", REVISION], true),
+        (&["list", "--authority"], true),
+        (&["show", BOT], true),
+        (&["show", "01900000-0000-4000-8000-00000000000a"], true),
+        (&["show", "01900000-0000-7000-8000-00000000000A"], true),
+    ] {
+        let mut flags = vec!["--contract", "2", "--json", "bot"];
+        flags.extend(args);
+        if explicit_target {
+            flags.extend(target);
+        }
+        let output = sandbox.run(&flags);
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{flags:?} {result}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(result["schema_version"], 2);
+        assert_eq!(result["command"], format!("bot {}", args[0]));
+        assert_eq!(result["error"]["code"], "INVALID_ARGUMENT");
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn v1_bot_help_matches_the_reviewed_cli() {
+    let sandbox = Sandbox::new();
+    // Captured from e4749287044a71ec752f8539c51e77dfbbfe5ba0.
+    let expected = concat!(
+        "List or inspect registered Manager Bots\n",
+        "\n",
+        "Usage: hive bot <COMMAND>\n",
+        "\n",
+        "Commands:\n",
+        "  list  List registered Manager Bots\n",
+        "  show  Show a registered Bot's identity and routing metadata\n",
+        "  help  Print this message or the help of the given subcommand(s)\n",
+        "\n",
+        "Options:\n",
+        "  -h, --help  Print help\n",
+        "List registered Manager Bots\n",
+        "\n",
+        "Usage: hive bot list [OPTIONS]\n",
+        "\n",
+        "Options:\n",
+        "      --limit <LIMIT>        [default: 50]\n",
+        "      --after <KEY>          \n",
+        "      --contract <VERSION>   Select the CLI contract version [possible values: 1, 2]\n",
+        "      --workspace <PATH>     Select the Hive workspace\n",
+        "      --project <ID>         Select the project or reserved scope\n",
+        "      --project-root <PATH>  Select the Git project root\n",
+        "      --format <FORMAT>      Set the output format [possible values: text, json]\n",
+        "      --json                 Use JSON output\n",
+        "      --at <COMMIT>          Read a snapshot at a full local commit object ID\n",
+        "      --authority            Check the selected workspace's authority for this read\n",
+        "  -h, --help                 Print help\n",
+        "Show a registered Bot's identity and routing metadata\n",
+        "\n",
+        "Usage: hive bot show [OPTIONS] <BOT-ID>\n",
+        "\n",
+        "Arguments:\n",
+        "  <BOT-ID>  \n",
+        "\n",
+        "Options:\n",
+        "      --contract <VERSION>   Select the CLI contract version [possible values: 1, 2]\n",
+        "      --workspace <PATH>     Select the Hive workspace\n",
+        "      --project <ID>         Select the project or reserved scope\n",
+        "      --project-root <PATH>  Select the Git project root\n",
+        "      --format <FORMAT>      Set the output format [possible values: text, json]\n",
+        "      --json                 Use JSON output\n",
+        "      --at <COMMIT>          Read a snapshot at a full local commit object ID\n",
+        "      --authority            Check the selected workspace's authority for this read\n",
+        "  -h, --help                 Print help\n",
+    );
+    let mut actual = Vec::new();
+    for args in [
+        &["bot", "--help"][..],
+        &["bot", "list", "--help"],
+        &["bot", "show", "--help"],
+    ] {
+        let output = sandbox.run(args);
+        assert!(output.status.success(), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        actual.extend(output.stdout);
+    }
+    assert_eq!(String::from_utf8(actual).unwrap(), expected);
+    sandbox.assert_empty();
+}
+
+#[test]
+fn malformed_dolt_bot_arguments_preserve_trailing_contract_and_format() {
+    let sandbox = Sandbox::new();
+    let target = [
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+    ];
+    let check = |args: &[&str], leaf: &str, code, exit| {
+        let output = sandbox.run(args);
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{args:?}: {error}\n{output:?}"));
+        assert_eq!(output.status.code(), Some(exit), "{args:?}: {report}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], format!("bot {leaf}"));
+        assert_eq!(report["error"]["code"], code);
+        assert!(report.get("context").is_none(), "{args:?}");
+        report
+    };
+    for (options, code, exit) in [
+        (
+            &["show", "01900000-0000-7000-8000-00000000000A"][..],
+            "INVALID_ARGUMENT",
+            2,
+        ),
+        (&["list", "--limit", "malformed"], "INVALID_ARGUMENT", 2),
+        (&["list", "--limit", "-1"], "INVALID_ARGUMENT", 2),
+        (&["list", "--limit=-1"], "INVALID_ARGUMENT", 2),
+        (&["list", "--limit", "101"], "INVALID_ARGUMENT", 2),
+        (&["list", "--limit"], "INVALID_ARGUMENT", 2),
+        (
+            &["list", "--project", "INVALID_PROJECT"],
+            "INVALID_ARGUMENT",
+            2,
+        ),
+        (&["list", "--cursor", "malformed"], "STALE_CURSOR", 5),
+        (&["list", "--cursor"], "INVALID_ARGUMENT", 2),
+        (&["list", "--cursor", "-1"], "INVALID_ARGUMENT", 2),
+        (&["list", "--cursor=-1"], "STALE_CURSOR", 5),
+        (&["list", "--status", "-1"], "INVALID_ARGUMENT", 2),
+        (&["list", "--status=-1"], "INVALID_ARGUMENT", 2),
+        (&["list", "--after="], "INVALID_ARGUMENT", 2),
+    ] {
+        let (leaf, options) = options.split_first().unwrap();
+        let args = [
+            &["bot", leaf][..],
+            &target,
+            options,
+            &["--contract", "2", "--json"],
+        ]
+        .concat();
+        check(&args, leaf, code, exit);
+    }
+
+    let command = ["bot", "list"];
+    let trailing = ["--contract", "2", "--json"];
+    for (flag, value) in [
+        ("--database", "fixture_db"),
+        ("--workspace-id", "01900000-0000-7000-8000-000000000001"),
+        ("--port", "3307"),
+        ("--status", "active"),
+        ("--cursor", "cursor-fixture"),
+        ("--limit", "25"),
+        ("--after", "legacy-key"),
+    ] {
+        let other = target
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter(|pair| pair[0] != flag)
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        for invalid in [&[flag][..], &[flag, "-1"]] {
+            let args = [&command[..], &other, invalid, &trailing].concat();
+            check(&args, "list", "INVALID_ARGUMENT", 2);
+        }
+        let duplicate = [flag, value, flag, value];
+        let args = [&command[..], &other, &duplicate, &trailing].concat();
+        let report = check(&args, "list", "INVALID_ARGUMENT", 2);
+        assert_eq!(
+            report["error"]["message"], "Arguments conflict.",
+            "{args:?}"
+        );
+    }
+
+    for flag in ["--project", "--at", "--workspace", "--project-root"] {
+        let empty = format!("{flag}=");
+        for invalid in [&[flag][..], &[flag, "-1"], &[empty.as_str()]] {
+            let root = [invalid, &trailing, &command, &target].concat();
+            let leaf = [&command[..], &target, invalid, &trailing].concat();
+            check(&root, "list", "INVALID_ARGUMENT", 2);
+            check(&leaf, "list", "INVALID_ARGUMENT", 2);
+        }
+    }
+
+    for at in [
+        &["--at", "BAD"][..],
+        &["--at=BAD"],
+        &["--at", "-1"],
+        &["--at=-1"],
+    ] {
+        for (leaf, command) in [
+            ("list", &["bot", "list"][..]),
+            (
+                "show",
+                &["bot", "show", "01900000-0000-7000-8000-00000000000a"],
+            ),
+        ] {
+            let trailing = ["--contract", "2", "--json"];
+            check(
+                &[at, command, &target, &trailing].concat(),
+                leaf,
+                "INVALID_ARGUMENT",
+                2,
+            );
+            check(
+                &[command, &target, at, &trailing].concat(),
+                leaf,
+                "INVALID_ARGUMENT",
+                2,
+            );
+        }
+    }
+
+    for (literal, exit) in [
+        ("--project=--json", 2),
+        ("--cursor=--json", 5),
+        ("--status=--json", 2),
+        ("--at=--json", 2),
+        ("--after=--json", 2),
+        ("--database=--json", 2),
+        ("--workspace-id=--json", 2),
+    ] {
+        let command = ["bot", "list"];
+        let trailing = ["--contract", "2"];
+        let args = [&command[..], &target, &[literal], &trailing].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(exit), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+        if matches!(literal, "--at=--json" | "--project=--json") {
+            let args = [&[literal][..], &command, &target, &trailing].concat();
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(exit), "{args:?}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            assert!(!output.stderr.is_empty(), "{args:?}");
+        }
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn dolt_area_reads_require_contract_2_and_an_explicit_target() {
     let sandbox = Sandbox::new();
     let help = sandbox.run(&["--help"]);
@@ -942,6 +1240,21 @@ fn dolt_area_reads_require_contract_2_and_an_explicit_target() {
     for option in ["--parent", "--limit", "--cursor", "--workspace-id"] {
         assert!(help.contains(option), "{help}");
     }
+    let tree_help = sandbox.run(&["--contract", "2", "area", "tree", "--help"]);
+    assert_eq!(tree_help.status.code(), Some(0));
+    assert!(
+        String::from_utf8(tree_help.stdout)
+            .unwrap()
+            .contains("--root")
+    );
+    let args = ["--json", "area", "tree"];
+    assert_json_failure(
+        &sandbox.run(&args),
+        &args,
+        "area tree",
+        "INVALID_ARGUMENT",
+        2,
+    );
 
     let args = ["--json", "area", "list"];
     assert_json_failure(
@@ -1007,10 +1320,14 @@ fn malformed_dolt_area_options_preserve_v2_json_at_root_and_leaf() {
     let selectors = ["--contract", "2", "--json"];
     let project = ["--project", "BAD!"];
     let cursor = ["--cursor", "-1"];
+    let root = ["--root", "-1"];
     let cases = [
         ("area list", &["area", "list"][..], &cursor[..], false),
         ("area list", &["area", "list"][..], &project[..], false),
         ("area list", &["area", "list"][..], &project[..], true),
+        ("area tree", &["area", "tree"][..], &root[..], false),
+        ("area tree", &["area", "tree"][..], &project[..], false),
+        ("area tree", &["area", "tree"][..], &project[..], true),
         (
             "area show",
             &["area", "show", target[1]][..],
