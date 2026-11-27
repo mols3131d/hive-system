@@ -46,12 +46,25 @@ mod unix {
         policy_revision: String,
     }
 
-    // A descriptor supplies expected identity only. A future runtime integration
-    // must verify that the explicitly selected reader endpoint serves this root's
-    // db/ before passing the expected UUID to the committed snapshot reader.
-    struct Candidate {
-        root: PathBuf,
+    pub(crate) struct Candidate {
+        pub(crate) root: ScopedDirectory,
         descriptor: Descriptor,
+    }
+
+    impl Candidate {
+        pub(crate) fn workspace_id(&self) -> &str {
+            &self.descriptor.workspace_id
+        }
+
+        pub(crate) fn policy_revision(&self) -> &str {
+            &self.descriptor.policy_revision
+        }
+    }
+
+    pub(crate) fn read_explicit(path: &Path) -> Result<Candidate, HiveError> {
+        validate_path(path)?;
+        let target = resolve_path(path, &current_dir()?, absolute_env("HOME").as_deref())?;
+        read_candidate(&target)
     }
 
     pub(super) fn show(
@@ -96,11 +109,7 @@ mod unix {
         let explicit = options
             .workspace
             .as_deref()
-            .map(|path| {
-                validate_path(path)?;
-                let target = resolve_path(path, &current_dir()?, home)?;
-                read_candidate(&target)
-            })
+            .map(read_explicit)
             .transpose()
             .map_err(|error| workspace_error("CLI workspace", error))?;
 
@@ -203,11 +212,11 @@ mod unix {
         let descriptor = candidate.descriptor;
         let mut report = json!({
             "scope": if resolved { "resolved" } else { "workspace" },
-            "workspace_root": json_path(&candidate.root)?,
+            "workspace_root": json_path(&candidate.root.path)?,
             "workspace_id": descriptor.workspace_id,
             "policy_revision": descriptor.policy_revision,
             "storage_schema_version": STORAGE_SCHEMA_VERSION,
-            "descriptor": json_path(&candidate.root.join(MARKER))?,
+            "descriptor": json_path(&candidate.root.path.join(MARKER))?,
             "output_format": format.as_str(),
             "sources": {"workspace": workspace_source, "output_format": output_source},
             "verification": {
@@ -263,7 +272,7 @@ mod unix {
         validate_path(path)?;
         let target = resolve_path(path, config_parent(source), home)?;
         let candidate = if let Some(candidate) = explicit {
-            if normalized_root(&target) != candidate.root {
+            if normalized_root(&target) != candidate.root.path {
                 return Ok((candidate, false));
             }
             // Verify the matching spelling still traverses only real directories.
@@ -376,10 +385,7 @@ mod unix {
                 )
             })?;
         let descriptor = parse_descriptor(&bytes)?;
-        Ok(Candidate {
-            root: root.path,
-            descriptor,
-        })
+        Ok(Candidate { root, descriptor })
     }
 
     #[cfg(target_os = "linux")]
@@ -438,6 +444,9 @@ mod unix {
         HiveError::new(ErrorCode::InvalidConfig, message)
     }
 }
+
+#[cfg(unix)]
+pub(crate) use unix::read_explicit;
 
 use crate::cli::{CommonOptions, ConfigShowArgs, Format};
 use crate::error::HiveError;

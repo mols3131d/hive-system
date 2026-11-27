@@ -4,6 +4,9 @@ mod area;
 mod artifacts;
 #[path = "dolt_validation/bots.rs"]
 mod bots;
+#[cfg(unix)]
+#[path = "dolt_validation/conversation.rs"]
+mod conversation;
 #[path = "dolt_validation/directives.rs"]
 mod directives;
 #[path = "dolt_validation/issue_list.rs"]
@@ -22,6 +25,8 @@ mod project;
 mod receipts;
 #[path = "dolt_validation/relations.rs"]
 mod relations;
+#[path = "dolt_validation/resource.rs"]
+mod resource;
 
 use std::fs;
 use std::io::Write;

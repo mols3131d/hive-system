@@ -163,6 +163,27 @@ List orders summaries by Project ID and accepts exact `active`, `completed`, or 
 
 Show takes a canonical lowercase UUIDv7 and returns Project details and up to 25 direct member Issue IDs across Areas. The `issues.truncated` field indicates additional members. Use `issue list --project UUID` to page through member summaries.
 
+## Committed Artifact inspection
+
+Use an explicit Dolt target and SELECT-only account for contract 2 Artifact reads.
+
+```sh
+hive --contract 2 --json artifact list \
+  --scope area:01900000-0000-7000-8000-000000000002 \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+
+hive --contract 2 --json artifact show 01900000-0000-7000-8000-000000000004 \
+  --scope area:01900000-0000-7000-8000-000000000002 \
+  --scope project:01900000-0000-7000-8000-000000000003 \
+  --database fixture_db --port 3307 \
+  --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+List selects exactly one direct scope using `area:UUID`, `project:UUID`, `issue:UUID`, or `resource:UUID` and returns only Artifact ID, kind, title, and revision. It defaults to 25 items and caps pages at 100. Pass `next_cursor` as `--cursor` with the same target, scope, and page size. A changed commit or query returns `STALE_CURSOR`.
+
+Show takes an exact canonical lowercase UUIDv7. An exact ID alone suffices for a standalone Artifact. For a linked Artifact, repeat `--scope` to explicitly cover every direct link. The CLI verifies the Artifact and each selected scope at the same committed snapshot before returning up to 64 KiB of Markdown. Incomplete coverage returns `UNAUTHORIZED` without disclosing linked scopes or body content.
+
 ## Committed Bot metadata
 
 Use the same explicit Dolt target and SELECT-only account for contract 2 Bot reads.
@@ -177,6 +198,33 @@ hive --contract 2 --json bot show 01900000-0000-7000-8000-00000000000a \
 `bot list` defaults to `--status active` and accepts `retired` or `all`. It orders entries by ascending Bot UUID, with 25 results per page by default and a maximum of 100. Pass `next_cursor` as `--cursor` with the same target, status and page size. Changes to the committed snapshot or query return `STALE_CURSOR`.
 
 `bot show` takes an exact lowercase UUIDv7 and can inspect retired Queens. Both commands return registry metadata and the verified Dolt commit. Registry status describes retirement. Committed Soul inspection requires the workspace and asset repository pairing from [#18](https://github.com/mols3131d/hive-system/issues/18).
+
+## Committed Resource reads
+
+Use the same explicit Dolt target and SELECT-only account for contract 2 Resource reads.
+
+```sh
+hive --contract 2 --json resource list --area 01900000-0000-7000-8000-000000000002 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+hive --contract 2 --json resource show 01900000-0000-7000-8000-000000000014 \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001
+```
+
+`resource list` requires exactly one of `--all`, `--area UUID`, or `--issue UUID`. Scope and Resource selectors use canonical lowercase UUIDv7 IDs. Area and Issue scopes include only directly linked Resources. A known scope with no links returns an empty page, and an unknown scope returns `NOT_FOUND`.
+
+List pages contain Resource IDs, kinds, names, and revisions in ascending bytewise ID order, with 25 items by default and a maximum of 100. Pass `next_cursor` as `--cursor` with the same target, scope, and page size. A changed snapshot or query returns `STALE_CURSOR`. Exact-ID `resource show` adds the stored URI to the selected record. Both commands report the verified Dolt commit and leave URIs unopened.
+
+## Historical Queen conversations
+
+Use contract 2 with an explicit workspace root, the same authenticated Dolt reader and target options, and exact lowercase UUIDv7 selectors for the Queen and conversation.
+
+```sh
+hive --contract 2 --json conversation show --workspace /example/hive-v2-userdata \
+  --database fixture_db --port 3307 --workspace-id 01900000-0000-7000-8000-000000000001 \
+  --bot 01900000-0000-7000-8000-00000000000a --id 01900000-0000-7000-8000-00000000000b
+```
+
+The read returns validated metadata and the verbatim Markdown body for an active or retired Queen. Hive matches the portable workspace UUID across the descriptor, committed Dolt target, and conversation header. The header must also match the committed Queen UUID and slug. Copies can share a workspace UUID, so select the filesystem copy and its Dolt target explicitly. Physical database-to-root binding and active-root authority are outside this inspection. See the [conversation file contract](../architecture/dolt-workspace-contract.md#private-queen-conversation-file-contract).
 
 ## Agent-assisted development
 

@@ -1422,6 +1422,195 @@ fn malformed_dolt_area_options_preserve_v2_json_at_root_and_leaf() {
 }
 
 #[test]
+fn dolt_resource_reads_preserve_json_errors_and_option_literals() {
+    let sandbox = Sandbox::new();
+    let id = "01900000-0000-7000-8000-000000000001";
+    let target = [
+        "--workspace-id",
+        id,
+        "--database",
+        "fixture_db",
+        "--port",
+        "3307",
+    ];
+    let selectors = ["--contract", "2", "--json"];
+    let help = sandbox.run(&["--contract", "2", "resource", "show", "--help"]);
+    assert!(help.status.success(), "{help:?}");
+    assert!(String::from_utf8_lossy(&help.stdout).contains("hive resource show"));
+    for (command, invalid, at_root, code) in [
+        (
+            &["list", "--all"][..],
+            &["--project", "BAD!"][..],
+            true,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list", "--all"][..],
+            &["--at", "BAD!"][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list", "--all"][..],
+            &["--cursor", "-1"][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list", "--all"][..],
+            &["--limit", "-1"][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list", "--all"][..],
+            &["--workspace", "-1"][..],
+            true,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list", "--all"][..],
+            &["--all"][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list"][..],
+            &["--all=false"][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["show", id][..],
+            &["--area", id][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            &["list", "--all"][..],
+            &["--issue", id][..],
+            false,
+            "AMBIGUOUS_SCOPE",
+        ),
+        (&["list"][..], &[][..], false, "INVALID_ARGUMENT"),
+        (
+            &["list", "--issue", "#1"][..],
+            &[][..],
+            false,
+            "INVALID_ARGUMENT",
+        ),
+        (&["show", "BAD!"][..], &[][..], false, "INVALID_ARGUMENT"),
+        (
+            &["show", id][..],
+            &["--at=--json"][..],
+            true,
+            "INVALID_ARGUMENT",
+        ),
+    ] {
+        let name = format!("resource {}", command[0]);
+        let command = [&["resource"][..], command, &target].concat();
+        let invalid_command = if at_root {
+            [invalid, &command].concat()
+        } else {
+            [&command[..], invalid].concat()
+        };
+        let early = sandbox.run(&[&selectors[..], &invalid_command].concat());
+        let late = sandbox.run(&[&invalid_command[..], &selectors].concat());
+        let report: Value = serde_json::from_slice(&early.stdout)
+            .unwrap_or_else(|error| panic!("{invalid_command:?}: {error}: {early:?}"));
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], name);
+        assert_eq!(report["error"]["code"], code);
+        assert!(!report.to_string().contains("BAD!"));
+        assert!(early.stderr.is_empty());
+        assert_eq!(late.status, early.status, "{invalid_command:?}");
+        assert_eq!(late.stdout, early.stdout, "{invalid_command:?}: {late:?}");
+        assert!(late.stderr.is_empty());
+    }
+
+    for args in [
+        &["--project=--json", "resource", "list", "--contract", "2"][..],
+        &[
+            "resource",
+            "list",
+            "--cursor=--json",
+            "--at",
+            "BAD!",
+            "--contract",
+            "2",
+        ],
+        &["--contract", "2", "resource", "show", "--", "--json"],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+
+    let v1 = sandbox.run(&["--json", "resource", "list"]);
+    let unknown = sandbox.run(&["--json", "unrecognized", "list"]);
+    assert_eq!(v1.status, unknown.status);
+    assert_eq!(v1.stdout, unknown.stdout);
+    assert_eq!(v1.stderr, unknown.stderr);
+    sandbox.assert_empty();
+}
+
+#[test]
+fn malformed_resource_json_switch_preserves_independent_output_selection() {
+    let sandbox = Sandbox::new();
+    let command = ["--contract", "2", "resource", "list"];
+    let early = sandbox.run(&[&command[..], &["--format", "json", "--json=false"]].concat());
+    assert_eq!(early.status.code(), Some(2), "{early:?}");
+    assert!(early.stderr.is_empty(), "{early:?}");
+    let report: Value = serde_json::from_slice(&early.stdout).unwrap();
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["command"], "resource list");
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    assert_eq!(
+        report["error"]["message"],
+        "An argument has a missing or invalid value."
+    );
+
+    for options in [
+        &["--json=false", "--format", "json"][..],
+        &["--json=false", "--json"],
+        &["--json", "--json=false"],
+    ] {
+        let output = sandbox.run(&[&command[..], options].concat());
+        assert_eq!(output.status, early.status, "{options:?}");
+        assert_eq!(output.stdout, early.stdout, "{options:?}");
+        assert!(output.stderr.is_empty(), "{options:?}");
+    }
+
+    for args in [
+        [&command[..], &["--json=false"]].concat(),
+        [&command[..], &["--json=true"]].concat(),
+        [&command[..], &["--json="]].concat(),
+        [&command[..], &["--json=--json"]].concat(),
+        [&command[..], &["--json=--format=json"]].concat(),
+        [&command[..], &["--json=false", "--cursor=--json"]].concat(),
+        vec![
+            "--contract",
+            "2",
+            "resource",
+            "show",
+            "--json=false",
+            "--",
+            "--json",
+        ],
+    ] {
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Usage: hive resource"),
+            "{args:?}"
+        );
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn dolt_area_option_recovery_preserves_literals_and_v1_errors() {
     let sandbox = Sandbox::new();
     for args in [
@@ -1488,6 +1677,123 @@ fn dolt_area_option_recovery_preserves_literals_and_v1_errors() {
         assert_eq!(explicit.status.code(), output.status.code(), "{v1:?}");
         assert_eq!(explicit.stdout, output.stdout, "{v1:?}");
         assert_eq!(explicit.stderr, output.stderr, "{v1:?}");
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn artifact_contract_selection_preserves_legacy_help_and_v2_error_boundaries() {
+    let sandbox = Sandbox::new();
+    let legacy = sandbox.run(&["artifact", "list", "--help"]);
+    assert!(legacy.status.success());
+    let help = String::from_utf8(legacy.stdout).unwrap();
+    assert!(help.contains("--task"));
+    assert!(help.contains("--standalone"));
+    assert!(!help.contains("--scope"));
+    let v2 = sandbox.run(&["artifact", "list", "--contract", "2", "--help"]);
+    assert!(v2.status.success());
+    assert!(String::from_utf8(v2.stdout).unwrap().contains("--scope"));
+
+    for (leaf, options) in [
+        ("list", &["--limit", "-7"][..]),
+        ("list", &["--scope", "unknown:bad"][..]),
+        ("list", &["--scope", "one", "--scope", "two"][..]),
+        ("list", &["--standalone"][..]),
+        ("list", &["--scope"][..]),
+        ("show", &["bad", "--authority"][..]),
+        ("show", &["bad", "--approval", "fixture"][..]),
+        ("show", &["--workspace", "fixture"][..]),
+        ("show", &["not-a-uuid", "--file", "fixture"][..]),
+    ] {
+        let selectors = ["--contract", "2", "--json"];
+        let command = [&["artifact", leaf][..], options].concat();
+        let early = sandbox.run(&[&selectors[..], &command].concat());
+        let late = sandbox.run(&[&command[..], &selectors].concat());
+        assert_eq!(early.status.code(), Some(2), "{command:?}");
+        assert_eq!(early.status.code(), late.status.code(), "{command:?}");
+        assert_eq!(early.stdout, late.stdout, "{command:?}");
+        assert!(
+            early.stderr.is_empty() && late.stderr.is_empty(),
+            "{command:?}"
+        );
+        let report: Value = serde_json::from_slice(&early.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], format!("artifact {leaf}"));
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    }
+
+    for args in [
+        &["artifact", "list", "--scope=--json", "--contract", "2"][..],
+        &["artifact", "show", "--project=--json", "--contract", "2"][..],
+        &["artifact", "show", "--contract", "2", "--", "--json"][..],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn unknown_artifact_long_option_preserves_v2_errors_and_literal_boundaries() {
+    let sandbox = Sandbox::new();
+    let artifact = "01900000-0000-7000-8000-000000000004";
+    for leaf in ["list", "show"] {
+        let mut command = vec!["artifact", leaf];
+        if leaf == "show" {
+            command.push(artifact);
+        }
+        for options in [
+            &["--unknown", "--contract=2", "--json"][..],
+            &["--unknown=--contract=1", "--contract", "2", "--format=json"],
+            &["--unknown=--help", "--contract=2", "--json"],
+            &["--contract=2", "--unknown=--json", "--format=json"],
+        ] {
+            let args = [&command[..], options].concat();
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert!(output.stderr.is_empty(), "{args:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                report,
+                serde_json::json!({
+                    "schema_version": 2, "ok": false, "command": format!("artifact {leaf}"),
+                    "error": {
+                        "code": "INVALID_ARGUMENT",
+                        "message": "An argument or command is not recognized.",
+                    },
+                    "warnings": [],
+                }),
+                "{args:?}",
+            );
+        }
+        for options in [
+            &["--unknown=--json", "--contract=2"][..],
+            &["--unknown", "--contract=2", "--", "--json"],
+            &["--", "--unknown", "--contract=2", "--json"],
+            &["--unknown", "detached", "--contract=2", "--json"],
+        ] {
+            let args = [&command[..], options].concat();
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            assert!(!output.stderr.is_empty(), "{args:?}");
+        }
+
+        let args = [&["--json"][..], &command, &["--unknown=--contract=2"]].concat();
+        let output = sandbox.run(&args);
+        let explicit_v1 = sandbox.run(&[&["--contract", "1"][..], &args].concat());
+        assert_json_failure(
+            &output,
+            &args,
+            &format!("artifact {leaf}"),
+            "INVALID_ARGUMENT",
+            2,
+        );
+        assert_eq!(output.status.code(), explicit_v1.status.code(), "{args:?}");
+        assert_eq!(output.stdout, explicit_v1.stdout, "{args:?}");
+        assert_eq!(output.stderr, explicit_v1.stderr, "{args:?}");
     }
     sandbox.assert_empty();
 }
@@ -1770,4 +2076,376 @@ fn duplicate_and_missing_config_scope_options_preserve_v2_parse_errors() {
         assert!(output.stdout.is_empty(), "{args:?}");
         assert!(!output.stderr.is_empty(), "{args:?}");
     }
+}
+
+#[test]
+fn conversation_show_rejects_default_selection_and_preserves_late_v2_json() {
+    let sandbox = Sandbox::new();
+    let uuid = "01900000-0000-7000-8000-000000000001";
+    let target = [
+        "--workspace-id",
+        uuid,
+        "--database",
+        "fixture",
+        "--port",
+        "3306",
+    ];
+    let selectors = ["--bot", uuid, "--id", uuid];
+    let late = ["--contract", "2", "--json"];
+    let command = ["conversation", "show"];
+    let default = sandbox.0.join(".local/share/hive/v2/userdata");
+    fs::create_dir_all(&default).unwrap();
+    fs::write(
+        default.join("hive-workspace.yml"),
+        format!(
+            "version: 2\nworkspace_id: {uuid}\nschema_version: 1\npolicy_revision: {REVISION}\n"
+        ),
+    )
+    .unwrap();
+
+    for args in [
+        [&command[..], &target, &selectors, &late].concat(),
+        [&command[..], &["--workspace", "."], &selectors, &late].concat(),
+        [
+            &command[..],
+            &["--workspace", "."],
+            &target,
+            &["--bot", uuid],
+            &late,
+        ]
+        .concat(),
+        [
+            &command[..],
+            &["--workspace", "."],
+            &target,
+            &["--bot=--json", "--id", uuid],
+            &late,
+        ]
+        .concat(),
+        [
+            &command[..],
+            &["--workspace", "."],
+            &target,
+            &["--bot", uuid, "--id", "private-invalid-selector"],
+            &late,
+        ]
+        .concat(),
+    ] {
+        let output = sandbox.run(&args);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?} {report}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "conversation show");
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(report.get("data").is_none());
+        assert!(
+            !String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("private-invalid-selector")
+        );
+    }
+
+    let literal = [
+        &command[..],
+        &["--workspace", "."],
+        &target,
+        &["--bot=--json", "--id", uuid, "--contract", "2"],
+    ]
+    .concat();
+    let output = sandbox.run(&literal);
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.status.code(), Some(2));
+
+    let legacy = [&command[..], &selectors, &["--json"]].concat();
+    let output = sandbox.run(&legacy);
+    assert_json_failure(&output, &legacy, "conversation show", "INVALID_ARGUMENT", 2);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1);
+}
+
+#[test]
+fn conversation_show_recovers_v2_json_for_duplicate_and_hyphenated_selectors() {
+    let sandbox = Sandbox::new();
+    let uuid = "01900000-0000-7000-8000-000000000001";
+    let command = [
+        "conversation",
+        "show",
+        "--workspace",
+        ".",
+        "--workspace-id",
+        uuid,
+        "--database",
+        "fixture",
+        "--port",
+        "3306",
+    ];
+    let late = ["--contract", "2", "--json"];
+    for selectors in [
+        &["--bot", uuid, "--bot", uuid, "--id", uuid][..],
+        &[
+            "--bot",
+            uuid,
+            "--id",
+            uuid,
+            "--id",
+            "private-invalid-selector",
+        ],
+        &["--bot", "-invalid", "--id", uuid],
+        &["--bot", uuid, "--id", "-invalid"],
+        &["--bot", uuid, "--bot=--json", "--id", uuid],
+        &["--bot", uuid, "--id", uuid, "--id=--contract"],
+        &["--bot=-invalid", "--id", uuid],
+        &["--bot", uuid, "--id=-invalid"],
+        &["--bot", uuid, "--id"],
+        &["--id", uuid, "--bot"],
+    ] {
+        let args = [&command[..], selectors, &late].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], "conversation show");
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(report.get("data").is_none());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!stdout.contains("-invalid"));
+    }
+
+    for selectors in [
+        &[
+            "--bot",
+            uuid,
+            "--bot=--json",
+            "--id",
+            uuid,
+            "--contract",
+            "2",
+        ][..],
+        &[
+            "--bot",
+            "123",
+            "--id",
+            uuid,
+            "--id=--json",
+            "--contract",
+            "2",
+        ],
+        &[
+            "--bot",
+            "-invalid",
+            "--id",
+            uuid,
+            "--",
+            "--contract",
+            "2",
+            "--json",
+        ],
+        &[
+            "--bot",
+            uuid,
+            "--id",
+            uuid,
+            "--id",
+            uuid,
+            "--",
+            "--contract",
+            "2",
+            "--json",
+        ],
+        &[
+            "--bot",
+            uuid,
+            "--id",
+            uuid,
+            "--id",
+            "--",
+            "--contract",
+            "2",
+            "--json",
+        ],
+    ] {
+        let args = [&command[..], selectors].concat();
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("-invalid"));
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn conversation_show_recovers_output_for_target_and_scope_errors() {
+    let sandbox = Sandbox::new();
+    let uuid = "01900000-0000-7000-8000-000000000001";
+    fs::write(
+        sandbox.0.join("hive-workspace.yml"),
+        format!(
+            "version: 2\nworkspace_id: {uuid}\nschema_version: 1\npolicy_revision: {REVISION}\n"
+        ),
+    )
+    .unwrap();
+    let command = ["conversation", "show"];
+    let output_options = ["--contract", "2", "--json"];
+    let target = [
+        ["--workspace", "."],
+        ["--workspace-id", uuid],
+        ["--database", "fixture"],
+        ["--port", "3306"],
+        ["--bot", uuid],
+        ["--id", uuid],
+    ];
+    let check = |args: &[&str]| {
+        let output = sandbox.run(args);
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{args:?}: {error}\n{output:?}"));
+        assert!(output.status.code().is_some_and(|code| code != 0));
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert_eq!(report["schema_version"], 2, "{args:?}");
+        assert_eq!(report["command"], "conversation show", "{args:?}");
+        assert_eq!(report["ok"], false, "{args:?}");
+        assert!(report.get("data").is_none(), "{args:?}");
+        let message = report["error"]["message"].as_str().unwrap();
+        for private in ["INVALID", "-hidden", "private-selector", "other-copy"] {
+            assert!(!message.contains(private), "{report}");
+        }
+        (output.status.code(), report)
+    };
+
+    for (flag, valid, duplicate, invalid, root_allowed) in [
+        ("--port", "3306", "3306", "private-selector", false),
+        (
+            "--database",
+            "fixture",
+            "fixture",
+            "private-selector!",
+            false,
+        ),
+        ("--workspace-id", uuid, uuid, "private-selector", false),
+        ("--bot", uuid, uuid, "private-selector", false),
+        ("--id", uuid, uuid, "private-selector", false),
+        (
+            "--workspace",
+            ".",
+            "other-copy",
+            "https://private-selector",
+            true,
+        ),
+        (
+            "--project",
+            "example-project",
+            "other-project",
+            "INVALID",
+            true,
+        ),
+        (
+            "--project-root",
+            ".",
+            "other-copy",
+            "private-selector",
+            true,
+        ),
+        (
+            "--at",
+            REVISION,
+            "2222222222222222222222222222222222222222",
+            "INVALID",
+            true,
+        ),
+    ] {
+        let other = target
+            .iter()
+            .filter(|pair| pair[0] != flag)
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let empty = format!("{flag}=");
+        for (values, expected_message) in [
+            (
+                &[flag, valid, flag, duplicate][..],
+                (!root_allowed).then_some("Arguments conflict."),
+            ),
+            (&[flag, ""], None),
+            (&[empty.as_str()], None),
+            (&[flag, "-1"], None),
+            (
+                &[flag, "-hidden"],
+                Some("An argument has a missing or invalid value."),
+            ),
+            (
+                &[flag, invalid],
+                matches!(flag, "--project" | "--at")
+                    .then_some("An argument has a missing or invalid value."),
+            ),
+        ] {
+            for at_root in [false, true] {
+                if at_root && !root_allowed {
+                    continue;
+                }
+                let (root, leaf) = if at_root {
+                    (values, &[][..])
+                } else {
+                    (&[][..], values)
+                };
+                let early = [&output_options[..], root, &command, &other, leaf].concat();
+                let late = [root, &command, &other, leaf, &output_options].concat();
+                let early = check(&early);
+                let late = check(&late);
+                assert_eq!(early, late, "{flag} {values:?} at_root={at_root}");
+                if let Some(message) = expected_message {
+                    assert_eq!(late.0, Some(2));
+                    assert_eq!(late.1["error"]["code"], "INVALID_ARGUMENT");
+                    assert_eq!(late.1["error"]["message"], message, "{flag} {values:?}");
+                }
+            }
+        }
+
+        for at_root in [false, true] {
+            if at_root && !root_allowed {
+                continue;
+            }
+            let literal = format!("{flag}=--json");
+            let literal = [literal.as_str()];
+            let (root, leaf) = if at_root {
+                (&literal[..], &[][..])
+            } else {
+                (&[][..], &literal[..])
+            };
+            let args = [
+                root,
+                &command,
+                &other,
+                &["--port", "3306", "--port", "3306"],
+                leaf,
+                &["--contract", "2"],
+            ]
+            .concat();
+            let output = sandbox.run(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            assert!(!output.stderr.is_empty(), "{args:?}");
+        }
+    }
+
+    let full = target.into_iter().flatten().collect::<Vec<_>>();
+    for authority in [
+        "--authority",
+        "--authority=",
+        "--authority=INVALID",
+        "--authority=-1",
+    ] {
+        let early = [&output_options[..], &command, &full, &[authority]].concat();
+        let late = [&command[..], &full, &[authority], &output_options].concat();
+        assert_eq!(check(&early), check(&late), "{authority}");
+    }
+    let legacy = [&command[..], &full, &["--project", "INVALID", "--json"]].concat();
+    let explicit_v1 = [&["--contract", "1"][..], &legacy].concat();
+    let implicit = sandbox.run(&legacy);
+    let explicit = sandbox.run(&explicit_v1);
+    assert_eq!(implicit.status, explicit.status);
+    assert_eq!(implicit.stdout, explicit.stdout);
+    assert_eq!(implicit.stderr, explicit.stderr);
 }
