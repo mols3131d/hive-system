@@ -2794,6 +2794,58 @@ fn conversation_list_recovers_scoped_v2_output_without_consuming_values_as_flags
 }
 
 #[test]
+fn workspace_init_recovers_output_flags_after_an_unknown_option_value() {
+    let sandbox = Sandbox::new();
+    let command = ["workspace", "init"];
+    let unknown = ["--database", "fixture"];
+    let options = ["--contract", "2", "--json"];
+    let mut original_error = None;
+    for args in [
+        [&options[..], &command, &unknown].concat(),
+        [&command[..], &unknown, &options].concat(),
+        [&command[..], &["--database"], &options].concat(),
+        [&command[..], &["--database=--"], &options].concat(),
+        [&command[..], &unknown, &options, &["--", "--target=after"]].concat(),
+    ] {
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert_eq!(report["command"], "workspace init");
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert_eq!(
+            report["error"]["message"],
+            "An argument or command is not recognized."
+        );
+        assert_eq!(
+            original_error.get_or_insert_with(|| report["error"].clone()),
+            &report["error"]
+        );
+    }
+
+    for tail in [
+        &["--database=--json", "--contract", "2"][..],
+        &[&unknown[..], &["--", "--contract", "2", "--json"]].concat(),
+    ] {
+        let output = sandbox.run(&[&command[..], tail].concat());
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    for tail in [
+        &["--database=--contract", "2"][..],
+        &[&unknown[..], &["--", "--contract", "2"]].concat(),
+    ] {
+        let output = sandbox.run(&[&["--json"][..], &command, tail].concat());
+        assert_eq!(output.status.code(), Some(2));
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert_ne!(report["command"], "workspace init");
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
 fn workspace_status_recovers_output_flags_after_a_duplicate_target() {
     let sandbox = Sandbox::new();
     let command = ["workspace", "status"];

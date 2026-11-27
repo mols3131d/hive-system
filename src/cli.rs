@@ -1393,16 +1393,17 @@ fn recover_unknown_long(
         return None;
     }
 
-    // Let Clap replay the original tokens. Label list has no positionals, so
-    // its temporary option can also take one plain separated value. The
-    // original parse error still determines the result.
-    let allow_separated_value = domain == "label" && action == "list";
+    // Let Clap replay the original tokens. Init and Label list take no
+    // positionals, so the temporary option can take one plain separated
+    // value. The original parse error still determines the result.
+    let workspace_init = (domain, action) == ("workspace", "init");
+    let allow_separated_value = workspace_init || (domain, action) == ("label", "list");
     const UNKNOWN_LONG: &str = "recovered_unknown_long";
     let retry = cli.clone().mut_subcommand(domain, |command| {
         command.mut_subcommand(action, |leaf| {
             // A missing init target must not prevent recovery of the original
             // unknown-option error and its explicit output flags.
-            let leaf = if (domain, action) == ("workspace", "init") {
+            let leaf = if workspace_init {
                 leaf.mut_arg("target", |arg| arg.required(false))
             } else {
                 leaf
@@ -1417,7 +1418,16 @@ fn recover_unknown_long(
             )
         })
     });
-    let matches = retry.try_get_matches_from(args).ok()?;
+    let end = if workspace_init {
+        args.iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, arg)| *arg == "--")
+            .map_or(args.len(), |(index, _)| index)
+    } else {
+        args.len()
+    };
+    let matches = retry.try_get_matches_from(&args[..end]).ok()?;
     let recovered = matches
         .subcommand_matches(domain)?
         .subcommand_matches(action)?;
