@@ -1613,6 +1613,60 @@ fn unknown_area_create_options_keep_the_late_v2_envelope() {
 }
 
 #[test]
+fn malformed_area_create_values_and_conflicts_keep_the_v2_envelope() {
+    let sandbox = Sandbox::new();
+    let command = [
+        "area",
+        "create",
+        "--slug",
+        "fixture",
+        "--name",
+        "Fixture",
+        "--actor",
+        "fixture",
+        "--request-id",
+        "01900000-0000-7000-8000-000000000003",
+        "--evidence-file",
+        "fixture.json",
+        "--workspace",
+        ".",
+        "--workspace-id",
+        "01900000-0000-7000-8000-000000000001",
+        "--database",
+        "fixture",
+        "--port",
+        "3307",
+    ];
+    let flags = ["--contract", "2", "--json"];
+    for invalid in [&["--project", "BAD!"][..], &["--slug", "duplicate-slug"]] {
+        for args in [
+            [&flags[..], &command, invalid].concat(),
+            [&command[..], invalid, &flags].concat(),
+        ] {
+            let result = sandbox.run(&args);
+            assert_eq!(result.status.code(), Some(2), "{args:?}: {result:?}");
+            assert!(result.stderr.is_empty(), "{args:?}: {result:?}");
+            let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], "area create");
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+            assert!(!report.to_string().contains("BAD!"));
+            assert!(!report.to_string().contains("duplicate-slug"));
+        }
+    }
+    let args = [
+        &command[..],
+        &["--project", "BAD!", "--contract", "2", "--name=--json"],
+    ]
+    .concat();
+    let result = sandbox.run(&args);
+    assert_eq!(result.status.code(), Some(2));
+    assert!(result.stdout.is_empty());
+    assert!(!result.stderr.is_empty());
+    sandbox.assert_empty();
+}
+
+#[test]
 fn malformed_dolt_area_options_preserve_v2_json_at_root_and_leaf() {
     let sandbox = Sandbox::new();
     let target = [
