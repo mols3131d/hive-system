@@ -481,14 +481,32 @@ fn context_resolves_owned_snapshot_and_clean_asset_commit() {
          INSERT INTO projects (id, name, status, revision) VALUES ('{project}', 'Fixture project', 'active', 'project-r1');
          INSERT INTO project_issues VALUES ('{project}', '{issue}');
          INSERT INTO directives (id, scope_kind, project_id, title, body, status, issuer_ref, source_ref, approval_ref, revision, created_at, updated_at)
-             VALUES ('{directive}', 'project', '{project}', 'Fixture directive', 'Synthetic direction', 'active',
-                     'fixture-issuer', 'fixture-source', 'fixture-approval', 'directive-r1', '2026-01-01', '2026-01-01');
+             VALUES ('{directive}', 'project', '{project}', 'Fixture directive', 'Synthetic direction', 'proposed',
+                     'fixture-issuer', 'fixture-source', NULL, 'draft-r1', '2026-01-01', '2026-01-01');
+",
+        seed_sql(CASE_INSENSITIVE),
+    ));
+    let base = fixture.local(
+        &[
+            "sql",
+            "-r",
+            "csv",
+            "-q",
+            "SELECT DOLT_HASHOF('HEAD') AS head",
+        ],
+        None,
+    );
+    let base = base.lines().last().unwrap();
+    fixture.local(&["sql"], Some(&format!(
+        "UPDATE directives SET status = 'active', approval_ref = 'fixture-approval', revision = 'directive-r1'
+         WHERE id = '{directive}';
          INSERT INTO operation_receipts
              (request_id, kind, fingerprint, actor_ref, authorization_ref, workflow_evidence_json, base_commit, result_json, created_at)
              VALUES ('{activation}', 'directive.activate', '{fingerprint}', 'fixture-actor', 'fixture-approval',
-                     '{approval}', REPEAT('a', 32), '{activation_result}', '2026-01-01');",
-        seed_sql(CASE_INSENSITIVE),
-    ));
+                     '{approval}', '{base}', '{activation_result}', '2026-01-01');"
+    )));
+    fixture.local(&["add", "."], None);
+    fixture.local(&["commit", "-m", "Synthetic atomic activation"], None);
     let root = fixture.root.join("workspace");
     fs::create_dir(&root).unwrap();
     fs::rename(fixture.root.join(DATABASE), root.join("db")).unwrap();

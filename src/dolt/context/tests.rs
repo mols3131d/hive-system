@@ -28,6 +28,11 @@ const HANDOFF: &str = "01900000-0000-7000-8000-000000000040";
 const PROGRESS: &str = "01900000-0000-7000-8000-000000000041";
 const ARTIFACT_ISSUE: &str = "01900000-0000-7000-8000-000000000021";
 const ARTIFACT: &str = "01900000-0000-7000-8000-000000000051";
+const MIXED_ARTIFACT: &str = "01900000-0000-7000-8000-000000000052";
+const THIRD_ARTIFACT: &str = "01900000-0000-7000-8000-000000000056";
+const LATE_RECEIPT: &str = "01900000-0000-7000-8000-000000000083";
+const INVALID_BASE_RECEIPT: &str = "01900000-0000-7000-8000-000000000084";
+const WRONG_BASE_RECEIPT: &str = "01900000-0000-7000-8000-000000000085";
 const INVOCATION: &str = "01900000-0000-7000-8000-000000000061";
 const DIRECTIVE: &str = "01900000-0000-7000-8000-000000000071";
 const RECEIPT: &str = "01900000-0000-7000-8000-000000000081";
@@ -85,6 +90,7 @@ fn committed_scope_and_resume() {
             args[0],
             String::from_utf8_lossy(&output.stderr)
         );
+        String::from_utf8(output.stdout).unwrap()
     };
     run(&[
         "init",
@@ -126,19 +132,22 @@ fn committed_scope_and_resume() {
          ('01900000-0000-7000-8000-00000000004a', '{ISSUE}', 'handoff', 'tie', 'fixture-actor', '{AT}', NULL);
          INSERT INTO artifacts (id, kind, title, body, author_ref, revision, created_at, substantive_updated_at)
          VALUES ('{ARTIFACT}', 'handoff', 'Handoff', 'é', 'fixture-author', 'artifact-r1', '{AT}', '{AT}'),
-                ('01900000-0000-7000-8000-000000000052', 'handoff', 'Ambiguous', 'fixture', 'fixture-author', 'artifact-r1', '{AT}', '{AT}'),
+                ('{MIXED_ARTIFACT}', 'handoff', 'Mixed', 'fixture mixed handoff', 'fixture-author', 'artifact-r1', '{AT}', '{AT}'),
+                ('01900000-0000-7000-8000-000000000055', 'handoff', 'Second', 'fixture second handoff', 'fixture-author', 'artifact-r1', '{AT}', '{AT}'),
+                ('{THIRD_ARTIFACT}', 'handoff', 'Third', 'fixture third handoff', 'fixture-author', 'artifact-r1', '{AT}', '{AT}'),
                 ('{REPORT}', 'report', 'Report', 'selected report', 'fixture-author', 'report-r1', '{AT}', '{AT}');
-         INSERT INTO artifact_issues VALUES ('{ARTIFACT}', '{ARTIFACT_ISSUE}'), ('01900000-0000-7000-8000-000000000052', '{OTHER}'), ('{REPORT}', '{ISSUE}');
+         INSERT INTO artifact_issues VALUES ('{ARTIFACT}', '{ARTIFACT_ISSUE}'), ('{MIXED_ARTIFACT}', '{OTHER}'), ('{REPORT}', '{ISSUE}'),
+                ('01900000-0000-7000-8000-000000000055', '{ARTIFACT_ISSUE}'), ('{THIRD_ARTIFACT}', '{ARTIFACT_ISSUE}');
          INSERT INTO artifact_projects VALUES ('{ARTIFACT}', '{PROJECT}');
          INSERT INTO project_issues VALUES ('{PROJECT}', '{ARTIFACT_ISSUE}');
          INSERT INTO directives (id, scope_kind, area_id, project_id, include_descendants,
              title, body, status, issuer_ref, source_ref, approval_ref, revision, created_at, updated_at)
          VALUES
-         ('{DIRECTIVE}', 'workspace', NULL, NULL, 0, 'Workspace', 'fixture', 'active', 'issuer', 'source', 'approval', 'r1', '{AT}', '{AT}'),
+         ('{DIRECTIVE}', 'workspace', NULL, NULL, 0, 'Workspace', 'fixture', 'proposed', 'issuer', 'source', NULL, 'draft-r1', '{AT}', '{AT}'),
          ('01900000-0000-7000-8000-000000000072', 'area', '{ROOT}', NULL, 0, 'Root only', 'fixture', 'active', 'issuer', 'source', 'approval', 'r1', '{AT}', '{AT}'),
-         ('01900000-0000-7000-8000-000000000073', 'area', '{ROOT}', NULL, 1, 'Root cascade', 'fixture', 'active', 'issuer', 'source', 'approval', 'r1', '{AT}', '{AT}'),
-         ('01900000-0000-7000-8000-000000000074', 'area', '{AREA}', NULL, 0, 'Exact Area', 'fixture', 'active', 'issuer', 'source', 'approval', 'r1', '{AT}', '{AT}'),
-         ('01900000-0000-7000-8000-000000000075', 'project', NULL, '{PROJECT}', 0, 'Project', 'fixture', 'active', 'issuer', 'source', 'approval', 'r1', '{AT}', '{AT}'),
+         ('01900000-0000-7000-8000-000000000073', 'area', '{ROOT}', NULL, 1, 'Root cascade', 'fixture', 'proposed', 'issuer', 'source', NULL, 'draft-r1', '{AT}', '{AT}'),
+         ('01900000-0000-7000-8000-000000000074', 'area', '{AREA}', NULL, 0, 'Exact Area', 'fixture', 'proposed', 'issuer', 'source', NULL, 'draft-r1', '{AT}', '{AT}'),
+         ('01900000-0000-7000-8000-000000000075', 'project', NULL, '{PROJECT}', 0, 'Project', 'fixture', 'proposed', 'issuer', 'source', NULL, 'draft-r1', '{AT}', '{AT}'),
          ('01900000-0000-7000-8000-000000000076', 'workspace', NULL, NULL, 0, 'Upcoming', 'fixture', 'active', 'issuer', 'source', 'approval', 'r1', '{AT}', '{AT}');
          UPDATE directives SET valid_from = '2027-01-01' WHERE id = '01900000-0000-7000-8000-000000000076';
          INSERT INTO operation_receipts
@@ -157,70 +166,80 @@ fn committed_scope_and_resume() {
              ('01900000-0000-7000-8000-00000001{n:04x}', '{ISSUE}', 'evidence', 'fixture evidence', 'fixture-actor', '{AT}', NULL);"
         ).unwrap();
     }
-    use activation_receipt as receipt;
-    use std::fmt::Write as _;
+    let sql = |content: &str| {
+        let mut child = dolt()
+            .arg("sql")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(content.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    };
+    let head = || {
+        let output = run(&[
+            "sql",
+            "-r",
+            "csv",
+            "-q",
+            "SELECT DOLT_HASHOF('HEAD') AS head",
+        ]);
+        output.lines().last().unwrap().to_owned()
+    };
+    sql(&seed);
+    run(&["add", "."]);
+    run(&["commit", "-m", "Synthetic proposed directives"]);
+    let base = head();
+
+    let mut activation = String::new();
     for (index, scope) in [
-        receipt::DirectiveScope::Workspace,
-        receipt::DirectiveScope::Area {
+        activation_receipt::DirectiveScope::Workspace,
+        activation_receipt::DirectiveScope::Area {
             id: ROOT.to_owned(),
             include_descendants: true,
         },
-        receipt::DirectiveScope::Area {
+        activation_receipt::DirectiveScope::Area {
             id: AREA.to_owned(),
             include_descendants: false,
         },
-        receipt::DirectiveScope::Project {
+        activation_receipt::DirectiveScope::Project {
             id: PROJECT.to_owned(),
         },
     ]
     .into_iter()
     .enumerate()
     {
+        use std::fmt::Write as _;
         let (id, request_id) = approval_ids(index);
-        let directive = receipt::ActivatedDirective {
-            id,
-            revision: "r1".to_owned(),
-            scope,
-        };
-        let fingerprint = "a".repeat(64);
-        let approval = receipt::Approval {
-            version: 1,
-            workspace_id: WORKSPACE.to_owned(),
-            request_id: request_id.clone(),
-            fingerprint: fingerprint.clone(),
-            actor_ref: "fixture-actor".to_owned(),
-            reviewer_ref: "fixture-reviewer".to_owned(),
-            approval_ref: "approval".to_owned(),
-            decision: receipt::Decision::Approved,
-            directive: directive.clone(),
-        };
-        let evidence = serde_json::to_string(&approval).unwrap();
-        let result = serde_json::to_string(&receipt::ResultRecord {
-            version: 1,
-            directive,
-        })
-        .unwrap();
-        writeln!(seed,
-            "INSERT INTO operation_receipts
-             (request_id, kind, fingerprint, actor_ref, authorization_ref, workflow_evidence_json, base_commit, result_json, created_at)
-             VALUES ('{request_id}', '{}', '{fingerprint}', 'fixture-actor', 'approval', '{evidence}', REPEAT('a', 32), '{result}', '{AT}');",
-             receipt::KIND,
-        ).unwrap();
+        writeln!(activation, "UPDATE directives SET status = 'active', revision = 'r1', approval_ref = 'approval' WHERE id = '{id}';").unwrap();
+        activation.push_str(&activation_receipt_sql(id, &request_id, scope, &base));
     }
-    let mut sql = dolt()
-        .arg("sql")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
-    sql.stdin
-        .take()
-        .unwrap()
-        .write_all(seed.as_bytes())
-        .unwrap();
-    assert!(sql.wait().unwrap().success());
+    sql(&activation);
     run(&["add", "."]);
-    run(&["commit", "-m", "Synthetic context"]);
+    run(&["commit", "-m", "Synthetic atomic activation"]);
+    let activated = head();
+
+    // All three payloads match the current Directive. The introduction commit
+    // and its actual parent distinguish these rows from the genuine receipt.
+    for (request_id, declared_base) in [
+        (LATE_RECEIPT, activated.as_str()),
+        (INVALID_BASE_RECEIPT, "invalid-base"),
+        (WRONG_BASE_RECEIPT, base.as_str()),
+    ] {
+        sql(&activation_receipt_sql(
+            DIRECTIVE.to_owned(),
+            request_id,
+            activation_receipt::DirectiveScope::Workspace,
+            declared_base,
+        ));
+    }
+    run(&["add", "."]);
+    run(&["commit", "-m", "Synthetic late receipt rows"]);
     // A dirty Issue edit must remain outside the captured committed state.
     run(&[
         "sql",
@@ -383,6 +402,21 @@ fn read_synthetic_snapshot() {
     assert_eq!(body.revision, snapshot.commit);
     assert_eq!(body.inline_bytes, 15);
     assert_eq!(body.body, "fixture handoff");
+    let older = declaration(
+        &snapshot.commit,
+        ISSUE,
+        "issue_update",
+        "01900000-0000-7000-8000-00000000004a",
+        &snapshot.commit,
+        "read_handoff_body",
+    );
+    let older_bytes = serde_json::to_vec(&older).unwrap();
+    assert!(matches!(
+        resume::read_required(&mut snapshot, &scope, &work, MAX_INLINE_BYTES, &Request {
+            input: Some(CurrentInput::OperatorRequest(&older_bytes)), ..request
+        }),
+        Err(e) if matches!(e.code, ErrorCode::Unauthorized)
+    ));
 
     let candidates = directives::collect(&mut snapshot, &scope, request.observed_at).unwrap();
     assert_eq!(
@@ -405,6 +439,20 @@ fn read_synthetic_snapshot() {
         directives::lookup_activation_receipt(&mut snapshot, &candidates[0], MALFORMED_RECEIPT),
         Err(error) if matches!(error.code, ErrorCode::InvalidRecord)
     ));
+
+    let first_activation = approval_ids(0).1;
+    assert_eq!(
+        directives::read_approved(&mut snapshot, &candidates[0], &first_activation, 128).unwrap(),
+        "fixture"
+    );
+    for (id, expected) in [
+        (LATE_RECEIPT, ErrorCode::AuthorityUnverified),
+        (INVALID_BASE_RECEIPT, ErrorCode::InvalidRecord),
+        (WRONG_BASE_RECEIPT, ErrorCode::AuthorityUnverified),
+    ] {
+        let error = directives::read_approved(&mut snapshot, &candidates[0], id, 128).unwrap_err();
+        assert_eq!(error.code as u8, expected as u8, "{id}");
+    }
 
     let evidence = declaration(
         &snapshot.commit,
@@ -443,9 +491,78 @@ fn read_synthetic_snapshot() {
     let competing_work = collect_work(&mut snapshot, &competing_scope, None)
         .unwrap()
         .unwrap();
+    for (scope, work) in [
+        (&artifact_scope, &artifact_work),
+        (&competing_scope, &competing_work),
+    ] {
+        assert!(matches!(
+            resume::read_required(&mut snapshot, scope, work, MAX_INLINE_BYTES, &Request { input: None, ..request }),
+            Err(e) if matches!(e.code, ErrorCode::AmbiguousScope)
+        ));
+    }
+    let commit = snapshot.commit.clone();
+    let latest_competing_note = competing_work.handoff.as_ref().unwrap().id.as_str();
+    for (scope, work, issue, kind, id, revision, operation, expected_body) in [
+        (
+            &competing_scope,
+            &competing_work,
+            OTHER,
+            "issue_update",
+            latest_competing_note,
+            commit.as_str(),
+            "read_handoff_body",
+            "unrelated",
+        ),
+        (
+            &competing_scope,
+            &competing_work,
+            OTHER,
+            "artifact",
+            MIXED_ARTIFACT,
+            "artifact-r1",
+            "disclose_artifact_body",
+            "fixture mixed handoff",
+        ),
+        (
+            &artifact_scope,
+            &artifact_work,
+            ARTIFACT_ISSUE,
+            "artifact",
+            THIRD_ARTIFACT,
+            "artifact-r1",
+            "disclose_artifact_body",
+            "fixture third handoff",
+        ),
+    ] {
+        let mut selected = declaration(&commit, issue, kind, id, revision, operation);
+        selected["area_id"] = json!(work.issue.area_id);
+        let bytes = serde_json::to_vec(&selected).unwrap();
+        let request = Request {
+            input: Some(CurrentInput::OperatorRequest(&bytes)),
+            ..request
+        };
+        let chosen = resume::read_required(&mut snapshot, scope, work, MAX_INLINE_BYTES, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(chosen.id, id);
+        assert_eq!(chosen.body, expected_body);
+    }
+    let wrong_revision = declaration(
+        &commit,
+        ARTIFACT_ISSUE,
+        "artifact",
+        THIRD_ARTIFACT,
+        "stale-r1",
+        "disclose_artifact_body",
+    );
+    let bytes = serde_json::to_vec(&wrong_revision).unwrap();
+    let stale = Request {
+        input: Some(CurrentInput::OperatorRequest(&bytes)),
+        ..request
+    };
     assert!(matches!(
-        resume::read_required(&mut snapshot, &competing_scope, &competing_work, MAX_INLINE_BYTES, &request),
-        Err(e) if matches!(e.code, ErrorCode::AmbiguousScope)
+        resume::read_required(&mut snapshot, &artifact_scope, &artifact_work, MAX_INLINE_BYTES, &stale),
+        Err(e) if matches!(e.code, ErrorCode::Unauthorized)
     ));
     let again = collect_work(&mut snapshot, &scope, None).unwrap().unwrap();
     assert_eq!(again.handoff, work.handoff);
@@ -651,6 +768,44 @@ fn validates_current_exact_declaration_and_rejects_historical_or_mismatched_evid
         .code,
         ErrorCode::ContextLimit
     ));
+}
+
+fn activation_receipt_sql(
+    id: String,
+    request_id: &str,
+    scope: activation_receipt::DirectiveScope,
+    base: &str,
+) -> String {
+    use activation_receipt as receipt;
+    let directive = receipt::ActivatedDirective {
+        id,
+        revision: "r1".to_owned(),
+        scope,
+    };
+    let fingerprint = "a".repeat(64);
+    let approval = receipt::Approval {
+        version: 1,
+        workspace_id: WORKSPACE.to_owned(),
+        request_id: request_id.to_owned(),
+        fingerprint: fingerprint.clone(),
+        actor_ref: "fixture-actor".to_owned(),
+        reviewer_ref: "fixture-reviewer".to_owned(),
+        approval_ref: "approval".to_owned(),
+        decision: receipt::Decision::Approved,
+        directive: directive.clone(),
+    };
+    let evidence = serde_json::to_string(&approval).unwrap();
+    let result = serde_json::to_string(&receipt::ResultRecord {
+        version: 1,
+        directive,
+    })
+    .unwrap();
+    format!(
+        "INSERT INTO operation_receipts
+         (request_id, kind, fingerprint, actor_ref, authorization_ref, workflow_evidence_json, base_commit, result_json, created_at)
+         VALUES ('{request_id}', '{}', '{fingerprint}', 'fixture-actor', 'approval', '{evidence}', '{base}', '{result}', '{AT}');",
+        receipt::KIND,
+    )
 }
 
 fn approval_ids(index: usize) -> (String, String) {

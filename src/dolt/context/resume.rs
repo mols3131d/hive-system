@@ -2,10 +2,10 @@
 //!
 //! The latest Issue note uses committed creation time and an exact ID tie-break.
 //! An active exact Issue-linked handoff Artifact is an alternative source. A
-//! selection spanning both representations, or multiple Artifacts, is ambiguous
-//! until the resolver has a reviewed explicit selection rule.
+//! supplied exact declaration selects among eligible candidates. Without one,
+//! competing sources are ambiguous.
 
-use super::workflow::{self, Expected, Operation, RecordKind, Request};
+use super::workflow::{self, CurrentInput, Declaration, Expected, Operation, RecordKind, Request};
 use super::{Scope, Work, invalid_record, limit};
 use crate::dolt::{Snapshot, artifact::verify_context_artifact_links, is_uuid_v7};
 use crate::error::{ErrorCode, HiveError};
@@ -42,36 +42,13 @@ pub(super) fn read_required(
         .filter(|_| work_budget <= super::MAX_INLINE_BYTES)
         .ok_or_else(|| limit("Required Issue text exceeds the remaining context budget."))?;
 
-    let artifacts = artifact_candidates(snapshot, &work.issue.id)?;
-    let candidate = match (work.handoff.as_ref(), artifacts.as_slice()) {
-        (None, []) if request.input.is_none() => return Ok(None),
-        (None, []) => {
-            return Err(HiveError::new(
-                ErrorCode::Unauthorized,
-                "No current handoff matches the supplied declaration.",
-            ));
-        }
-        (Some(note), []) => (
-            RecordKind::IssueUpdate,
-            Operation::ReadHandoffBody,
-            note.id.as_str(),
-            snapshot.commit.as_str(),
-        ),
-        (None, [(id, revision)]) => (
-            RecordKind::Artifact,
-            Operation::DiscloseArtifactBody,
-            id.as_str(),
-            revision.as_str(),
-        ),
-        _ => {
-            return Err(HiveError::new(
-                ErrorCode::AmbiguousScope,
-                "Multiple handoff sources are current candidates. An exact handoff selection is required.",
-            ));
-        }
+    let Some((kind, id, revision)) = select_handoff(snapshot, work, request.input)? else {
+        return Ok(None);
     };
-
-    let (kind, operation, id, revision) = candidate;
+    let operation = match kind {
+        RecordKind::IssueUpdate => Operation::ReadHandoffBody,
+        RecordKind::Artifact => Operation::DiscloseArtifactBody,
+    };
     workflow::verify(
         request,
         &Expected {
@@ -81,12 +58,10 @@ pub(super) fn read_required(
             issue_id: &work.issue.id,
             operation,
             record_kind: kind,
-            record_id: id,
-            record_revision: revision,
+            record_id: &id,
+            record_revision: &revision,
         },
     )?;
-    let revision = revision.to_owned();
-
     let body = match kind {
         RecordKind::IssueUpdate => {
             let rows = snapshot.exec_rows(
@@ -99,21 +74,73 @@ pub(super) fn read_required(
                      AND transition_json IS NULL LIMIT 2"
                     )
                 },
-                (remaining, id, id, &work.issue.id),
+                (remaining, &id, &id, &work.issue.id),
             )?;
             checked_body(rows, remaining)
-                .map_err(|error| error.context_limit_ref("issue_update", id))?
+                .map_err(|error| error.context_limit_ref("issue_update", &id))?
         }
-        RecordKind::Artifact => read_artifact_body(snapshot, scope, work, id, &revision, remaining)
-            .map_err(|error| error.context_limit_ref("artifact", id))?,
+        RecordKind::Artifact => {
+            read_artifact_body(snapshot, scope, work, &id, &revision, remaining)
+                .map_err(|error| error.context_limit_ref("artifact", &id))?
+        }
     };
     Ok(Some(HandoffBody {
         kind,
-        id: id.to_owned(),
+        id,
         revision,
         inline_bytes: body.len(),
         body,
     }))
+}
+
+fn select_handoff(
+    snapshot: &mut Snapshot,
+    work: &Work,
+    input: Option<CurrentInput<'_>>,
+) -> Result<Option<(RecordKind, String, String)>, HiveError> {
+    let note = work.handoff.as_ref().map(|note| {
+        (
+            RecordKind::IssueUpdate,
+            note.id.clone(),
+            snapshot.commit.clone(),
+        )
+    });
+    if let Some(input) = input {
+        #[cfg(not(test))]
+        let CurrentInput::OperatorRequest(bytes) = input;
+        #[cfg(test)]
+        let bytes = match input {
+            CurrentInput::OperatorRequest(bytes) => bytes,
+            CurrentInput::ResolvedSource { bytes, .. } => bytes,
+        };
+        // This only selects a candidate. Current authority is verified against
+        // the chosen committed ID, scope and revision before reading any body.
+        let declaration = Declaration::parse(bytes)?;
+        let id = declaration.record.id.as_str();
+        let selected = match declaration.record.kind {
+            RecordKind::IssueUpdate => note.filter(|(_, latest, _)| latest == id),
+            RecordKind::Artifact => artifact_candidates(snapshot, &work.issue.id, Some(id))?
+                .into_iter()
+                .next()
+                .map(|(id, revision)| (RecordKind::Artifact, id, revision)),
+        };
+        return selected.map(Some).ok_or_else(|| {
+            HiveError::new(
+                ErrorCode::Unauthorized,
+                "No eligible current handoff matches the supplied declaration.",
+            )
+        });
+    }
+
+    let artifacts = artifact_candidates(snapshot, &work.issue.id, None)?;
+    match (note, artifacts.as_slice()) {
+        (note, []) => Ok(note),
+        (None, [(id, revision)]) => Ok(Some((RecordKind::Artifact, id.clone(), revision.clone()))),
+        _ => Err(HiveError::new(
+            ErrorCode::AmbiguousScope,
+            "Multiple handoff sources are current candidates. An exact handoff selection is required.",
+        )),
+    }
 }
 
 pub(super) fn selected_artifact_revision(
@@ -204,6 +231,7 @@ type ArtifactCandidateRow = (
 fn artifact_candidates(
     snapshot: &mut Snapshot,
     issue: &str,
+    selected: Option<&str>,
 ) -> Result<Vec<(String, String)>, HiveError> {
     let rows: Vec<ArtifactCandidateRow> = snapshot.exec_rows(
         |commit| {
@@ -213,12 +241,13 @@ fn artifact_candidates(
                  FROM artifact_issues AS OF '{commit}' AS l
                  LEFT JOIN artifacts AS OF '{commit}' AS a ON a.id = l.artifact_id
                  WHERE (l.issue_id = ? OR CAST(LOWER(l.issue_id) AS BINARY) = ?)
+                 AND (? IS NULL OR CAST(l.artifact_id AS BINARY) = ?)
                  AND (a.id IS NULL OR LOWER(a.kind) = 'handoff')
                  AND (a.archived_at IS NULL OR a.archive_reason IS NULL)
                  ORDER BY CAST(l.artifact_id AS BINARY) LIMIT 2"
             )
         },
-        (issue, issue),
+        (issue, issue, selected, selected),
     )?;
     rows.into_iter()
         .map(|(id, owner, actual, kind, revision, archived, reason)| {

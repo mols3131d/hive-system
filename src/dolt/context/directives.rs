@@ -14,12 +14,13 @@ use super::{
 use crate::dolt::{
     Snapshot,
     directive::{METADATA, MetadataRow, Scope as DirectiveScope},
-    is_uuid,
+    is_commit_hash, is_uuid,
 };
 use crate::error::{ErrorCode, HiveError};
 
 pub(super) const MAX_DIRECTIVES: usize = 100;
 const MAX_RECEIPT_BYTES: usize = 256 * 1024;
+const MAX_RECEIPT_HISTORY: usize = 128;
 
 pub(super) struct Candidate {
     db_commit: String,
@@ -179,10 +180,22 @@ fn currently_applicable(
         && end.is_none_or(|value| observed_at < value))
 }
 
-type ReceiptRow = (String, String, String, bool, Option<String>, Option<String>);
+type ReceiptRow = (
+    String,
+    String,
+    String,
+    bool,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
+#[derive(PartialEq, Eq)]
 pub(super) struct HistoricalReceipt {
     fingerprint: String,
+    base_commit: String,
+    created_at: String,
     pub(super) actor_ref: String,
     pub(super) workflow_evidence: String,
     pub(super) result: String,
@@ -207,10 +220,25 @@ pub(super) fn lookup_activation_receipt(
             "Select an exact activation receipt request ID.",
         ));
     }
+    let observed = snapshot.commit.clone();
+    receipt_at(snapshot, candidate, request_id, &observed)?.ok_or_else(workflow::unverified)
+}
+
+fn receipt_at(
+    snapshot: &mut Snapshot,
+    candidate: &Candidate,
+    request_id: &str,
+    commit: &str,
+) -> Result<Option<HistoricalReceipt>, HiveError> {
+    // Dolt requires a literal AS OF revision. Never interpolate unvalidated history.
+    if !is_commit_hash(commit) {
+        return Err(invalid_record("A receipt history commit is malformed."));
+    }
     let rows: Vec<ReceiptRow> = snapshot.exec_rows(
-        |commit| {
+        |_| {
             format!(
                 "SELECT kind, actor_ref, fingerprint, CAST(authorization_ref AS BINARY) = ?,
+                base_commit, DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'),
                 CASE WHEN OCTET_LENGTH(workflow_evidence_json) + OCTET_LENGTH(result_json) <= ?
                      THEN workflow_evidence_json END,
                 CASE WHEN OCTET_LENGTH(workflow_evidence_json) + OCTET_LENGTH(result_json) <= ?
@@ -225,7 +253,12 @@ pub(super) fn lookup_activation_receipt(
             request_id,
         ),
     )?;
-    let [(kind, actor, fingerprint, matches_approval, evidence, result)] = rows.as_slice() else {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let [(kind, actor, fingerprint, matches_approval, base_commit, created_at, evidence, result)] =
+        rows.as_slice()
+    else {
         return Err(workflow::unverified());
     };
     if kind != activation_receipt::KIND
@@ -238,12 +271,116 @@ pub(super) fn lookup_activation_receipt(
     {
         return Err(workflow::unverified());
     }
-    Ok(HistoricalReceipt {
+    Ok(Some(HistoricalReceipt {
         fingerprint: fingerprint.clone(),
+        base_commit: base_commit.clone(),
+        created_at: created_at.clone(),
         actor_ref: actor.clone(),
         workflow_evidence: receipt_object(evidence.as_deref())?.to_owned(),
         result: receipt_object(result.as_deref())?.to_owned(),
-    })
+    }))
+}
+
+/// Follow the retained linear history of the authenticated main snapshot. A
+/// receipt must be identical across the suffix and absent at its declared base.
+fn receipt_introduction(
+    snapshot: &mut Snapshot,
+    candidate: &Candidate,
+    request_id: &str,
+    receipt: &HistoricalReceipt,
+) -> Result<String, HiveError> {
+    if !is_commit_hash(&receipt.base_commit) {
+        return Err(invalid_record("The receipt has a malformed base commit."));
+    }
+    let mut commit = snapshot.commit.clone();
+    for _ in 0..MAX_RECEIPT_HISTORY {
+        if commit == receipt.base_commit {
+            return Err(workflow::unverified());
+        }
+        let parents: Vec<String> = snapshot.exec_rows(
+            |_| {
+                "SELECT parent_hash FROM dolt_commit_ancestors WHERE commit_hash = ? LIMIT 2"
+                    .to_owned()
+            },
+            (&commit,),
+        )?;
+        let [parent] = parents.as_slice() else {
+            return Err(workflow::unverified());
+        };
+        match receipt_at(snapshot, candidate, request_id, parent)? {
+            Some(previous) if previous == *receipt => commit.clone_from(parent),
+            None if parent == &receipt.base_commit => return Ok(commit),
+            _ => return Err(workflow::unverified()),
+        }
+    }
+    Err(limit(
+        "The retained activation receipt history exceeds 128 revisions.",
+    ))
+}
+
+type DirectiveVersion = (
+    String,
+    Option<String>,
+    Option<String>,
+    i8,
+    String,
+    String,
+    String,
+);
+
+fn directive_version(
+    snapshot: &mut Snapshot,
+    id: &str,
+    commit: &str,
+) -> Result<DirectiveVersion, HiveError> {
+    if !is_commit_hash(commit) {
+        return Err(invalid_record("A Directive history commit is malformed."));
+    }
+    let rows = snapshot.exec_rows(
+        |_| {
+            format!(
+                "SELECT scope_kind, area_id, project_id, include_descendants, status, revision,
+                SHA2(CAST(JSON_ARRAY(title, SHA2(body, 256), issuer_ref, SHA2(source_ref, 256),
+                    SHA2(approval_ref, 256), valid_from, expires_at, supersedes_id) AS CHAR), 256)
+             FROM directives AS OF '{commit}' WHERE CAST(id AS BINARY) = ? LIMIT 2"
+            )
+        },
+        (id,),
+    )?;
+    let Ok([version]) = <[_; 1]>::try_from(rows) else {
+        return Err(workflow::unverified());
+    };
+    Ok(version)
+}
+
+fn verify_activation(
+    before: &DirectiveVersion,
+    introduced: &DirectiveVersion,
+    observed: &DirectiveVersion,
+    revision: &str,
+) -> Result<(), HiveError> {
+    let (
+        before_kind,
+        before_area,
+        before_project,
+        before_descendants,
+        before_status,
+        before_revision,
+        _,
+    ) = before;
+    let (kind, area, project, descendants, status, activated_revision, _) = introduced;
+    if before_status != "proposed"
+        || before_revision.trim().is_empty()
+        || before_revision == activated_revision
+        || status != "active"
+        || activated_revision != revision
+        || (before_kind, before_area, before_project, before_descendants)
+            != (kind, area, project, descendants)
+        || introduced != observed
+    {
+        return Err(workflow::unverified());
+    }
+    Ok(())
 }
 
 pub(super) fn read_approved(
@@ -254,6 +391,12 @@ pub(super) fn read_approved(
 ) -> Result<String, HiveError> {
     let receipt = lookup_activation_receipt(snapshot, candidate, request_id)?;
     verify_receipt(candidate, &receipt, &snapshot.workspace_id, request_id)?;
+    let introduced_at = receipt_introduction(snapshot, candidate, request_id, &receipt)?;
+    let observed_at = snapshot.commit.clone();
+    let before = directive_version(snapshot, &candidate.id, &receipt.base_commit)?;
+    let introduced = directive_version(snapshot, &candidate.id, &introduced_at)?;
+    let observed = directive_version(snapshot, &candidate.id, &observed_at)?;
+    verify_activation(&before, &introduced, &observed, &candidate.revision)?;
     let rows: Vec<Option<String>> = snapshot.exec_rows(
         |commit| {
             format!(
@@ -323,6 +466,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn requires_an_activation_delta_and_an_unchanged_observed_revision() {
+        let before = (
+            "workspace".to_owned(),
+            None,
+            None,
+            0,
+            "proposed".to_owned(),
+            "draft-r1".to_owned(),
+            "draft-fingerprint".to_owned(),
+        );
+        let mut activated = before.clone();
+        activated.4 = "active".to_owned();
+        activated.5 = "r1".to_owned();
+        activated.6 = "activated-fingerprint".to_owned();
+        assert!(verify_activation(&before, &activated, &activated, "r1").is_ok());
+        assert!(verify_activation(&activated, &activated, &activated, "r1").is_err());
+        assert!(verify_activation(&before, &activated, &activated, "r2").is_err());
+        let mut edited = activated.clone();
+        edited.6 = "edited-fingerprint".to_owned();
+        assert!(verify_activation(&before, &activated, &edited, "r1").is_err());
+    }
+
+    #[test]
     fn accepts_only_historical_provenance_objects_within_the_read_limit() {
         assert_eq!(receipt_object(Some("{}")).unwrap(), "{}");
         for malformed in ["[]", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] {
@@ -365,6 +531,8 @@ mod tests {
         let result = serde_json::json!({"version": 1, "directive": target});
         let mut receipt = HistoricalReceipt {
             fingerprint: "fingerprint".to_owned(),
+            base_commit: "base".to_owned(),
+            created_at: "fixture-date".to_owned(),
             actor_ref: "actor".to_owned(),
             workflow_evidence: approval.to_string(),
             result: result.to_string(),
