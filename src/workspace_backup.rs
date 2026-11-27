@@ -13,13 +13,14 @@ use sha2::{Digest, Sha256};
 use crate::config_file::ScopedDirectory;
 use crate::config_git::with_asset_bundle;
 use crate::config_v2::Candidate;
-use crate::dolt::{DOLT_VERSION, INITIAL_SCHEMA, STORAGE_SCHEMA_VERSION, is_commit_hash};
+use crate::dolt::{DOLT_VERSION, INITIAL_SCHEMA, STORAGE_SCHEMA_VERSION, is_commit_hash, is_uuid};
 use crate::error::{ErrorCode, HiveError};
 use crate::workspace_init::{Installed, fd_path, sync_tree};
 use crate::workspace_status::require_local_filesystem;
 
 const MAX_FILES: usize = 2048;
 const MAX_MANIFEST_BYTES: usize = 512 * 1024;
+const MAX_SERVER_CONFIG_BYTES: usize = 64 * 1024;
 
 #[derive(Serialize, Eq, PartialEq)]
 struct DigestEntry {
@@ -100,7 +101,7 @@ pub(crate) fn create(
     let backup_url = format!("file://{}/dolt", process_fd(&payload_dir));
     let verify_source = || {
         check_stopped()?;
-        verify_native_layout(db, native, noms)?;
+        verify_native_layout(state, db, native, noms)?;
         verify_db(&installed, &source, workspace.workspace_id())
     };
     let revision = verify_source()?;
@@ -214,6 +215,7 @@ pub(crate) fn create(
 }
 
 fn verify_native_layout(
+    state_dir: &ScopedDirectory,
     db: &ScopedDirectory,
     native: &ScopedDirectory,
     noms: &ScopedDirectory,
@@ -230,8 +232,12 @@ fn verify_native_layout(
     if serde_json::from_slice::<Value>(&state).ok()
         != Some(json!({"head": "refs/heads/main", "remotes": {}, "backups": {}, "branches": {}}))
         || !config.as_object().is_some_and(|config| {
-            config.iter().all(|(key, value)| {
-                matches!(key.as_str(), "user.name" | "user.email") && value.is_string()
+            config.iter().all(|(key, value)| match key.as_str() {
+                "user.name" | "user.email" => value.is_string(),
+                "sqlserver.global.server_uuid" => value
+                    .as_str()
+                    .is_some_and(|id| is_uuid(id) && id.as_bytes()[14] == b'4'),
+                _ => false,
             })
         })
     {
@@ -241,6 +247,7 @@ fn verify_native_layout(
         let entry = entry.map_err(io_error)?;
         match entry.file_name().to_str() {
             Some(".dolt") if entry.file_type().map_err(io_error)?.is_dir() => {}
+            Some("config.yaml") => verify_server_config(state_dir, db)?,
             Some(".doltcfg") => {
                 let config = db.require_child_directory(OsStr::new(".doltcfg"))?;
                 for file in fs::read_dir(fd_path(config.directory_file())).map_err(io_error)? {
@@ -296,6 +303,43 @@ fn verify_native_layout(
                 return Err(unsupported());
             }
         }
+    }
+    Ok(())
+}
+
+fn verify_server_config(state: &ScopedDirectory, db: &ScopedDirectory) -> Result<(), HiveError> {
+    let unsupported = || unverified("The Dolt server configuration is unsupported for backup.");
+    let bytes = db
+        .read_bounded(&[OsStr::new("config.yaml")], MAX_SERVER_CONFIG_BYTES)
+        .map_err(|_| unsupported())?
+        .ok_or_else(unsupported)?;
+    let config: Value = crate::config_file::parse_v2(&bytes, "Dolt server configuration")
+        .map_err(|_| unsupported())?;
+    let run = Path::new(config["cfg_dir"].as_str().ok_or_else(unsupported)?);
+    let nonce = run
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|name| name.strip_prefix("run-"))
+        .filter(|nonce| is_uuid(nonce))
+        .ok_or_else(unsupported)?;
+    let expected_run = state.path.join(format!("run-{nonce}"));
+    let port = config["listener"]["port"]
+        .as_u64()
+        .filter(|port| (1024..=65535).contains(port))
+        .ok_or_else(unsupported)?;
+    // These paths are the previous launch's configuration values. Compare
+    // them as data without opening either the run directory or privilege file.
+    if config
+        != json!({
+            "log_level": "error",
+            "behavior": {"event_scheduler": "OFF"},
+            "listener": {"host": "127.0.0.1", "port": port},
+            "data_dir": db.path,
+            "cfg_dir": expected_run,
+            "privilege_file": expected_run.join("privileges.db"),
+        })
+    {
+        return Err(unsupported());
     }
     Ok(())
 }

@@ -1426,6 +1426,51 @@ Two lines.
     let state = xdg
         .join("hive/v2/workspaces")
         .join(initial["workspace_id"].as_str().unwrap());
+    // Reproduce the files Dolt 2.7.6 leaves after Hive stops its server.
+    // The credentials directory from that launch is already absent.
+    let server_config = db.join("config.yaml");
+    let run = state.join("run-01900000-0000-4000-8000-000000000001");
+    let stopped_config = format!(
+        "log_level: error\nbehavior:\n  event_scheduler: \"OFF\"\nlistener:\n  host: 127.0.0.1\n  port: 38765\ndata_dir: {}\ncfg_dir: {}\nprivilege_file: {}\n",
+        serde_json::json!(db),
+        serde_json::json!(run),
+        serde_json::json!(run.join("privileges.db")),
+    );
+    symlink(db.join(".dolt/config.json"), &server_config).unwrap();
+    expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
+    fs::remove_file(&server_config).unwrap();
+    fs::write(&server_config, vec![b'#'; 64 * 1024 + 1]).unwrap();
+    expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
+    fs::write(
+        &server_config,
+        format!("{stopped_config}remotesapi: {{}}\n"),
+    )
+    .unwrap();
+    expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
+    fs::write(
+        &server_config,
+        stopped_config.replace("127.0.0.1", "0.0.0.0"),
+    )
+    .unwrap();
+    expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
+    fs::write(&server_config, &stopped_config).unwrap();
+
+    let native_config = db.join(".dolt/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&native_config).unwrap()).unwrap();
+    config["sqlserver.global.server_uuid"] = serde_json::json!("not-an-engine-uuid");
+    fs::write(&native_config, config.to_string()).unwrap();
+    expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
+    config["sqlserver.global.server_uuid"] =
+        serde_json::json!("00000000-0000-4000-8000-000000000002");
+    config["sqlserver.global.foreign_key_checks"] = serde_json::json!("off");
+    fs::write(&native_config, config.to_string()).unwrap();
+    expect_failure("failed", 7, "AUTHORITY_UNVERIFIED");
+    config
+        .as_object_mut()
+        .unwrap()
+        .remove("sqlserver.global.foreign_key_checks");
+    fs::write(&native_config, config.to_string()).unwrap();
+
     for marker in [
         "pending-request.json",
         "starting",
@@ -1499,6 +1544,12 @@ Two lines.
     assert_eq!(manifest["format_version"], 1);
     assert_eq!(manifest["conversations_included"], false);
     assert_eq!(manifest["workspace_id"], initial["workspace_id"]);
+    assert_eq!(fs::read_to_string(server_config).unwrap(), stopped_config);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(native_config).unwrap()).unwrap(),
+        config
+    );
+    assert!(!run.exists());
     assert_eq!(
         backup.metadata().unwrap().permissions().mode() & 0o777,
         0o700
@@ -1506,7 +1557,9 @@ Two lines.
     assert_eq!(fs::read_dir(&backup).unwrap().count(), 3);
     let files = manifest["files"].as_array().unwrap();
     for entry in files {
-        let bytes = fs::read(backup.join(entry["path"].as_str().unwrap())).unwrap();
+        let relative = entry["path"].as_str().unwrap();
+        assert!(!relative.contains("config") && !relative.contains("privileges"));
+        let bytes = fs::read(backup.join(relative)).unwrap();
         assert_eq!(entry["bytes"], bytes.len());
         assert_eq!(entry["sha256"], format!("{:x}", Sha256::digest(bytes)));
     }
