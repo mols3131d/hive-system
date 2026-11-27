@@ -213,12 +213,26 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::IssueNote(args) => dolt::issue_note::write(&invocation.common, &args),
         Command::IssueCreate(args) => dolt::issue_create::write(&invocation.common, &args),
         Command::IssueUpdate(args) => dolt::issue_update::write(&invocation.common, &args),
-        Command::IssueSelect(args) => {
-            dolt::issue_transition::write(&invocation.common, &args, None)
-        }
-        Command::IssueClaim(args) => {
-            dolt::issue_transition::write(&invocation.common, &args.transition, Some(&args.holder))
-        }
+        Command::IssueSelect(args) => dolt::issue_transition::write(
+            &invocation.common,
+            &args,
+            dolt::issue_transition::Input::Select,
+        ),
+        Command::IssueClaim(args) => dolt::issue_transition::write(
+            &invocation.common,
+            &args.transition,
+            dolt::issue_transition::Input::Claim(&args.holder),
+        ),
+        Command::IssueCancel(args) => dolt::issue_transition::write(
+            &invocation.common,
+            &args.transition,
+            dolt::issue_transition::Input::Cancel(&args.reason),
+        ),
+        Command::IssueReopen(args) => dolt::issue_transition::write(
+            &invocation.common,
+            &args.transition,
+            dolt::issue_transition::Input::Reopen(&args.reason),
+        ),
         Command::IssueDependency(args, add) => {
             dolt::issue_dependency::write(&invocation.common, &args, add)
         }

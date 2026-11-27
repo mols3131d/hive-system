@@ -90,6 +90,8 @@ impl Kind {
             Self::BotRegister => "Bot register",
             Self::Transition(issue_transition::Operation::Select) => "Issue select",
             Self::Transition(issue_transition::Operation::Claim) => "Issue claim",
+            Self::Transition(issue_transition::Operation::Cancel) => "Issue cancel",
+            Self::Transition(issue_transition::Operation::Reopen) => "Issue reopen",
             Self::SetParent => "Issue set-parent",
         }
     }
@@ -106,7 +108,7 @@ impl Kind {
                 ("issue_claims", "INSERT"),
                 ("operation_receipts", "INSERT"),
             ],
-            Self::Note | Self::Transition(issue_transition::Operation::Select) => &[
+            Self::Note | Self::Transition(_) => &[
                 ("issues", "UPDATE"),
                 ("issue_updates", "INSERT"),
                 ("operation_receipts", "INSERT"),
@@ -1135,6 +1137,8 @@ mod tests {
         for (name, operation) in [
             ("issue.select", issue_transition::Operation::Select),
             ("issue.claim", issue_transition::Operation::Claim),
+            ("issue.cancel", issue_transition::Operation::Cancel),
+            ("issue.reopen", issue_transition::Operation::Reopen),
         ] {
             value["kind"] = json!(name);
             let marker = read(&value).unwrap();
@@ -1150,12 +1154,7 @@ mod tests {
 
         let mut project = value;
         project["version"] = json!(4);
-        project["project_id"] = project
-            .as_object_mut()
-            .unwrap()
-            .remove("artifact_id")
-            .unwrap();
-        project.as_object_mut().unwrap().remove("issue_id");
+        project["project_id"] = project.as_object_mut().unwrap().remove("issue_id").unwrap();
         project["kind"] = json!("project.add-issue");
         let linked = read(&project).unwrap();
         assert!(matches!(linked.operation(), Ok(Kind::ProjectAddIssue)));

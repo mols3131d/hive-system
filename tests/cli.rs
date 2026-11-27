@@ -4236,3 +4236,56 @@ fn issue_set_parent_keeps_late_v2_errors_and_literal_argument_boundaries() {
     assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
     sandbox.assert_empty();
 }
+
+#[test]
+fn issue_reconciliation_preserves_contract_selection_and_structured_errors() {
+    let sandbox = Sandbox::new();
+    let id = "01900000-0000-7000-8000-000000000001";
+    let revision = format!("{id}=fixture-r1");
+    for action in ["cancel", "reopen"] {
+        let command = [
+            "issue",
+            action,
+            id,
+            "--area",
+            id,
+            "--actor",
+            "fixture",
+            "--request-id",
+            id,
+            "--if-match",
+            &revision,
+            "--workspace",
+            ".",
+            "--workspace-id",
+            id,
+            "--database",
+            "db",
+            "--port",
+            "3306",
+            "--evidence-file",
+            "fixture.json",
+        ];
+        for suffix in [
+            &[][..],
+            &["--reason", "fixture-reason", "--reason", "fixture-reason"][..],
+            &["--reason=--json", "--unknown", "fixture-value"][..],
+        ] {
+            let output =
+                sandbox.run(&[&command[..], suffix, &["--contract", "2", "--json"]].concat());
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["schema_version"], 2);
+            assert_eq!(report["command"], format!("issue {action}"));
+            assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+            assert!(!report.to_string().contains("fixture-reason"));
+        }
+        let output =
+            sandbox.run(&[&["--json"][..], &command[..], &["--reason=--contract=2"]].concat());
+        assert_eq!(output.status.code(), Some(2));
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema_version"], 1);
+    }
+    sandbox.assert_empty();
+}

@@ -438,6 +438,55 @@ pub(super) fn check_parent_edit(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn check_issue_reconciliation(
+    reader: &mut RecordReader<'_>,
+    issue_id: &str,
+    reopening: bool,
+) -> Result<(), HiveError> {
+    use crate::error::ErrorCode;
+
+    let graph = read_work_graph(reader)?;
+    graph.require_valid()?;
+    let issue = graph
+        .issues
+        .iter()
+        .find(|row| row.id == issue_id)
+        .ok_or_else(|| {
+            HiveError::new(
+                ErrorCode::InvalidRecord,
+                "The Issue is absent from the work graph.",
+            )
+        })?;
+    let dependents: BTreeSet<_> = graph
+        .dependencies
+        .iter()
+        .filter(|edge| reopening && edge.prerequisite_id == issue_id)
+        .map(|edge| edge.issue_id.as_str())
+        .collect();
+    for row in &graph.issues {
+        if issue.parent_id.as_deref() == Some(row.id.as_str())
+            && matches!(row.status, Some(IssueStatus::Review | IssueStatus::Done))
+        {
+            return Err(HiveError::new(
+                ErrorCode::InvalidTransition,
+                "The parent Issue in review or done requires prior reconciliation.",
+            ));
+        }
+        if dependents.contains(row.id.as_str())
+            && row
+                .status
+                .is_some_and(IssueStatus::requires_done_prerequisites)
+        {
+            return Err(HiveError::new(
+                ErrorCode::InvalidTransition,
+                "A dependent Issue in progress, review or done requires prior reconciliation.",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn validate(snapshot: &mut RecordReader<'_>) -> Result<Diagnostics, HiveError> {
     let WorkGraph {
         areas,
