@@ -128,8 +128,9 @@ fn linked_area(
 pub(super) fn require_active_area(
     db: &mut impl mysql::prelude::Queryable,
     area: &str,
+    archived_message: &'static str,
 ) -> Result<(), HiveError> {
-    verify_area_ancestry(area, |id| {
+    verify_area_ancestry(area, archived_message, |id| {
         db.exec_first(
             "SELECT parent_id, slug, archived_at IS NOT NULL FROM areas
              WHERE CAST(id AS BINARY) = ?",
@@ -142,6 +143,7 @@ pub(super) fn require_active_area(
 #[cfg(target_os = "linux")]
 fn verify_area_ancestry(
     area: &str,
+    archived_message: &'static str,
     mut read: impl FnMut(&str) -> Result<Option<(Option<String>, String, bool)>, HiveError>,
 ) -> Result<(), HiveError> {
     let invalid = || {
@@ -171,7 +173,7 @@ fn verify_area_ancestry(
     if archived {
         return Err(HiveError::new(
             ErrorCode::InvalidTransition,
-            "A progress note requires active Area ancestry.",
+            archived_message,
         ));
     }
     Ok(())
@@ -187,7 +189,7 @@ mod tests {
         let parent = "01900000-0000-7000-8000-000000000002";
         let leaf = "01900000-0000-7000-8000-000000000003";
         let verify = |root_row: Option<(Option<&str>, bool)>| {
-            verify_area_ancestry(leaf, |id| {
+            verify_area_ancestry(leaf, "Archived ancestry.", |id| {
                 Ok(match id {
                     id if id == leaf => Some((Some(parent), false)),
                     id if id == parent => Some((Some(root), false)),

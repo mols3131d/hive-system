@@ -202,6 +202,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         }
         Command::Issue(IssueCommand::Show(args)) => dolt::issue_show(&args),
         Command::IssueNote(args) => dolt::issue_note::write(&invocation.common, &args),
+        Command::IssueCreate(args) => dolt::issue_create::write(&invocation.common, &args),
         Command::ConversationImport(args) => dolt::conversation_import(&invocation.common, &args),
         Command::Conversation(ConversationCommand::Show(args)) => {
             dolt::conversation_read(&invocation.common, &args, None)

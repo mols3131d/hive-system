@@ -288,6 +288,25 @@ impl<'a> Installed<'a> {
         run(command, "Git", args[0])
     }
 
+    pub(crate) fn read_committed_soul(
+        &self,
+        assets: &Path,
+        revision: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, HiveError> {
+        crate::config_git::read_committed_asset_blob(
+            &|| Ok(self.git_command(assets)),
+            revision,
+            Path::new(path),
+        )?
+        .ok_or_else(|| {
+            HiveError::new(
+                ErrorCode::NotFound,
+                "The selected Queen's Soul is missing from the asset commit.",
+            )
+        })
+    }
+
     pub(crate) fn git_command(&self, cwd: &Path) -> Command {
         let mut command = self.command(&self.git, cwd);
         command

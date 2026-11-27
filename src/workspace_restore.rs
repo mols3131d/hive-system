@@ -44,7 +44,7 @@ mod linux {
     use crate::config_v2::{BOOTSTRAP_LAYOUT, MARKER, verify_bootstrap_layout};
     use crate::dolt::{
         DOLT_VERSION, STORAGE_SCHEMA_VERSION, conversation_archive, is_commit_hash, is_uuid,
-        validate_archived_queens, validate_restored_records,
+        validate_restored_records,
     };
     use crate::error::{ErrorCode, HiveError};
     use crate::workspace_backup::{
@@ -183,14 +183,12 @@ mod linux {
             &format!("{snapshot_path}/assets.bundle"),
             &manifest.asset_git_commit,
         )?;
-        validate_restored_records(&installed, &db, &manifest.dolt_commit)?;
-        let queens = validate_archived_queens(
+        let queens = validate_restored_records(
             &installed,
             &db,
             &manifest.dolt_commit,
             &manifest.workspace_id,
-            &assets,
-            &manifest.asset_git_commit,
+            |path| installed.read_committed_soul(&assets, &manifest.asset_git_commit, path),
         )?;
         if let Some(conversations) = conversations {
             conversations.restore(&source, &conversation_dir, &manifest.workspace_id, &queens)?;

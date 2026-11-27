@@ -15,7 +15,7 @@ use crate::config_git::with_asset_bundle;
 use crate::config_v2::Candidate;
 use crate::dolt::{
     DOLT_VERSION, INITIAL_SCHEMA, STORAGE_SCHEMA_VERSION, conversation_archive, is_commit_hash,
-    is_uuid, validate_archived_queens,
+    is_uuid, validate_backup_souls,
 };
 use crate::error::{ErrorCode, HiveError};
 use crate::workspace_init::{Installed, fd_path, sync_tree};
@@ -125,6 +125,13 @@ pub(crate) fn create(
                     "The staged Dolt backup differs from the selected committed revision.",
                 ));
             }
+            let queens = validate_backup_souls(
+                &installed,
+                &restored_db,
+                &revision,
+                workspace.workspace_id(),
+                |path| installed.read_committed_soul(verified_assets, asset_revision, path),
+            )?;
             // This is an empty lock file created by the local native transport.
             for lock in ["dolt/LOCK", "dolt/oldgen/LOCK"] {
                 let lock = payload.join(lock);
@@ -143,14 +150,6 @@ pub(crate) fn create(
             fs::set_permissions(&bundle, fs::Permissions::from_mode(0o600)).map_err(io_error)?;
             let files = digest_payload(&payload_dir, false)?;
             let conversations = if include_conversations {
-                let queens = validate_archived_queens(
-                    &installed,
-                    &restored_db,
-                    &revision,
-                    workspace.workspace_id(),
-                    verified_assets,
-                    asset_revision,
-                )?;
                 Some(conversation_archive::capture(
                     &workspace.root,
                     &payload_dir,

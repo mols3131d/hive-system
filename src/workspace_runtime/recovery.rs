@@ -1,7 +1,7 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
-use crate::dolt::issue_note::{Pending, uncertain};
+use crate::dolt::issue_writer::{Pending, uncertain};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -424,7 +424,10 @@ fn inspect_copy(
     let port =
         NonZeroU16::new(available.local_addr().map_err(io_error)?.port()).ok_or_else(uncertain)?;
     let mut launch = dolt_command(executable, cwd);
-    launch.args(server_args(&db, cwd, port)).arg("--readonly");
+    // This launch can only write local config into the private scratch copy.
+    launch
+        .args(legacy_server_args(&db, cwd, port))
+        .arg("--readonly");
     let parent = i32::try_from(std::process::id()).map_err(|_| uncertain())?;
     // SAFETY: the callback only makes async-signal-safe system calls. Check
     // parent identity after registration to cover exit just before prctl.

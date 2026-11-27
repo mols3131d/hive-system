@@ -346,8 +346,9 @@ impl<'a> PinnedAssets<'a> {
             .read(OsStr::new("config"))?
             .unwrap_or_default();
         let reader = AssetObjectReader::new(&repository.objects, &config, revision.len())?;
-        let tree = reader.commit_tree(revision)?;
-        reader.verified_object("tree", &tree, 1024 * 1024)?;
+        let git = || reader.command();
+        let tree = committed_asset_tree(&git, revision)?;
+        verified_asset_object(&git, "tree", &tree, 1024 * 1024)?;
         let pinned = Self {
             root,
             repository,
@@ -700,16 +701,10 @@ impl AssetRepository {
     }
 
     fn read(&self, revision: &str, relative: &Path) -> Result<Option<Vec<u8>>, HiveError> {
-        if !is_full_oid(revision) {
-            return Err(HiveError::new(
-                ErrorCode::InvalidArgument,
-                "A snapshot requires a full Git commit object ID",
-            ));
-        }
-        relative_git_path(relative)?;
+        validate_asset_blob_selection(revision, relative)?;
         let config = self.git_dir.read(OsStr::new("config"))?.unwrap_or_default();
         let reader = AssetObjectReader::new(&self.objects, &config, revision.len())?;
-        reader.read(revision, relative)
+        read_committed_asset_blob(&|| reader.command(), revision, relative)
     }
 }
 
@@ -790,56 +785,81 @@ impl<'a> AssetObjectReader<'a> {
         command.env("GIT_OBJECT_DIRECTORY", objects);
         Ok(command)
     }
+}
 
-    fn read(&self, revision: &str, relative: &Path) -> Result<Option<Vec<u8>>, HiveError> {
-        const MAX_METADATA_BYTES: usize = 1024 * 1024;
-
-        let mut oid = self.commit_tree(revision)?;
-        let mut path = relative.components().peekable();
-        while let Some(component) = path.next() {
-            let tree = self.verified_object("tree", &oid, MAX_METADATA_BYTES)?;
-            let Some(child) = asset_tree_child(
-                &tree,
-                component.as_os_str().as_encoded_bytes(),
-                revision.len() / 2,
-                path.peek().is_none(),
-            )?
-            else {
-                return Ok(None);
-            };
-            oid = child;
-        }
-        self.verified_object("blob", &oid, MAX_BLOB_BYTES).map(Some)
+#[cfg(target_os = "linux")]
+fn validate_asset_blob_selection(revision: &str, relative: &Path) -> Result<(), HiveError> {
+    if !is_full_oid(revision) {
+        return Err(HiveError::new(
+            ErrorCode::InvalidArgument,
+            "A snapshot requires a full Git commit object ID",
+        ));
     }
+    relative_git_path(relative)?;
+    Ok(())
+}
 
-    fn commit_tree(&self, revision: &str) -> Result<String, HiveError> {
-        let commit = self.verified_object("commit", &revision.to_ascii_lowercase(), 1024 * 1024)?;
-        commit
-            .split(|byte| *byte == b'\n')
-            .next()
-            .and_then(|line| line.strip_prefix(b"tree "))
-            .and_then(|oid| str::from_utf8(oid).ok())
-            .filter(|oid| oid.len() == revision.len() && is_full_oid(oid))
-            .map(str::to_ascii_lowercase)
-            .ok_or_else(unavailable_blob)
+#[cfg(target_os = "linux")]
+pub(crate) fn read_committed_asset_blob(
+    git: &impl Fn() -> Result<Command, HiveError>,
+    revision: &str,
+    relative: &Path,
+) -> Result<Option<Vec<u8>>, HiveError> {
+    validate_asset_blob_selection(revision, relative)?;
+    let mut oid = committed_asset_tree(git, revision)?;
+    let mut path = relative.components().peekable();
+    while let Some(component) = path.next() {
+        let tree = verified_asset_object(git, "tree", &oid, 1024 * 1024)?;
+        let Some(child) = asset_tree_child(
+            &tree,
+            component.as_os_str().as_encoded_bytes(),
+            revision.len() / 2,
+            path.peek().is_none(),
+        )?
+        else {
+            return Ok(None);
+        };
+        oid = child;
     }
+    verified_asset_object(git, "blob", &oid, MAX_BLOB_BYTES).map(Some)
+}
 
-    fn verified_object(&self, kind: &str, oid: &str, limit: usize) -> Result<Vec<u8>, HiveError> {
-        let result = execute_asset(self.command()?.args(["cat-file", kind, oid]), limit, None)?;
-        if !result.status.success() {
-            return Err(unavailable_blob());
-        }
-        let hash = execute_asset(
-            self.command()?
-                .args(["hash-object", "-t", kind, "--stdin", "--no-filters"]),
-            65,
-            Some(&result.stdout),
-        )?;
-        if !hash.status.success() || git_line(&hash.stdout) != Some(oid.as_bytes()) {
-            return Err(unavailable_blob());
-        }
-        Ok(result.stdout)
+#[cfg(target_os = "linux")]
+fn committed_asset_tree(
+    git: &impl Fn() -> Result<Command, HiveError>,
+    revision: &str,
+) -> Result<String, HiveError> {
+    let commit = verified_asset_object(git, "commit", &revision.to_ascii_lowercase(), 1024 * 1024)?;
+    commit
+        .split(|byte| *byte == b'\n')
+        .next()
+        .and_then(|line| line.strip_prefix(b"tree "))
+        .and_then(|oid| std::str::from_utf8(oid).ok())
+        .filter(|oid| oid.len() == revision.len() && is_full_oid(oid))
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(unavailable_blob)
+}
+
+#[cfg(target_os = "linux")]
+fn verified_asset_object(
+    git: &impl Fn() -> Result<Command, HiveError>,
+    kind: &str,
+    oid: &str,
+    limit: usize,
+) -> Result<Vec<u8>, HiveError> {
+    let result = execute_asset(git()?.args(["cat-file", kind, oid]), limit, None)?;
+    if !result.status.success() {
+        return Err(unavailable_blob());
     }
+    let hash = execute_asset(
+        git()?.args(["hash-object", "-t", kind, "--stdin", "--no-filters"]),
+        65,
+        Some(&result.stdout),
+    )?;
+    if !hash.status.success() || git_line(&hash.stdout) != Some(oid.as_bytes()) {
+        return Err(unavailable_blob());
+    }
+    Ok(result.stdout)
 }
 
 #[cfg(target_os = "linux")]
@@ -1387,6 +1407,14 @@ mod tests {
         let read = |revision| read_asset_blob(&directory, revision, relative);
         assert_eq!(read(&committed).unwrap().unwrap(), b"committed");
         assert!(read(&missing).unwrap().is_none());
+        let read_snapshot = |revision| {
+            read_committed_asset_blob(&|| Ok(isolated_git_command(&assets)), revision, relative)
+        };
+        assert_eq!(read_snapshot(&committed).unwrap().unwrap(), b"committed");
+        assert!(matches!(
+            read_snapshot(&linked).unwrap_err().code,
+            ErrorCode::InvalidConfig
+        ));
         for (revision, expected) in [
             (&linked[..], ErrorCode::InvalidConfig),
             (&oversized, ErrorCode::InvalidConfig),
@@ -1614,6 +1642,9 @@ mod context_tests {
                     "user.name=Fixture",
                     "-c",
                     "user.email=fixture@example.invalid",
+                    // Detached maintenance can race with the object-store walk.
+                    "-c",
+                    "maintenance.auto=false",
                 ])
                 .args(args)
                 .output()

@@ -16,6 +16,7 @@ pub(crate) mod directive;
 mod directive_receipt;
 mod graph;
 mod issue;
+pub(crate) mod issue_create;
 mod issue_list;
 pub(crate) mod issue_note;
 #[cfg(any(test, target_os = "linux"))]
@@ -23,6 +24,8 @@ mod issue_note_fingerprint;
 #[cfg(target_os = "linux")]
 mod issue_note_receipt;
 mod issue_readiness;
+#[cfg(target_os = "linux")]
+pub(crate) mod issue_writer;
 pub(crate) mod label;
 pub(crate) mod operation;
 mod project;
@@ -207,7 +210,9 @@ pub(crate) fn validate_restored_records(
     installed: &crate::workspace_init::Installed<'_>,
     db: &std::path::Path,
     commit: &str,
-) -> Result<(), HiveError> {
+    workspace_id: &str,
+    read_soul_blob: impl FnMut(&str) -> Result<Vec<u8>, HiveError>,
+) -> Result<std::collections::BTreeMap<String, String>, HiveError> {
     let mut reader = records::RecordReader::Offline {
         installed,
         db,
@@ -220,37 +225,23 @@ pub(crate) fn validate_restored_records(
             diagnostics.truncated,
         ));
     }
-    Ok(())
+    bot::validate_snapshot_souls(&mut reader, workspace_id, read_soul_blob)
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn validate_archived_queens(
+pub(crate) fn validate_backup_souls(
     installed: &crate::workspace_init::Installed<'_>,
     db: &std::path::Path,
     commit: &str,
     workspace_id: &str,
-    assets: &std::path::Path,
-    asset_commit: &str,
+    read_soul_blob: impl FnMut(&str) -> Result<Vec<u8>, HiveError>,
 ) -> Result<std::collections::BTreeMap<String, String>, HiveError> {
     let mut reader = records::RecordReader::Offline {
         installed,
         db,
         commit,
     };
-    bot::validate_archived_souls(&mut reader, workspace_id, |path| {
-        let object = format!("{asset_commit}:{path}");
-        let size = installed.git(assets, &["cat-file", "-s", &object])?;
-        if !size
-            .trim()
-            .parse::<usize>()
-            .is_ok_and(|size| size <= crate::config_git::MAX_BLOB_BYTES)
-        {
-            return Err(unverified_authority(
-                "An archived Soul exceeds the asset blob limit.",
-            ));
-        }
-        installed.git(assets, &["cat-file", "blob", &object])
-    })
+    bot::validate_snapshot_souls(&mut reader, workspace_id, read_soul_blob)
 }
 
 fn encode_id_cursor(id: &str, binding: &Value) -> String {

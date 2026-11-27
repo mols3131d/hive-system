@@ -1,11 +1,12 @@
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::fmt::Write as _;
+use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::num::NonZeroU16;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -29,6 +30,10 @@ use crate::error::{ErrorCode, HiveError};
 const WAIT: Duration = Duration::from_secs(10);
 const RETRY: Duration = Duration::from_millis(25);
 const DATABASE: &str = "db";
+const SERVER_CONFIG: &str = "server-config.yaml";
+const CONFIG_ID: &str = "config-id";
+const CONFIG_SEALS: i32 =
+    libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
 
 pub(super) fn run(
     options: &CommonOptions,
@@ -240,7 +245,7 @@ fn start(
     let nonce = token()?;
     let run = create_run(state, &nonce)?;
     let command = || dolt_command(&executable, &run.path);
-    let prepare = || -> Result<(), HiveError> {
+    let prepare = || -> Result<File, HiveError> {
         let mut version = command();
         version.arg("version").stdout(Stdio::piped());
         let version = run_checked(&mut version, None)?;
@@ -265,7 +270,7 @@ fn start(
             ))
             .arg("sql");
         let sql = format!(
-            "CREATE USER '{reader_user}'@'127.0.0.1' IDENTIFIED BY '{reader}';\n             CREATE USER '{writer_user}'@'127.0.0.1' IDENTIFIED BY '{writer}';\n             GRANT SELECT ON db.* TO '{reader_user}'@'127.0.0.1';\n             GRANT SELECT ON db.* TO '{writer_user}'@'127.0.0.1';\n             GRANT UPDATE ON db.workspace_counters TO '{writer_user}'@'127.0.0.1';\n             GRANT UPDATE ON db.issues TO '{writer_user}'@'127.0.0.1';\n             GRANT INSERT ON db.issue_updates TO '{writer_user}'@'127.0.0.1';\n             GRANT INSERT ON db.operation_receipts TO '{writer_user}'@'127.0.0.1';\n             DROP USER 'root'@'localhost';"
+            "CREATE USER '{reader_user}'@'127.0.0.1' IDENTIFIED BY '{reader}';\n             CREATE USER '{writer_user}'@'127.0.0.1' IDENTIFIED BY '{writer}';\n             GRANT SELECT ON db.* TO '{reader_user}'@'127.0.0.1';\n             GRANT SELECT ON db.* TO '{writer_user}'@'127.0.0.1';\n             GRANT UPDATE ON db.workspace_counters TO '{writer_user}'@'127.0.0.1';\n             GRANT UPDATE, INSERT ON db.issues TO '{writer_user}'@'127.0.0.1';\n             GRANT INSERT ON db.issue_updates TO '{writer_user}'@'127.0.0.1';\n             GRANT INSERT ON db.operation_receipts TO '{writer_user}'@'127.0.0.1';\n             DROP USER 'root'@'localhost';"
         );
         run_checked(&mut provision, Some(sql.as_bytes()))?;
         for (name, contents) in [
@@ -278,26 +283,37 @@ fn start(
         regular(&run, "privileges.db")?
             .sync_all()
             .map_err(io_error)?;
+        let bytes = server_config(&db.path, &run.path, port)?;
+        let config = seal_config(&bytes)?;
+        write_new(&run, SERVER_CONFIG, &bytes)?;
+        let identity = config_identity(config.as_raw_fd(), &config.metadata().map_err(io_error)?);
+        write_new(&run, CONFIG_ID, identity.as_bytes())?;
+        require_private_dir(&run)?;
+        require_private_file(&regular(&run, SERVER_CONFIG)?)?;
+        require_private_file(&regular(&run, CONFIG_ID)?)?;
         sync(&run)?;
-        record_launch_intent(state, &run, db, &nonce)
+        record_launch_intent(state, &run, db, &nonce)?;
+        Ok(config)
     };
-    if let Err(error) = prepare() {
-        if !state.contains(c"starting")? {
-            remove_run(&run)?;
+    let config = match prepare() {
+        Ok(config) => config,
+        Err(error) => {
+            if !state.contains(c"starting")? {
+                remove_run(&run)?;
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
 
     drop(available);
-    let mut launch = command();
-    launch.args(server_args(&db.path, &run.path, port));
-    let mut child = match launch.spawn() {
+    let mut child = match spawn_configured(command(), &config) {
         Ok(child) => child,
         Err(error) => {
             clear_intent(state, &run)?;
             return Err(io_error(error));
         }
     };
+    drop(config);
     let pid = i32::try_from(child.id()).map_err(|_| unavailable("Dolt PID is out of range."))?;
     let handle = pidfd(pid)?;
     let ready = (|| -> Result<Value, HiveError> {
@@ -687,22 +703,17 @@ fn verify_with<T>(
         let exe = fs::metadata(proc.join("exe")).map_err(io_error)?;
         let binary_id = read_private(run, "binary-id")?;
         let cmdline = fs::read(proc.join("cmdline")).map_err(io_error)?;
-        let args = server_args(&root, &run.path, server.endpoint.port);
         for dir in [state, run, noms] {
             require_current_directory(dir)?;
         }
-        let actual = cmdline.strip_suffix(&[0]).unwrap_or(&cmdline);
         if (cwd.dev(), cwd.ino()) != run.file_identity()?
             || binary_id != format!("{}:{}", exe.dev(), exe.ino())
-            || !actual
-                .split(|byte| *byte == 0)
-                .skip(1)
-                .eq(args.iter().map(|arg| arg.as_bytes()))
         {
             return Err(unverified(
-                "Dolt executable, launch arguments, or canonical directories changed.",
+                "Dolt executable or canonical working directory changed.",
             ));
         }
+        verify_server_launch(&proc, &cmdline, &root, run, server.endpoint.port)?;
         if !owns_store(&proc, noms, server.pid)? {
             return Err(unverified(
                 "Dolt does not hold the selected store's exclusive lock.",
@@ -924,8 +935,33 @@ fn path_flag(flag: &str, path: &Path) -> OsString {
     arg
 }
 
-fn server_args(db: &Path, run: &Path, port: NonZeroU16) -> Vec<OsString> {
-    vec![
+fn server_args(fd: i32) -> [OsString; 4] {
+    [
+        "sql-server".into(),
+        "--config".into(),
+        format!("/proc/self/fd/{fd}").into(),
+        "--skip-root-user-initialization".into(),
+    ]
+}
+
+fn spawn_configured(mut command: Command, config: &File) -> io::Result<Child> {
+    let fd = config.as_raw_fd();
+    command.args(server_args(fd));
+    // SAFETY: config stays open across spawn. Only the forked child clears
+    // close-on-exec, using the async-signal-safe fcntl call.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn()
+}
+
+fn legacy_server_args(db: &Path, run: &Path, port: NonZeroU16) -> [OsString; 9] {
+    [
         "sql-server".into(),
         "--skip-root-user-initialization".into(),
         "--host=127.0.0.1".into(),
@@ -936,6 +972,133 @@ fn server_args(db: &Path, run: &Path, port: NonZeroU16) -> Vec<OsString> {
         "--event-scheduler=OFF".into(),
         "--loglevel=error".into(),
     ]
+}
+
+fn server_config(db: &Path, run: &Path, port: NonZeroU16) -> Result<Vec<u8>, HiveError> {
+    // Dolt expands environment variables before parsing YAML. Double each
+    // dollar so paths are literal, and use JSON quoting for YAML scalars.
+    let literal = |path: &Path| json_path(path).map(|path| path.replace('$', "$$"));
+    let json = serde_json::to_string(&json!({
+        "log_level": "error",
+        "behavior": { "event_scheduler": "OFF" },
+        "listener": { "host": "127.0.0.1", "port": port },
+        "data_dir": literal(db)?,
+        "cfg_dir": literal(run)?,
+        "privilege_file": literal(&run.join("privileges.db"))?,
+    }))
+    .map_err(|_| unavailable("Could not encode the Dolt launch configuration."))?;
+    // JSON emits these characters literally. YAML rejects some of them and
+    // interprets NEL, LS and PS as line breaks even inside quoted scalars.
+    let mut yaml = String::with_capacity(json.len());
+    for ch in json.chars() {
+        match ch {
+            '\u{007f}'..='\u{009f}' | '\u{2028}' | '\u{2029}' | '\u{fffe}' | '\u{ffff}' => {
+                write!(yaml, "\\u{:04x}", u32::from(ch)).expect("writing to a String cannot fail");
+            }
+            _ => yaml.push(ch),
+        }
+    }
+    Ok(yaml.into_bytes())
+}
+
+fn seal_config(bytes: &[u8]) -> Result<File, HiveError> {
+    // SAFETY: the name is NUL-terminated and the flags permit sealing.
+    let fd = unsafe {
+        libc::memfd_create(
+            c"hive-dolt-config".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd == -1 {
+        return Err(io_error(io::Error::last_os_error()));
+    }
+    // SAFETY: memfd_create returned a fresh descriptor owned by this call.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    if fd < 3 {
+        return Err(unavailable(
+            "Dolt configuration requires a non-stdio descriptor.",
+        ));
+    }
+    file.set_permissions(Permissions::from_mode(0o600))
+        .map_err(io_error)?;
+    file.write_all(bytes).map_err(io_error)?;
+    // SAFETY: file owns fd, and these seals freeze its bytes and size.
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, CONFIG_SEALS) } == -1 {
+        return Err(io_error(io::Error::last_os_error()));
+    }
+    Ok(file)
+}
+
+fn config_identity(fd: i32, metadata: &Metadata) -> String {
+    format!("{fd}:{}:{}", metadata.dev(), metadata.ino())
+}
+
+fn verify_server_launch(
+    proc: &Path,
+    cmdline: &[u8],
+    db: &Path,
+    run: &ScopedDirectory,
+    port: NonZeroU16,
+) -> Result<(), HiveError> {
+    let actual = cmdline
+        .strip_suffix(&[0])
+        .ok_or_else(|| unverified("Dolt launch arguments are unavailable."))?;
+    let matches = |args: &[OsString]| {
+        actual
+            .split(|byte| *byte == 0)
+            .skip(1)
+            .eq(args.iter().map(|arg| arg.as_bytes()))
+    };
+    if matches(&legacy_server_args(db, &run.path, port)) {
+        return Ok(());
+    }
+    let identity = read_private(run, CONFIG_ID)?;
+    let fd = identity
+        .split_once(':')
+        .and_then(|(fd, _)| fd.parse::<i32>().ok())
+        .filter(|fd| *fd >= 3)
+        .ok_or_else(|| unverified("The Dolt launch configuration identity is invalid."))?;
+    if !matches(&server_args(fd)) {
+        return Err(unverified("Dolt launch arguments changed."));
+    }
+    let path = proc.join("fd").join(fd.to_string());
+    let matches_file = |metadata: &Metadata| {
+        metadata.is_file()
+            && metadata.nlink() == 0
+            && metadata.mode() & 0o777 == 0o600
+            && config_identity(fd, metadata) == identity
+    };
+    if !matches_file(&fs::metadata(&path).map_err(io_error)?) {
+        return Err(unverified(
+            "The Dolt launch configuration descriptor changed.",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(&path)
+        .map_err(io_error)?;
+    // SAFETY: file is open for the duration of the call.
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if !matches_file(&file.metadata().map_err(io_error)?)
+        || seals == -1
+        || seals & CONFIG_SEALS != CONFIG_SEALS
+    {
+        return Err(unverified(
+            "Dolt's configuration descriptor is not the sealed launch file.",
+        ));
+    }
+    let expected = server_config(db, &run.path, port)?;
+    let mut contents = Vec::new();
+    file.take(expected.len() as u64 + 1)
+        .read_to_end(&mut contents)
+        .map_err(io_error)?;
+    if contents != expected {
+        return Err(unverified(
+            "The sealed Dolt launch configuration does not match.",
+        ));
+    }
+    Ok(())
 }
 
 fn dolt_command(executable: &Path, directory: &Path) -> Command {
@@ -1227,6 +1390,90 @@ mod tests {
             assert!(!pidfd_matches(info, 123), "{info:?}");
         }
         assert!(!pidfd_matches("Pid:\t0\n", 0));
+    }
+
+    #[test]
+    fn verifies_exact_configured_and_legacy_launches() {
+        let directory = tempfile::Builder::new()
+            .prefix("hive-runtime-$HOME-")
+            .tempdir()
+            .unwrap();
+        let root = directory.path();
+        let run = ScopedDirectory::open_absolute(root).unwrap();
+        let db = root.join("data ${HOME} $$ ' \"\\\n\u{7f}\u{85}\u{2028}\u{2029}");
+        let proc = Path::new("/proc/self");
+        let port = NonZeroU16::new(3307).unwrap();
+        let encode = |args: &[OsString]| {
+            let mut cmdline = b"/fixture/dolt\0".to_vec();
+            for arg in args {
+                cmdline.extend_from_slice(arg.as_bytes());
+                cmdline.push(0);
+            }
+            cmdline
+        };
+        let legacy = encode(&legacy_server_args(&db, root, port));
+        verify_server_launch(proc, &legacy, &db, &run, port).unwrap();
+        assert!(
+            verify_server_launch(
+                proc,
+                &[legacy, b"--config=other\0".to_vec()].concat(),
+                &db,
+                &run,
+                port
+            )
+            .is_err()
+        );
+
+        let bytes = server_config(&db, root, port).unwrap();
+        let yaml = std::str::from_utf8(&bytes).unwrap();
+        assert!(yaml.contains(r"\u007f\u0085\u2028\u2029"));
+        let config: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(config["data_dir"], db.to_str().unwrap().replace('$', "$$"));
+        assert_eq!(config["behavior"]["event_scheduler"], "OFF");
+
+        let mut sealed = seal_config(&bytes).unwrap();
+        let fd = sealed.as_raw_fd();
+        let configured = encode(&server_args(fd));
+        assert!(verify_server_launch(proc, &configured, &db, &run, port).is_err());
+        let identity = config_identity(fd, &sealed.metadata().unwrap());
+        write_new(&run, CONFIG_ID, identity.as_bytes()).unwrap();
+        write_new(&run, SERVER_CONFIG, &bytes).unwrap();
+        verify_server_launch(proc, &configured, &db, &run, port).unwrap();
+        assert!(
+            verify_server_launch(proc, &configured, &db, &run, NonZeroU16::new(3308).unwrap())
+                .is_err()
+        );
+
+        fs::rename(root.join(SERVER_CONFIG), root.join("moved-config")).unwrap();
+        write_new(&run, SERVER_CONFIG, b"replacement").unwrap();
+        verify_server_launch(proc, &configured, &db, &run, port).unwrap();
+        assert_eq!(
+            sealed.write_all(b"changed").unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            sealed.set_len(0).unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exec /bin/cat \"$3\"", "fixture"])
+            .stdout(Stdio::piped());
+        let output = spawn_configured(command, &sealed)
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, bytes);
+
+        let replacement = seal_config(&bytes).unwrap();
+        let other_fd = replacement.as_raw_fd();
+        let original = sealed.metadata().unwrap();
+        fs::write(root.join(CONFIG_ID), config_identity(other_fd, &original)).unwrap();
+        assert!(
+            verify_server_launch(proc, &encode(&server_args(other_fd)), &db, &run, port).is_err()
+        );
     }
 
     #[test]

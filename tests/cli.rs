@@ -3576,3 +3576,46 @@ fn operation_is_registered_for_v2_help_and_preserves_v1_unknown_command_bytes() 
     }
     sandbox.assert_empty();
 }
+
+#[test]
+fn issue_create_is_registered_only_in_v2_grammar() {
+    let sandbox = Sandbox::new();
+    for selection in [&[][..], &["--contract", "1"][..]] {
+        let help = sandbox.run(&[selection, &["issue", "--help"]].concat());
+        assert!(help.status.success());
+        assert!(!String::from_utf8(help.stdout).unwrap().contains("create"));
+        let create = sandbox.run(&[selection, &["issue", "create", "--help"]].concat());
+        let unknown = sandbox.run(&[selection, &["issue", "unknown-leaf", "--help"]].concat());
+        assert_eq!(create.status.code(), Some(2));
+        assert_eq!(create.stdout, unknown.stdout);
+        assert_eq!(create.stderr, unknown.stderr);
+    }
+    for args in [
+        &["--contract", "2", "help", "issue", "create"][..],
+        &["issue", "create", "--help", "--contract", "2"][..],
+    ] {
+        let help = sandbox.run(args);
+        assert!(help.status.success(), "{args:?}: {help:?}");
+        let text = String::from_utf8(help.stdout).unwrap();
+        assert!(text.contains("[possible values: epic, feature, task, bug]"));
+        assert!(text.contains("--evidence-file"));
+        assert!(!text.contains("--claim") && !text.contains("--if-match"));
+    }
+
+    let invalid = sandbox.run(&[
+        "issue",
+        "create",
+        "--contract",
+        "2",
+        "--json",
+        "--type",
+        "TASK",
+        "--title",
+        "Fixture",
+    ]);
+    let report: Value = serde_json::from_slice(&invalid.stdout).unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+    assert_eq!(report["command"], "issue create");
+    assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+    sandbox.assert_empty();
+}
