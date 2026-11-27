@@ -1,13 +1,17 @@
+use std::collections::HashSet;
+
 use mysql::Value as SqlValue;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::cli::{AreaListArgs, AreaShowArgs, is_slug};
+use crate::cli::{AreaListArgs, AreaShowArgs, AreaTreeArgs, is_slug};
 use crate::error::{ErrorCode, HiveError};
 
 use super::{DoltFailure, DoltSuccess, Snapshot, is_uuid_v7};
 
 const MAX_LIMIT: u64 = 100;
+const MAX_TREE_NODES: u64 = 100;
+const MAX_TREE_LEVELS: usize = 32;
 const SORT: &str = "CAST(slug AS BINARY) ASC, CAST(id AS BINARY) ASC";
 const SUMMARY_COLUMNS: &str = "id, parent_id, slug, name, \
     DATE_FORMAT(archived_at, '%Y-%m-%dT%H:%i:%s.%fZ'), revision";
@@ -67,6 +71,84 @@ pub(crate) fn list(args: &AreaListArgs) -> Result<DoltSuccess, Box<DoltFailure>>
         Ok(data) => Ok(DoltSuccess { context, data }),
         Err(error) => Err(DoltFailure::with_context(context, error)),
     }
+}
+
+pub(crate) fn tree(args: &AreaTreeArgs) -> Result<DoltSuccess, Box<DoltFailure>> {
+    let root = args.root.as_deref();
+    if let Some(id) = root {
+        check_selector(id).map_err(DoltFailure::without_context)?;
+    }
+    let (mut snapshot, workspace_id) =
+        Snapshot::open(&args.target).map_err(DoltFailure::without_context)?;
+    let scope = match root {
+        Some(id) => json!({"kind": "area", "id": id}),
+        None => json!({"kind": "roots"}),
+    };
+    let context = json!({
+        "workspace_id": workspace_id,
+        "db_commit": snapshot.commit,
+        "scope": scope,
+    });
+    let result = (|| {
+        let roots = match root {
+            Some(id) => vec![select_area(
+                &mut snapshot,
+                &format!("{SUMMARY_COLUMNS}, NULL"),
+                id,
+            )?],
+            None => select_children(&mut snapshot, None, MAX_TREE_NODES + 1, 0)?,
+        };
+        let mut remaining = MAX_TREE_NODES;
+        let roots = tree_nodes(&mut snapshot, roots, 1, &mut remaining, &mut HashSet::new())?;
+        Ok(json!({"roots": roots}))
+    })();
+    match result {
+        Ok(data) => Ok(DoltSuccess { context, data }),
+        Err(error) => Err(DoltFailure::with_context(context, error)),
+    }
+}
+
+fn tree_nodes(
+    snapshot: &mut Snapshot,
+    rows: Vec<AreaRow>,
+    level: usize,
+    remaining: &mut u64,
+    seen: &mut HashSet<String>,
+) -> Result<Vec<Value>, HiveError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The bounded probe can expose a back edge even when no more nodes fit.
+    if rows.iter().any(|(id, ..)| !seen.insert(id.clone())) {
+        return Err(HiveError::new(
+            ErrorCode::InvalidRecord,
+            "The selected Area tree contains a cycle or duplicate Area ID.",
+        ));
+    }
+    if level > MAX_TREE_LEVELS || rows.len() as u64 > *remaining {
+        return Err(HiveError::new(
+            ErrorCode::ContextLimit,
+            format!("Area tree exceeds {MAX_TREE_NODES} nodes or {MAX_TREE_LEVELS} levels."),
+        ));
+    }
+    // Reserve every sibling before descending so the node budget applies to
+    // the whole forest, including rows held by ancestor calls.
+    *remaining -= rows.len() as u64;
+    rows.into_iter()
+        .map(|row| {
+            let mut area = area_value(row)?;
+            let id = area["id"].as_str().expect("validated Area ID");
+            let limit = if level == MAX_TREE_LEVELS {
+                1
+            } else {
+                *remaining + 1
+            };
+            let children = select_children(snapshot, Some(id), limit, 0)?;
+            area["children"] =
+                Value::Array(tree_nodes(snapshot, children, level + 1, remaining, seen)?);
+            Ok(area)
+        })
+        .collect()
 }
 
 pub(crate) fn show(args: &AreaShowArgs) -> Result<DoltSuccess, Box<DoltFailure>> {
@@ -142,25 +224,10 @@ fn list_page(
         None => 0,
     };
 
-    let mut params = Vec::new();
-    let predicate = if let Some(id) = parent {
+    if let Some(id) = parent {
         select_area::<(String,)>(snapshot, "id", id)?;
-        params.push(SqlValue::from(id));
-        "CAST(parent_id AS BINARY) = ?"
-    } else {
-        "parent_id IS NULL"
-    };
-    params.extend([SqlValue::from(limit + 1), SqlValue::from(offset)]);
-    let rows: Vec<AreaRow> = snapshot.exec_rows(
-        |commit| {
-            format!(
-                "SELECT {SUMMARY_COLUMNS}, NULL FROM areas AS OF '{commit}' \
-                 WHERE {predicate} ORDER BY {SORT} LIMIT ? OFFSET ?"
-            )
-        },
-        params,
-    )?;
-
+    }
+    let rows = select_children(snapshot, parent, limit + 1, offset)?;
     let truncated = rows.len() as u64 > limit;
     let mut items = rows
         .into_iter()
@@ -174,6 +241,31 @@ fn list_page(
         "truncated": truncated,
         "observed_revision": snapshot.commit,
     }))
+}
+
+fn select_children(
+    snapshot: &mut Snapshot,
+    parent: Option<&str>,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<AreaRow>, HiveError> {
+    let mut params = Vec::new();
+    let predicate = if let Some(id) = parent {
+        params.push(SqlValue::from(id));
+        "CAST(parent_id AS BINARY) = ?"
+    } else {
+        "parent_id IS NULL"
+    };
+    params.extend([SqlValue::from(limit), SqlValue::from(offset)]);
+    snapshot.exec_rows(
+        |commit| {
+            format!(
+                "SELECT {SUMMARY_COLUMNS}, NULL FROM areas AS OF '{commit}' \
+                 WHERE {predicate} ORDER BY {SORT} LIMIT ? OFFSET ?"
+            )
+        },
+        params,
+    )
 }
 
 fn area_value(row: AreaRow) -> Result<Value, HiveError> {
