@@ -38,7 +38,8 @@ const DIRECTIVE: &str = "01900000-0000-7000-8000-000000000071";
 const RECEIPT: &str = "01900000-0000-7000-8000-000000000081";
 const MALFORMED_RECEIPT: &str = "01900000-0000-7000-8000-000000000082";
 const RESOURCE: &str = "01900000-0000-7000-8000-000000000055";
-const SIBLING_RESOURCE: &str = "01900000-0000-7000-8000-000000000056";
+const SIBLING_RESOURCE: &str = "01900000-0000-7000-8000-000000000057";
+const SIBLING_REPORT: &str = "01900000-0000-7000-8000-000000000058";
 const REPORT: &str = "01900000-0000-7000-8000-000000000053";
 const QUEEN: &str = "01900000-0000-7000-8000-000000000054";
 const GIT_PIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -137,8 +138,10 @@ fn committed_scope_and_resume() {
                 ('{MIXED_ARTIFACT}', 'handoff', 'Mixed', 'fixture mixed handoff', 'fixture-author', 'artifact-r1', '{AT}', '{AT}'),
                 ('01900000-0000-7000-8000-000000000055', 'handoff', 'Second', 'fixture second handoff', 'fixture-author', 'artifact-r1', '{AT}', '{AT}'),
                 ('{THIRD_ARTIFACT}', 'handoff', 'Third', 'fixture third handoff', 'fixture-author', 'artifact-r1', '{AT}', '{AT}'),
-                ('{REPORT}', 'report', 'Report', 'selected report', 'fixture-author', 'report-r1', '{AT}', '{AT}');
+                ('{REPORT}', 'report', 'Report', 'selected report', 'fixture-author', 'report-r1', '{AT}', '{AT}'),
+                ('{SIBLING_REPORT}', 'report', 'Sibling report', 'unrelated report', 'fixture-author', 'report-r1', '{AT}', '{AT}');
          INSERT INTO artifact_issues VALUES ('{ARTIFACT}', '{ARTIFACT_ISSUE}'), ('{MIXED_ARTIFACT}', '{OTHER}'), ('{REPORT}', '{ISSUE}'),
+                ('{SIBLING_REPORT}', '{OTHER}'),
                 ('01900000-0000-7000-8000-000000000055', '{ARTIFACT_ISSUE}'), ('{THIRD_ARTIFACT}', '{ARTIFACT_ISSUE}');
          INSERT INTO artifact_projects VALUES ('{ARTIFACT}', '{PROJECT}');
          INSERT INTO resources VALUES
@@ -146,7 +149,7 @@ fn committed_scope_and_resume() {
              ('{SIBLING_RESOURCE}', 'repository', 'Sibling resource', NULL, 'resource-r1');
          INSERT INTO area_resources VALUES ('{AREA}', '{RESOURCE}'), ('{AREA}', '{SIBLING_RESOURCE}');
          INSERT INTO issue_resources VALUES ('{ISSUE}', '{RESOURCE}'), ('{ARTIFACT_ISSUE}', '{SIBLING_RESOURCE}');
-         INSERT INTO artifact_resources VALUES ('01900000-0000-7000-8000-000000000052', '{RESOURCE}');
+         INSERT INTO artifact_resources VALUES ('{SIBLING_REPORT}', '{RESOURCE}');
          INSERT INTO project_issues VALUES ('{PROJECT}', '{ARTIFACT_ISSUE}');
          INSERT INTO directives (id, scope_kind, area_id, project_id, include_descendants,
              title, body, status, issuer_ref, source_ref, approval_ref, revision, created_at, updated_at)
