@@ -1,10 +1,30 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::cli::ProjectRead;
+use crate::cli::{CommonOptions, ProjectRead, ProjectWrite};
 use crate::error::{ErrorCode, HiveError};
 
 use super::{DoltFailure, DoltSuccess, Snapshot, is_uuid_v7};
+
+#[cfg(target_os = "linux")]
+pub(super) mod planning;
+
+pub(crate) fn write(
+    common: &CommonOptions,
+    command: &ProjectWrite,
+) -> Result<DoltSuccess, Box<DoltFailure>> {
+    #[cfg(target_os = "linux")]
+    let result = planning::write(common, command);
+    #[cfg(not(target_os = "linux"))]
+    let result = {
+        let _ = (common, command);
+        Err(HiveError::new(
+            ErrorCode::NotImplemented,
+            "Project mutations require a verified Linux workspace runtime.",
+        ))
+    };
+    result.map_err(DoltFailure::without_context)
+}
 
 const MAX_PAGE_SIZE: u64 = 100;
 const MEMBER_LIMIT: usize = 25;

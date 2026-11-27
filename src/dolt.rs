@@ -17,6 +17,7 @@ mod directive_receipt;
 mod graph;
 mod issue;
 pub(crate) mod issue_create;
+pub(crate) mod issue_dependency;
 mod issue_list;
 pub(crate) mod issue_note;
 #[cfg(any(test, target_os = "linux"))]
@@ -57,6 +58,7 @@ use crate::error::{ErrorCode, HiveError};
 pub(crate) use issue::show as issue_show;
 pub(crate) use issue_list::{IssueView, list as issue_list};
 pub(crate) use project::read as project_read;
+pub(crate) use project::write as project_write;
 #[cfg(unix)]
 pub(crate) use scope::{ScopeRef, verify_scope};
 

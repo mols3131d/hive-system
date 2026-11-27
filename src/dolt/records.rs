@@ -75,7 +75,7 @@ impl IssueStatus {
         matches!(self, Self::Done | Self::Cancelled)
     }
 
-    fn requires_done_prerequisites(self) -> bool {
+    pub(super) fn requires_done_prerequisites(self) -> bool {
         matches!(self, Self::InProgress | Self::Review | Self::Done)
     }
 }
@@ -154,6 +154,11 @@ impl Diagnostics {
 pub(super) enum RecordReader<'a> {
     Online(&'a mut Snapshot),
     #[cfg(target_os = "linux")]
+    Historical {
+        connection: &'a mut mysql::Conn,
+        commit: &'a str,
+    },
+    #[cfg(target_os = "linux")]
     Offline {
         installed: &'a crate::workspace_init::Installed<'a>,
         db: &'a std::path::Path,
@@ -171,7 +176,7 @@ impl RecordReader<'_> {
         match self {
             Self::Online(snapshot) => snapshot.records(table, columns, order),
             #[cfg(target_os = "linux")]
-            Self::Offline { .. } => {
+            Self::Offline { .. } | Self::Historical { .. } => {
                 let limit = super::MAX_ROWS_PER_TABLE;
                 let rows = self.rows(
                     table,
@@ -198,6 +203,16 @@ impl RecordReader<'_> {
         match self {
             Self::Online(snapshot) => snapshot.rows(table, columns, suffix),
             #[cfg(target_os = "linux")]
+            Self::Historical { connection, commit } => {
+                if !super::is_commit_hash(commit) {
+                    return Err(super::context_workflow::unverified());
+                }
+                super::query_rows(
+                    connection,
+                    format!("SELECT {columns} FROM {table} AS OF '{commit}' {suffix}"),
+                )
+            }
+            #[cfg(target_os = "linux")]
             Self::Offline { installed, db, commit } => installed
                 .query(
                     db,
@@ -216,7 +231,14 @@ impl RecordReader<'_> {
     }
 }
 
-pub(super) fn validate(snapshot: &mut RecordReader<'_>) -> Result<Diagnostics, HiveError> {
+struct WorkGraph {
+    areas: Vec<AreaRow>,
+    issues: Vec<IssueRow>,
+    claims: Vec<ClaimRow>,
+    dependencies: Vec<DependencyRow>,
+}
+
+fn read_work_graph(snapshot: &mut RecordReader<'_>) -> Result<WorkGraph, HiveError> {
     let areas: Vec<_> = snapshot
         .records::<(String, Option<String>, String, bool)>(
             "areas",
@@ -280,6 +302,91 @@ pub(super) fn validate(snapshot: &mut RecordReader<'_>) -> Result<Diagnostics, H
             prerequisite_id,
         })
         .collect();
+    Ok(WorkGraph {
+        areas,
+        issues,
+        claims,
+        dependencies,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn check_dependency_edit(
+    reader: &mut RecordReader<'_>,
+    issue: &str,
+    prerequisite: &str,
+    add: bool,
+) -> Result<(), HiveError> {
+    use crate::error::ErrorCode;
+
+    let WorkGraph {
+        areas,
+        issues,
+        claims,
+        mut dependencies,
+    } = read_work_graph(reader)?;
+    if !validate_rows(&areas, &issues, &claims, &dependencies)
+        .items
+        .is_empty()
+    {
+        return Err(HiveError::new(
+            ErrorCode::InvalidRecord,
+            "The stored Issue graph or lifecycle state is invalid.",
+        ));
+    }
+    let edge = dependencies
+        .iter()
+        .position(|edge| edge.issue_id == issue && edge.prerequisite_id == prerequisite);
+    match (add, edge) {
+        (true, None) => {
+            if dependencies.len() == super::MAX_ROWS_PER_TABLE {
+                return Err(HiveError::new(
+                    ErrorCode::ContextLimit,
+                    "Adding the dependency exceeds the Issue graph limit.",
+                ));
+            }
+            dependencies.push(DependencyRow {
+                issue_id: issue.to_owned(),
+                prerequisite_id: prerequisite.to_owned(),
+            });
+            // The current graph is valid. The added edge can introduce an unmet
+            // prerequisite or a cycle in the prerequisite or completion graph.
+            if !validate_rows(&areas, &issues, &claims, &dependencies)
+                .items
+                .is_empty()
+            {
+                return Err(HiveError::new(
+                    ErrorCode::InvalidTransition,
+                    "The dependency violates the Issue prerequisite or completion graph.",
+                ));
+            }
+        }
+        (false, Some(_)) => {
+            // Removing an edge preserves acyclicity and every remaining obligation.
+        }
+        (true, Some(_)) => {
+            return Err(HiveError::new(
+                ErrorCode::InvalidTransition,
+                "The dependency already exists.",
+            ));
+        }
+        (false, None) => {
+            return Err(HiveError::new(
+                ErrorCode::InvalidTransition,
+                "The dependency does not exist.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate(snapshot: &mut RecordReader<'_>) -> Result<Diagnostics, HiveError> {
+    let WorkGraph {
+        areas,
+        issues,
+        claims,
+        dependencies,
+    } = read_work_graph(snapshot)?;
     let counters = snapshot
         .rows::<(String, String)>(
             "workspace_counters",

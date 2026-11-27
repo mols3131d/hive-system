@@ -17,7 +17,7 @@ use clap::{
 };
 
 pub(crate) use conversation_v2::{ConversationImportArgs, ConversationListArgs};
-pub(crate) use project_v2::ProjectRead;
+pub(crate) use project_v2::{ProjectRead, ProjectWrite};
 
 pub(crate) struct Invocation {
     pub(crate) common: CommonOptions,
@@ -236,6 +236,8 @@ pub(crate) enum Command {
     Project(ProjectCommand),
     #[command(skip)]
     ProjectRead(ProjectRead),
+    #[command(skip)]
+    ProjectWrite(ProjectWrite),
     /// Read or manage task records.
     #[command(subcommand)]
     Task(TaskCommand),
@@ -271,6 +273,8 @@ pub(crate) enum Command {
     IssueSelect(IssueTransitionArgs),
     #[command(skip)]
     IssueClaim(IssueClaimArgs),
+    #[command(skip)]
+    IssueDependency(IssueDependencyArgs, bool),
     #[command(skip)]
     Resource(ResourceCommand),
     #[command(skip)]
@@ -825,6 +829,9 @@ pub(crate) enum DirectiveStatus {
 
 #[derive(Subcommand)]
 pub(crate) enum BotCommand {
+    /// Register a Queen from a reviewed, committed Soul (contract 2).
+    #[command(hide = true)]
+    Register(BotRegisterArgs),
     /// List registered Manager Bots.
     List {
         #[command(flatten)]
@@ -848,6 +855,27 @@ pub(crate) enum BotCommand {
         #[command(flatten)]
         target: DoltTargetArgs,
     },
+}
+
+#[derive(Args)]
+pub(crate) struct BotRegisterArgs {
+    /// Canonical lowercase kebab-case registry slug.
+    #[arg(long)]
+    pub(crate) slug: String,
+    #[arg(long)]
+    pub(crate) name: String,
+    /// Exact lowercase Git commit object ID of the clean asset HEAD.
+    #[arg(long, value_name = "REV")]
+    pub(crate) asset_revision: String,
+    #[arg(long)]
+    pub(crate) actor: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Subcommand)]
@@ -980,6 +1008,31 @@ pub(crate) enum AreaCommand {
     Tree(AreaTreeArgs),
     /// Show one committed Area.
     Show(AreaShowArgs),
+    /// Create a root Area or a direct child of an explicit parent.
+    Create(AreaCreateArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct AreaCreateArgs {
+    #[arg(long)]
+    pub(crate) slug: String,
+    #[arg(long)]
+    pub(crate) name: String,
+    /// Exact parent UUIDv7. Omit for a root Area.
+    #[arg(long)]
+    pub(crate) parent: Option<String>,
+    /// Expected revision of the selected parent as PARENT=REV.
+    #[arg(long)]
+    pub(crate) if_match: Option<String>,
+    #[arg(long)]
+    pub(crate) actor: String,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Current request-bound operator decision.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
 }
 
 #[derive(Args)]
@@ -1212,6 +1265,32 @@ pub(crate) struct IssueTransitionArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct IssueDependencyArgs {
+    /// Exact dependent Issue UUIDv7.
+    pub(crate) issue: String,
+    /// Exact prerequisite Issue UUIDv7.
+    pub(crate) prerequisite: String,
+    /// Exact owning Area UUIDv7 of the dependent Issue.
+    #[arg(long)]
+    pub(crate) area: String,
+    /// Exact owning Area UUIDv7 of the prerequisite Issue.
+    #[arg(long)]
+    pub(crate) prerequisite_area: String,
+    #[arg(long)]
+    pub(crate) actor: String,
+    /// Expected revision as ISSUE=REV, once per endpoint.
+    #[arg(long, num_args = 1, required = true)]
+    pub(crate) if_match: Vec<String>,
+    #[arg(long)]
+    pub(crate) request_id: String,
+    /// Fresh, request-bound decision file covering both endpoints.
+    #[arg(long)]
+    pub(crate) evidence_file: PathBuf,
+    #[command(flatten)]
+    pub(crate) target: DoltTargetArgs,
+}
+
+#[derive(Args)]
 pub(crate) struct IssueClaimArgs {
     #[command(flatten)]
     pub(crate) transition: IssueTransitionArgs,
@@ -1282,6 +1361,9 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
     for domain in ["bot", "directive"] {
         cli = cli.mut_subcommand(domain, |command| {
             command.mut_subcommands(|leaf| {
+                if leaf.get_name() == "register" {
+                    return leaf;
+                }
                 leaf.mut_args(|arg| match arg.get_id().as_str() {
                     "workspace_id" | "database" | "port" => arg.hide(true),
                     _ => arg,
@@ -1358,6 +1440,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
             let partial = extension_matches
                 .or(config_error_matches)
                 .or(area_matches)
+                .or_else(|| retry_area_create_failure(&cli, &args, error.kind()))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "bot"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "directive"))
                 .or_else(|| retry_scoped_read_failure(&cli, &args, &error, "context"))
@@ -1371,6 +1454,7 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                         .try_get_matches_from(&args)
                         .ok()?;
                     recover_unknown_long(&cli, &args, &partial, &error, "workspace")
+                        .or_else(|| recover_unknown_long(&cli, &args, &partial, &error, "area"))
                         .or_else(|| recover_context_resolve(&cli, &args, &partial, &error))
                         .or(Some(partial))
                 });
@@ -1457,6 +1541,18 @@ pub(crate) fn parse() -> Result<Invocation, ParseFailure> {
                 Command::IssueClaim(
                     IssueClaimArgs::from_arg_matches(leaf)
                         .map_err(|error| safe_parse_message(error.kind()))?,
+                )
+            }
+            Some(("issue", issue))
+                if matches!(
+                    issue.subcommand_name(),
+                    Some("add-dependency" | "remove-dependency")
+                ) =>
+            {
+                Command::IssueDependency(
+                    IssueDependencyArgs::from_arg_matches(leaf)
+                        .map_err(|error| safe_parse_message(error.kind()))?,
+                    issue.subcommand_name() == Some("add-dependency"),
                 )
             }
             Some(("resource", resource)) => Command::Resource(
@@ -1953,14 +2049,26 @@ fn recover_unknown_long(
         return None;
     }
     let (action, _) = matched.subcommand()?;
-    if !matches!(
+    let named_write = matches!((domain, action), ("area" | "project", "create"));
+    let positional_write = matches!(
         (domain, action),
-        (
-            "workspace",
-            "init" | "status" | "start" | "stop" | "recover"
-        ) | ("artifact", "create")
-            | (_, "list" | "show")
-    ) {
+        ("project", "add-issue")
+            | (
+                "issue",
+                "add-dependency" | "remove-dependency" | "select" | "claim"
+            )
+    );
+    if !(named_write
+        || positional_write
+        || matches!(
+            (domain, action),
+            (
+                "workspace",
+                "init" | "status" | "start" | "stop" | "recover"
+            ) | ("artifact", "create")
+                | (_, "list" | "show")
+        ))
+    {
         return None;
     }
     let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
@@ -1969,32 +2077,38 @@ fn recover_unknown_long(
     let leaf = cli.find_subcommand(domain)?.find_subcommand(action)?;
     let long = unknown_long_name(leaf, invalid)?;
 
-    // Let Clap replay the original tokens. These selected leaves take no
-    // positionals, so the temporary option can take one plain separated
-    // value. The original parse error still determines the result.
     let workspace_init = (domain, action) == ("workspace", "init");
-    let allow_separated_value =
-        workspace_init || matches!((domain, action), ("label", "list") | ("artifact", "create"));
+    let allow_incomplete = named_write || positional_write;
+    let accept_value = workspace_init
+        || named_write
+        || matches!((domain, action), ("label", "list") | ("artifact", "create"));
+    // When the command has positional IDs, first let those slots consume
+    // ordinary tokens. Try a separated unknown-option value if that fails.
+    let modes: &[bool] = if positional_write {
+        &[false, true]
+    } else {
+        &[accept_value]
+    };
     const UNKNOWN_LONG: &str = "recovered_unknown_long";
-    let retry = cli.clone().mut_subcommand(domain, |command| {
-        command.mut_subcommand(action, |leaf| {
-            // A missing init target must not prevent recovery of the original
-            // unknown-option error and its explicit output flags.
-            let leaf = if workspace_init {
-                leaf.mut_arg("target", |arg| arg.required(false))
-            } else {
-                leaf
-            };
-            leaf.arg(
-                Arg::new(UNKNOWN_LONG)
-                    .long(long.to_owned())
-                    .num_args(0..=1)
-                    .require_equals(!allow_separated_value)
-                    .value_parser(OsStringValueParser::new())
-                    .hide(true),
-            )
+    let build_retry = |accept_value: bool| {
+        cli.clone().mut_subcommand(domain, |command| {
+            command.mut_subcommand(action, |leaf| {
+                let leaf = if workspace_init {
+                    leaf.mut_arg("target", |arg| arg.required(false))
+                } else {
+                    leaf
+                };
+                leaf.arg(
+                    Arg::new(UNKNOWN_LONG)
+                        .long(long.to_owned())
+                        .num_args(0..=1)
+                        .require_equals(!accept_value)
+                        .value_parser(OsStringValueParser::new())
+                        .hide(true),
+                )
+            })
         })
-    });
+    };
     let end = if workspace_init {
         args.iter()
             .enumerate()
@@ -2004,11 +2118,32 @@ fn recover_unknown_long(
     } else {
         args.len()
     };
-    let matches = retry.try_get_matches_from(&args[..end]).ok()?;
-    let recovered = matches
-        .subcommand_matches(domain)?
-        .subcommand_matches(action)?;
-    (recovered.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine)).then_some(matches)
+    let recognized = |matches: &ArgMatches| {
+        matches
+            .subcommand_matches(domain)
+            .and_then(|command| command.subcommand_matches(action))
+            .is_some_and(|leaf| leaf.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine))
+    };
+    let mut missing = None;
+    for &accept_value in modes {
+        let retry = build_retry(accept_value);
+        match retry.clone().try_get_matches_from(&args[..end]) {
+            Ok(matches) if recognized(&matches) => return Some(matches),
+            Err(error)
+                if allow_incomplete
+                    && missing.is_none()
+                    && error.kind() == ErrorKind::MissingRequiredArgument =>
+            {
+                missing = retry
+                    .ignore_errors(true)
+                    .try_get_matches_from(&args[..end])
+                    .ok()
+                    .filter(recognized);
+            }
+            _ => {}
+        }
+    }
+    missing
 }
 
 struct ExtendedParse {
@@ -2042,6 +2177,13 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
             .subcommand(add_leaf_options(IssueClaimArgs::augment_args(
                 clap::Command::new("claim").about("Record an exclusive Claim for a ready Issue."),
             )))
+            .subcommand(add_leaf_options(IssueDependencyArgs::augment_args(
+                clap::Command::new("add-dependency").about("Add an exact Issue prerequisite."),
+            )))
+            .subcommand(add_leaf_options(IssueDependencyArgs::augment_args(
+                clap::Command::new("remove-dependency")
+                    .about("Remove an exact Issue prerequisite."),
+            )))
     });
     // Probe contract selection through Clap so a file name or an actor that
     // resembles a switch does not introduce the new leaf into the v1 grammar.
@@ -2053,6 +2195,8 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
                 .mut_subcommand("update", extended_error_options)
                 .mut_subcommand("select", extended_error_options)
                 .mut_subcommand("claim", extended_error_options)
+                .mut_subcommand("add-dependency", extended_error_options)
+                .mut_subcommand("remove-dependency", extended_error_options)
         });
     let partial = match recovery.clone().try_get_matches_from(args) {
         Ok(matches) => matches,
@@ -2067,7 +2211,11 @@ fn issue_writer_parser(cli: &clap::Command, args: &[OsString]) -> Option<Extende
     };
     let leaf = match partial.subcommand() {
         Some(("issue", issue)) => match issue.subcommand() {
-            Some(("note" | "create" | "update" | "select" | "claim", leaf)) => Some(leaf),
+            Some((
+                "note" | "create" | "update" | "select" | "claim" | "add-dependency"
+                | "remove-dependency",
+                leaf,
+            )) => Some(leaf),
             None => None,
             _ => return None,
         },
@@ -2535,6 +2683,54 @@ fn retry_conversation_failure(
         .then_some(matches)
 }
 
+fn retry_area_create_failure(
+    cli: &clap::Command,
+    args: &[OsString],
+    kind: ErrorKind,
+) -> Option<ArgMatches> {
+    if !matches!(
+        kind,
+        ErrorKind::ValueValidation
+            | ErrorKind::InvalidValue
+            | ErrorKind::ArgumentConflict
+            | ErrorKind::UnknownArgument
+            | ErrorKind::TooManyValues
+            | ErrorKind::InvalidUtf8
+    ) {
+        return None;
+    }
+    let recover_values = |command| {
+        extended_error_options(command).mut_args(|arg| {
+            if arg.get_long().is_some()
+                && !matches!(
+                    arg.get_id().as_str(),
+                    "contract" | "format" | "json" | "extended_help_probe"
+                )
+            {
+                arg.value_parser(OsStringValueParser::new())
+            } else {
+                arg
+            }
+        })
+    };
+    let retry =
+        recover_values(cli.clone().disable_help_subcommand(true)).mut_subcommand("area", |area| {
+            extended_help_probe(area).mut_subcommand("create", |create| {
+                recover_values(create).arg(
+                    Arg::new("area_create_extra_values")
+                        .num_args(0..)
+                        .action(ArgAction::Append)
+                        .value_parser(OsStringValueParser::new())
+                        .hide(true),
+                )
+            })
+        });
+    let matches = retry.try_get_matches_from(args).ok()?;
+    let (command, leaf) = matched_leaf(cli, &matches)?;
+    (command == "area create" && requested_contract(Some(&matches), Some(leaf)) == Contract::V2)
+        .then_some(matches)
+}
+
 fn retry_area_read(cli: &clap::Command, args: &[OsString]) -> Option<ArgMatches> {
     // Recover the output options for the original error. A forbidden Project
     // or negative cursor can stop the initial parse before it sees them.
@@ -2937,6 +3133,22 @@ impl Command {
                     }
                     Ok(())
                 }
+                Self::IssueDependency(args, _) => {
+                    if common.workspace.is_none() || !args.target.has_all() {
+                        return Err(
+                            "Issue dependency edits require --workspace, --workspace-id, --database, and --port.",
+                        );
+                    }
+                    if common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree)
+                    {
+                        return Err(
+                            "Issue dependency edits require exact current Issue and Area scopes.",
+                        );
+                    }
+                    Ok(())
+                }
                 Self::IssueNote(args) => {
                     if args.kind != "progress" {
                         return Err("Issue note requires --kind progress.");
@@ -3035,7 +3247,8 @@ impl Command {
             | Self::IssueCreate(_)
             | Self::IssueUpdate(_)
             | Self::IssueSelect(_)
-            | Self::IssueClaim(_) => Err("Issue commands require --contract 2."),
+            | Self::IssueClaim(_)
+            | Self::IssueDependency(_, _) => Err("Issue commands require --contract 2."),
             Self::Backup(_) => Err("Backup commands require --contract 2."),
             Self::Workspace(_) => Err("Workspace commands require --contract 2."),
             Self::Conversation(_) => Err("Conversation commands require --contract 2."),
@@ -3106,6 +3319,20 @@ impl DirectiveCommand {
 impl BotCommand {
     fn validate(&self, common: &CommonOptions) -> Result<(), &'static str> {
         let target = match self {
+            Self::Register(args) => {
+                if common.contract != Contract::V2 {
+                    return Err("Bot register requires --contract 2.");
+                }
+                if common.workspace.is_none() || !args.target.has_all() {
+                    return Err(
+                        "Bot register requires --workspace, --workspace-id, --database, and --port.",
+                    );
+                }
+                if common.project.is_some() || common.project_root.is_some() {
+                    return Err("Bot register applies to the selected workspace.");
+                }
+                return common.require_working_tree();
+            }
             Self::List { target, .. } | Self::Show { target, .. } => target,
         };
         if common.contract == Contract::V1 {
@@ -3212,6 +3439,20 @@ impl AreaCommand {
             Self::List(args) => &args.target,
             Self::Tree(args) => &args.target,
             Self::Show(args) => &args.target,
+            Self::Create(args) => {
+                if common.workspace.is_none() || !args.target.has_all() {
+                    return Err(
+                        "Area create requires --workspace, --workspace-id, --database, and --port.",
+                    );
+                }
+                if common.project.is_some()
+                    || common.project_root.is_some()
+                    || !matches!(common.view, View::WorkingTree)
+                {
+                    return Err("Area create requires explicit workspace or exact parent scope.");
+                }
+                return Ok(());
+            }
         };
         target.validate_common(
             common,

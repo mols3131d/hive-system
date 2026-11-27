@@ -165,12 +165,15 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         Command::Area(AreaCommand::List(args)) => dolt::area::list(&args),
         Command::Area(AreaCommand::Tree(args)) => dolt::area::tree(&args),
         Command::Area(AreaCommand::Show(args)) => dolt::area::show(&args),
+        Command::Area(AreaCommand::Create(args)) => dolt::area::create(&invocation.common, &args),
         Command::Label(cli::LabelCommand::List(args)) => {
             dolt::label::list(&args, invocation.common.project.as_ref())
         }
         Command::Resource(ResourceCommand::List(args)) => dolt::resource::list(&args),
         Command::Resource(ResourceCommand::Show(args)) => dolt::resource::show(&args),
         Command::ProjectRead(args) => dolt::project_read(&args),
+        Command::ProjectWrite(args) => dolt::project_write(&invocation.common, &args),
+        Command::Bot(BotCommand::Register(args)) => dolt::bot::register(&invocation.common, &args),
         Command::Bot(BotCommand::List {
             target,
             status,
@@ -215,6 +218,9 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
         }
         Command::IssueClaim(args) => {
             dolt::issue_transition::write(&invocation.common, &args.transition, Some(&args.holder))
+        }
+        Command::IssueDependency(args, add) => {
+            dolt::issue_dependency::write(&invocation.common, &args, add)
         }
         Command::ConversationImport(args) => dolt::conversation_import(&invocation.common, &args),
         Command::Conversation(ConversationCommand::Show(args)) => {

@@ -358,6 +358,10 @@ impl<'a> PinnedAssets<'a> {
         Ok(pinned)
     }
 
+    pub(crate) fn read_blob(&self, relative: &Path) -> Result<Option<Vec<u8>>, HiveError> {
+        self.repository.read(self.revision, relative)
+    }
+
     pub(crate) fn recheck(&self) -> Result<(), HiveError> {
         self.check_status(false)
     }
