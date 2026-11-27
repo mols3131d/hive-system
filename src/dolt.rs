@@ -1,3 +1,4 @@
+pub(crate) mod area;
 mod graph;
 mod issue;
 mod issue_list;
