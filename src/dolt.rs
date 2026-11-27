@@ -1,4 +1,5 @@
 pub(crate) mod area;
+pub(crate) mod bot;
 #[cfg(unix)]
 pub(crate) mod conversation;
 #[cfg(not(unix))]
