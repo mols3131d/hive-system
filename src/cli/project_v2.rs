@@ -1,6 +1,11 @@
 use std::ffi::OsString;
 
-use clap::{Arg, ArgAction, Args, FromArgMatches, Subcommand};
+use clap::{
+    Arg, ArgAction, ArgMatches, Args, FromArgMatches, Subcommand,
+    builder::OsStringValueParser,
+    error::{ContextKind, ContextValue, ErrorKind},
+    parser::ValueSource,
+};
 
 use super::{
     Command, CommonArgs, Contract, DoltTargetArgs, Invocation, ParseFailure, matched_leaf,
@@ -57,21 +62,23 @@ pub(super) fn parse(
     }
     // Both grammars use Clap so values and the -- delimiter retain their
     // meaning. Opt into the replacement only after parsing contract 2.
-    let mut cli = legacy.clone().mut_subcommand("project", |_| {
+    let cli = legacy.clone().mut_subcommand("project", |_| {
         ProjectRead::augment_subcommands(
             clap::Command::new("project").about("Inspect committed Projects."),
         )
         .mut_subcommands(add_options)
     });
-    let (matches, parse_error) = match cli.try_get_matches_from_mut(args) {
+    let (matches, parse_error) = match cli.clone().try_get_matches_from(args) {
         Ok(matches) => (matches, None),
-        Err(error) => (
-            cli.clone()
+        Err(error) => {
+            let partial = cli
+                .clone()
                 .ignore_errors(true)
                 .try_get_matches_from(args)
-                .ok()?,
-            Some(error.kind()),
-        ),
+                .ok()?;
+            let matches = recover_unknown_long(&cli, args, &partial, &error).unwrap_or(partial);
+            (matches, Some(error.kind()))
+        }
     };
     let (name, leaf) = matched_leaf(&cli, &matches)?;
     if !matches!(name.as_str(), "project list" | "project show")
@@ -124,6 +131,62 @@ pub(super) fn parse(
         command: Some(name),
         message: message.to_owned(),
     }))
+}
+
+fn recover_unknown_long(
+    cli: &clap::Command,
+    args: &[OsString],
+    partial: &ArgMatches,
+    error: &clap::Error,
+) -> Option<ArgMatches> {
+    if error.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    let (action @ ("list" | "show"), _) = partial.subcommand_matches("project")?.subcommand()?
+    else {
+        return None;
+    };
+    let Some(ContextValue::String(invalid)) = error.get(ContextKind::InvalidArg) else {
+        return None;
+    };
+    let long = invalid.strip_prefix("--")?.split('=').next()?;
+    if !long.starts_with(|ch: char| ch.is_ascii_alphanumeric())
+        || !long
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    let leaf = cli.find_subcommand("project")?.find_subcommand(action)?;
+    if leaf.get_arguments().any(|arg| {
+        arg.get_long() == Some(long)
+            || arg
+                .get_all_aliases()
+                .is_some_and(|aliases| aliases.contains(&long))
+    }) {
+        return None;
+    }
+
+    // Let Clap replay the original tokens. The temporary option can take an
+    // attached value, and the original parse error still determines the result.
+    const UNKNOWN_LONG: &str = "unknown_project_long";
+    let retry = cli.clone().mut_subcommand("project", |project| {
+        project.mut_subcommand(action, |leaf| {
+            leaf.arg(
+                Arg::new(UNKNOWN_LONG)
+                    .long(long.to_owned())
+                    .num_args(0..=1)
+                    .require_equals(true)
+                    .value_parser(OsStringValueParser::new())
+                    .hide(true),
+            )
+        })
+    });
+    let matches = retry.try_get_matches_from(args).ok()?;
+    let recovered = matches
+        .subcommand_matches("project")?
+        .subcommand_matches(action)?;
+    (recovered.value_source(UNKNOWN_LONG) == Some(ValueSource::CommandLine)).then_some(matches)
 }
 
 fn add_options(command: clap::Command) -> clap::Command {

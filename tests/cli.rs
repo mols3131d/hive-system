@@ -1191,3 +1191,159 @@ fn project_reads_parse_late_v2_flags_and_preserve_literal_values() {
     assert!(output.stderr.is_empty());
     sandbox.assert_empty();
 }
+
+#[test]
+fn unknown_project_long_option_keeps_original_error_with_late_v2_json() {
+    let sandbox = Sandbox::new();
+    for (command, args) in [
+        (
+            "project list",
+            &["project", "list", "--unknown", "--contract=2", "--json"][..],
+        ),
+        (
+            "project list",
+            &[
+                "project",
+                "list",
+                "--unknown",
+                "--limit",
+                "0",
+                "--contract=2",
+                "--json",
+            ],
+        ),
+        (
+            "project list",
+            &[
+                "project",
+                "list",
+                "--unknown=--contract=1",
+                "--contract=2",
+                "--json",
+            ],
+        ),
+        (
+            "project list",
+            &[
+                "project",
+                "list",
+                "--unknown=--help",
+                "--contract=2",
+                "--json",
+            ],
+        ),
+        (
+            "project show",
+            &[
+                "project",
+                "show",
+                "--unknown=--json",
+                "01900000-0000-7000-8000-000000000003",
+                "--contract",
+                "2",
+                "--format=json",
+            ],
+        ),
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "schema_version": 2, "ok": false, "command": command,
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "An argument or command is not recognized.",
+                },
+                "warnings": [],
+            }),
+            "{args:?}",
+        );
+    }
+    sandbox.assert_empty();
+}
+
+#[test]
+fn unknown_project_long_option_recovery_keeps_literals_and_legacy_boundaries() {
+    let sandbox = Sandbox::new();
+    for args in [
+        &["project", "list", "--unknown=--json", "--contract=2"][..],
+        &[
+            "project",
+            "list",
+            "--status=--json",
+            "--unknown",
+            "--contract=2",
+        ],
+        &[
+            "project",
+            "list",
+            "--unknown",
+            "--contract=2",
+            "--",
+            "--json",
+        ],
+        &[
+            "project",
+            "show",
+            "--unknown",
+            "--contract=2",
+            "--",
+            "--json",
+        ],
+        &[
+            "project",
+            "list",
+            "--",
+            "--unknown",
+            "--contract=2",
+            "--json",
+        ],
+        &[
+            "project",
+            "list",
+            "--unknown",
+            "value",
+            "--contract=2",
+            "--json",
+        ],
+        &["--unknown", "project", "list", "--contract=2", "--json"],
+    ] {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            output
+                .stderr
+                .starts_with(b"error: An argument or command is not recognized.\n"),
+            "{args:?}",
+        );
+    }
+    for args in [
+        &["--json", "project", "list", "--unknown=--contract=2"][..],
+        &[
+            "--json",
+            "project",
+            "show",
+            "--unknown",
+            "--",
+            "--contract=2",
+        ],
+    ] {
+        let output = sandbox.run(args);
+        let explicit_v1 = sandbox.run(&[&["--contract", "1"][..], args].concat());
+        assert_json_failure(
+            &output,
+            args,
+            &format!("project {}", args[2]),
+            "INVALID_ARGUMENT",
+            2,
+        );
+        assert_eq!(output.status.code(), explicit_v1.status.code(), "{args:?}");
+        assert_eq!(output.stdout, explicit_v1.stdout, "{args:?}");
+        assert_eq!(output.stderr, explicit_v1.stderr, "{args:?}");
+    }
+    sandbox.assert_empty();
+}
