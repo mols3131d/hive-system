@@ -9,6 +9,8 @@ pub(crate) mod context_resolve;
 mod context_workflow;
 #[cfg(unix)]
 mod conversation;
+#[cfg(target_os = "linux")]
+pub(crate) use conversation::archive as conversation_archive;
 pub(crate) mod directive;
 #[cfg(any(test, target_os = "linux"))]
 mod directive_receipt;
@@ -205,13 +207,13 @@ pub(crate) fn validate(args: &ValidateArgs) -> Result<DoltSuccess, Box<DoltFailu
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn validate_restored_records<T: AsRef<[u8]>>(
+pub(crate) fn validate_restored_records(
     installed: &crate::workspace_init::Installed<'_>,
     db: &std::path::Path,
     commit: &str,
     workspace_id: &str,
-    read_soul_blob: impl FnMut(&str) -> Result<T, HiveError>,
-) -> Result<(), HiveError> {
+    read_soul_blob: impl FnMut(&str) -> Result<Vec<u8>, HiveError>,
+) -> Result<std::collections::BTreeMap<String, String>, HiveError> {
     let mut reader = records::RecordReader::Offline {
         installed,
         db,
@@ -234,7 +236,7 @@ pub(crate) fn validate_backup_souls(
     commit: &str,
     workspace_id: &str,
     read_soul_blob: impl FnMut(&str) -> Result<Vec<u8>, HiveError>,
-) -> Result<(), HiveError> {
+) -> Result<std::collections::BTreeMap<String, String>, HiveError> {
     let mut reader = records::RecordReader::Offline {
         installed,
         db,
