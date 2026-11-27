@@ -1424,7 +1424,14 @@ Two lines.
     execute(assets(&asset_root).args(["commit", "-m", "Revise synthetic Soul"]));
     let previous = initial["db_commit"].as_str().unwrap();
     let changes = format!(
-        "UPDATE workspace_counters SET next_value = 42 WHERE name = 'issue_number';
+        "UPDATE workspace_counters SET next_value = 18446744073709551615 WHERE name = 'issue_number';
+         INSERT INTO areas (id, slug, name, revision)
+         VALUES ('01900000-0000-7000-8000-000000000007', 'synthetic', 'Synthetic Area',
+           '01900000-0000-7000-8000-000000000008');
+         INSERT INTO issues (id, number, area_id, title, type, status, revision, created_at, updated_at)
+         VALUES ('01900000-0000-7000-8000-000000000009', 18446744073709551614,
+           '01900000-0000-7000-8000-000000000007', 'Synthetic Issue', 'task', 'todo',
+           '01900000-0000-7000-8000-00000000000a', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6));
          INSERT INTO bots VALUES ('01900000-0000-7000-8000-000000000001', 'synthetic',
            'Synthetic Queen', '01900000-0000-7000-8000-000000000002', NULL);
          INSERT INTO resources VALUES ('01900000-0000-7000-8000-000000000003', 'reference',
@@ -1882,7 +1889,8 @@ Two lines.
 
     let verify = format!(
         "SELECT DOLT_HASHOF('HEAD') AS revision,
-           (SELECT next_value FROM workspace_counters) AS current_value,
+           (SELECT CAST(next_value AS CHAR) FROM workspace_counters) AS current_value,
+           (SELECT CAST(number AS CHAR) FROM issues) AS issue_number,
            (SELECT next_value FROM workspace_counters AS OF '{previous}') AS prior_value,
            (SELECT request_id FROM operation_receipts) AS current_receipt,
            (SELECT request_id FROM operation_receipts AS OF '{receipt_commit}') AS past_receipt"
@@ -1892,7 +1900,8 @@ Two lines.
     ))
     .unwrap();
     assert_eq!(rows["rows"][0]["revision"], manifest["dolt_commit"]);
-    assert_eq!(rows["rows"][0]["current_value"], 42);
+    assert_eq!(rows["rows"][0]["current_value"], "18446744073709551615");
+    assert_eq!(rows["rows"][0]["issue_number"], "18446744073709551614");
     assert_eq!(rows["rows"][0]["prior_value"], 1);
     assert_eq!(
         rows["rows"][0]["current_receipt"],
