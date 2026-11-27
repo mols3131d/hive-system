@@ -12,7 +12,9 @@ use crate::error::{ErrorCode, HiveError};
 pub(crate) use filesystem::open_regular_child;
 pub(crate) use filesystem::read_scoped;
 #[cfg(unix)]
-pub(crate) use filesystem::{ScopedDirectory, read_regular};
+pub(crate) use filesystem::{
+    ScopedDirectory, has_nonempty_regular, open_scoped_directory, read_regular,
+};
 
 pub(crate) const MAX_FILE_BYTES: usize = 64 * 1024;
 const MAX_YAML_DEPTH: usize = 8;
@@ -325,40 +327,43 @@ mod filesystem {
         name: &OsStr,
         directories: &[&OsStr],
     ) -> Result<Option<File>, HiveError> {
-        let child_directory = open_scoped_directory(directory, directories)?;
-        let Some(child_directory) = child_directory
-            .as_ref()
-            .or_else(|| directories.is_empty().then_some(directory))
-        else {
+        let Some((first, rest)) = directories.split_first() else {
+            return open_child(directory, name, libc::O_NONBLOCK);
+        };
+        let Some(parent) = open_scoped_directory(directory, first, rest)? else {
             return Ok(None);
         };
-        open_child(child_directory, name, libc::O_NONBLOCK)
+        open_child(&parent, name, libc::O_NONBLOCK)
     }
 
-    fn open_scoped_directory(
-        directory: &File,
-        directories: &[&OsStr],
+    pub(crate) fn open_scoped_directory(
+        directory: &impl AsRawFd,
+        first: &OsStr,
+        rest: &[&OsStr],
     ) -> Result<Option<File>, HiveError> {
         // Open each child relative to the descriptor so replacing a path component
         // cannot redirect a subsequent open through a symlink.
-        let mut child_directory = None;
-        for component in directories {
-            let Some(child) = open_child(
-                child_directory.as_ref().unwrap_or(directory),
-                component,
-                libc::O_DIRECTORY,
-            )?
-            else {
+        let Some(mut current) = open_child(directory, first, libc::O_DIRECTORY)? else {
+            return Ok(None);
+        };
+        for component in rest {
+            let Some(child) = open_child(&current, component, libc::O_DIRECTORY)? else {
                 return Ok(None);
             };
-            child_directory = Some(child);
+            current = child;
         }
-        Ok(child_directory)
+        Ok(Some(current))
     }
 
     pub(crate) struct ScopedDirectory {
         file: File,
         pub(crate) path: PathBuf,
+    }
+
+    impl AsRawFd for ScopedDirectory {
+        fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            self.file.as_raw_fd()
+        }
     }
 
     impl ScopedDirectory {
@@ -519,25 +524,7 @@ mod filesystem {
         }
 
         pub(crate) fn contains(&self, name: &std::ffi::CStr) -> Result<bool, HiveError> {
-            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-            // SAFETY: The directory descriptor, name, and output buffer are valid.
-            let result = unsafe {
-                libc::fstatat(
-                    self.file.as_raw_fd(),
-                    name.as_ptr(),
-                    metadata.as_mut_ptr(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if result == 0 {
-                return Ok(true);
-            }
-            let error = Error::last_os_error();
-            if error.kind() == ErrorKind::NotFound {
-                Ok(false)
-            } else {
-                Err(read_error(error))
-            }
+            Ok(scoped_metadata(&self.file, name)?.is_some())
         }
 
         pub(crate) fn read(&self, name: &OsStr) -> Result<Option<Vec<u8>>, HiveError> {
@@ -546,12 +533,30 @@ mod filesystem {
                 .transpose()
         }
 
+        pub(crate) fn try_lock_shared(&self) -> Result<(), HiveError> {
+            // SAFETY: The candidate retains its directory descriptor.
+            if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+                return Ok(());
+            }
+            let error = Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(HiveError::new(
+                    ErrorCode::ConcurrentChange,
+                    "Workspace initialization is still being verified.",
+                ));
+            }
+            Err(read_error(error))
+        }
+
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         pub(crate) fn open_directory(
             &self,
             components: &[&OsStr],
         ) -> Result<Option<File>, HiveError> {
-            open_scoped_directory(&self.file, components)
+            let Some((first, rest)) = components.split_first() else {
+                return Ok(None);
+            };
+            open_scoped_directory(&self.file, first, rest)
         }
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -575,8 +580,43 @@ mod filesystem {
         }
     }
 
-    fn open_child(
+    pub(crate) fn has_nonempty_regular(
         directory: &File,
+        name: &std::ffi::CStr,
+    ) -> Result<bool, HiveError> {
+        Ok(scoped_metadata(directory, name)?.is_some_and(|metadata| {
+            metadata.st_mode & libc::S_IFMT == libc::S_IFREG && metadata.st_size > 0
+        }))
+    }
+
+    fn scoped_metadata(
+        directory: &File,
+        name: &std::ffi::CStr,
+    ) -> Result<Option<libc::stat>, HiveError> {
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: The directory descriptor, name, and output buffer are valid.
+        let result = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == 0 {
+            // SAFETY: fstatat initialized the structure.
+            return Ok(Some(unsafe { metadata.assume_init() }));
+        }
+        let error = Error::last_os_error();
+        if error.kind() == ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(read_error(error))
+        }
+    }
+
+    fn open_child(
+        directory: &impl AsRawFd,
         name: &OsStr,
         flags: libc::c_int,
     ) -> Result<Option<File>, HiveError> {

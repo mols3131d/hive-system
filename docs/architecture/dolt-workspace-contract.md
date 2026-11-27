@@ -6,6 +6,8 @@ description: "Use when implementing or verifying Dolt v2 workspace layout, descr
 
 This document specifies the Dolt v2 local filesystem layout, workspace descriptor, XDG configuration, local Area/resource bindings, canonical asset root, runtime state, and private Queen conversation storage for `#22`, `#18`, and `#20` against approved baseline `c66b3c50150e18426485d134de92c6b311dac125`. Existing workspaces continue under their [pinned v1 contracts](README.md#v1-compatibility). Migration mapping, live migration, and an authority switch are out of scope and require separate explicit approval.
 
+The Rust CLI supports [descriptor inspection](../development/README.md#dolt-workspace-descriptor-inspection), [inactive workspace initialization](../development/README.md#dolt-workspace-initialization), and [offline workspace status](#workspace-status).
+
 Read this with the [Dolt v2 architecture](dolt-redesign.md), [MVP contract](dolt-mvp-contract.md), and [relational schema](dolt-schema.md).
 
 ## Contract selection and XDG layout
@@ -49,7 +51,7 @@ A v2 workspace root (`<workspace-root>/`) separates the nonsecret descriptor, au
 ```
 
 - `db/` and `conversations/` must never be tracked in ordinary Git worktrees or placed inside `assets/`.
-- Credentials, local endpoints, PIDs, locks, recovery markers, and machine-local bindings must never be stored inside `<workspace-root>/` or any shared/tracked file.
+- Credentials, local endpoints, PIDs, runtime locks, runtime recovery markers, and machine-local bindings must never be stored inside `<workspace-root>/` or any shared/tracked file.
 
 ## Shared YAML and filesystem validation
 
@@ -78,8 +80,11 @@ policy_revision: c66b3c50150e18426485d134de92c6b311dac125
 | `workspace_id` | string | Required immutable canonical lowercase UUID. Match the exact committed `workspace_meta.workspace_id` in `db/`. |
 | `schema_version` | integer | Required; must equal `1` for the pinned initial migration and match committed `schema_migrations.version` in `db/`. |
 | `policy_revision` | string | Required; 40-character lowercase hexadecimal `hive-system` commit SHA pinning the reviewed v2 policy revision. |
+| `bootstrap_layout` | string | Optional. New installations write `dolt-native-v1`. A missing field preserves descriptor-only inspection behavior. Other values return `SCHEMA_INCOMPATIBLE`. |
 
 - Reject `hive-workspace.yml` if it contains credentials, machine-local paths, endpoints, bindings, or unknown fields.
+- Workspace initialization creates a private, nonsecret `.hive-init-publication-incomplete` sentinel before publishing workspace entries. V2 readers refuse any entry with this name in the root, including a symlink. Init clears the sentinel before final verification and installs the descriptor only after the checks and payload syncs pass. The descriptor move is the readiness event. For a descriptor with `bootstrap_layout`, readers take a nonblocking shared lock on the same directory, re-read the descriptor, and verify the layout. An active initializer at this point returns `CONCURRENT_CHANGE`.
+- The native layout check requires real directories and nonempty regular files at `db/.dolt/repo_state.json`, `db/.dolt/noms/manifest`, and `assets/.git/HEAD`, plus real Git `objects/` and `refs/` directories. A missing or unsafe layout returns `INVALID_CONFIG`. The check confirms the storage layout. Committed database identity and committed asset contents require separate verification.
 - A v2 workspace has `hive-workspace.yml` and no v1 `hive.yml`. V2 selection returns `SCHEMA_INCOMPATIBLE` for a v1-only root or a root with both markers. A standalone v2-only root lacks the reviewed v1 workspace policy. V1 keeps its existing Git and policy checks, including its legacy rules for `hive.yml`.
 - A mismatch between `hive-workspace.yml` `workspace_id` and `workspace_meta.workspace_id` in `db/` returns `AUTHORITY_UNVERIFIED` and leaves all targets untouched.
 

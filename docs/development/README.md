@@ -47,6 +47,26 @@ An explicit workspace takes precedence. Without one, the CLI uses the v2 user co
 
 Use `hive --contract 2 --json config show` for the resolved report. It reads machine-local `bindings.yml` and selects the longest registered directory that contains the invocation directory. Use `--resource PATH` after `show` to require an exact bound directory. An explicit workspace takes precedence over the binding, and explicit `--area UUID` and `--project UUID` override the applicable binding defaults. Both IDs must be canonical lowercase UUIDv7 values. The report includes the contributing paths and marks Dolt scope membership, committed identity, and runtime as unverified.
 
+## Dolt workspace initialization
+
+Use a new, existing empty directory owned by the invoking user. Bootstrap currently supports Linux 5.11 or later with procfs on an ext-family filesystem or tmpfs. Supply installed Dolt 2.7.6 and Git on absolute `PATH` entries.
+
+```sh
+workspace=$(mktemp -d)
+hive --contract 2 --json workspace init --target "$workspace"
+hive --contract 2 --json config show --scope workspace --workspace "$workspace"
+```
+
+Init builds and verifies the Dolt and Git commits in private sibling staging. It locks the original target directory, installs a private `.hive-init-publication-incomplete` sentinel, and moves the verified payload without replacing existing names. After removing the sentinel, it rechecks the named target and parent, the prepared repository directories, the initial Git HEAD, commit and empty tree, and the staged descriptor. The pinned Dolt engine re-verifies the committed main revision, migration ledger, workspace identity, counter, and schema in the moved database before the payload sync. Init syncs the payload and descriptor before moving the descriptor into place as the final readiness event, then syncs the target directory. The published workspace is inactive, with private `conversations/` storage, and XDG configuration and runtime state stay untouched.
+
+If init fails or is interrupted before the descriptor move, readers refuse the incomplete target. Private artifacts can remain in the target or under a sibling named `.hive-init-incomplete-*`. A sync error after the descriptor move returns `UNKNOWN_WRITE_OUTCOME` because the workspace may already be visible. Success describes the state observed during the checks under the lock. Later unrelated changes and hostile writes by another process with the same UID fall outside this guarantee.
+
+To run the disposable init tests with the actual installed engines, supply the absolute path to Dolt 2.7.6.
+
+```sh
+HIVE_DOLT_BIN=/absolute/path/to/dolt cargo test --locked --test workspace_init -- --include-ignored
+```
+
 ## Dolt record validation
 
 The v2 validator reads a single committed snapshot of Dolt `main` through a dedicated SELECT-only account on loopback. It verifies the pinned server version, required tables, migration ledger version and digest, and expected workspace UUID. It checks canonical UUIDv7 Area and Issue IDs, their graph references, lowercase sibling slugs, Issue numbers, and cycles in Area ancestry, Issue parentage, prerequisites and combined completion obligations. Validation returns up to 100 diagnostics and refuses scans above 100,000 rows per checked table. The JSON result identifies the observed Dolt commit after schema and identity verification.
@@ -71,7 +91,7 @@ hive --contract 2 --json validate --all \
   --workspace-id 01900000-0000-7000-8000-000000000001
 ```
 
-Contract 1 remains the CLI default. Under contract 2, schema incompatibility and record violations exit 4. Reader authentication failures exit 6. Unverified workspace identity and unavailable runtime exit 7. Explicit workspace path and scoped validation, full lifecycle provenance checks, and bootstrap and migration commands are follow-up work.
+Contract 1 remains the CLI default. Under contract 2, schema incompatibility and record violations exit 4. Reader authentication failures exit 6. Unverified workspace identity and unavailable runtime exit 7. Explicit workspace path and scoped validation, full lifecycle provenance checks, and migration commands are follow-up work.
 
 Run the integration tests with the pinned Dolt executable. The fixtures provision disposable data and accounts, invoke the Hive binary built by Cargo, and compare the database commit and working and staged states before and after validation.
 

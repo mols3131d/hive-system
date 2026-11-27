@@ -6,6 +6,7 @@ mod config_v2;
 mod dolt;
 mod error;
 mod output;
+mod workspace_init;
 mod workspace_status;
 
 use std::io::Write;
@@ -14,6 +15,7 @@ use std::process::ExitCode;
 use cli::{
     AreaCommand, BotCommand, Command, ConfigCommand, Contract, ConversationCommand,
     DirectiveCommand, DoltArtifactCommand, Invocation, IssueCommand, ParseFailure, ResourceCommand,
+    WorkspaceAction,
 };
 use error::{ErrorCode, HiveError};
 
@@ -92,8 +94,11 @@ fn dispatch(invocation: Invocation) -> ExitCode {
 fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let name = &invocation.command_name;
     let format = invocation.common.format.unwrap_or_default();
-    if let Command::Workspace(command) = &invocation.command {
-        let (format, result) = workspace_status::run(&invocation.common, command);
+    if let Command::Workspace(action) = &invocation.command {
+        let (format, result) = match action {
+            WorkspaceAction::Init { target } => (format, workspace_init::run(target)),
+            WorkspaceAction::Runtime(command) => workspace_status::run(&invocation.common, command),
+        };
         return match result {
             Ok(data) => output::success(Contract::V2, format, name, None, &data),
             Err(error) => output::failure(Contract::V2, format, Some(name), None, error),

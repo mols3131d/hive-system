@@ -35,7 +35,7 @@ pub(crate) use project::read as project_read;
 
 pub(crate) const DOLT_VERSION: &str = "2.7.6";
 pub(crate) const STORAGE_SCHEMA_VERSION: u32 = 1;
-const INITIAL_SCHEMA: &[u8] = include_bytes!("../assets/schema/dolt/0001_initial.sql");
+pub(crate) const INITIAL_SCHEMA: &[u8] = include_bytes!("../assets/schema/dolt/0001_initial.sql");
 const INITIAL_SCHEMA_MANIFEST: &str = include_str!("../assets/schema/dolt/0001_schema.sha256");
 const MAX_ROWS_PER_TABLE: usize = 100_000;
 
@@ -467,7 +467,7 @@ impl Snapshot {
     }
 }
 
-fn initial_schema_tables() -> impl Iterator<Item = (&'static str, &'static str)> {
+pub(crate) fn initial_schema_tables() -> impl Iterator<Item = (&'static str, &'static str)> {
     INITIAL_SCHEMA_MANIFEST.lines().map(|entry| {
         let (digest, table) = entry
             .split_once("  ")
@@ -476,7 +476,7 @@ fn initial_schema_tables() -> impl Iterator<Item = (&'static str, &'static str)>
     })
 }
 
-fn table_shape(definition: &str) -> &str {
+pub(crate) fn table_shape(definition: &str) -> &str {
     // The migration inherits the table-default collation. Preserve the charset and all column clauses.
     if let Some((shape, collation)) = definition.rsplit_once(" COLLATE=")
         && shape.ends_with(" DEFAULT CHARSET=utf8mb4")
@@ -541,7 +541,7 @@ fn unverified_authority(message: &'static str) -> HiveError {
     HiveError::new(ErrorCode::AuthorityUnverified, message)
 }
 
-fn is_commit_hash(value: &str) -> bool {
+pub(crate) fn is_commit_hash(value: &str) -> bool {
     value.len() == 32
         && value
             .bytes()
