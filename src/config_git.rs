@@ -96,12 +96,18 @@ pub(crate) fn is_full_oid(oid: &str) -> bool {
 }
 
 fn resolve_commit(root: &Path, revision: &str) -> Result<Option<String>, HiveError> {
-    resolve_commit_with(&mut git_command(root), revision)
+    resolve_commit_with(&mut git_command(root), revision, execute)
 }
 
-fn resolve_commit_with(command: &mut Command, revision: &str) -> Result<Option<String>, HiveError> {
+type GitExecute = fn(&mut Command) -> Result<Output, HiveError>;
+
+fn resolve_commit_with(
+    command: &mut Command,
+    revision: &str,
+    run: GitExecute,
+) -> Result<Option<String>, HiveError> {
     let expression = format!("{revision}^{{commit}}");
-    let result = execute(command.args([
+    let result = run(command.args([
         "rev-parse",
         "--verify",
         "--quiet",
@@ -278,7 +284,31 @@ pub(crate) fn read_blob(
     revision: &str,
     relative: &Path,
 ) -> Result<Option<Vec<u8>>, HiveError> {
-    read_blob_with(|| git_command(root), revision, relative)
+    let command = || git_command(root);
+    let Some(object) = find_blob(command, revision, relative, execute)? else {
+        return Ok(None);
+    };
+    let size = execute(command().args(["cat-file", "-s", &object]))?;
+    let size = size
+        .status
+        .success()
+        .then_some(git_line(&size.stdout))
+        .flatten()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(|size| size.parse::<usize>().ok())
+        .ok_or_else(unavailable_blob)?;
+    if size > MAX_BLOB_BYTES {
+        return Err(HiveError::new(
+            ErrorCode::InvalidConfig,
+            "The Git configuration source exceeds 128 KiB",
+        ));
+    }
+
+    let result = execute(command().args(["cat-file", "blob", &object]))?;
+    if !result.status.success() || result.stdout.len() != size {
+        return Err(unavailable_blob());
+    }
+    Ok(Some(result.stdout))
 }
 
 #[cfg(unix)]
@@ -296,31 +326,51 @@ pub(crate) fn read_asset_blob(
             "The assets directory must have a dedicated Git repository.",
         ));
     }
-    read_blob_with(
-        || {
-            let mut command = git_command(Path::new("."));
-            command.arg("--git-dir=.");
-            // SAFETY: read_blob_with runs the commands before git_dir is dropped.
-            unsafe { git_dir.set_command_directory(&mut command) };
-            command
-        },
-        revision,
-        relative,
-    )
+    git_dir
+        .open_directory(OsStr::new("objects"))?
+        .verify_git_objects()?;
+    let command = || {
+        let mut command = git_command(Path::new("."));
+        command.arg("--git-dir=.").env("GIT_COMMON_DIR", ".");
+        // SAFETY: All commands are spawned before git_dir is dropped.
+        unsafe { git_dir.set_command_directory(&mut command) };
+        command
+    };
+    let Some(object) = find_blob(command, revision, relative, execute_asset_metadata)? else {
+        return Ok(None);
+    };
+    let result = execute_asset(
+        command().args(["cat-file", "blob", &object]),
+        MAX_BLOB_BYTES,
+        None,
+    )?;
+    if !result.status.success() {
+        return Err(unavailable_blob());
+    }
+    let hash = execute_asset(
+        command().args(["hash-object", "--stdin", "--no-filters"]),
+        65,
+        Some(&result.stdout),
+    )?;
+    if !hash.status.success() || git_line(&hash.stdout) != Some(object.as_bytes()) {
+        return Err(unavailable_blob());
+    }
+    Ok(Some(result.stdout))
 }
 
-fn read_blob_with(
+fn find_blob(
     command: impl Fn() -> Command,
     revision: &str,
     relative: &Path,
-) -> Result<Option<Vec<u8>>, HiveError> {
+    run: GitExecute,
+) -> Result<Option<String>, HiveError> {
     if !is_full_oid(revision) {
         return Err(HiveError::new(
             ErrorCode::InvalidArgument,
             "A snapshot requires a full Git commit object ID",
         ));
     }
-    let Some(commit) = resolve_commit_with(&mut command(), revision)? else {
+    let Some(commit) = resolve_commit_with(&mut command(), revision, run)? else {
         return Err(unavailable_blob());
     };
     if !commit.eq_ignore_ascii_case(revision) {
@@ -328,46 +378,79 @@ fn read_blob_with(
     }
 
     let path = relative_git_path(relative)?;
-    let result = execute(
-        command()
-            .args([
-                "--literal-pathspecs",
-                "ls-tree",
-                "--full-tree",
-                "-z",
-                &commit,
-                "--",
-            ])
-            .arg(path),
-    )?;
+    let result = run(command()
+        .args([
+            "--literal-pathspecs",
+            "ls-tree",
+            "--full-tree",
+            "-z",
+            &commit,
+            "--",
+        ])
+        .arg(path))?;
     if !result.status.success() {
         return Err(unavailable_blob());
     }
     if result.stdout.is_empty() {
         return Ok(None);
     }
-    let object = tree_blob_oid(&result.stdout, path)?;
-    let size = execute(command().args(["cat-file", "-s", object]))?;
-    let size = size
-        .status
-        .success()
-        .then_some(git_line(&size.stdout))
-        .flatten()
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .and_then(|size| size.parse::<usize>().ok())
-        .ok_or_else(unavailable_blob)?;
-    if size > MAX_BLOB_BYTES {
+    Ok(Some(tree_blob_oid(&result.stdout, path)?.to_owned()))
+}
+
+#[cfg(unix)]
+fn execute_asset_metadata(command: &mut Command) -> Result<Output, HiveError> {
+    execute_asset(command, MAX_BLOB_BYTES, None)
+}
+
+#[cfg(unix)]
+fn execute_asset(
+    command: &mut Command,
+    limit: usize,
+    input: Option<&[u8]>,
+) -> Result<Output, HiveError> {
+    use std::io::{Read, Write};
+
+    command.stderr(Stdio::null()).stdout(Stdio::piped());
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let io_error = || {
+        HiveError::new(
+            ErrorCode::IoError,
+            "Could not read the assets Git subprocess",
+        )
+    };
+    let mut child = command.spawn().map_err(|_| io_error())?;
+    let mut stdout = Vec::new();
+    let collected = (|| {
+        if let Some(input) = input {
+            // hash-object consumes its input before writing a fixed-size object ID.
+            child.stdin.take().expect("piped stdin").write_all(input)?;
+        }
+        child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .take(limit as u64 + 1)
+            .read_to_end(&mut stdout)
+    })();
+    let overflow = stdout.len() > limit;
+    if collected.is_err() || overflow {
+        let _ = child.kill();
+    }
+    let status = child.wait().map_err(|_| io_error())?;
+    collected.map_err(|_| io_error())?;
+    if overflow {
         return Err(HiveError::new(
             ErrorCode::InvalidConfig,
-            "The Git configuration source exceeds 128 KiB",
+            "Git output for committed Soul inspection exceeds its size limit.",
         ));
     }
-
-    let result = execute(command().args(["cat-file", "blob", object]))?;
-    if !result.status.success() || result.stdout.len() != size {
-        return Err(unavailable_blob());
-    }
-    Ok(Some(result.stdout))
+    Ok(Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
 }
 
 fn tree_blob_oid<'a>(entry: &'a [u8], path: &OsStr) -> Result<&'a str, HiveError> {
@@ -620,32 +703,34 @@ mod tests {
     use super::*;
     use crate::config_file::ScopedDirectory;
 
-    #[test]
-    fn asset_blob_reads_only_a_bounded_regular_entry_at_the_selected_commit() {
-        struct Fixture(PathBuf);
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let fixture = Self(
+                env::temp_dir().join(format!("hive-asset-test-{}-{nonce}", std::process::id())),
+            );
+            fs::create_dir(fixture.assets().parent().unwrap()).unwrap();
+            fs::create_dir(fixture.assets()).unwrap();
+            fixture.git(&["init", "--initial-branch=main"]);
+            fixture
         }
-        let nonce = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = Fixture(
-            env::temp_dir().join(format!("hive-asset-test-{}-{nonce}", std::process::id())),
-        );
-        let assets = root.0.join("assets");
-        let relative = Path::new("bots/queen/SOUL.md");
-        let soul = assets.join(relative);
-        fs::create_dir_all(soul.parent().unwrap()).unwrap();
-        let git = |args: &[&str]| {
+
+        fn assets(&self) -> PathBuf {
+            self.0.join("assets")
+        }
+
+        fn git(&self, args: &[&str]) -> String {
             let output = Command::new("git")
                 .env_clear()
-                .env("HOME", &root.0)
+                .env("HOME", &self.0)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("PATH", env::var_os("PATH").unwrap())
-                .current_dir(&assets)
+                .current_dir(self.assets())
                 .args([
                     "-c",
                     "user.name=Fixture",
@@ -657,13 +742,28 @@ mod tests {
                 .unwrap();
             assert!(output.status.success(), "{:?}", output.stderr);
             String::from_utf8(output.stdout).unwrap().trim().to_owned()
-        };
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn asset_blob_reads_only_a_bounded_regular_entry_at_the_selected_commit() {
+        let root = Fixture::new();
+        let assets = root.assets();
+        let relative = Path::new("bots/queen/SOUL.md");
+        let soul = assets.join(relative);
+        fs::create_dir_all(soul.parent().unwrap()).unwrap();
+        let git = |args: &[&str]| root.git(args);
         let save = || {
             git(&["add", "--all"]);
             git(&["commit", "-m", "Synthetic asset snapshot"]);
             git(&["rev-parse", "HEAD"])
         };
-        git(&["init", "--initial-branch=main"]);
         fs::write(soul.with_file_name("README.md"), "management").unwrap();
         let missing = save();
         fs::write(&soul, "committed").unwrap();
@@ -721,6 +821,95 @@ mod tests {
         assert!(matches!(
             read(&committed).unwrap_err().code,
             ErrorCode::NotFound
+        ));
+    }
+
+    #[test]
+    fn asset_repository_rejects_external_git_object_storage() {
+        let fixture = Fixture::new();
+        let assets = fixture.assets();
+        let relative = Path::new("bots/queen/SOUL.md");
+        let soul = assets.join(relative);
+        fs::create_dir_all(soul.parent().unwrap()).unwrap();
+        fs::write(&soul, "synthetic").unwrap();
+        fixture.git(&["add", "--all"]);
+        fixture.git(&["commit", "-m", "Synthetic Soul"]);
+        let commit = fixture.git(&["rev-parse", "HEAD"]);
+        let entry = format!("{commit}:bots/queen/SOUL.md");
+        let oid = fixture.git(&["rev-parse", &entry]);
+        let objects = assets.join(".git/objects");
+        let outside = fixture.0.join("other-object-store");
+        let directory = ScopedDirectory::open_absolute(&fixture.0).unwrap();
+        let inspect = || read_asset_blob(&directory, &commit, relative);
+        let rejects_redirect = || {
+            assert_eq!(fixture.git(&["cat-file", "blob", &entry]), "synthetic");
+            assert!(matches!(
+                inspect().unwrap_err().code,
+                ErrorCode::InvalidConfig
+            ));
+        };
+
+        fs::rename(&objects, &outside).unwrap();
+        fs::create_dir_all(objects.join("info")).unwrap();
+        let alternates = objects.join("info/alternates");
+        fs::write(&alternates, format!("{}\n", outside.display())).unwrap();
+        rejects_redirect();
+        fs::remove_file(alternates).unwrap();
+        fs::remove_dir(objects.join("info")).unwrap();
+        fs::remove_dir(&objects).unwrap();
+
+        symlink(&outside, &objects).unwrap();
+        rejects_redirect();
+        fs::remove_file(&objects).unwrap();
+        fs::rename(&outside, &objects).unwrap();
+
+        let loose = objects.join(&oid[..2]).join(&oid[2..]);
+        fs::rename(&loose, &outside).unwrap();
+        symlink(&outside, &loose).unwrap();
+        rejects_redirect();
+        fs::remove_file(&loose).unwrap();
+        fs::rename(&outside, &loose).unwrap();
+
+        fixture.git(&["repack", "-ad"]);
+        assert_eq!(inspect().unwrap().unwrap(), b"synthetic");
+        let pack = fs::read_dir(objects.join("pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension() == Some(OsStr::new("pack")))
+            .unwrap();
+        fs::rename(&pack, &outside).unwrap();
+        symlink(&outside, &pack).unwrap();
+        rejects_redirect();
+    }
+
+    #[test]
+    fn asset_blob_rejects_bytes_that_do_not_match_the_selected_id() {
+        let fixture = Fixture::new();
+        let assets = fixture.assets();
+        let relative = Path::new("SOUL.md");
+        fs::write(assets.join(relative), "original").unwrap();
+        fs::write(assets.join("other"), "modified").unwrap();
+        fixture.git(&["add", "--all"]);
+        fixture.git(&["commit", "-m", "Synthetic blobs"]);
+        let commit = fixture.git(&["rev-parse", "HEAD"]);
+        let loose = |entry| {
+            let oid = fixture.git(&["rev-parse", entry]);
+            assets.join(".git/objects").join(&oid[..2]).join(&oid[2..])
+        };
+        let object = loose("HEAD:SOUL.md");
+        fs::remove_file(&object).unwrap();
+        fs::copy(loose("HEAD:other"), object).unwrap();
+        assert_eq!(
+            fixture.git(&["cat-file", "blob", "HEAD:SOUL.md"]),
+            "modified"
+        );
+
+        let directory = ScopedDirectory::open_absolute(&fixture.0).unwrap();
+        assert!(matches!(
+            read_asset_blob(&directory, &commit, relative)
+                .unwrap_err()
+                .code,
+            ErrorCode::ObjectUnavailable
         ));
     }
 }

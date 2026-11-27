@@ -408,6 +408,42 @@ mod filesystem {
             })
         }
 
+        pub(crate) fn verify_git_objects(&self) -> Result<(), HiveError> {
+            // Git stores objects in loose-object fanout directories and pack files.
+            // Its info directory may also have a split commit-graph chain.
+            self.check_object_entries(0)
+        }
+
+        fn check_object_entries(&self, depth: usize) -> Result<(), HiveError> {
+            use rustix::fs::{AtFlags, Dir, FileType, statat};
+
+            let unsafe_store =
+                || invalid("The assets Git object store must use local regular files");
+            if depth > 2 {
+                return Err(unsafe_store());
+            }
+            let entries = Dir::read_from(&self.file).map_err(|_| unsafe_store())?;
+            for entry in entries {
+                let entry = entry.map_err(|_| unsafe_store())?;
+                let name = entry.file_name();
+                match name.to_bytes() {
+                    b"." | b".." => continue,
+                    b"alternates" | b"http-alternates" => return Err(unsafe_store()),
+                    _ => {}
+                }
+                let metadata = statat(&self.file, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|_| unsafe_store())?;
+                match FileType::from_raw_mode(metadata.st_mode) {
+                    FileType::RegularFile => {}
+                    FileType::Directory => self
+                        .open_directory(OsStr::from_bytes(name.to_bytes()))?
+                        .check_object_entries(depth + 1)?,
+                    _ => return Err(unsafe_store()),
+                }
+            }
+            Ok(())
+        }
+
         /// The caller must keep this directory open until the command is spawned.
         pub(crate) unsafe fn set_command_directory(&self, command: &mut std::process::Command) {
             use std::os::unix::process::CommandExt;
