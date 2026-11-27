@@ -1,4 +1,5 @@
 mod artifacts;
+mod bots;
 mod directives;
 mod issue_updates;
 mod receipts;
@@ -226,6 +227,7 @@ pub(super) fn validate(snapshot: &mut Snapshot) -> Result<Diagnostics, HiveError
     let issue_ids = issues.iter().map(|issue| issue.id.as_str()).collect();
     relations::validate(snapshot, &area_ids, &issue_ids, &mut diagnostics)?;
     issue_updates::validate(snapshot, &issue_ids, &mut diagnostics)?;
+    bots::validate(snapshot, &mut diagnostics)?;
     receipts::validate(snapshot, &mut diagnostics)?;
     Ok(diagnostics)
 }

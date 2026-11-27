@@ -1,5 +1,7 @@
 #[path = "dolt_validation/artifacts.rs"]
 mod artifacts;
+#[path = "dolt_validation/bots.rs"]
+mod bots;
 #[path = "dolt_validation/directives.rs"]
 mod directives;
 #[path = "dolt_validation/issue_updates.rs"]
