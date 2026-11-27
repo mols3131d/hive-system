@@ -3,6 +3,15 @@ use serde_json::Value;
 use crate::cli::{CommonOptions, DoltTargetArgs, Format, WorkspaceCommand};
 use crate::error::HiveError;
 
+#[cfg(unix)]
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Registration {
+    pub(crate) version: u32,
+    pub(crate) workspace_id: String,
+    pub(crate) workspace_root: String,
+}
+
 #[cfg(target_os = "linux")]
 #[path = "workspace_runtime.rs"]
 mod runtime;
@@ -28,7 +37,10 @@ pub(crate) fn run(
     (format, result)
 }
 
-fn observe(options: &CommonOptions, target: &DoltTargetArgs) -> (Format, Result<Value, HiveError>) {
+pub(crate) fn observe(
+    options: &CommonOptions,
+    target: &DoltTargetArgs,
+) -> (Format, Result<Value, HiveError>) {
     #[cfg(unix)]
     {
         let mut format = options.format.unwrap_or_default();
@@ -56,6 +68,7 @@ mod unix {
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
     use serde_json::{Value, json};
 
+    use super::Registration;
     use crate::cli::{CommonOptions, DoltTargetArgs, Format};
     use crate::config::{absolute_env, json_path};
     use crate::config_file::ScopedDirectory;
@@ -64,14 +77,6 @@ mod unix {
         DoltTarget, STORAGE_SCHEMA_VERSION, committed_identity, is_database_name, is_uuid,
     };
     use crate::error::{ErrorCode, HiveError};
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub(super) struct Registration {
-        pub(super) version: u32,
-        pub(super) workspace_id: String,
-        pub(super) workspace_root: String,
-    }
 
     #[derive(Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]

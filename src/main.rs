@@ -96,7 +96,10 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
     let format = invocation.common.format.unwrap_or_default();
     if let Command::Workspace(action) = &invocation.command {
         let (format, result) = match action {
-            WorkspaceAction::Init { target } => (format, workspace_init::run(target)),
+            WorkspaceAction::Init {
+                target,
+                register_runtime,
+            } => (format, workspace_init::run(target, *register_runtime)),
             WorkspaceAction::Runtime(command) => workspace_status::run(&invocation.common, command),
         };
         return match result {
