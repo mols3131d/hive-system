@@ -6,7 +6,11 @@
 
 use time::OffsetDateTime;
 
-use super::{Scope, invalid_record, limit, workflow};
+use super::{
+    Scope,
+    activation_receipt::{self, ActivatedDirective, DirectiveScope as ReceiptScope},
+    invalid_record, limit, workflow,
+};
 use crate::dolt::{
     Snapshot,
     directive::{METADATA, MetadataRow, Scope as DirectiveScope},
@@ -14,11 +18,14 @@ use crate::dolt::{
 };
 use crate::error::{ErrorCode, HiveError};
 
-const MAX_DIRECTIVES: usize = 100;
+pub(super) const MAX_DIRECTIVES: usize = 100;
 const MAX_RECEIPT_BYTES: usize = 256 * 1024;
 
 pub(super) struct Candidate {
     db_commit: String,
+    scope: ReceiptScope,
+    pub(super) valid_from: Option<String>,
+    pub(super) expires_at: Option<String>,
     pub(super) id: String,
     pub(super) revision: String,
     pub(super) issuer_ref: String,
@@ -130,6 +137,16 @@ pub(super) fn collect(
             }
             candidates.push(Candidate {
                 db_commit: snapshot.commit.clone(),
+                scope: match selection {
+                    DirectiveScope::Workspace => ReceiptScope::Workspace,
+                    DirectiveScope::Area(id) => ReceiptScope::Area {
+                        id: id.to_owned(),
+                        include_descendants: metadata.include_descendants,
+                    },
+                    DirectiveScope::Project(id) => ReceiptScope::Project { id: id.to_owned() },
+                },
+                valid_from: metadata.valid_from,
+                expires_at: metadata.expires_at,
                 id: metadata.id,
                 revision: metadata.revision,
                 issuer_ref: issuer.clone(),
@@ -162,12 +179,13 @@ fn currently_applicable(
         && end.is_none_or(|value| observed_at < value))
 }
 
-type ReceiptRow = (String, String, bool, Option<String>, Option<String>);
+type ReceiptRow = (String, String, String, bool, Option<String>, Option<String>);
 
 pub(super) struct HistoricalReceipt {
+    fingerprint: String,
     pub(super) actor_ref: String,
-    pub(super) workflow_evidence: serde_json::Value,
-    pub(super) result: serde_json::Value,
+    pub(super) workflow_evidence: String,
+    pub(super) result: String,
 }
 
 /// This is a historical lookup only. The caller supplies an exact request ID
@@ -192,7 +210,7 @@ pub(super) fn lookup_activation_receipt(
     let rows: Vec<ReceiptRow> = snapshot.exec_rows(
         |commit| {
             format!(
-                "SELECT kind, actor_ref, CAST(authorization_ref AS BINARY) = ?,
+                "SELECT kind, actor_ref, fingerprint, CAST(authorization_ref AS BINARY) = ?,
                 CASE WHEN OCTET_LENGTH(workflow_evidence_json) + OCTET_LENGTH(result_json) <= ?
                      THEN workflow_evidence_json END,
                 CASE WHEN OCTET_LENGTH(workflow_evidence_json) + OCTET_LENGTH(result_json) <= ?
@@ -207,25 +225,93 @@ pub(super) fn lookup_activation_receipt(
             request_id,
         ),
     )?;
-    let [(kind, actor, matches_approval, evidence, result)] = rows.as_slice() else {
+    let [(kind, actor, fingerprint, matches_approval, evidence, result)] = rows.as_slice() else {
         return Err(workflow::unverified());
     };
-    // Candidate operation spelling until the guarded writer defines its codec.
-    if kind != "directive.activate" || !*matches_approval || !workflow::valid_ref(actor) {
+    if kind != activation_receipt::KIND
+        || !*matches_approval
+        || !workflow::valid_ref(actor)
+        || fingerprint.len() != 64
+        || !fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err(workflow::unverified());
     }
     Ok(HistoricalReceipt {
+        fingerprint: fingerprint.clone(),
         actor_ref: actor.clone(),
-        workflow_evidence: receipt_object(evidence.as_deref())?,
-        result: receipt_object(result.as_deref())?,
+        workflow_evidence: receipt_object(evidence.as_deref())?.to_owned(),
+        result: receipt_object(result.as_deref())?.to_owned(),
     })
 }
 
-fn receipt_object(value: Option<&str>) -> Result<serde_json::Value, HiveError> {
+pub(super) fn read_approved(
+    snapshot: &mut Snapshot,
+    candidate: &Candidate,
+    request_id: &str,
+    remaining: usize,
+) -> Result<String, HiveError> {
+    let receipt = lookup_activation_receipt(snapshot, candidate, request_id)?;
+    verify_receipt(candidate, &receipt, &snapshot.workspace_id, request_id)?;
+    let rows: Vec<Option<String>> = snapshot.exec_rows(
+        |commit| {
+            format!(
+                "SELECT CASE WHEN OCTET_LENGTH(body) <= ? THEN body END
+             FROM directives AS OF '{commit}' WHERE CAST(id AS BINARY) = ?
+               AND CAST(revision AS BINARY) = ? AND CAST(status AS BINARY) = 'active' LIMIT 2"
+            )
+        },
+        (remaining, &candidate.id, &candidate.revision),
+    )?;
+    let Ok([body]) = <[_; 1]>::try_from(rows) else {
+        return Err(workflow::unverified());
+    };
+    let body = body.filter(|body| body.len() <= remaining).ok_or_else(|| {
+        limit("A required Directive exceeds the remaining inline context budget.")
+    })?;
+    if body.trim().is_empty() || body.contains('\0') {
+        return Err(invalid_record("An applicable Directive body is invalid."));
+    }
+    Ok(body)
+}
+
+fn verify_receipt(
+    candidate: &Candidate,
+    receipt: &HistoricalReceipt,
+    workspace_id: &str,
+    request_id: &str,
+) -> Result<(), HiveError> {
+    let evidence: activation_receipt::Approval =
+        serde_json::from_str(&receipt.workflow_evidence).map_err(|_| workflow::unverified())?;
+    let result: activation_receipt::ResultRecord =
+        serde_json::from_str(&receipt.result).map_err(|_| workflow::unverified())?;
+    let expected = ActivatedDirective {
+        id: candidate.id.clone(),
+        revision: candidate.revision.clone(),
+        scope: candidate.scope.clone(),
+    };
+    if evidence.version != 1
+        || result.version != 1
+        || evidence.workspace_id != workspace_id
+        || evidence.request_id != request_id
+        || evidence.fingerprint != receipt.fingerprint
+        || evidence.actor_ref != receipt.actor_ref
+        || !workflow::valid_ref(&evidence.reviewer_ref)
+        || evidence.approval_ref != candidate.approval_ref
+        || evidence.directive != expected
+        || result.directive != expected
+    {
+        return Err(workflow::unverified());
+    }
+    Ok(())
+}
+
+fn receipt_object(value: Option<&str>) -> Result<&str, HiveError> {
     let value =
         value.ok_or_else(|| limit("The historical receipt exceeds the provenance read limit."))?;
     match serde_json::from_str(value) {
-        Ok(value @ serde_json::Value::Object(_)) => Ok(value),
+        Ok(serde_json::Value::Object(_)) => Ok(value),
         _ => Err(invalid_record(
             "The historical receipt has invalid provenance JSON.",
         )),
@@ -238,7 +324,7 @@ mod tests {
 
     #[test]
     fn accepts_only_historical_provenance_objects_within_the_read_limit() {
-        assert_eq!(receipt_object(Some("{}")).unwrap(), serde_json::json!({}));
+        assert_eq!(receipt_object(Some("{}")).unwrap(), "{}");
         for malformed in ["[]", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] {
             assert!(matches!(
                 receipt_object(Some(malformed)).unwrap_err().code,
@@ -249,6 +335,52 @@ mod tests {
             receipt_object(None).unwrap_err().code,
             ErrorCode::ContextLimit
         ));
+    }
+
+    #[test]
+    fn requires_the_same_directive_revision_and_scope_in_both_historical_payloads() {
+        let candidate = Candidate {
+            db_commit: "db".to_owned(),
+            scope: ReceiptScope::Area {
+                id: "area".to_owned(),
+                include_descendants: false,
+            },
+            valid_from: None,
+            expires_at: None,
+            id: "directive".to_owned(),
+            revision: "r1".to_owned(),
+            issuer_ref: "issuer".to_owned(),
+            source_ref: "source".to_owned(),
+            approval_ref: "approval".to_owned(),
+        };
+        let target = serde_json::json!({
+            "id": "directive", "revision": "r1",
+            "scope": {"kind": "area", "id": "area", "include_descendants": false}
+        });
+        let approval = serde_json::json!({
+            "version": 1, "workspace_id": "workspace", "request_id": "request",
+            "fingerprint": "fingerprint", "actor_ref": "actor", "reviewer_ref": "reviewer",
+            "approval_ref": "approval", "decision": "approved", "directive": target
+        });
+        let result = serde_json::json!({"version": 1, "directive": target});
+        let mut receipt = HistoricalReceipt {
+            fingerprint: "fingerprint".to_owned(),
+            actor_ref: "actor".to_owned(),
+            workflow_evidence: approval.to_string(),
+            result: result.to_string(),
+        };
+        assert!(verify_receipt(&candidate, &receipt, "workspace", "request").is_ok());
+
+        let mut wrong = result.clone();
+        wrong["directive"]["scope"]["include_descendants"] = serde_json::json!(true);
+        receipt.result = wrong.to_string();
+        assert!(verify_receipt(&candidate, &receipt, "workspace", "request").is_err());
+
+        receipt.result = result.to_string();
+        let mut wrong = approval;
+        wrong["directive"]["revision"] = serde_json::json!("other");
+        receipt.workflow_evidence = wrong.to_string();
+        assert!(verify_receipt(&candidate, &receipt, "workspace", "request").is_err());
     }
 
     #[test]

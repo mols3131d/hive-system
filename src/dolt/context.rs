@@ -2,6 +2,9 @@
 //! must be verified before disclosing these inputs. Snapshot authentication
 //! establishes the database selection, not the actor's workflow authority.
 
+use crate::dolt::directive_receipt as activation_receipt;
+#[path = "context/assembly.rs"]
+mod assembly;
 #[path = "context/directives.rs"]
 mod directives;
 #[path = "context/resume.rs"]

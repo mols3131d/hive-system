@@ -149,7 +149,7 @@ pub(super) struct Metadata {
     pub(super) revision: String,
     pub(super) valid_from: Option<String>,
     pub(super) expires_at: Option<String>,
-    include_descendants: bool,
+    pub(super) include_descendants: bool,
 }
 
 pub(crate) fn list(

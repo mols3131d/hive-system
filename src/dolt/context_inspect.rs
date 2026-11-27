@@ -10,7 +10,7 @@ const DEFAULT_BUDGET: usize = 32 * 1024;
 const MAX_BUDGET: usize = 64 * 1024;
 
 impl ContextRole {
-    fn policy_name(self) -> &'static str {
+    pub(super) fn policy_name(self) -> &'static str {
         match self {
             Self::Queen => "Queen",
             Self::Overlord => "Overlord",

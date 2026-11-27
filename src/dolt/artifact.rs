@@ -253,7 +253,7 @@ fn verify_links(snapshot: &mut Snapshot, id: &str, scopes: &[Scope<'_>]) -> Resu
 }
 
 #[cfg(test)]
-pub(super) fn verify_context_handoff_links(
+pub(super) fn verify_context_artifact_links(
     snapshot: &mut Snapshot,
     artifact: &str,
     issue: &str,

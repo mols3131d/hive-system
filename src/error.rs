@@ -83,6 +83,11 @@ pub(crate) struct HiveError {
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 enum ErrorDetails {
+    #[cfg(test)]
+    ContextReference {
+        kind: &'static str,
+        id: String,
+    },
     Legacy {
         diagnostics: [Diagnostic; 1],
     },
@@ -118,6 +123,17 @@ impl HiveError {
             message: message.into(),
             details: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_limit_ref(mut self, kind: &'static str, id: &str) -> Self {
+        if matches!(self.code, ErrorCode::ContextLimit) && self.details.is_none() {
+            self.details = Some(ErrorDetails::ContextReference {
+                kind,
+                id: id.to_owned(),
+            });
+        }
+        self
     }
 
     pub(crate) fn diagnostic(mut self, path: Option<&str>) -> Self {

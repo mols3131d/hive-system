@@ -32,6 +32,9 @@ const INVOCATION: &str = "01900000-0000-7000-8000-000000000061";
 const DIRECTIVE: &str = "01900000-0000-7000-8000-000000000071";
 const RECEIPT: &str = "01900000-0000-7000-8000-000000000081";
 const MALFORMED_RECEIPT: &str = "01900000-0000-7000-8000-000000000082";
+const REPORT: &str = "01900000-0000-7000-8000-000000000053";
+const QUEEN: &str = "01900000-0000-7000-8000-000000000054";
+const GIT_PIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const AT: &str = "2026-01-01 00:00:00";
 
 struct Fixture {
@@ -113,6 +116,7 @@ fn committed_scope_and_resume() {
          INSERT INTO issues (id, number, area_id, parent_id, title, body, acceptance_criteria,
              type, status, revision, created_at, updated_at)
          VALUES ('{ISSUE}', 1, '{AREA}', '{OTHER}', 'Task', 'é', 'OK', 'task', 'todo', 'r1', '{AT}', '{AT}');
+         INSERT INTO bots (id, slug, display_name, revision) VALUES ('{QUEEN}', 'queen', 'Fixture Queen', 'bot-r1');
          INSERT INTO project_issues VALUES ('{PROJECT}', '{ISSUE}'), ('{PROJECT}', '{OTHER}'), ('{UNRELATED}', '{aliased_issue}');
          INSERT INTO issue_dependencies VALUES ('{ISSUE}', '{OTHER}');
          INSERT INTO issue_updates VALUES
@@ -122,8 +126,9 @@ fn committed_scope_and_resume() {
          ('01900000-0000-7000-8000-00000000004a', '{ISSUE}', 'handoff', 'tie', 'fixture-actor', '{AT}', NULL);
          INSERT INTO artifacts (id, kind, title, body, author_ref, revision, created_at, substantive_updated_at)
          VALUES ('{ARTIFACT}', 'handoff', 'Handoff', 'é', 'fixture-author', 'artifact-r1', '{AT}', '{AT}'),
-                ('01900000-0000-7000-8000-000000000052', 'handoff', 'Ambiguous', 'fixture', 'fixture-author', 'artifact-r1', '{AT}', '{AT}');
-         INSERT INTO artifact_issues VALUES ('{ARTIFACT}', '{ARTIFACT_ISSUE}'), ('01900000-0000-7000-8000-000000000052', '{OTHER}');
+                ('01900000-0000-7000-8000-000000000052', 'handoff', 'Ambiguous', 'fixture', 'fixture-author', 'artifact-r1', '{AT}', '{AT}'),
+                ('{REPORT}', 'report', 'Report', 'selected report', 'fixture-author', 'report-r1', '{AT}', '{AT}');
+         INSERT INTO artifact_issues VALUES ('{ARTIFACT}', '{ARTIFACT_ISSUE}'), ('01900000-0000-7000-8000-000000000052', '{OTHER}'), ('{REPORT}', '{ISSUE}');
          INSERT INTO artifact_projects VALUES ('{ARTIFACT}', '{PROJECT}');
          INSERT INTO project_issues VALUES ('{PROJECT}', '{ARTIFACT_ISSUE}');
          INSERT INTO directives (id, scope_kind, area_id, project_id, include_descendants,
@@ -150,6 +155,56 @@ fn committed_scope_and_resume() {
         writeln!(seed,
             "INSERT INTO issue_updates VALUES
              ('01900000-0000-7000-8000-00000001{n:04x}', '{ISSUE}', 'evidence', 'fixture evidence', 'fixture-actor', '{AT}', NULL);"
+        ).unwrap();
+    }
+    use activation_receipt as receipt;
+    use std::fmt::Write as _;
+    for (index, scope) in [
+        receipt::DirectiveScope::Workspace,
+        receipt::DirectiveScope::Area {
+            id: ROOT.to_owned(),
+            include_descendants: true,
+        },
+        receipt::DirectiveScope::Area {
+            id: AREA.to_owned(),
+            include_descendants: false,
+        },
+        receipt::DirectiveScope::Project {
+            id: PROJECT.to_owned(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (id, request_id) = approval_ids(index);
+        let directive = receipt::ActivatedDirective {
+            id,
+            revision: "r1".to_owned(),
+            scope,
+        };
+        let fingerprint = "a".repeat(64);
+        let approval = receipt::Approval {
+            version: 1,
+            workspace_id: WORKSPACE.to_owned(),
+            request_id: request_id.clone(),
+            fingerprint: fingerprint.clone(),
+            actor_ref: "fixture-actor".to_owned(),
+            reviewer_ref: "fixture-reviewer".to_owned(),
+            approval_ref: "approval".to_owned(),
+            decision: receipt::Decision::Approved,
+            directive: directive.clone(),
+        };
+        let evidence = serde_json::to_string(&approval).unwrap();
+        let result = serde_json::to_string(&receipt::ResultRecord {
+            version: 1,
+            directive,
+        })
+        .unwrap();
+        writeln!(seed,
+            "INSERT INTO operation_receipts
+             (request_id, kind, fingerprint, actor_ref, authorization_ref, workflow_evidence_json, base_commit, result_json, created_at)
+             VALUES ('{request_id}', '{}', '{fingerprint}', 'fixture-actor', 'approval', '{evidence}', REPEAT('a', 32), '{result}', '{AT}');",
+             receipt::KIND,
         ).unwrap();
     }
     let mut sql = dolt()
@@ -344,8 +399,8 @@ fn read_synthetic_snapshot() {
     let receipt =
         directives::lookup_activation_receipt(&mut snapshot, &candidates[0], RECEIPT).unwrap();
     assert_eq!(receipt.actor_ref, "fixture-reviewer");
-    assert_eq!(receipt.workflow_evidence, json!({}));
-    assert_eq!(receipt.result, json!({}));
+    assert_eq!(receipt.workflow_evidence, "{}");
+    assert_eq!(receipt.result, "{}");
     assert!(matches!(
         directives::lookup_activation_receipt(&mut snapshot, &candidates[0], MALFORMED_RECEIPT),
         Err(error) if matches!(error.code, ErrorCode::InvalidRecord)
@@ -395,6 +450,7 @@ fn read_synthetic_snapshot() {
     let again = collect_work(&mut snapshot, &scope, None).unwrap().unwrap();
     assert_eq!(again.handoff, work.handoff);
     assert_eq!(again.updates, work.updates);
+    assert_required_assembly(&mut snapshot, &scope);
 }
 
 #[test]
@@ -595,4 +651,132 @@ fn validates_current_exact_declaration_and_rejects_historical_or_mismatched_evid
         .code,
         ErrorCode::ContextLimit
     ));
+}
+
+fn approval_ids(index: usize) -> (String, String) {
+    let directive_suffix = [1, 3, 4, 5][index];
+    (
+        format!("01900000-0000-7000-8000-00000000007{directive_suffix}"),
+        format!("01900000-0000-7000-8000-00000000009{index}"),
+    )
+}
+
+fn assert_required_assembly(snapshot: &mut Snapshot, scope: &Scope) {
+    use crate::cli::ContextRole;
+    use assembly::{Inputs, RoleBody, SelectedArtifact, SoulBody, assemble};
+
+    let mut note = declaration(
+        &snapshot.commit,
+        ISSUE,
+        "issue_update",
+        HANDOFF,
+        &snapshot.commit,
+        "read_handoff_body",
+    );
+    let mut report = declaration(
+        &snapshot.commit,
+        ISSUE,
+        "artifact",
+        REPORT,
+        "report-r1",
+        "disclose_artifact_body",
+    );
+    for evidence in [&mut note, &mut report] {
+        evidence["bot_id"] = json!(QUEEN);
+    }
+    let note = serde_json::to_vec(&note).unwrap();
+    let report = serde_json::to_vec(&report).unwrap();
+    let receipts: Vec<_> = (0..4).map(approval_ids).collect();
+    let approvals: std::collections::BTreeMap<_, _> = receipts
+        .iter()
+        .map(|(id, receipt)| (id.as_str(), receipt.as_str()))
+        .collect();
+    let artifacts = [SelectedArtifact {
+        id: REPORT,
+        evidence: CurrentInput::OperatorRequest(&report),
+    }];
+    let commit = snapshot.commit.clone();
+    let role = ContextRole::Queen;
+    let mut inputs = Inputs {
+        role,
+        policy_revision: GIT_PIN,
+        asset_commit: GIT_PIN,
+        role_body: RoleBody {
+            role,
+            policy_revision: GIT_PIN,
+            body: "role",
+        },
+        soul: Some(SoulBody {
+            workspace_id: WORKSPACE,
+            db_commit: &commit,
+            asset_commit: GIT_PIN,
+            bot_id: QUEEN,
+            bot_slug: "queen",
+            registry_revision: "bot-r1",
+            body: "soul",
+        }),
+        request: Request {
+            bot_id: Some(QUEEN),
+            ..request(Some(CurrentInput::OperatorRequest(&note)))
+        },
+        activation_receipts: &approvals,
+        artifacts: &artifacts,
+        budget: Some(4 + 4 + 4 * 7 + 8 + 15 + 15),
+    };
+    let result = assemble(snapshot, scope, &inputs).unwrap();
+    assert_eq!(result.context["db_commit"], commit);
+    let sections = result.data["sections"].as_array().unwrap();
+    assert_eq!(
+        sections
+            .iter()
+            .map(|section| section["section"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "identity",
+            "directives",
+            "issue",
+            "project",
+            "handoff",
+            "artifacts"
+        ]
+    );
+    assert_eq!(sections[0]["content"]["soul"]["id"], QUEEN);
+    assert_eq!(sections[1]["content"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        sections[2]["content"]["record"]["acceptance_criteria"],
+        "OK"
+    );
+    assert_eq!(sections[4]["content"]["id"], HANDOFF);
+    assert_eq!(sections[5]["content"][0]["body"], "selected report");
+    assert_eq!(result.data["inline_bytes"], inputs.budget.unwrap());
+    assert_eq!(result.data["omitted"]["updates"]["count"], 1);
+    assert!(!result.data.to_string().contains(OTHER));
+    assert!(!result.data.to_string().contains(ARTIFACT));
+
+    inputs.budget = Some(inputs.budget.unwrap() - 1);
+    assert!(
+        matches!(assemble(snapshot, scope, &inputs), Err(e) if matches!(e.code, ErrorCode::ContextLimit))
+    );
+    inputs.budget = None;
+    let soul = inputs.soul.take();
+    assert!(
+        matches!(assemble(snapshot, scope, &inputs), Err(e) if matches!(e.code, ErrorCode::AuthorityUnverified))
+    );
+    inputs.soul = soul;
+    inputs.soul.as_mut().unwrap().registry_revision = "wrong-revision";
+    assert!(
+        matches!(assemble(snapshot, scope, &inputs), Err(e) if matches!(e.code, ErrorCode::AuthorityUnverified))
+    );
+    inputs.soul.as_mut().unwrap().registry_revision = "bot-r1";
+    let mut wrong = approvals.clone();
+    wrong.insert(DIRECTIVE, &receipts[1].1);
+    inputs.activation_receipts = &wrong;
+    assert!(
+        matches!(assemble(snapshot, scope, &inputs), Err(e) if matches!(e.code, ErrorCode::AuthorityUnverified))
+    );
+    inputs.activation_receipts = &approvals;
+    inputs.request.input = None;
+    assert!(
+        matches!(assemble(snapshot, scope, &inputs), Err(e) if matches!(e.code, ErrorCode::AuthorityUnverified))
+    );
 }

@@ -56,6 +56,7 @@ struct Declaration {
     withdrawn: bool,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct Locator<'a> {
     pub(super) evidence_id: &'a str,
     pub(super) revision: &'a str,
@@ -63,6 +64,7 @@ pub(super) struct Locator<'a> {
     pub(super) issuer_ref: &'a str,
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum CurrentInput<'a> {
     /// A one-invocation declaration supplied through the explicit operator path.
     OperatorRequest(&'a [u8]),
@@ -73,6 +75,7 @@ pub(super) enum CurrentInput<'a> {
     },
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct Request<'a> {
     pub(super) actor_ref: &'a str,
     pub(super) bot_id: Option<&'a str>,

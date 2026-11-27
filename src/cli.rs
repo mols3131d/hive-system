@@ -289,7 +289,7 @@ pub(crate) enum ContextCommand {
     Inspect(ContextInspectArgs),
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum ContextRole {
     Queen,
     Overlord,

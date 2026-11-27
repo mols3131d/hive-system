@@ -7,10 +7,11 @@
 
 use super::workflow::{self, Expected, Operation, RecordKind, Request};
 use super::{Scope, Work, invalid_record, limit};
-use crate::dolt::{Snapshot, artifact::verify_context_handoff_links, is_uuid_v7};
+use crate::dolt::{Snapshot, artifact::verify_context_artifact_links, is_uuid_v7};
 use crate::error::{ErrorCode, HiveError};
 
 pub(super) struct HandoffBody {
+    pub(super) kind: RecordKind,
     pub(super) id: String,
     pub(super) revision: String,
     pub(super) body: String,
@@ -94,36 +95,94 @@ pub(super) fn read_required(
                 },
                 (remaining, id, id, &work.issue.id),
             )?;
-            checked_body(rows, remaining)?
+            checked_body(rows, remaining)
+                .map_err(|error| error.context_limit_ref("issue_update", id))?
         }
-        RecordKind::Artifact => {
-            verify_context_handoff_links(
-                snapshot,
-                id,
-                &work.issue.id,
-                &work.issue.area_id,
-                scope.project.as_ref().map(|project| project.id.as_str()),
-            )?;
-            let rows = snapshot.exec_rows(
-                |commit| {
-                    format!(
-                        "SELECT author_ref, CASE WHEN OCTET_LENGTH(body) <= ? THEN body END
-                     FROM artifacts AS OF '{commit}' WHERE id = ? AND CAST(id AS BINARY) = ?
-                     AND CAST(revision AS BINARY) = ? AND CAST(kind AS BINARY) = 'handoff'
-                     AND archived_at IS NULL AND archive_reason IS NULL LIMIT 2"
-                    )
-                },
-                (remaining, id, id, &revision),
-            )?;
-            checked_body(rows, remaining)?
-        }
+        RecordKind::Artifact => read_artifact_body(snapshot, scope, work, id, &revision, remaining)
+            .map_err(|error| error.context_limit_ref("artifact", id))?,
     };
     Ok(Some(HandoffBody {
+        kind,
         id: id.to_owned(),
         revision,
         inline_bytes: body.len(),
         body,
     }))
+}
+
+pub(super) fn selected_artifact_revision(
+    snapshot: &mut Snapshot,
+    work: &Work,
+    id: &str,
+    request: &Request<'_>,
+) -> Result<String, HiveError> {
+    if snapshot.commit != work.db_commit {
+        return Err(HiveError::new(
+            ErrorCode::StaleRevision,
+            "Select Artifacts from the same committed context.",
+        ));
+    }
+    let rows: Vec<(String, String)> = snapshot.exec_rows(
+        |commit| format!(
+            "SELECT kind, revision FROM artifacts AS OF '{commit}'
+             WHERE CAST(id AS BINARY) = ? AND archived_at IS NULL AND archive_reason IS NULL LIMIT 2"
+        ),
+        (id,),
+    )?;
+    let Ok([(kind, revision)]) = <[_; 1]>::try_from(rows) else {
+        return Err(HiveError::new(
+            ErrorCode::NotFound,
+            "The selected active Artifact is unavailable.",
+        ));
+    };
+    if !crate::dolt::records::is_artifact_kind(&kind) || !workflow::valid_ref(&revision) {
+        return Err(invalid_record(
+            "A selected Artifact has invalid committed metadata.",
+        ));
+    }
+    workflow::verify(
+        request,
+        &Expected {
+            workspace_id: &snapshot.workspace_id,
+            db_commit: &snapshot.commit,
+            area_id: &work.issue.area_id,
+            issue_id: &work.issue.id,
+            operation: Operation::DiscloseArtifactBody,
+            record_kind: RecordKind::Artifact,
+            record_id: id,
+            record_revision: &revision,
+        },
+    )?;
+    Ok(revision)
+}
+
+pub(super) fn read_artifact_body(
+    snapshot: &mut Snapshot,
+    scope: &Scope,
+    work: &Work,
+    id: &str,
+    revision: &str,
+    remaining: usize,
+) -> Result<String, HiveError> {
+    verify_context_artifact_links(
+        snapshot,
+        id,
+        &work.issue.id,
+        &work.issue.area_id,
+        scope.project.as_ref().map(|project| project.id.as_str()),
+    )?;
+    let rows = snapshot.exec_rows(
+        |commit| {
+            format!(
+                "SELECT author_ref, CASE WHEN OCTET_LENGTH(body) <= ? THEN body END
+             FROM artifacts AS OF '{commit}'
+             WHERE CAST(id AS BINARY) = ? AND CAST(revision AS BINARY) = ?
+               AND archived_at IS NULL AND archive_reason IS NULL LIMIT 2"
+            )
+        },
+        (remaining, id, revision),
+    )?;
+    checked_body(rows, remaining)
 }
 
 type ArtifactCandidateRow = (
@@ -183,16 +242,18 @@ fn checked_body(
     remaining: usize,
 ) -> Result<String, HiveError> {
     let Ok([(author, body)]) = <[_; 1]>::try_from(rows) else {
-        return Err(invalid_record("The exact handoff record is unavailable."));
+        return Err(invalid_record("The exact work record is unavailable."));
     };
     if !workflow::valid_ref(&author) {
-        return Err(invalid_record("The handoff has invalid author provenance."));
+        return Err(invalid_record(
+            "The work record has invalid author provenance.",
+        ));
     }
-    let body = body
-        .filter(|body| body.len() <= remaining)
-        .ok_or_else(|| limit("The required handoff body exceeds the remaining context budget."))?;
-    if body.trim().is_empty() {
-        return Err(invalid_record("The current handoff body is empty."));
+    let body = body.filter(|body| body.len() <= remaining).ok_or_else(|| {
+        limit("The required work record body exceeds the remaining context budget.")
+    })?;
+    if body.trim().is_empty() || body.contains('\0') {
+        return Err(invalid_record("The required work record body is invalid."));
     }
     Ok(body)
 }

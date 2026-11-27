@@ -5,6 +5,8 @@ pub(crate) mod context_inspect;
 #[cfg(unix)]
 mod conversation;
 pub(crate) mod directive;
+#[cfg(test)]
+mod directive_receipt;
 mod graph;
 mod issue;
 mod issue_list;
