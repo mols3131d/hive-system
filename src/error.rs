@@ -80,6 +80,16 @@ pub(crate) struct HiveError {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<ErrorDetails>,
+    #[cfg(unix)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) input: Option<Box<ErrorInput>>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ErrorInput {
+    pub(crate) kind: &'static str,
+    pub(crate) source: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -132,6 +142,12 @@ pub(crate) struct RecordDiagnostic {
 
 impl HiveError {
     #[cfg(unix)]
+    pub(crate) fn with_input(mut self, kind: &'static str, source: &'static str) -> Self {
+        self.input = Some(Box::new(ErrorInput { kind, source }));
+        self
+    }
+
+    #[cfg(unix)]
     pub(crate) fn ambiguous_areas(candidates: Vec<AreaCandidate>, truncated: bool) -> Self {
         Self {
             code: ErrorCode::AmbiguousScope,
@@ -142,6 +158,7 @@ impl HiveError {
                 candidates,
                 truncated,
             }),
+            input: None,
         }
     }
 
@@ -161,6 +178,8 @@ impl HiveError {
             code,
             message: message.into(),
             details: None,
+            #[cfg(unix)]
+            input: None,
         }
     }
 
@@ -197,6 +216,8 @@ impl HiveError {
                 diagnostics,
                 truncated,
             }),
+            #[cfg(unix)]
+            input: None,
         }
     }
 

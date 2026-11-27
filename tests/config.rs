@@ -1437,6 +1437,8 @@ fn v2_resolved_verification_compares_descriptor_before_requesting_credentials() 
     v2_error(run(RESOURCE), 7, "AUTHORITY_UNVERIFIED");
     let matched = v2_json(run("0195f1b2-3c4d-7e8f-9a0b-1c2d3e4f5a6b"), 2);
     assert_eq!(matched["error"]["code"], "INVALID_ARGUMENT");
+    assert_eq!(matched["error"]["input"]["kind"], "dolt_target");
+    assert_eq!(matched["error"]["input"]["source"], "cli");
     assert_eq!(
         matched["error"]["message"],
         "Set HIVE_DOLT_USER for the selected Dolt reader."

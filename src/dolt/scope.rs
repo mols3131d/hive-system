@@ -10,36 +10,58 @@ pub(crate) struct VerifiedScope {
     pub(crate) inferred_area: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ScopeRef<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) source: &'static str,
+}
+
+impl<'a> ScopeRef<'a> {
+    pub(crate) fn select(cli: Option<&'a str>, bound: Option<&'a str>) -> Option<Self> {
+        cli.or(bound).map(|id| Self {
+            id,
+            source: if cli.is_some() { "cli" } else { "binding" },
+        })
+    }
+}
+
 pub(crate) fn verify_scope(
     target: DoltTarget<'_>,
-    resource: Option<&str>,
-    area: Option<&str>,
-    project: Option<&str>,
+    resource: Option<ScopeRef<'_>>,
+    area: Option<ScopeRef<'_>>,
+    project: Option<ScopeRef<'_>>,
 ) -> Result<VerifiedScope, HiveError> {
-    let (mut snapshot, _) = Snapshot::open_target(target)?;
-    for (table, id, kind) in [
-        ("resources", resource, "Resource"),
-        ("areas", area, "Area"),
-        ("projects", project, "Project"),
+    let (mut snapshot, _) =
+        Snapshot::open_target(target).map_err(|error| error.with_input("dolt_target", "cli"))?;
+    for (table, reference, kind, label) in [
+        ("resources", resource, "resource", "Resource"),
+        ("areas", area, "area", "Area"),
+        ("projects", project, "project", "Project"),
     ] {
-        if let Some(id) = id {
+        if let Some(reference) = reference {
             let rows: Vec<String> = snapshot.exec_rows(
                 |commit| {
                     format!("SELECT id FROM {table} AS OF '{commit}' WHERE CAST(id AS BINARY) = ? LIMIT 1")
                 },
-                (id,),
-            )?;
+                (reference.id,),
+            ).map_err(|error| error.with_input(kind, reference.source))?;
             if rows.is_empty() {
                 return Err(HiveError::new(
                     ErrorCode::NotFound,
-                    format!("The selected {kind} does not exist at the verified Dolt commit."),
-                ));
+                    format!("The selected {label} does not exist at the verified Dolt commit."),
+                )
+                .with_input(kind, reference.source));
             }
         }
     }
 
     let inferred_area = resource
-        .map(|resource| linked_area(&mut snapshot, resource, area))
+        .map(|resource| {
+            let (kind, source) =
+                area.map_or(("resource", resource.source), |area| ("area", area.source));
+            linked_area(&mut snapshot, resource.id, area.map(|area| area.id))
+                .map_err(|error| error.with_input(kind, source))
+        })
         .transpose()?
         .flatten();
     Ok(VerifiedScope {

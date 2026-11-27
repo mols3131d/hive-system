@@ -132,6 +132,10 @@ fn verifies_resolved_binding_against_committed_scope() {
     let read = |options: &[&str], exit| run(&workspace, options, &fixture.password, exit);
     let ambiguous = read(&[], 2);
     assert_eq!(ambiguous["error"]["code"], "AMBIGUOUS_SCOPE");
+    assert_eq!(
+        ambiguous["error"]["input"],
+        json!({"kind": "resource", "source": "binding"})
+    );
     let details = &ambiguous["error"]["details"];
     assert_eq!(details["truncated"], true);
     let candidates = details["candidates"].as_array().unwrap();
@@ -154,17 +158,33 @@ fn verifies_resolved_binding_against_committed_scope() {
         data["verification"],
         json!({"descriptor":"verified","committed_identity":"verified","scope_membership":"verified","runtime":"unverified"})
     );
+    let missing_project = id(99);
+    let project_failure = read(&["--area", &child, "--project", &missing_project], 3);
+    assert_eq!(project_failure["error"]["code"], "NOT_FOUND");
     assert_eq!(
-        read(&["--area", &unlinked], 3)["error"]["code"],
-        "NOT_FOUND"
-    );
-    assert_eq!(
-        read(&["--area", &child, "--project", &id(99)], 3)["error"]["code"],
-        "NOT_FOUND"
+        project_failure["error"]["input"],
+        json!({"kind": "project", "source": "cli"})
     );
 
     set_binding(&resource, &format!("    area_id: {unlinked}\n"));
-    assert_eq!(read(&[], 3)["error"]["code"], "NOT_FOUND");
+    for (options, source) in [(&[][..], "binding"), (&["--area", &unlinked][..], "cli")] {
+        let failure = read(options, 3);
+        assert_eq!(failure["error"]["code"], "NOT_FOUND");
+        assert_eq!(
+            failure["error"]["input"],
+            json!({"kind": "area", "source": source})
+        );
+        assert!(failure.get("data").is_none());
+        let encoded = failure.to_string();
+        for private in [
+            unlinked.as_str(),
+            resource.as_str(),
+            workspace.as_str(),
+            fixture.root.to_str().unwrap(),
+        ] {
+            assert!(!encoded.contains(private));
+        }
+    }
     assert_eq!(
         read(&["--area", &child], 0)["data"]["sources"]["area"],
         "cli"
@@ -176,7 +196,12 @@ fn verifies_resolved_binding_against_committed_scope() {
     set_binding(&standalone_resource, "");
     assert!(read(&[], 0)["data"].get("area_id").is_none());
     set_binding(&id(99), "");
-    assert_eq!(read(&[], 3)["error"]["code"], "NOT_FOUND");
+    let missing_resource = read(&[], 3);
+    assert_eq!(missing_resource["error"]["code"], "NOT_FOUND");
+    assert_eq!(
+        missing_resource["error"]["input"],
+        json!({"kind": "resource", "source": "binding"})
+    );
     assert_eq!(
         run(&id(99), &[], "", 7)["error"]["code"],
         "AUTHORITY_UNVERIFIED"

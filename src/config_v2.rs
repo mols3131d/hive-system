@@ -10,7 +10,9 @@ mod unix {
     use crate::cli::{CommonOptions, ConfigScope, ConfigShowArgs, Format, View};
     use crate::config::{absolute_env, current_dir, json_path, resolve_path};
     use crate::config_file::{self, OutputFields, ScopedDirectory, parse_v2, present, untagged};
-    use crate::dolt::{DoltTarget, STORAGE_SCHEMA_VERSION, is_uuid, is_uuid_v7, verify_scope};
+    use crate::dolt::{
+        DoltTarget, STORAGE_SCHEMA_VERSION, ScopeRef, is_uuid, is_uuid_v7, verify_scope,
+    };
     use crate::error::{ErrorCode, HiveError};
 
     use super::{BOOTSTRAP_LAYOUT, INIT_PENDING, MARKER, has_init_stage_component};
@@ -144,8 +146,8 @@ mod unix {
         let resource = binding.map(|selected| &selected.binding);
         let bound_area = resource.and_then(|binding| binding.area_id.as_deref());
         let bound_project = resource.and_then(|binding| binding.project_id.as_deref());
-        let effective_area = area.or(bound_area);
-        let effective_project = project.or(bound_project);
+        let effective_area = ScopeRef::select(area, bound_area);
+        let effective_project = ScopeRef::select(project, bound_project);
         let descriptor = &candidate.descriptor;
         let mut report = json!({
             "scope": if resolved { "resolved" } else { "workspace" },
@@ -173,13 +175,13 @@ mod unix {
                 report["resource_id"] = json!(selected.binding.resource_id);
                 report["sources"]["resource"] = json!("binding");
             }
-            for (scope, field, cli, id) in [
-                ("area", "area_id", area, effective_area),
-                ("project", "project_id", project, effective_project),
+            for (scope, field, reference) in [
+                ("area", "area_id", effective_area),
+                ("project", "project_id", effective_project),
             ] {
-                if let Some(id) = id {
-                    report[field] = json!(id);
-                    report["sources"][scope] = json!(if cli.is_some() { "cli" } else { "binding" });
+                if let Some(reference) = reference {
+                    report[field] = json!(reference.id);
+                    report["sources"][scope] = json!(reference.source);
                 }
             }
         }
@@ -188,11 +190,12 @@ mod unix {
                 return Err(HiveError::new(
                     ErrorCode::AuthorityUnverified,
                     "The expected workspace ID does not match the selected descriptor.",
-                ));
+                )
+                .with_input("dolt_target", "cli"));
             }
             let verified = verify_scope(
                 target,
-                resource.map(|binding| binding.resource_id.as_str()),
+                ScopeRef::select(None, resource.map(|binding| binding.resource_id.as_str())),
                 effective_area,
                 effective_project,
             )?;
