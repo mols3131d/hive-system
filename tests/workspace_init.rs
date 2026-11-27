@@ -806,3 +806,63 @@ exec {dolt} "$@"
     assert!(staged.join("workspace/hive-workspace.yml").is_file());
     assert!(!staged.join("scratch").exists());
 }
+
+#[test]
+#[ignore = "requires installed Dolt 2.7.6 and Git"]
+fn moved_dolt_verification_refuses_replaced_storage_inside_the_pinned_directory() {
+    let fixture = Fixture::new();
+    let donor = fixture.dir("donor");
+    let target = fixture.dir("target");
+    let changed = fixture.0.join("storage-swapped");
+    let moved = fixture.0.join("original-noms");
+    let dolt = PathBuf::from(std::env::var_os("HIVE_DOLT_BIN").unwrap());
+    assert!(dolt.is_absolute());
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+
+    // A real committed donor retains a valid native layout and schema but
+    // has a different workspace identity and committed main revision.
+    let donor_path = std::env::join_paths([dolt.parent().unwrap(), git.parent().unwrap()]).unwrap();
+    response(
+        fixture
+            .init(&donor)
+            .env("PATH", donor_path)
+            .output()
+            .unwrap(),
+        0,
+    );
+    let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\"'\"'"));
+    fixture.fake_dolt(&format!(
+        r#"
+set -eu
+if [ "$1" = sql ] && [ "$(/bin/pwd -P)" = {target_db} ] && [ ! -e {changed} ]; then
+    /bin/mv .dolt/noms {moved}
+    /bin/mv {donor_noms} .dolt/noms
+    : > {changed}
+fi
+exec {dolt} "$@"
+"#,
+        target_db = quote(&target.join("db")),
+        changed = quote(&changed),
+        moved = quote(&moved),
+        donor_noms = quote(&donor.join("db/.dolt/noms")),
+        dolt = quote(&dolt),
+    ));
+    symlink(git, fixture.0.join("bin/git")).unwrap();
+
+    let error = response(fixture.init(&target).output().unwrap(), 7);
+    assert!(
+        changed.is_file(),
+        "must replace storage only after the DB has moved"
+    );
+    assert_eq!(error["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert!(!target.join("hive-workspace.yml").exists());
+    assert!(target.join("db/.dolt/noms/manifest").is_file());
+    assert!(moved.join("manifest").is_file());
+    let stages = fixture.stages();
+    assert_eq!(stages.len(), 1);
+    assert!(!stages[0].join("scratch").exists());
+}

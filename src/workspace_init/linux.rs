@@ -16,6 +16,8 @@ use crate::{config_file, config_v2};
 mod tools;
 
 const POLICY_REVISION: &str = "c66b3c50150e18426485d134de92c6b311dac125";
+// Assets init fixes the Git object format to SHA-1.
+const EMPTY_GIT_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const PAYLOAD_ENTRIES: [&str; 3] = ["db", "assets", "conversations"];
 
 struct Prepared {
@@ -26,6 +28,7 @@ struct Prepared {
     conversations: File,
     asset_commit: String,
     asset_object_digest: [u8; 32],
+    asset_tree_digest: [u8; 32],
 }
 
 impl Prepared {
@@ -44,7 +47,12 @@ impl Prepared {
         verify_entry(&self.db, ".dolt", &self.dolt)?;
         verify_entry(&self.assets, ".git", &self.git)?;
         config_v2::verify_bootstrap_layout(target)?;
-        verify_git_revision(&self.git, &self.asset_commit, &self.asset_object_digest)
+        verify_git_revision(
+            &self.git,
+            &self.asset_commit,
+            &self.asset_object_digest,
+            &self.asset_tree_digest,
+        )
     }
 }
 
@@ -75,9 +83,15 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
     let stage = open_directory(&stage_entry)?;
     let scratch = fd_path(&stage).join("scratch");
     let payload = fd_path(&stage).join("workspace");
-    let result: Result<_, HiveError> = (|| {
-        private_dir(&scratch)?;
-        let scratch_fd = open_directory(&scratch)?;
+    let with_stage = |error: HiveError| {
+        HiveError::new(
+            error.code,
+            format!("{error} Incomplete staging under the original parent: {stage_name}."),
+        )
+    };
+    private_dir(&scratch).map_err(with_stage)?;
+    let scratch_fd = open_directory(&scratch).map_err(with_stage)?;
+    let result = (|| {
         let tools = tools::Installed::check(&scratch_fd)?;
         private_dir(&payload)?;
         for name in PAYLOAD_ENTRIES {
@@ -89,103 +103,92 @@ pub(super) fn run(target: &Path) -> Result<Value, HiveError> {
         let (db_commit, dolt) = tools.initialize_db(&fd_path(&db), &workspace_id)?;
         let (asset_commit, git) = tools.initialize_assets(&fd_path(&assets))?;
         let asset_object_digest = git_object_digest(&git, &asset_commit)?;
-        Ok((
-            db_commit,
-            Prepared {
-                db,
-                dolt,
-                assets,
-                git,
-                conversations,
-                asset_commit,
-                asset_object_digest,
+        let asset_tree_digest = git_object_digest(&git, EMPTY_GIT_TREE)?;
+        let prepared = Prepared {
+            db,
+            dolt,
+            assets,
+            git,
+            conversations,
+            asset_commit,
+            asset_object_digest,
+            asset_tree_digest,
+        };
+        let descriptor = format!(
+            "version: 2\nworkspace_id: {workspace_id}\nschema_version: {STORAGE_SCHEMA_VERSION}\npolicy_revision: {POLICY_REVISION}\nbootstrap_layout: {}\n",
+            config_v2::BOOTSTRAP_LAYOUT,
+        );
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(payload.join(config_v2::MARKER))
+            .map_err(|_| io_error("Could not create the staged workspace descriptor."))?;
+        marker
+            .write_all(descriptor.as_bytes())
+            .map_err(|_| io_error("Could not write the staged workspace descriptor."))?;
+        let mut bytes = Vec::new();
+        marker
+            .rewind()
+            .and_then(|()| marker.read_to_end(&mut bytes))
+            .map_err(|_| io_error("Could not read the staged workspace descriptor."))?;
+        config_v2::verify_descriptor(&bytes)?;
+
+        let payload_fd = open_directory(&payload)?;
+        sync_directory(&parent)?;
+        publish(
+            &payload_fd,
+            &original,
+            &prepared,
+            &marker,
+            &bytes,
+            check_path,
+            |db| {
+                tools
+                    .verify_db(&fd_path(db), &workspace_id, Some(&db_commit))
+                    .map(|_| ())
             },
-        ))
+        )
+        .map_err(|error| {
+            HiveError::new(
+                error.code,
+                format!("{error} Any moved entries remain in the original target directory."),
+            )
+        })?;
+        Ok(json!({
+            "workspace_root": target_json,
+            "workspace_id": workspace_id,
+            "policy_revision": POLICY_REVISION,
+            "storage_schema_version": STORAGE_SCHEMA_VERSION,
+            "dolt_version": DOLT_VERSION,
+            "db_commit": db_commit,
+            "asset_commit": prepared.asset_commit,
+        }))
     })();
 
-    // Keep verified or partial payloads identifiable on refusal. Clean up
-    // only our scratch tree, and remove the empty staging container on success.
-    let with_stage = |error: HiveError| {
-        HiveError::new(
-            error.code,
-            format!("{error} Incomplete staging under the original parent: {stage_name}."),
-        )
-    };
-    let cleanup = fs::remove_dir_all(&scratch);
-    let (db_commit, prepared) = match result {
-        Ok(commits) => {
-            cleanup.map_err(|_| with_stage(io_error("Could not remove isolated tool state.")))?;
-            commits
+    // Scratch remains available to the engine until the moved database has
+    // been verified. Never clean a different directory at the scratch name.
+    let scratch_removed = verify_entry(&stage, "scratch", &scratch_fd).is_ok()
+        && fs::remove_dir_all(&scratch).is_ok();
+    match result {
+        Ok(mut output) => {
+            if !scratch_removed
+                || fs::remove_dir(&payload)
+                    .and_then(|()| fs::remove_dir(&stage_entry))
+                    .is_err()
+            {
+                output["staging_directory"] = json!(stage_name);
+            }
+            Ok(output)
         }
-        Err(error) => {
-            return Err(
-                if !payload.exists() && fs::remove_dir(&stage_entry).is_ok() {
-                    error
-                } else {
-                    with_stage(error)
-                },
-            );
+        Err(error)
+            if scratch_removed && !payload.exists() && fs::remove_dir(&stage_entry).is_ok() =>
+        {
+            Err(error)
         }
-    };
-
-    let descriptor = format!(
-        "version: 2\nworkspace_id: {workspace_id}\nschema_version: {STORAGE_SCHEMA_VERSION}\npolicy_revision: {POLICY_REVISION}\nbootstrap_layout: {}\n",
-        config_v2::BOOTSTRAP_LAYOUT,
-    );
-    let mut marker = OpenOptions::new()
-        .write(true)
-        .read(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(payload.join(config_v2::MARKER))
-        .map_err(|_| {
-            with_stage(io_error(
-                "Could not create the staged workspace descriptor.",
-            ))
-        })?;
-    marker
-        .write_all(descriptor.as_bytes())
-        .map_err(|_| with_stage(io_error("Could not write the staged workspace descriptor.")))?;
-    let mut bytes = Vec::new();
-    marker
-        .rewind()
-        .and_then(|()| marker.read_to_end(&mut bytes))
-        .map_err(|_| with_stage(io_error("Could not read the staged workspace descriptor.")))?;
-    config_v2::verify_descriptor(&bytes).map_err(with_stage)?;
-
-    let payload_fd = open_directory(&payload).map_err(with_stage)?;
-    sync_directory(&parent).map_err(with_stage)?;
-    publish(
-        &payload_fd,
-        &original,
-        &prepared,
-        &marker,
-        &bytes,
-        check_path,
-    )
-    .map_err(|error| {
-        with_stage(HiveError::new(
-            error.code,
-            format!("{error} Any moved entries remain in the original target directory."),
-        ))
-    })?;
-
-    let mut output = json!({
-        "workspace_root": target_json,
-        "workspace_id": workspace_id,
-        "policy_revision": POLICY_REVISION,
-        "storage_schema_version": STORAGE_SCHEMA_VERSION,
-        "dolt_version": DOLT_VERSION,
-        "db_commit": db_commit,
-        "asset_commit": prepared.asset_commit,
-    });
-    if fs::remove_dir(&payload)
-        .and_then(|()| fs::remove_dir(&stage_entry))
-        .is_err()
-    {
-        output["staging_directory"] = json!(stage_name);
+        Err(error) => Err(with_stage(error)),
     }
-    Ok(output)
 }
 
 fn check_target_path(target: &Path, parent: &File, original: &File) -> Result<(), HiveError> {
@@ -270,6 +273,7 @@ fn publish(
     descriptor: &File,
     descriptor_bytes: &[u8],
     mut check_path: impl FnMut() -> Result<(), HiveError>,
+    verify_moved_db: impl FnOnce(&File) -> Result<(), HiveError>,
 ) -> Result<(), HiveError> {
     check_path()?;
     require_entries(target, &[])?;
@@ -295,6 +299,7 @@ fn publish(
 
     check_path()?;
     prepared.verify(target)?;
+    verify_moved_db(&prepared.db)?;
     for (_, directory) in prepared.entries() {
         sync_tree(directory)?;
     }
@@ -349,14 +354,20 @@ fn sync_tree(directory: &File) -> Result<(), HiveError> {
     sync_directory(directory)
 }
 
-fn verify_git_revision(git: &File, commit: &str, digest: &[u8; 32]) -> Result<(), HiveError> {
-    // The bootstrap commit is installed as a loose object and a loose main
-    // reference. Read only these anchored Git files after moving the tree.
+fn verify_git_revision(
+    git: &File,
+    commit: &str,
+    digest: &[u8; 32],
+    tree_digest: &[u8; 32],
+) -> Result<(), HiveError> {
+    // The initial commit and empty tree are loose objects. Read their
+    // recorded bytes and main reference through the pinned Git directory.
     let refs = config_file::open_scoped_directory(git, OsStr::new("refs"), &[OsStr::new("heads")])?
         .ok_or_else(unverified_asset_commit)?;
     if read_git_file(git, "HEAD", 128)? != b"ref: refs/heads/main\n"
         || read_git_file(&refs, "main", 128)? != format!("{commit}\n").as_bytes()
         || git_object_digest(git, commit)? != *digest
+        || git_object_digest(git, EMPTY_GIT_TREE)? != *tree_digest
     {
         return Err(unverified_asset_commit());
     }
@@ -748,6 +759,12 @@ mod tests {
                 b"fixture object",
             )
             .unwrap();
+            fs::create_dir(git.join("objects/4b")).unwrap();
+            fs::write(
+                git.join("objects/4b").join(&EMPTY_GIT_TREE[2..]),
+                b"fixture empty tree",
+            )
+            .unwrap();
             fs::write(payload.join(config_v2::MARKER), FIXTURE_DESCRIPTOR).unwrap();
             Self {
                 root,
@@ -783,6 +800,7 @@ mod tests {
             conversations: open_directory(&source.join("conversations"))?,
             asset_commit: FIXTURE_COMMIT.to_owned(),
             asset_object_digest: Sha256::digest(b"fixture object").into(),
+            asset_tree_digest: Sha256::digest(b"fixture empty tree").into(),
         };
         let mut checks = 0;
         publish(
@@ -797,6 +815,7 @@ mod tests {
                 after_check(checks);
                 Ok(())
             },
+            |_| Ok(()),
         )
     }
 
@@ -931,7 +950,7 @@ mod tests {
 
     #[test]
     fn missing_replaced_or_changed_git_repo_keeps_descriptor_unpublished() {
-        for mode in ["missing", "replaced", "revision", "object"] {
+        for mode in ["missing", "replaced", "revision", "object", "tree"] {
             let fixture = Publication::new();
             let git = fixture.target.join("assets/.git");
             let error = fixture
@@ -945,6 +964,9 @@ mod tests {
                                 b"replacement object",
                             )
                             .unwrap();
+                        } else if mode == "tree" {
+                            fs::remove_file(git.join("objects/4b").join(&EMPTY_GIT_TREE[2..]))
+                                .unwrap();
                         } else {
                             let original = fixture.root.join("original-git");
                             fs::rename(&git, &original).unwrap();
@@ -956,7 +978,7 @@ mod tests {
                     }
                 })
                 .unwrap_err();
-            if matches!(mode, "revision" | "object") {
+            if matches!(mode, "revision" | "object" | "tree") {
                 assert!(matches!(error.code, ErrorCode::AuthorityUnverified));
             } else {
                 assert!(matches!(error.code, ErrorCode::ConcurrentChange));

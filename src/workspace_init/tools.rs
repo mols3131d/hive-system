@@ -108,6 +108,16 @@ impl<'a> Installed<'a> {
             None,
         )?;
 
+        let commit = self.verify_db(db, workspace_id, None)?;
+        Ok((commit, native))
+    }
+
+    pub(super) fn verify_db(
+        &self,
+        db: &Path,
+        workspace_id: &str,
+        expected_commit: Option<&str>,
+    ) -> Result<String, HiveError> {
         let head = self.query(
             db,
             "SELECT ACTIVE_BRANCH() AS branch, DOLT_HASHOF('HEAD') AS revision",
@@ -119,7 +129,7 @@ impl<'a> Installed<'a> {
             .as_str()
             .filter(|hash| is_commit_hash(hash))
             .ok_or_else(unverified_db)?;
-        if row["branch"] != "main" {
+        if row["branch"] != "main" || expected_commit.is_some_and(|expected| commit != expected) {
             return Err(unverified_db());
         }
 
@@ -131,6 +141,7 @@ impl<'a> Installed<'a> {
         {
             return Err(unverified_db());
         }
+        let digest = format!("{:x}", Sha256::digest(INITIAL_SCHEMA));
         for (select, expected) in [
             (
                 "singleton_id, workspace_id FROM workspace_meta",
@@ -168,7 +179,7 @@ impl<'a> Installed<'a> {
             }
         }
         restrict_db_modes(db)?;
-        Ok((commit.to_owned(), native))
+        Ok(commit.to_owned())
     }
 
     pub(super) fn initialize_assets(&self, assets: &Path) -> Result<(String, File), HiveError> {
@@ -193,6 +204,10 @@ impl<'a> Installed<'a> {
             || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
             || self.git(assets, &["symbolic-ref", "HEAD"])?.trim() != "refs/heads/main"
             || self.git(assets, &["rev-list", "--count", "HEAD"])?.trim() != "1"
+            || self
+                .git(assets, &["rev-parse", "--verify", "HEAD^{tree}"])?
+                .trim()
+                != super::EMPTY_GIT_TREE
             || !self.git(assets, &["ls-tree", "HEAD"])?.is_empty()
             || !self
                 .git(assets, &["status", "--porcelain", "--untracked-files=all"])?
