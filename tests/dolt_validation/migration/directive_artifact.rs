@@ -347,6 +347,91 @@ fn cli_migration_plan_prepares_only_exact_reviewed_records_under_both_pins() {
         );
         assert_invalid_format(&duplicate);
 
+        for (index, provenance_fields) in [
+            (
+                0,
+                [
+                    "area_id",
+                    "source_ref",
+                    "issuer_ref",
+                    "created_at",
+                    "updated_at",
+                    "supersession",
+                    "approval_and_validity",
+                ],
+            ),
+            (
+                1,
+                [
+                    "artifact_kind",
+                    "source_ref",
+                    "author_ref",
+                    "created_at",
+                    "substantive_updated_at",
+                    "links",
+                    "archive",
+                ],
+            ),
+        ] {
+            let mut changed = mapping.clone();
+            let record = &mut changed["reviewed_records"][index];
+            *record = json!([
+                record["source_path"],
+                record["source_git_blob_sha"],
+                record["target_id"],
+                record["provenance"],
+            ]);
+            assert_invalid_format(&changed.to_string());
+
+            let mut changed = mapping.clone();
+            let provenance = &mut changed["reviewed_records"][index]["provenance"];
+            *provenance = Value::Array(
+                std::iter::once("kind")
+                    .chain(provenance_fields)
+                    .map(|field| provenance[field].clone())
+                    .collect(),
+            );
+            assert_invalid_format(&changed.to_string());
+        }
+
+        let mut lowercase = mapping.clone();
+        for (index, path, field, date) in [
+            (0, PROPOSAL, "created_at", CREATED),
+            (0, PROPOSAL, "updated_at", UPDATED),
+            (1, REPORT, "created_at", CREATED),
+            (1, REPORT, "substantive_updated_at", UPDATED),
+        ] {
+            for separator in ["X", "\n"] {
+                let mut changed = mapping.clone();
+                changed["reviewed_records"][index]["provenance"][field] =
+                    json!(date.replace('T', separator));
+                let result = run(&changed, 0);
+                let outcome = &reviewed_row(&result, path)["outcome"];
+                assert_eq!(outcome["status"], "held", "{field} with {separator:?}");
+                assert_eq!(
+                    outcome["reason_codes"],
+                    json!(["incomplete_historical_provenance"])
+                );
+                assert!(outcome.get("target_id").is_none());
+            }
+            lowercase["reviewed_records"][index]["provenance"][field] =
+                json!(date.replace('T', "t"));
+        }
+        let result = run(&lowercase, 0);
+        for (index, path, updated_field) in [
+            (0, PROPOSAL, "updated_at"),
+            (1, REPORT, "substantive_updated_at"),
+        ] {
+            let outcome = &reviewed_row(&result, path)["outcome"];
+            assert_eq!(outcome["status"], "prepared");
+            for field in ["created_at", updated_field] {
+                assert_eq!(
+                    outcome["provenance"][field],
+                    lowercase["reviewed_records"][index]["provenance"][field]
+                );
+            }
+        }
+
         let mut changed = mapping.clone();
         for value in [Value::Null, json!({})] {
             changed["reviewed_records"] = value;
