@@ -178,7 +178,7 @@ The command repeats source preflight and plans directly from its verified invent
         "project_evidence": [
           {
             "path": "tasks/example-app/README.md",
-            "project_key": "reviewed-example-app"
+            "canonical_ref": "https://forge.example/projects/example-app"
           }
         ]
       }
@@ -191,11 +191,12 @@ The command repeats source preflight and plans directly from its verified invent
 }
 ```
 
-- Scope keys come from committed directories under `tasks/`, `directives/`, and `bots/*/memory/`. Ordinary scopes require one reviewed `project_evidence` entry for the committed `README.md` or scoped `MEMORY.md` in every such directory. Review the project's canonical reference in each entrypoint and assign the same nonsecret lowercase kebab-case `project_key` (up to 100 bytes) only where they agree. The reviewed evidence supplies the identity from v1 prose. The command verifies entrypoint coverage and agreement without interpreting that prose. Leave unresolved evidence out to hold the scope.
+- Scope keys come from committed directories under `tasks/`, `directives/`, and `bots/*/memory/`. Ordinary scopes require one reviewed `project_evidence` entry for the committed `README.md` or scoped `MEMORY.md` in every such directory. Supply the same literal `canonical_ref` from each verified entrypoint's body. Review which project the prose identifies. The planner checks for a standalone HTTPS URL, including plain prose and simple Markdown links, and requires every URL candidate in that body to match the reviewed reference. A second distinct URL causes a hold even if it may serve another purpose.
+- Portable references in this planner use a dotted DNS hostname and a project path, with credentials, queries and fragments omitted. Host-local URLs, missing evidence, unrecognized reference forms and conflicting entrypoints hold the scope. V1 prose and entrypoints stay intact.
 - Confirm `_general` and `_hive-userdata` with explicit Area decisions and omit `project_evidence` for them. Supply a distinct Area for `_hive-userdata` and `hive-system`. The planner always holds `_hive` as `unsplit_legacy_scope`. Use an `external` decision for an ordinary scope with an explicit external ownership designation. This excludes the scope as `external_backend_owned`.
 - Areas require a lowercase UUIDv7, a lowercase kebab-case slug of up to 100 bytes, and a nonblank name of up to 255 characters without control characters. Omit `parent_id` or use null for a root, or supply a distinct lowercase UUIDv7. Missing or repeated scope decisions, missing or conflicting project evidence, duplicate Area IDs, and duplicate root or sibling slugs hold the affected scopes as `ambiguous_scope_or_collision`.
 
-A completed plan returns `mode: scope_plan`, the verified source and inventory summary, the declared target workspace ID, the mapping version and its raw SHA-256, and scope outcomes ordered by legacy key. Each outcome lists committed scope directories and either the proposed Area or a hold or exclusion reason. Exit status zero means classification completed, including when some scopes are held. The plan contains no record bodies, reviewed project keys, or host-local file paths.
+A completed plan returns `mode: scope_plan`, the verified source and inventory summary, the declared target workspace ID, the mapping version and its raw SHA-256, and scope outcomes ordered by legacy key. Each outcome lists committed scope directories and either the proposed Area's ID, slug and parent ID or a hold or exclusion reason. Exit status zero means classification completed, including when some scopes are held. The report omits record bodies, canonical references, free-form Area names and host-local file paths.
 
 The workspace ID identifies the intended target for review. Actual target identity, Area ancestry, and target constraints require validation at the later staging step. Projects, resources, record mapping, staged writes, rollback, the A15 report, and live cutover are outside this command's scope.
 

@@ -885,6 +885,27 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             "# Synthetic product area\n\nProject: https://forge.example/synthetic/product\n",
         ),
         ("tasks/unmapped/README.md", "# Unmapped\n"),
+        ("tasks/empty-ref/README.md", ""),
+        (
+            "tasks/local-ref/README.md",
+            "# Local project\n\nThe canonical checkout is /home/synthetic/private/app.\n",
+        ),
+        (
+            "tasks/conflicting-refs/README.md",
+            "# Project navigation\n\nSee <https://forge.example/synthetic/app> for this project.\n",
+        ),
+        (
+            "directives/conflicting-refs/README.md",
+            "# Directive scope\n\n[Project](https://forge.example/synthetic/app(other)) owns these directives.\n",
+        ),
+        (
+            "tasks/ambiguous-refs/README.md",
+            "# Project navigation\n\nProject: <https://forge.example/synthetic/app> or <https://forge.example/synthetic/app-other>.\n",
+        ),
+        (
+            "tasks/frontmatter-only/README.md",
+            "---\ndescription: https://forge.example/synthetic/app\n---\n# Project navigation\n",
+        ),
     ] {
         let file = source.join(path);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -925,27 +946,46 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             "decision": {"kind": "area", "area": {"id": id(id_value), "slug": slug, "name": "Synthetic Area"}, "project_evidence": evidence}
         })
     };
-    let evidence = |path, key| json!({"path": path, "project_key": key});
-    let mapping = json!({
+    let evidence = |path, reference| json!({"path": path, "canonical_ref": reference});
+    let app_ref = "https://forge.example/synthetic/app";
+    let local_path = "/home/synthetic/private/app";
+    let mut mapping = json!({
         "version": 1,
         "source_commit": commit,
         "policy_pin": POLICY_PIN,
         "workspace_id": workspace,
         "scopes": [
             area("synth-app", AREA_APP, "application", json!([
-                evidence("tasks/synth-app/README.md", "reviewed-synthetic-app"),
-                evidence("directives/synth-app/README.md", "reviewed-synthetic-app"),
-                evidence("bots/queen-synth/memory/synth-app/MEMORY.md", "reviewed-synthetic-app"),
+                evidence("tasks/synth-app/README.md", app_ref),
+                evidence("directives/synth-app/README.md", app_ref),
+                evidence("bots/queen-synth/memory/synth-app/MEMORY.md", app_ref),
             ])),
             area("_general", AREA_GENERAL, "general", json!([])),
             area("_hive-userdata", AREA_USERDATA, "workspace-operations", json!([])),
             area("hive-system", 0x104, "product", json!([
-                evidence("tasks/hive-system/README.md", "reviewed-synthetic-product")
+                evidence("tasks/hive-system/README.md", "https://forge.example/synthetic/product")
             ])),
             {"scope": "external-team", "decision": {"kind": "external"}},
             area("_hive", 0x105, "legacy-hive", json!([])),
+            area("empty-ref", 0x106, "empty", json!([
+                evidence("tasks/empty-ref/README.md", app_ref)
+            ])),
+            area("local-ref", 0x107, "local", json!([
+                evidence("tasks/local-ref/README.md", local_path)
+            ])),
+            area("conflicting-refs", 0x108, "conflicting", json!([
+                evidence("tasks/conflicting-refs/README.md", app_ref),
+                evidence("directives/conflicting-refs/README.md", app_ref),
+            ])),
+            area("ambiguous-refs", 0x109, "ambiguous", json!([
+                evidence("tasks/ambiguous-refs/README.md", app_ref)
+            ])),
+            area("frontmatter-only", 0x10a, "frontmatter", json!([
+                evidence("tasks/frontmatter-only/README.md", app_ref)
+            ])),
         ]
     });
+    mapping["scopes"][0]["decision"]["area"]["name"] = json!(local_path);
     let original_git_files = [
         ".git/index",
         ".git/HEAD",
@@ -965,7 +1005,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(data["source"], snapshot["data"]["source"]);
     assert_eq!(data["inventory"], snapshot["data"]["inventory"]);
     assert_eq!(data["target"], json!({"workspace_id": workspace}));
-    assert_eq!(data["scopes"].as_array().unwrap().len(), 7);
+    assert_eq!(data["scopes"].as_array().unwrap().len(), 12);
     let outcomes = |report: &Value| {
         report["scopes"]
             .as_array()
@@ -986,7 +1026,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(
         mapped["synth-app"],
         json!({"status": "mapped", "area": {
-            "id": id(AREA_APP), "slug": "application", "name": "Synthetic Area", "parent_id": null
+            "id": id(AREA_APP), "slug": "application", "parent_id": null
         }})
     );
     assert_eq!(
@@ -998,10 +1038,24 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         json!({"status": "held", "reason": "unsplit_legacy_scope"})
     );
     let held = json!({"status": "held", "reason": "ambiguous_scope_or_collision"});
-    assert_eq!(mapped["unmapped"], held);
-    assert_eq!(data["scopes"][5]["scope"], "synth-app");
+    for scope in [
+        "unmapped",
+        "empty-ref",
+        "local-ref",
+        "conflicting-refs",
+        "ambiguous-refs",
+        "frontmatter-only",
+    ] {
+        assert_eq!(mapped[scope], held, "{scope}");
+    }
+    let app = data["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|scope| scope["scope"] == "synth-app")
+        .unwrap();
     assert_eq!(
-        data["scopes"][5]["source_paths"],
+        app["source_paths"],
         json!([
             "bots/queen-synth/memory/synth-app",
             "directives/synth-app",
@@ -1011,15 +1065,16 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     let encoded = data.to_string();
     for private in [
         "https://forge.example",
-        "reviewed-synthetic-app",
+        local_path,
+        "Synthetic Area",
         "Synthetic persona bytes.",
     ] {
         assert!(!encoded.contains(private));
     }
 
     let mut changed = mapping.clone();
-    changed["scopes"][0]["decision"]["project_evidence"][2]["project_key"] =
-        json!("different-owner");
+    changed["scopes"][0]["decision"]["project_evidence"][2]["canonical_ref"] =
+        json!("https://forge.example/synthetic/other-owner");
     changed["scopes"][2]["decision"]["area"]["id"] = json!(id(0x104));
     let conflicts = outcomes(&plan(&changed));
     for scope in ["synth-app", "_hive-userdata", "hive-system"] {

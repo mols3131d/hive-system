@@ -17,12 +17,13 @@ const MAX_TREE_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveError> {
-    let (source, inventory) = verified_source(source, revision)?;
-    Ok(json!({
-        "mode": "source_preflight",
-        "source": source,
-        "inventory": inventory.summary,
-    }))
+    verified_source(source, revision, |source, inventory, _| {
+        Ok(json!({
+            "mode": "source_preflight",
+            "source": source,
+            "inventory": inventory.summary,
+        }))
+    })
 }
 
 #[derive(Serialize)]
@@ -36,14 +37,46 @@ struct SourceSnapshot<'a> {
 }
 
 struct Inventory {
-    entries: BTreeMap<String, (String, bool)>,
+    entries: BTreeMap<String, InventoryEntry>,
     summary: Value,
 }
 
-fn verified_source<'a>(
+struct InventoryEntry {
+    mode: &'static str,
+    oid: String,
+    size: Option<usize>,
+}
+
+impl InventoryEntry {
+    fn is_directory(&self) -> bool {
+        self.size.is_none()
+    }
+
+    fn digest_fields(&self) -> String {
+        let size = self
+            .size
+            .map_or_else(|| "-".into(), |size| size.to_string());
+        format!("{}\0{}\0{size}\0", self.mode, self.oid)
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Reason {
+    AmbiguousScopeOrCollision,
+    ExternalBackendOwned,
+    UnsplitLegacyScope,
+}
+
+fn verified_source<T>(
     source: &Path,
-    revision: &'a str,
-) -> Result<(SourceSnapshot<'a>, Inventory), HiveError> {
+    revision: &str,
+    inspect: impl FnOnce(
+        &SourceSnapshot<'_>,
+        &Inventory,
+        &AssetObjectReader<'_>,
+    ) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
     if !source.is_absolute() || !is_full_lowercase_oid(revision) {
         return Err(HiveError::new(
             ErrorCode::InvalidArgument,
@@ -116,6 +149,15 @@ fn verified_source<'a>(
         Some(Coordination::Remote(_)) => json!({"version": 1, "mode": "remote"}),
         None => Value::Null,
     };
+    let snapshot = SourceSnapshot {
+        source_commit: revision,
+        source_clean: true,
+        policy_pin,
+        hive_yml,
+        tree_oid: tree,
+        root_tree_sha256: format!("{:x}", Sha256::digest(raw_tree)),
+    };
+    let result = inspect(&snapshot, &inventory, &reader);
 
     check_clean()?;
     verify_layout()?;
@@ -128,17 +170,7 @@ fn verified_source<'a>(
     if !repository.same_worktree(&select().map_err(|_| changed())?)? {
         return Err(changed());
     }
-    Ok((
-        SourceSnapshot {
-            source_commit: revision,
-            source_clean: true,
-            policy_pin,
-            hive_yml,
-            tree_oid: tree,
-            root_tree_sha256: format!("{:x}", Sha256::digest(raw_tree)),
-        },
-        inventory,
-    ))
+    result
 }
 
 fn snapshot_object(
@@ -233,33 +265,32 @@ fn inventory(
                 }
                 _ => return Err(invalid()),
             };
-            let size_field = size.map_or_else(|| "-".into(), |size| size.to_string());
-            let fields = format!("{mode}\0{oid}\0{size_field}\0");
-            catalog_bytes += path.len() + 1 + fields.len();
+            let entry = InventoryEntry { mode, oid, size };
+            catalog_bytes += path.len() + 1 + entry.digest_fields().len();
             if catalog_bytes > MAX_INVENTORY_BYTES {
                 return Err(HiveError::new(
                     ErrorCode::InvalidConfig,
                     "The v1 source inventory exceeds 4 MiB.",
                 ));
             }
-            if entries.insert(path, (fields, size.is_none())).is_some() {
+            if entries.insert(path, entry).is_some() {
                 return Err(invalid());
             }
         }
     }
     let mut digest = Sha256::new();
-    for (path, (fields, _)) in &entries {
+    for (path, entry) in &entries {
         digest.update(path);
         digest.update(b"\0");
-        digest.update(fields);
+        digest.update(entry.digest_fields());
     }
     let summary = json!({
         "directory_count": directories,
         "file_count": entries.len() - directories,
         "blob_bytes": blob_bytes,
         "catalog_sha256": format!("{:x}", digest.finalize()),
-        "rulesync_directory": entries.get(".rulesync").is_some_and(|entry| entry.1),
-        "rulesync_config": entries.get("rulesync.jsonc").is_some_and(|entry| !entry.1),
+        "rulesync_directory": entries.get(".rulesync").is_some_and(InventoryEntry::is_directory),
+        "rulesync_config": entries.get("rulesync.jsonc").is_some_and(|entry| !entry.is_directory()),
     });
     Ok(Inventory { entries, summary })
 }
