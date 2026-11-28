@@ -44,7 +44,7 @@ struct Mapping {
     task_reviews: Vec<TaskReview>,
     #[serde(default, deserialize_with = "optional_object_list")]
     queen_assets: Option<Vec<SoulReview>>,
-    #[serde(default, deserialize_with = "QueenMapping::optional_list")]
+    #[serde(default, deserialize_with = "optional_object_list")]
     queen_preparation: Option<Vec<QueenMapping>>,
     #[serde(default, deserialize_with = "resources::deserialize_section")]
     resource_bindings: Option<resources::Bindings>,
@@ -815,7 +815,7 @@ fn unresolved_link_destination(before: &str) -> bool {
         .is_some_and(|prefix| prefix.trim_end().ends_with(']'))
 }
 
-fn closed_raw_html_block(raw: &str) -> bool {
+pub(super) fn closed_raw_html_block(raw: &str) -> bool {
     let raw = raw.trim();
     if raw.starts_with("<!--") {
         let mut remaining = raw;

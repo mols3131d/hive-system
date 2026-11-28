@@ -1,15 +1,19 @@
-use std::collections::HashMap;
+use std::cell::OnceCell;
+use std::collections::{HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
+use pulldown_cmark::{Event, Parser, Tag};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
-use super::scope_plan::is_portable_scope;
+use super::json_object::{self, Object};
+use super::scope_plan::{closed_raw_html_block, is_portable_scope};
 use super::task_intake::{CandidateStatus, TitleSource, parse_record, resolve_title};
 use super::{Reason, is_full_lowercase_oid};
 use crate::cli::is_slug;
-use crate::dolt::{is_uuid_v7, issue_update::valid_text};
+use crate::dolt::is_uuid_v7;
+use crate::dolt::issue_update::valid_text;
 use crate::error::{ErrorCode, HiveError};
 
 pub(super) type Key<'a> = (&'a str, &'a str);
@@ -17,18 +21,18 @@ pub(super) type Key<'a> = (&'a str, &'a str);
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TaskReview {
-    #[serde(deserialize_with = "super::json_object::deserialize")]
+    #[serde(deserialize_with = "json_object::deserialize")]
     legacy_key: LegacyKey,
     source_git_blob_sha: String,
     area_id: String,
     pub(super) relations: Option<Relations>,
-    #[serde(default, deserialize_with = "super::json_object::optional_object")]
+    #[serde(default, deserialize_with = "optional_object")]
     created_at: Option<BodyRange>,
-    #[serde(default, deserialize_with = "super::json_object::optional_object")]
+    #[serde(default, deserialize_with = "optional_object")]
     updated_at: Option<BodyRange>,
-    #[serde(default, deserialize_with = "super::json_object::optional_object")]
+    #[serde(default, deserialize_with = "optional_object")]
     acceptance_criteria: Option<BodyRange>,
-    #[serde(default, deserialize_with = "super::json_object::optional_object")]
+    #[serde(default, deserialize_with = "optional_object")]
     closure: Option<ClosureReview>,
 }
 
@@ -49,7 +53,7 @@ impl LegacyKey {
 #[serde(untagged)]
 pub(super) enum Relations {
     Simple(RelationDeclaration),
-    Reviewed(Obligations),
+    Reviewed(Object<Obligations>),
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -64,14 +68,29 @@ pub(super) enum RelationDeclaration {
 pub(super) struct Obligations {
     #[serde(default, deserialize_with = "declared_parent")]
     parent: Option<Option<LegacyKey>>,
+    #[serde(default, deserialize_with = "optional_objects")]
     prerequisites: Option<Vec<LegacyKey>>,
+    #[serde(default, deserialize_with = "optional_objects")]
     children: Option<Vec<ChildReview>>,
 }
 
-fn declared_parent<'de, D: serde::Deserializer<'de>>(
+fn declared_parent<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Option<LegacyKey>>, D::Error> {
-    Option::deserialize(deserializer).map(Some)
+    optional_object(deserializer).map(Some)
+}
+
+fn optional_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    Option::<Object<T>>::deserialize(deserializer).map(|object| object.map(|object| object.0))
+}
+
+fn optional_objects<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<T>>, D::Error> {
+    Option::<Vec<Object<T>>>::deserialize(deserializer)
+        .map(|objects| objects.map(|objects| objects.into_iter().map(|object| object.0).collect()))
 }
 
 impl Obligations {
@@ -91,20 +110,25 @@ impl Obligations {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ChildReview {
+    #[serde(deserialize_with = "json_object::deserialize")]
     pub(super) legacy_key: LegacyKey,
+    #[serde(default, deserialize_with = "optional_object")]
     pub(super) scope_acceptance: Option<BodyRange>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClosureReview {
+    #[serde(default, deserialize_with = "optional_object")]
     closed_at: Option<BodyRange>,
+    #[serde(default, deserialize_with = "optional_object")]
     closed_by_ref: Option<BodyRange>,
+    #[serde(default, deserialize_with = "optional_object")]
     resolution_note: Option<BodyRange>,
 }
 
 /// Half-open UTF-8 byte range relative to the body after frontmatter.
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct BodyRange {
     start: u32,
@@ -117,14 +141,16 @@ impl BodyRange {
     }
 }
 
-pub(super) struct Reviews<'a>(HashMap<Key<'a>, Option<&'a TaskReview>>);
+type ReviewsByBlob<'a> = HashMap<&'a str, Vec<&'a TaskReview>>;
+
+pub(super) struct Reviews<'a>(HashMap<Key<'a>, ReviewsByBlob<'a>>);
 
 impl<'a> Reviews<'a> {
     pub(super) fn new(
         reviews: &'a [TaskReview],
         keys: &HashMap<Key<'_>, usize>,
     ) -> Result<Self, HiveError> {
-        let mut index = HashMap::new();
+        let mut index: HashMap<Key<'a>, ReviewsByBlob<'a>> = HashMap::new();
         for review in reviews {
             let key = review.legacy_key.key();
             if !is_portable_scope(key.0) || !is_slug(key.1) || !keys.contains_key(&key) {
@@ -141,28 +167,43 @@ impl<'a> Reviews<'a> {
             }
             index
                 .entry(key)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(review));
+                .or_default()
+                .entry(&review.source_git_blob_sha)
+                .or_default()
+                .push(review);
         }
         Ok(Self(index))
     }
 
-    pub(super) fn get(
+    pub(super) fn source_bound<'lookup>(
+        &'lookup self,
+        key: Key<'lookup>,
+        oid: &str,
+    ) -> &'lookup [&'a TaskReview] {
+        self.0
+            .get(&key)
+            .and_then(|by_blob| by_blob.get(oid))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub(super) fn for_preparation(
         &self,
         key: Key<'_>,
         oid: &str,
         area_id: &str,
     ) -> Result<Option<&'a TaskReview>, Reason> {
-        match self.0.get(&key) {
-            None => Ok(None),
-            Some(None) => Err(Reason::ConflictingTaskReview),
-            Some(Some(review))
-                if review.source_git_blob_sha == oid && review.area_id == area_id =>
-            {
-                Ok(Some(review))
-            }
-            _ => Err(Reason::TaskReviewBindingMismatch),
+        let Some(by_blob) = self.0.get(&key) else {
+            return Ok(None);
+        };
+        if by_blob.len() > 1 || by_blob.values().any(|reviews| reviews.len() > 1) {
+            return Err(Reason::ConflictingTaskReview);
         }
+        by_blob
+            .get(oid)
+            .map(|reviews| reviews[0])
+            .filter(|review| review.area_id == area_id)
+            .map(Some)
+            .ok_or(Reason::TaskReviewBindingMismatch)
     }
 }
 
@@ -177,6 +218,7 @@ pub(super) struct SourceBody {
     title_sha256: String,
     priority: Option<u8>,
     pub(super) labels: Vec<String>,
+    scope_acceptance: OnceCell<HashSet<BodyRange>>,
 }
 
 impl SourceBody {
@@ -203,17 +245,62 @@ impl SourceBody {
             body_sha256: format!("{:x}", Sha256::digest(body)),
             title_source,
             title_sha256: format!("{:x}", Sha256::digest(title)),
-            title: title.to_owned(),
             priority,
+            title: title.to_owned(),
             labels: metadata
                 .tags
                 .into_iter()
                 .flatten()
                 .map(|tag| tag.trim().to_owned())
                 .collect(),
+            scope_acceptance: OnceCell::new(),
             text,
         })
     }
+
+    fn body(&self) -> &str {
+        &self.text[self.body_start..]
+    }
+
+    fn scope_acceptance(&self, range: BodyRange, key: &LegacyKey) -> Option<BodyEvidence> {
+        let body = self.body();
+        let (scope, work_id) = key.key();
+        let expected =
+            format!("Cancellation of `{scope}/{work_id}` was accepted as a scope change.");
+        BodyEvidence::select(range, body, |text| {
+            text == expected
+                && self
+                    .scope_acceptance
+                    .get_or_init(|| acceptance_paragraphs(body))
+                    .contains(&range)
+        })
+    }
+}
+
+fn acceptance_paragraphs(body: &str) -> HashSet<BodyRange> {
+    let mut ranges = HashSet::new();
+    let mut depth = 0;
+    for (event, range) in Parser::new(body).into_offset_iter() {
+        match event {
+            Event::Start(tag) => {
+                let text = &body[range.clone()];
+                if tag == Tag::HtmlBlock && !closed_raw_html_block(text) {
+                    return HashSet::new();
+                }
+                if depth == 0 && tag == Tag::Paragraph && text.starts_with("Cancellation of `") {
+                    let text = text.trim_end_matches(['\r', '\n']);
+                    ranges.insert(BodyRange {
+                        start: range.start as u32,
+                        end: (range.start + text.len()) as u32,
+                    });
+                }
+                depth += 1;
+            }
+            Event::End(_) => depth -= 1,
+            _ => {}
+        }
+    }
+    ranges
 }
 
 #[derive(Serialize)]
@@ -268,35 +355,37 @@ impl Timestamp {
     pub(super) fn select(range: Option<BodyRange>, body: &str) -> Option<(Self, OffsetDateTime)> {
         let body_range = range?;
         let value = body_range.select(body)?;
-        // Require an explicit offset and precision representable by DATETIME(6).
-        // RFC 3339 permits an unknown offset and leap seconds, which aren't
-        // usable as exact timestamps in the target.
-        if !matches!(value.as_bytes().get(10), Some(b'T' | b't'))
-            || value.len() > 32
-            || value.ends_with("-00:00")
-            || value.get(17..19) == Some("60")
-        {
-            return None;
-        }
-        if let Some((_, fraction)) = value.split_once('.')
-            && fraction.bytes().take_while(u8::is_ascii_digit).count() > 6
-        {
-            return None;
-        }
-        let instant = OffsetDateTime::parse(value, &Rfc3339)
-            .ok()?
-            .checked_to_offset(UtcOffset::UTC)?;
-        (1000..=9999).contains(&instant.year()).then(|| {
-            (
-                Self {
-                    value: value.to_owned(),
-                    body_range,
-                    instant,
-                },
+        let instant = parse_historical_timestamp(value)?;
+        Some((
+            Self {
+                value: value.to_owned(),
+                body_range,
                 instant,
-            )
-        })
+            },
+            instant,
+        ))
     }
+}
+
+fn parse_historical_timestamp(value: &str) -> Option<OffsetDateTime> {
+    // The time parser accepts any separator byte. Require T or t, a known
+    // offset, and a timestamp representable by DATETIME(6).
+    if !matches!(value.as_bytes().get(10), Some(b'T' | b't'))
+        || value.len() > 32
+        || value.ends_with("-00:00")
+        || value.get(17..19) == Some("60")
+    {
+        return None;
+    }
+    if let Some((_, fraction)) = value.split_once('.')
+        && fraction.bytes().take_while(u8::is_ascii_digit).count() > 6
+    {
+        return None;
+    }
+    let instant = OffsetDateTime::parse(value, &Rfc3339)
+        .ok()?
+        .checked_to_offset(UtcOffset::UTC)?;
+    (1000..=9999).contains(&instant.year()).then_some(instant)
 }
 
 #[derive(Serialize)]
@@ -419,12 +508,12 @@ impl ClosureReview {
 }
 
 impl Relations {
-    fn prepare(&self, body: &str, terminal: bool) -> Option<PreparedRelations> {
+    fn prepare(&self, source: &SourceBody, terminal: bool) -> Option<PreparedRelations> {
         match self {
             Self::Simple(RelationDeclaration::NoEdges) if !terminal => {
                 Some(PreparedRelations::Simple(RelationDeclaration::NoEdges))
             }
-            Self::Reviewed(obligations) => {
+            Self::Reviewed(Object(obligations)) => {
                 let parent = obligations.parent.as_ref()?.clone();
                 let mut prerequisites = obligations.prerequisites.as_ref()?.clone();
                 prerequisites.sort_unstable_by(|left, right| left.key().cmp(&right.key()));
@@ -432,7 +521,7 @@ impl Relations {
                 let mut children = Vec::with_capacity(reviewed_children.len());
                 for child in reviewed_children {
                     let scope_acceptance = match child.scope_acceptance {
-                        Some(range) => Some(BodyEvidence::select(range, body, fits_text_column)?),
+                        Some(range) => Some(source.scope_acceptance(range, &child.legacy_key)?),
                         None => None,
                     };
                     children.push(PreparedChild {
@@ -461,7 +550,7 @@ impl TaskReview {
         status: CandidateStatus,
         check_labels_at_staging: bool,
     ) -> Result<Prepared, Vec<Reason>> {
-        let body = &source.text[source.body_start..];
+        let body = source.body();
         let terminal = status.is_terminal();
         let dates = Timestamp::select(self.created_at, body)
             .zip(Timestamp::select(self.updated_at, body))
@@ -473,7 +562,7 @@ impl TaskReview {
         let relations = self
             .relations
             .as_ref()
-            .and_then(|review| review.prepare(body, terminal));
+            .and_then(|review| review.prepare(source, terminal));
         let criteria = self
             .acceptance_criteria
             .and_then(|range| BodyEvidence::select(range, body, valid_text));

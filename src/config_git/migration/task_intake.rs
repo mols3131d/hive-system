@@ -206,8 +206,9 @@ pub(super) fn prepare<'a>(
     let mut outcomes = Vec::with_capacity(records.len());
     let mut nodes = Vec::with_capacity(records.len());
     for record in &records {
-        let (outcome, relations) = record.assess(
-            scopes[record.scope.as_str()],
+        let scope = scopes[record.scope.as_str()];
+        let outcome = record.assess(
+            scope,
             counts[&record.key()] == 1,
             &reviews,
             &mut source_bodies,
@@ -220,9 +221,13 @@ pub(super) fn prepare<'a>(
             } => Some(candidate_status),
             _ => None,
         };
+        let source_reviews = match (scope, record.blob_oid.as_deref()) {
+            (ScopeOutcome::Excluded { .. }, _) | (_, None) => &[],
+            (_, Some(oid)) => reviews.source_bound(record.key(), oid),
+        };
         nodes.push(Node {
             key: record.key(),
-            relations,
+            source_reviews,
             status,
         });
         outcomes.push(outcome);
@@ -486,17 +491,17 @@ impl Record {
         reasons
     }
 
-    fn assess<'a, 'review>(
+    fn assess<'a>(
         &self,
         scope: &ScopeOutcome<'a>,
         unique: bool,
-        reviews: &Reviews<'review>,
+        reviews: &Reviews<'_>,
         source_bodies: &mut HashMap<String, SourceBody>,
         git: &impl Fn() -> Result<Command, HiveError>,
         check_labels_at_staging: bool,
-    ) -> Result<(Outcome<'a>, Option<&'review Relations>), HiveError> {
+    ) -> Result<Outcome<'a>, HiveError> {
         if let ScopeOutcome::Excluded { reason } = scope {
-            return Ok((Outcome::Excluded { reason: *reason }, None));
+            return Ok(Outcome::Excluded { reason: *reason });
         }
         let reason_codes = self.hold_reasons(scope, !unique);
         let hold = |reason_codes| Outcome::Held {
@@ -506,17 +511,12 @@ impl Record {
         };
         let area = match scope {
             ScopeOutcome::Mapped { area, .. } if unique && is_slug(&self.work_id) => area,
-            _ => return Ok((hold(reason_codes), None)),
+            _ => return Ok(hold(reason_codes)),
         };
-        let binding = self
-            .blob_oid
-            .as_deref()
-            .map_or(Ok(None), |oid| reviews.get(self.key(), oid, &area.id));
-        let relations = binding
-            .as_ref()
-            .ok()
-            .and_then(|review| review.and_then(|review| review.relations.as_ref()));
-        let outcome = match self.classification.candidate {
+        let binding = self.blob_oid.as_deref().map_or(Ok(None), |oid| {
+            reviews.for_preparation(self.key(), oid, &area.id)
+        });
+        match self.classification.candidate {
             Ok(status) if reason_codes.is_empty() => self.candidate_outcome(
                 status,
                 &area.id,
@@ -524,10 +524,9 @@ impl Record {
                 source_bodies,
                 git,
                 check_labels_at_staging,
-            )?,
-            _ => hold(reason_codes),
-        };
-        Ok((outcome, relations))
+            ),
+            _ => Ok(hold(reason_codes)),
+        }
     }
 
     fn candidate_outcome<'a>(

@@ -1,31 +1,38 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use super::json_object::Object;
 use super::task_intake::CandidateStatus;
-use super::task_provenance::{Key, Obligations, RelationDeclaration, Relations};
+use super::task_provenance::{Key, Obligations, RelationDeclaration, Relations, TaskReview};
 
 pub(super) struct Node<'a> {
     pub(super) key: Key<'a>,
-    pub(super) relations: Option<&'a Relations>,
+    pub(super) source_reviews: &'a [&'a TaskReview],
     pub(super) status: Option<CandidateStatus>,
 }
 
 impl Node<'_> {
-    fn obligations(&self) -> Option<&Obligations> {
-        match self.relations {
-            Some(Relations::Reviewed(obligations)) => Some(obligations),
-            _ => None,
-        }
+    fn obligations(&self) -> impl Iterator<Item = &Obligations> {
+        self.source_reviews
+            .iter()
+            .filter_map(|review| match &review.relations {
+                Some(Relations::Reviewed(Object(obligations))) => Some(obligations),
+                _ => None,
+            })
     }
 
     fn declares_no_edges(&self) -> bool {
-        matches!(
-            self.relations,
-            Some(Relations::Simple(RelationDeclaration::NoEdges))
-        )
+        self.source_reviews.iter().any(|review| {
+            matches!(
+                review.relations,
+                Some(Relations::Simple(RelationDeclaration::NoEdges))
+            )
+        })
     }
 }
 
 pub(super) fn held_nodes(nodes: &[Node<'_>]) -> Vec<bool> {
+    // Every row in a duplicate group is held. References to that key reach a
+    // held endpoint, while declarations from every matching row are inspected.
     let by_key: HashMap<_, _> = nodes
         .iter()
         .enumerate()
@@ -38,20 +45,23 @@ pub(super) fn held_nodes(nodes: &[Node<'_>]) -> Vec<bool> {
     // constraint propagates holds, but isn't itself a completion edge.
     let mut children = vec![Vec::new(); nodes.len()];
 
-    for (index, node) in nodes.iter().enumerate() {
-        let Some(review) = node.obligations() else {
-            continue;
-        };
+    let declarations = nodes
+        .iter()
+        .enumerate()
+        .flat_map(|(index, node)| node.obligations().map(move |review| (index, node, review)));
+    for (index, node, review) in declarations {
         if let Some(parent) = review.parent() {
             match by_key.get(&parent.key()).copied() {
                 Some(parent) => {
                     children[parent].push(index);
-                    if !nodes[parent].obligations().is_some_and(|review| {
-                        review
-                            .children()
-                            .iter()
-                            .any(|child| child.legacy_key.key() == node.key)
-                    }) {
+                    if nodes[parent].status.is_some()
+                        && !nodes[parent].obligations().any(|review| {
+                            review
+                                .children()
+                                .iter()
+                                .any(|child| child.legacy_key.key() == node.key)
+                        })
+                    {
                         held[index] = true;
                         held[parent] = true;
                     }
@@ -88,10 +98,11 @@ pub(super) fn held_nodes(nodes: &[Node<'_>]) -> Vec<bool> {
             };
             obligations[index] += 1;
             dependents[target].push(index);
-            if nodes[target]
-                .obligations()
-                .and_then(Obligations::parent)
-                .is_none_or(|parent| parent.key() != node.key)
+            if nodes[target].status.is_some()
+                && !nodes[target]
+                    .obligations()
+                    .filter_map(Obligations::parent)
+                    .any(|parent| parent.key() == node.key)
             {
                 held[index] = true;
                 held[target] = true;

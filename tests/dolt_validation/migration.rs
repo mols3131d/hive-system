@@ -939,7 +939,7 @@ fn installed_cli_stages_only_eligible_tasks_with_exact_history_and_links() {
     const RESOLUTION: &str = "Synthetic release result and closure.";
     const CRITERIA: &str = "- [ ] Verify synthetic output.";
     const SCOPE_ACCEPTANCE: &str =
-        "The reviewer agreed to remove the optional child from the release.";
+        "Cancellation of `_general/optional-child` was accepted as a scope change.";
     const CREATED: &str = "2026-04-01T11:01:02.345678+01:00";
     const CLOSED: &str = "2026-04-02T09:00:00Z";
     const UPDATED: &str = "2026-04-03T09:00:00Z";
@@ -995,7 +995,7 @@ fn installed_cli_stages_only_eligible_tasks_with_exact_history_and_links() {
     ];
     let body = format!(
         "# {TITLE}\r\n\r\nCreated: {CREATED}\r\nUpdated: {UPDATED}\r\nClosed: {CLOSED}\r\n\
-         Closed by: {ACTOR}\r\nOutcome: {RESOLUTION}\r\n{CRITERIA}\r\n{SCOPE_ACCEPTANCE}\r\n"
+         Closed by: {ACTOR}\r\nOutcome: {RESOLUTION}\r\n{CRITERIA}\r\n\r\n{SCOPE_ACCEPTANCE}\r\n"
     );
     for (scope_lifecycle, work_id, fields) in fixtures {
         let path = source.join(format!("tasks/{scope_lifecycle}/{work_id}/README.md"));
@@ -3825,6 +3825,13 @@ fn cli_migration_plan_prepares_only_exact_reviews_of_independent_tasks() {
 #[cfg(target_os = "linux")]
 #[test]
 fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
+    for policy_pin in [POLICY_PIN, EARLIER_POLICY_PIN] {
+        check_terminal_provenance_and_graph(policy_pin);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_terminal_provenance_and_graph(policy_pin: &str) {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
@@ -3838,18 +3845,23 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
     );
     fs::write(
         source.join("AGENTS.md"),
-        format!("hive-system@{POLICY_PIN}\n"),
+        format!("hive-system@{policy_pin}\n"),
     )
     .unwrap();
-    fs::write(
-        source.join("hive.yml"),
-        "version: 1\ncoordination:\n  mode: local\n",
-    )
-    .unwrap();
+    if policy_pin == POLICY_PIN {
+        fs::write(
+            source.join("hive.yml"),
+            "version: 1\ncoordination:\n  mode: local\n",
+        )
+        .unwrap();
+    }
 
     let actor = "synthetic:release-reviewer";
     let outcome = "Approved synthetic verification and archived the release checklist.";
-    let acceptance = "The release reviewer accepted cancellation of the workspace widget before closing the launch.";
+    let acceptance = "Cancellation of `_hive-userdata/widget` was accepted as a scope change.";
+    let second_acceptance =
+        "Cancellation of `_general/widget-extra` was accepted as a scope change.";
+    let wrong_scope = "Cancellation of `example-scope/widget` was accepted as a scope change.";
     let created = "2026-04-01T10:00:00Z";
     let updated = "2026-04-03T11:00:00+01:00";
     let closed = "2026-04-02T10:00:00Z";
@@ -3857,7 +3869,9 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
         "# Synthetic release check\n\nCreated: {created}\nClosed: {closed}\n\
          Updated: {updated}\nClosed by: {actor}\nOutcome: {outcome}\n"
     );
-    let parent_body = format!("{body}\n## Historical scope review\n\n{acceptance}\n");
+    let parent_body = format!(
+        "{body}\n## Historical scope review\n\n{acceptance}\r\n\r\n{second_acceptance}\n\n{wrong_scope}\n\n```text\n{acceptance}\n```\n"
+    );
     let cancelled_body =
         format!("{body}\nCancellation: workspace widget superseded by the plan.\n");
     let todo_criteria = "- [ ] Verify the replacement workspace widget.";
@@ -3877,10 +3891,16 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
             cancelled_body.as_str(),
         ),
         (
+            "_general/archive/widget-extra",
+            "cancelled",
+            "",
+            cancelled_body.as_str(),
+        ),
+        (
             "_general/archive/prepare-release",
             "done",
             "",
-            body.as_str(),
+            parent_body.as_str(),
         ),
         ("_general/archive/verify-release", "done", "", body.as_str()),
         ("_general/archive/follow-up", "done", "", body.as_str()),
@@ -3945,7 +3965,48 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
             "",
             body.as_str(),
         ),
-        ("_general/archive/unlisted-child", "done", "", body.as_str()),
+        (
+            "_hive-userdata/archive/unlisted-child",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/uses-incomplete-parent",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/metadata-parent",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/metadata-child",
+            "done",
+            "unknown: true\n",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/duplicate-parent",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/duplicate-child",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/active/duplicate-child",
+            "done",
+            "",
+            todo_body.as_str(),
+        ),
         ("_general/archive/cycle-parent", "done", "", body.as_str()),
         ("_general/archive/cycle-child", "done", "", body.as_str()),
         (
@@ -4014,7 +4075,9 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
         json!({"start": start, "end": start + evidence.len()})
     };
     let child = |key: Value| json!({"legacy_key": key});
-    let reviews: Vec<_> = fixtures.iter().map(|(bundle, state, _, body)| {
+    let reviews: Vec<_> = fixtures.iter()
+        .filter(|(bundle, ..)| *bundle != "_general/active/duplicate-child")
+        .map(|(bundle, state, _, body)| {
         let (scope, rest) = bundle.split_once('/').unwrap();
         let (_, name) = rest.split_once('/').unwrap();
         let area = if scope == "_general" { &general } else { &userdata };
@@ -4022,12 +4085,12 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
         match (scope, name) {
             ("_general", "widget") => {
                 relations["prerequisites"] = json!([local("verify-release"), local("prepare-release")]);
-                relations["children"] = json!([{
-                    "legacy_key": key("_hive-userdata", "widget"),
-                    "scope_acceptance": range(body, acceptance),
-                }]);
+                relations["children"] = json!([
+                    {"legacy_key": key("_hive-userdata", "widget"), "scope_acceptance": range(body, acceptance)},
+                    {"legacy_key": local("widget-extra"), "scope_acceptance": range(body, second_acceptance)},
+                ]);
             }
-            ("_hive-userdata", "widget") => relations["parent"] = local("widget"),
+            ("_hive-userdata", "widget") | (_, "widget-extra") => relations["parent"] = local("widget"),
             (_, "follow-up") => relations["prerequisites"] = json!([local("widget")]),
             (_, "missing-scope-acceptance") => {
                 relations["children"] = json!([child(local("child-without-approval"))]);
@@ -4042,6 +4105,13 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
             (_, "unfinished-parent") => relations["children"] = json!([child(local("unfinished-child"))]),
             (_, "unfinished-child") => relations["parent"] = local("unfinished-parent"),
             (_, "unlisted-child") => relations["parent"] = local("incomplete-parent-list"),
+            (_, "uses-incomplete-parent") => {
+                relations["prerequisites"] = json!([local("incomplete-parent-list")]);
+            }
+            (_, "metadata-child") => relations["parent"] = local("metadata-parent"),
+            (_, "duplicate-child") if rest.starts_with("archive/") => {
+                relations["parent"] = local("duplicate-parent");
+            }
             (_, "cycle-parent") => relations["children"] = json!([child(local("cycle-child"))]),
             (_, "cycle-child") => {
                 relations["parent"] = local("cycle-parent");
@@ -4078,7 +4148,7 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
         review
     }).collect();
     let mut mapping = json!({
-        "version": 1, "source_commit": commit, "policy_pin": POLICY_PIN, "workspace_id": workspace,
+        "version": 1, "source_commit": commit, "policy_pin": policy_pin, "workspace_id": workspace,
         "scopes": [
             {"scope": "_general", "decision": {"kind":"area","area":{"id":general,"slug":"general","name":"General"}}},
             {"scope": "_hive-userdata", "decision": {"kind":"area","area":{"id":userdata,"slug":"operations","name":"Operations"}}}
@@ -4097,10 +4167,11 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
         file.to_str().unwrap(),
         "--tasks",
     ];
-    let plan = |mapping: &Value| {
-        fs::write(&file, serde_json::to_vec(mapping).unwrap()).unwrap();
-        migration_cli(&home, &config, "migration-plan", &args, 0)["data"]["task_intake"].clone()
+    let run = |mapping: &str, status| {
+        fs::write(&file, mapping).unwrap();
+        migration_cli(&home, &config, "migration-plan", &args, status)
     };
+    let plan = |mapping: &Value| run(&mapping.to_string(), 0)["data"]["task_intake"].clone();
     let index = fs::read(source.join(".git/index")).unwrap();
     let report = plan(&mapping);
     assert_eq!(report, plan(&mapping));
@@ -4124,7 +4195,7 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
     assert_eq!(
         report["counts"],
         json!({
-            "inventoried": fixtures.len(), "prepared": 6, "held": fixtures.len() - 6, "excluded": 0
+            "inventoried": fixtures.len(), "prepared": 7, "held": fixtures.len() - 7, "excluded": 0
         })
     );
     let parent = &outcomes["_general/widget"];
@@ -4144,11 +4215,14 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
         json!({
             "parent": null,
             "prerequisites": [local("prepare-release"), local("verify-release")],
-            "children": [{
-                "legacy_key": key("_hive-userdata", "widget"),
-                "scope_acceptance": {"sha256": sha256_hex(acceptance.as_bytes()),
-                    "body_range": range(&parent_body, acceptance)}
-            }],
+            "children": [
+                {"legacy_key": local("widget-extra"),
+                 "scope_acceptance": {"sha256": sha256_hex(second_acceptance.as_bytes()),
+                    "body_range": range(&parent_body, second_acceptance)}},
+                {"legacy_key": key("_hive-userdata", "widget"),
+                 "scope_acceptance": {"sha256": sha256_hex(acceptance.as_bytes()),
+                    "body_range": range(&parent_body, acceptance)}},
+            ],
         })
     );
     let child = &outcomes["_hive-userdata/widget"];
@@ -4156,6 +4230,11 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
     assert_eq!(child["candidate_status"], "cancelled");
     assert_eq!(child["provenance"]["priority"], Value::Null);
     assert_eq!(child["provenance"]["relations"]["parent"], local("widget"));
+    assert_eq!(outcomes["_general/widget-extra"]["status"], "prepared");
+    assert_eq!(
+        outcomes["_general/prepare-release"]["provenance"]["relations"]["children"],
+        json!([])
+    );
     assert_eq!(outcomes["_general/follow-up"]["status"], "prepared");
     assert_eq!(
         outcomes["_general/independent-cancellation"]["status"],
@@ -4169,7 +4248,9 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
         "uses-cancelled-prerequisite",
         "unfinished-parent",
         "incomplete-parent-list",
-        "unlisted-child",
+        "uses-incomplete-parent",
+        "metadata-parent",
+        "duplicate-parent",
         "cycle-parent",
         "cycle-child",
         "depends-on-cycle",
@@ -4189,12 +4270,37 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
         ("claimed-done", "invalid_legacy_state"),
         ("claimed-cancelled", "invalid_legacy_state"),
         ("pending-review", "missing_typed_submission_evidence"),
-        ("claimed-todo", "execution_needs_reconciliation"),
+        (
+            "claimed-todo",
+            if policy_pin == POLICY_PIN {
+                "execution_needs_reconciliation"
+            } else {
+                "invalid_legacy_state"
+            },
+        ),
+        ("metadata-child", "unsupported_task_metadata"),
     ] {
         assert_eq!(
             outcomes[&format!("_general/{name}")]["reason_codes"],
             json!([reason]),
             "{name}"
+        );
+    }
+    assert_eq!(
+        outcomes["_hive-userdata/unlisted-child"]["reason_codes"],
+        json!(["unresolved_completion_obligation"])
+    );
+    let duplicates: Vec<_> = report["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["legacy_key"] == local("duplicate-child"))
+        .collect();
+    assert_eq!(duplicates.len(), 2);
+    for row in duplicates {
+        assert_eq!(
+            row["outcome"]["reason_codes"],
+            json!(["duplicate_legacy_work_id"])
         );
     }
     for raw in [
@@ -4208,22 +4314,172 @@ fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
         assert!(!report.to_string().contains(raw), "report exposed {raw}");
     }
 
-    // A malformed range removes preparation of the whole parent/child
-    // relationship and any dependent, while independent prerequisites survive.
-    mapping["task_reviews"][0]["relations"]["children"][0]["scope_acceptance"] =
-        json!({"start": 0, "end": 0});
-    let invalid_proof = rows(&plan(&mapping));
-    for name in [
-        "_general/widget",
-        "_hive-userdata/widget",
-        "_general/follow-up",
+    let witness_in_code = parent_body.rfind(acceptance).unwrap();
+    for (label, child_index, proof) in [
+        ("empty range", 0, json!({"start": 0, "end": 0})),
+        ("ordinary outcome", 0, range(&parent_body, outcome)),
+        ("copied sibling witness", 1, range(&parent_body, acceptance)),
+        (
+            "same work ID in another scope",
+            0,
+            range(&parent_body, wrong_scope),
+        ),
+        (
+            "quoted as code",
+            0,
+            json!({
+                "start": witness_in_code, "end": witness_in_code + acceptance.len(),
+            }),
+        ),
     ] {
-        assert_eq!(invalid_proof[name]["status"], "held");
+        let mut invalid = mapping.clone();
+        invalid["task_reviews"][0]["relations"]["children"][child_index]["scope_acceptance"] =
+            proof;
+        let invalid_proof = rows(&plan(&invalid));
+        for name in [
+            "_general/widget",
+            "_hive-userdata/widget",
+            "_general/widget-extra",
+            "_general/follow-up",
+        ] {
+            assert_eq!(invalid_proof[name]["status"], "held", "{label}: {name}");
+        }
+        assert_eq!(
+            invalid_proof["_general/widget"]["reason_codes"],
+            json!(["unresolved_completion_obligation"]),
+            "{label}",
+        );
+        assert_eq!(
+            invalid_proof["_general/verify-release"]["status"],
+            "prepared"
+        );
     }
+
+    let review_index = mapping["task_reviews"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|review| review["legacy_key"] == key("_hive-userdata", "unlisted-child"))
+        .unwrap();
+    let mut unmapped = mapping.clone();
+    unmapped["scopes"].as_array_mut().unwrap().pop();
+
+    let mut repeated = mapping.clone();
+    let mut alternate = mapping["task_reviews"][review_index].clone();
+    alternate["relations"]["parent"] = Value::Null;
+    repeated["task_reviews"]
+        .as_array_mut()
+        .unwrap()
+        .push(alternate);
+
+    let mut missing_closure = mapping.clone();
+    missing_closure["task_reviews"][review_index]
+        .as_object_mut()
+        .unwrap()
+        .remove("closure");
+
+    for (manifest, reason) in [
+        (unmapped, "ambiguous_scope_or_collision"),
+        (repeated, "conflicting_task_review"),
+        (missing_closure, "incomplete_historical_provenance"),
+    ] {
+        let held = rows(&plan(&manifest));
+        assert_eq!(
+            held["_hive-userdata/unlisted-child"]["reason_codes"],
+            json!([reason])
+        );
+        for name in [
+            "_general/incomplete-parent-list",
+            "_general/uses-incomplete-parent",
+        ] {
+            assert_eq!(held[name]["status"], "held", "{reason}: {name}");
+            assert_eq!(
+                held[name]["reason_codes"],
+                json!(["unresolved_completion_obligation"])
+            );
+        }
+        assert_eq!(held["_general/verify-release"]["status"], "prepared");
+    }
+
+    // An assertion with a stale blob cannot veto preparation of another Task.
+    let mut stale = mapping.clone();
+    stale["task_reviews"][review_index]["source_git_blob_sha"] = json!("0".repeat(40));
+    let stale = rows(&plan(&stale));
     assert_eq!(
-        invalid_proof["_general/verify-release"]["status"],
+        stale["_hive-userdata/unlisted-child"]["reason_codes"],
+        json!(["task_review_binding_mismatch"])
+    );
+    assert_eq!(
+        stale["_general/incomplete-parent-list"]["status"],
         "prepared"
     );
+    assert_eq!(
+        stale["_general/uses-incomplete-parent"]["status"],
+        "prepared"
+    );
+
+    let positional_range = |evidence| {
+        let selection = range(&parent_body, evidence);
+        json!([selection["start"], selection["end"]])
+    };
+    let parent_review = &mapping["task_reviews"][0];
+    for (pointer, positional) in [
+        (
+            "/relations",
+            json!([
+                null,
+                parent_review["relations"]["prerequisites"],
+                parent_review["relations"]["children"]
+            ]),
+        ),
+        ("/relations/parent", json!(["_general", "widget"])),
+        (
+            "/relations/prerequisites/0",
+            json!(["_general", "prepare-release"]),
+        ),
+        (
+            "/relations/children/0",
+            json!([
+                key("_hive-userdata", "widget"),
+                range(&parent_body, acceptance)
+            ]),
+        ),
+        (
+            "/relations/children/0/legacy_key",
+            json!(["_hive-userdata", "widget"]),
+        ),
+        (
+            "/relations/children/0/scope_acceptance",
+            positional_range(acceptance),
+        ),
+        (
+            "/closure",
+            json!([
+                range(&parent_body, closed),
+                range(&parent_body, actor),
+                range(&parent_body, outcome)
+            ]),
+        ),
+        ("/closure/closed_at", positional_range(closed)),
+    ] {
+        let mut malformed = mapping.clone();
+        *malformed["task_reviews"][0].pointer_mut(pointer).unwrap() = positional;
+        let rejected = run(&malformed.to_string(), 2);
+        assert_eq!(rejected["error"]["code"], "INVALID_CONFIG", "{pointer}");
+        assert!(rejected.get("data").is_none());
+    }
+    let manifest = mapping.to_string();
+    for (field, replacement) in [
+        ("\"children\":", "\"unknown\":null,\"children\":"),
+        ("\"parent\":null", "\"parent\":null,\"parent\":null"),
+        ("\"closed_at\":", "\"closed_at\":null,\"closed_at\":"),
+        ("\"start\":", "\"start\":0,\"start\":"),
+    ] {
+        assert!(manifest.contains(field));
+        let rejected = run(&manifest.replacen(field, replacement, 1), 2);
+        assert_eq!(rejected["error"]["code"], "INVALID_CONFIG", "{replacement}");
+        assert!(rejected.get("data").is_none());
+    }
     mapping["task_reviews"][0]["relations"]
         .as_object_mut()
         .unwrap()
@@ -6122,25 +6378,21 @@ fn check_prepared_queen_plan(pin: &str) {
             preparation("conflicting-role", &conflicting_role, id(7)),
         ],
     });
-    let run = |mapping: &Value, status| {
-        fs::write(&mapping_file, serde_json::to_vec(mapping).unwrap()).unwrap();
-        migration_cli(
-            &home,
-            &config,
-            "migration-plan",
-            &[
-                "--source",
-                source.to_str().unwrap(),
-                "--source-commit",
-                &commit,
-                "--workspace-id",
-                &workspace,
-                "--mapping-file",
-                mapping_file.to_str().unwrap(),
-            ],
-            status,
-        )
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+        "--workspace-id",
+        &workspace,
+        "--mapping-file",
+        mapping_file.to_str().unwrap(),
+    ];
+    let run_json = |manifest: &str, status| {
+        fs::write(&mapping_file, manifest).unwrap();
+        migration_cli(&home, &config, "migration-plan", &args, status)
     };
+    let run = |mapping: &Value, status| run_json(&mapping.to_string(), status);
     let index_before = fs::read(source.join(".git/index")).unwrap();
     let report = run(&mapping, 0);
     let data = &report["data"];
@@ -6175,11 +6427,105 @@ fn check_prepared_queen_plan(pin: &str) {
         "curated_memory_deferred"
     );
     assert!(!report.to_string().contains("sentinel"));
+
+    let mut intake_args = args.to_vec();
+    intake_args.extend(["--tasks", "--include-directives-artifacts"]);
+    let combined = migration_cli(&home, &config, "migration-plan", &intake_args, 0);
+    assert_eq!(combined["data"]["queen_assets"], data["queen_assets"]);
+    assert_eq!(combined["data"]["queen_preparation"], *prepared);
+    for section in ["task_intake", "directive_artifact_intake"] {
+        assert!(data.get(section).is_none(), "{pin}: {section}");
+        assert_eq!(combined["data"][section]["coverage"], "partial", "{pin}");
+    }
+
+    let positional_manifest = json!([
+        mapping["version"],
+        mapping["source_commit"],
+        mapping["policy_pin"],
+        mapping["workspace_id"],
+        mapping["scopes"],
+        mapping["queen_assets"],
+        mapping["queen_preparation"],
+    ]);
+    let rejects_manifest = |label: &str, manifest: &str| {
+        let report = run_json(manifest, 2);
+        assert_eq!(report["error"]["code"], "INVALID_CONFIG", "{pin}: {label}");
+        assert!(report.get("data").is_none(), "{pin}: {label}");
+    };
+    rejects_manifest("positional manifest", &positional_manifest.to_string());
+    for (section, fields) in [
+        ("queen_assets", &["slug", "source_git_blob_sha"][..]),
+        (
+            "queen_preparation",
+            &[
+                "slug",
+                "source_git_blob_sha",
+                "source_raw_sha256",
+                "bot_id",
+                "display_name",
+            ][..],
+        ),
+    ] {
+        let entry = &mapping[section][0];
+        let mut changed = mapping.clone();
+        changed[section][0] = json!(
+            fields
+                .iter()
+                .map(|field| &entry[*field])
+                .collect::<Vec<_>>()
+        );
+        rejects_manifest(&format!("positional {section} entry"), &changed.to_string());
+
+        for (shape, invalid_list) in [
+            ("null", Value::Null),
+            ("object", entry.clone()),
+            ("array with a null entry", json!([null])),
+        ] {
+            let mut changed = mapping.clone();
+            changed[section] = invalid_list;
+            rejects_manifest(&format!("{section} is {shape}"), &changed.to_string());
+        }
+
+        let mut changed = mapping.clone();
+        changed[section][0]["unknown"] = json!(true);
+        rejects_manifest(
+            &format!("unknown member in {section}"),
+            &changed.to_string(),
+        );
+
+        // A Value cannot represent repeated JSON members, so supply the raw entry.
+        let entry_json = entry.to_string();
+        let repeated_slug = format!("{{\"slug\":{},{}", entry["slug"], &entry_json[1..]);
+        let manifest = format!(
+            "{{\"{section}\":[{entry_json}],{}",
+            &mapping.to_string()[1..]
+        );
+        rejects_manifest(&format!("repeated {section} manifest member"), &manifest);
+        let mut changed = mapping.clone();
+        changed[section] = json!([entry]);
+        let manifest = changed.to_string().replace(&entry_json, &repeated_slug);
+        rejects_manifest(&format!("repeated member in {section} entry"), &manifest);
+    }
+
+    let mut changed = mapping.clone();
+    changed.as_object_mut().unwrap().remove("queen_preparation");
+    let report = run(&changed, 0);
+    assert!(report["data"].get("queen_preparation").is_none());
+    assert!(report["data"].get("queen_assets").is_some());
+
+    let mut changed = mapping.clone();
+    changed.as_object_mut().unwrap().remove("queen_assets");
+    assert_eq!(
+        run(&changed, 0)["data"]["queen_preparation"][0]["status"],
+        "held"
+    );
+    changed["queen_preparation"] = json!([]);
+    assert_eq!(run(&changed, 0)["data"]["queen_preparation"], json!([]));
+
     for (key, value) in [
         ("source_commit", json!("1".repeat(40))),
         ("workspace_id", json!(id(8))),
         ("policy_pin", json!("1".repeat(40))),
-        ("queen_preparation", Value::Null),
         (
             "scopes",
             json!([{"scope": "absent", "decision": {"kind": "external"}}]),
@@ -6192,7 +6538,6 @@ fn check_prepared_queen_plan(pin: &str) {
         assert!(report.get("data").is_none());
     }
     for (key, value) in [
-        ("role", json!("queen")),
         ("bot_id", json!("018f0000-0000-4000-8000-000000000001")),
         ("display_name", json!(" ")),
         ("slug", json!("../queen-example")),
