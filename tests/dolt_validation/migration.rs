@@ -16,6 +16,7 @@ use super::{ADMIN, Fixture, id, storage_state};
 mod directive_artifact;
 
 const POLICY_PIN: &str = "0e584830a7eff314d85b7af8c6f8cd69e735730a";
+const FORM_FEED_CRITERIA: &str = "A\x0cB";
 const REVISION: u32 = 4;
 const AREA_GENERAL: u32 = 0x101;
 const AREA_USERDATA: u32 = 0x102;
@@ -2513,7 +2514,7 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
     assert_eq!(
         intake["counts"],
         json!({
-            "inventoried": tasks.len(), "held": tasks.len() - 2, "excluded": 2
+            "inventoried": tasks.len(), "held": tasks.len() - 2, "excluded": 2, "prepared": 0
         })
     );
     let redacted_paths = [invalid_work, &invalid_scope_work, excluded_invalid_work]
@@ -2930,6 +2931,556 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             .find(|task| task["source_path"] == path)
             .unwrap();
         assert_eq!(task["outcome"], expected, "{path}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_prepares_only_exact_reviews_of_independent_tasks() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    init_git(
+        &source,
+        &home,
+        "Synthetic operator",
+        "operator@sample.invalid",
+    );
+    fs::write(
+        source.join("AGENTS.md"),
+        format!("hive-system@{POLICY_PIN}\n"),
+    )
+    .unwrap();
+    fs::write(
+        source.join("hive.yml"),
+        "version: 1\ncoordination:\n  mode: local\n",
+    )
+    .unwrap();
+
+    let created = "2026-01-02T11:20:00.123456+02:00";
+    let updated = "2026-01-02T09:25:00Z";
+    let criteria = "- [ ] Verify synthetic café output.";
+    let heading = "Synthetic fixture heading";
+    let title = "Synthetic frontmatter title";
+    let body = format!(
+        "# {heading} ###\r\n\r\nCreated: {created}\r\nUpdated: {updated}\r\n\r\n## Acceptance\r\n{criteria}\r\n"
+    );
+    let backlog = format!("---\r\ndescription: Synthetic description\r\n---\r\n{body}");
+    let task = |fields: &str, body: &str| {
+        format!("---\ndescription: Synthetic description\n{fields}---\n{body}")
+    };
+    let todo = task(
+        &format!("title: {title}\nstatus: todo\npriority: high\n"),
+        &body,
+    );
+    let archived = task("status: done\n", &body);
+    let claim = task(
+        "status: todo\nclaim: {id: synthetic-id, holder: synthetic-holder}\n",
+        &body,
+    );
+    let review = task("status: review\n", &body);
+    let relations = task(
+        "status: todo\n",
+        &format!("{body}Prerequisite: _general/absent\n"),
+    );
+    let tags = task("status: todo\ntags: [Synthetic]\n", &body);
+    let fixtures = [
+        ("_general/backlog/shared", &backlog),
+        ("_hive-userdata/backlog/shared", &backlog),
+        ("_general/active/independent", &todo),
+        ("_general/active/claimed", &claim),
+        ("_general/active/review", &review),
+        ("_general/archive/terminal", &archived),
+        ("_general/active/unresolved", &relations),
+        ("_general/active/stale", &todo),
+        ("_general/active/wrong-area", &todo),
+        ("_general/active/duplicate-review", &todo),
+        ("_general/active/missing-dates", &todo),
+        ("_general/active/invalid-dates", &todo),
+        ("_general/active/reversed-dates", &todo),
+        ("_general/active/missing-criteria", &todo),
+        ("_general/active/invalid-criteria", &todo),
+        ("_general/active/missing-relations", &todo),
+        ("_general/active/tagged", &tags),
+    ];
+    for (bundle, raw) in fixtures {
+        let path = source.join(format!("tasks/{bundle}/README.md"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, raw).unwrap();
+    }
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic reviewed Task fixtures"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let workspace = id(1);
+    let area = id(AREA_GENERAL);
+    let mapping_file = root.path().join("mapping.json");
+    let range = |value: &str| {
+        let start = body.find(value).unwrap();
+        json!({"start": start, "end": start + value.len()})
+    };
+    let mut task_reviews = Vec::new();
+    for (bundle, _) in fixtures {
+        let (scope, lifecycle_and_id) = bundle.split_once('/').unwrap();
+        let (_, work_id) = lifecycle_and_id.split_once('/').unwrap();
+        if scope != "_general" {
+            continue;
+        }
+        let oid = git_text(
+            &source,
+            &home,
+            &["rev-parse", &format!("HEAD:tasks/{bundle}/README.md")],
+        );
+        let mut decision = json!({
+            "legacy_key": {"scope": scope, "work_id": work_id},
+            "source_git_blob_sha": oid,
+            "area_id": area,
+            "relations": "no_edges",
+            "created_at": range(created),
+            "updated_at": range(updated),
+            "acceptance_criteria": range(criteria),
+        });
+        match work_id {
+            "shared" | "missing-criteria" => {
+                decision
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("acceptance_criteria");
+            }
+            "unresolved" => decision["relations"] = json!("unresolved"),
+            "missing-relations" => decision["relations"] = Value::Null,
+            "stale" => decision["source_git_blob_sha"] = json!("f".repeat(oid.len())),
+            "wrong-area" => decision["area_id"] = json!(id(AREA_USERDATA)),
+            "duplicate-review" => task_reviews.push(decision.clone()),
+            "missing-dates" => decision["created_at"] = Value::Null,
+            "invalid-dates" => decision["updated_at"] = range(heading),
+            "reversed-dates" => {
+                decision["created_at"] = range(updated);
+                decision["updated_at"] = range(created);
+            }
+            "invalid-criteria" => {
+                let start = body.find('é').unwrap() + 1;
+                decision["acceptance_criteria"] = json!({"start": start, "end": start + 2});
+            }
+            _ => {}
+        }
+        task_reviews.push(decision);
+    }
+    let mut mapping = json!({
+        "version": 1,
+        "source_commit": commit,
+        "policy_pin": POLICY_PIN,
+        "workspace_id": workspace,
+        "scopes": [
+            {"scope": "_general", "decision": {"kind": "area", "area": {
+                "id": area, "slug": "general", "name": "General"
+            }}},
+            {"scope": "_hive-userdata", "decision": {"kind": "area", "area": {
+                "id": id(AREA_USERDATA), "slug": "operations", "name": "Operations"
+            }}}
+        ],
+        "task_reviews": task_reviews,
+    });
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+        "--workspace-id",
+        &workspace,
+        "--mapping-file",
+        mapping_file.to_str().unwrap(),
+        "--tasks",
+    ];
+    fs::write(&mapping_file, serde_json::to_vec(&mapping).unwrap()).unwrap();
+    let original_mapping = fs::read(&mapping_file).unwrap();
+    let original_index = fs::read(source.join(".git/index")).unwrap();
+    let plan = |args: &[&str], code| migration_cli(&home, &config, "migration-plan", args, code);
+    let result = plan(&args, 0);
+    assert_eq!(result, plan(&args, 0));
+    let combined = plan(
+        &[args.as_slice(), &["--include-directives-artifacts"]].concat(),
+        0,
+    );
+    assert_eq!(
+        combined["data"]["task_intake"],
+        result["data"]["task_intake"]
+    );
+    assert!(combined["data"]["directive_artifact_intake"].is_object());
+    assert_eq!(fs::read(&mapping_file).unwrap(), original_mapping);
+    assert_eq!(fs::read(source.join(".git/index")).unwrap(), original_index);
+    assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+    assert!(!config.exists());
+    let intake = &result["data"]["task_intake"];
+    assert_eq!(
+        intake["counts"],
+        json!({
+            "inventoried": fixtures.len(), "held": fixtures.len()-2, "excluded": 0, "prepared": 2
+        })
+    );
+    let row = |scope, work_id| {
+        intake["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["legacy_key"] == json!({"scope": scope, "work_id": work_id}))
+            .unwrap()
+    };
+    for (work_id, raw, status, title, title_source, priority, criteria_evidence) in [
+        (
+            "shared",
+            backlog.as_str(),
+            "backlog",
+            heading,
+            "heading",
+            Value::Null,
+            None,
+        ),
+        (
+            "independent",
+            todo.as_str(),
+            "todo",
+            title,
+            "frontmatter_title",
+            json!(0),
+            Some(criteria),
+        ),
+    ] {
+        let prepared = row("_general", work_id);
+        assert_eq!(prepared["source_raw_sha256"], sha256_hex(raw.as_bytes()));
+        let mut provenance = json!({
+            "relations": "no_edges",
+            "body_sha256": sha256_hex(body.as_bytes()),
+            "title_source": title_source,
+            "title_sha256": sha256_hex(title.as_bytes()),
+            "priority": priority,
+            "created_at": {"value": created, "body_range": range(created)},
+            "updated_at": {"value": updated, "body_range": range(updated)},
+        });
+        if let Some(criteria) = criteria_evidence {
+            provenance["acceptance_criteria"] = json!({
+                "body_range": range(criteria), "sha256": sha256_hex(criteria.as_bytes()),
+            });
+        }
+        assert_eq!(
+            prepared["outcome"],
+            json!({
+                "status": "prepared", "candidate_status": status, "area_id": area,
+                "provenance": provenance,
+            })
+        );
+    }
+    let qualified_hold = row("_hive-userdata", "shared");
+    assert_eq!(
+        qualified_hold["source_git_blob_sha"],
+        row("_general", "shared")["source_git_blob_sha"]
+    );
+    assert_eq!(qualified_hold["outcome"]["status"], "held");
+    for (work_id, reasons) in [
+        ("claimed", vec!["execution_needs_reconciliation"]),
+        ("review", vec!["missing_typed_submission_evidence"]),
+        (
+            "terminal",
+            vec![
+                "incomplete_historical_provenance",
+                "unresolved_completion_obligation",
+            ],
+        ),
+        ("unresolved", vec!["unresolved_task_relations"]),
+        ("missing-relations", vec!["unresolved_task_relations"]),
+        ("stale", vec!["task_review_binding_mismatch"]),
+        ("wrong-area", vec!["task_review_binding_mismatch"]),
+        ("duplicate-review", vec!["conflicting_task_review"]),
+        ("missing-dates", vec!["incomplete_historical_provenance"]),
+        ("invalid-dates", vec!["incomplete_historical_provenance"]),
+        ("reversed-dates", vec!["incomplete_historical_provenance"]),
+        ("missing-criteria", vec!["unverified_acceptance_criteria"]),
+        ("invalid-criteria", vec!["unverified_acceptance_criteria"]),
+        ("tagged", vec!["unverified_task_labels"]),
+    ] {
+        let outcome = &row("_general", work_id)["outcome"];
+        assert_eq!(outcome["status"], "held", "{work_id}");
+        assert_eq!(outcome["reason_codes"], json!(reasons), "{work_id}");
+    }
+    let output = result.to_string();
+    for private in [
+        title,
+        heading,
+        criteria,
+        "synthetic-holder",
+        "Prerequisite:",
+        "issue_number",
+    ] {
+        assert!(!output.contains(private), "report exposed {private}");
+    }
+
+    mapping["task_reviews"][0]["legacy_key"]["work_id"] = json!("nonexistent");
+    fs::write(&mapping_file, serde_json::to_vec(&mapping).unwrap()).unwrap();
+    assert_eq!(plan(&args, 2)["error"]["code"], "INVALID_CONFIG");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_checks_task_review_boundaries_under_both_policy_pins() {
+    let max_criteria = format!("{}A", "é".repeat(32_767));
+    let oversized_criteria = format!("{max_criteria}B");
+    let created = "2025-05-04T08:10:11Z";
+    let updated = "2025-05-04t09:10:11z";
+    let dates = "incomplete_historical_provenance";
+    let titles = "missing_or_conflicting_title";
+    let criteria = "unverified_acceptance_criteria";
+    let description = Ok(("description", "Synthetic fallback"));
+    let mut cases = Vec::new();
+    cases.extend(
+        [
+            ("letter-created", "2025-05-04X08:10:11Z", updated),
+            ("newline-updated", created, "2025-05-04\n09:10:11Z"),
+            ("space-created", "2025-05-04 08:10:11Z", updated),
+            ("tab-updated", created, "2025-05-04\t09:10:11Z"),
+            ("padded-created", " 2025-05-04T08:10:11Z", updated),
+            ("padded-updated", created, "2025-05-04T09:10:11Z\n"),
+        ]
+        .map(|(id, created, updated)| (id, "", "", created, updated, "A", Err(dates))),
+    );
+    cases.extend(
+        [
+            ("blockquote", "> # Nested H1\n"),
+            ("list", "- # Nested H1\n"),
+            ("ordered-nested-setext", "1. > Nested H1\n   > ===\n"),
+            ("setext", "Setext H1\n===\n"),
+            ("indented-h1", "  # Indented H1\n"),
+            ("later-h1", "Prose first\n\n# Later H1\n"),
+            ("nbsp-paragraph", "\u{00a0}\n\n# Later H1\n"),
+            (
+                "reference-before-h1",
+                "[ref]: https://example.invalid\n\n# Later H1\n",
+            ),
+            ("additional-nested-h1", "# Leading H1\n\n> # Nested H1\n"),
+        ]
+        .map(|(id, opening)| (id, "", opening, created, updated, "A", Err(titles))),
+    );
+    cases.extend(
+        [
+            (
+                "explicit-title",
+                "title: Synthetic explicit title\n",
+                "> # Nested H1\n",
+                Ok(("frontmatter_title", "Synthetic explicit title")),
+            ),
+            (
+                "leading-h1",
+                "",
+                "\n# Leading H1 ###\n\n~~~\n# Fenced example\n~~~\n",
+                Ok(("heading", "Leading H1")),
+            ),
+            (
+                "leading-h1-cr",
+                "",
+                "# Exact first title\rFollowing text\r",
+                Ok(("heading", "Exact first title")),
+            ),
+            (
+                "leading-h1-blank-cr",
+                "",
+                "\r# Exact first title ###\rFollowing text\r",
+                Ok(("heading", "Exact first title")),
+            ),
+            (
+                "leading-h1-crlf",
+                "",
+                "\r\n# Exact first title ###\r\nFollowing text\r\n",
+                Ok(("heading", "Exact first title")),
+            ),
+            (
+                "fenced-h1",
+                "",
+                "```md\n# Example H1\nText\n===\n```\n",
+                description,
+            ),
+            ("indented-code", "", "    # Example H1\n", description),
+        ]
+        .map(|(id, header, opening, expected)| {
+            (id, header, opening, created, updated, "A", expected)
+        }),
+    );
+    cases.extend(
+        [
+            ("form-feed", FORM_FEED_CRITERIA, description),
+            ("max-criteria", max_criteria.as_str(), description),
+            (
+                "oversize-criteria",
+                oversized_criteria.as_str(),
+                Err(criteria),
+            ),
+            ("blank-criteria", " \x0c\u{2003}", Err(criteria)),
+        ]
+        .map(|(id, criteria, expected)| (id, "", "", created, updated, criteria, expected)),
+    );
+
+    for pin in [POLICY_PIN, "0fd0f8dbe632d14094a93599cb1b5f653789ac9c"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let config = root.path().join("config");
+        let source = root.path().join("source");
+        init_source(&source, &home);
+        fs::write(source.join("AGENTS.md"), format!("hive-system@{pin}\n")).unwrap();
+        if pin != POLICY_PIN {
+            fs::remove_file(source.join("hive.yml")).unwrap();
+        }
+        let mut reviews = Vec::new();
+        let area = id(AREA_GENERAL);
+        for (work_id, header, opening, created, updated, criteria, _) in cases.iter().copied() {
+            let path = format!("tasks/_general/active/{work_id}/README.md");
+            let entrypoint = source.join(&path);
+            let body = format!("{opening}\nCreated: {created}\nUpdated: {updated}\n\n{criteria}");
+            let raw =
+                format!("---\ndescription: Synthetic fallback\nstatus: todo\n{header}---\n{body}");
+            fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+            fs::write(entrypoint, raw).unwrap();
+            let blob = git_text(&source, &home, &["hash-object", &path]);
+            let range = |start, value: &str| json!({"start": start, "end": start + value.len()});
+            reviews.push(json!({
+                "legacy_key": {"scope": "_general", "work_id": work_id},
+                "source_git_blob_sha": blob,
+                "area_id": area,
+                "relations": "no_edges",
+                "created_at": range(opening.len() + "\nCreated: ".len(), created),
+                "updated_at": range(opening.len() + "\nCreated: ".len() + created.len() + "\nUpdated: ".len(), updated),
+                "acceptance_criteria": range(body.len() - criteria.len(), criteria),
+            }));
+        }
+        git(&source, &home, &["add", "."]);
+        git(
+            &source,
+            &home,
+            &["commit", "-qm", "Synthetic Task review boundaries"],
+        );
+        let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+        let workspace = id(1);
+        let mapping_file = root.path().join("mapping.json");
+        let mut mapping = json!({
+            "version": 1, "source_commit": commit, "policy_pin": pin, "workspace_id": workspace,
+            "scopes": [{"scope": "_general", "decision": {"kind": "area", "area": {
+                "id": area, "slug": "general", "name": "General"
+            }}}],
+            "task_reviews": reviews,
+        });
+        let plan = |input: &str, status| {
+            fs::write(&mapping_file, input).unwrap();
+            migration_cli(
+                &home,
+                &config,
+                "migration-plan",
+                &[
+                    "--source",
+                    source.to_str().unwrap(),
+                    "--source-commit",
+                    &commit,
+                    "--workspace-id",
+                    &workspace,
+                    "--mapping-file",
+                    mapping_file.to_str().unwrap(),
+                    "--tasks",
+                ],
+                status,
+            )
+        };
+        let report = plan(&mapping.to_string(), 0);
+        let tasks = report["data"]["task_intake"]["tasks"].as_array().unwrap();
+        for (work_id, _, _, created, updated, criteria, expected) in cases.iter().copied() {
+            let row = tasks
+                .iter()
+                .find(|row| row["legacy_key"]["work_id"] == work_id)
+                .unwrap();
+            let outcome = &row["outcome"];
+            match expected {
+                Ok((title_source, title)) => {
+                    assert_eq!(outcome["status"], "prepared", "{pin} {work_id}: {outcome}");
+                    let evidence = &outcome["provenance"];
+                    assert_eq!(evidence["title_source"], title_source);
+                    assert_eq!(evidence["title_sha256"], sha256_hex(title.as_bytes()));
+                    assert_eq!(evidence["created_at"]["value"], created);
+                    assert_eq!(evidence["updated_at"]["value"], updated);
+                    assert_eq!(
+                        evidence["acceptance_criteria"]["sha256"],
+                        sha256_hex(criteria.as_bytes())
+                    );
+                }
+                Err(reason) => {
+                    assert_eq!(outcome["status"], "held", "{pin} {work_id}");
+                    assert_eq!(outcome["reason_codes"], json!([reason]), "{pin} {work_id}");
+                }
+            }
+        }
+
+        mapping["task_reviews"] = json!([reviews
+            .iter()
+            .find(|review| review["legacy_key"]["work_id"] == "form-feed")
+            .unwrap()]);
+        let exact_json = mapping.to_string();
+        for (pointer, fields) in [
+            (
+                "",
+                &[
+                    "version",
+                    "source_commit",
+                    "policy_pin",
+                    "workspace_id",
+                    "scopes",
+                    "task_reviews",
+                ][..],
+            ),
+            (
+                "/task_reviews/0",
+                &[
+                    "legacy_key",
+                    "source_git_blob_sha",
+                    "area_id",
+                    "relations",
+                    "created_at",
+                    "updated_at",
+                    "acceptance_criteria",
+                ],
+            ),
+            ("/task_reviews/0/legacy_key", &["scope", "work_id"]),
+            ("/task_reviews/0/created_at", &["start", "end"]),
+            ("/task_reviews/0/updated_at", &["start", "end"]),
+            ("/task_reviews/0/acceptance_criteria", &["start", "end"]),
+        ] {
+            let mut positional = mapping.clone();
+            let object = positional.pointer_mut(pointer).unwrap();
+            *object = Value::Array(fields.iter().map(|field| object[*field].clone()).collect());
+            let mut unknown = mapping.clone();
+            unknown.pointer_mut(pointer).unwrap()["unexpected"] = json!(true);
+            let original = mapping.pointer(pointer).unwrap();
+            let original_json = original.to_string();
+            let field = fields[0];
+            let duplicate = exact_json.replacen(
+                &original_json,
+                &format!(
+                    "{{{}:{},{}",
+                    json!(field),
+                    original[field],
+                    &original_json[1..]
+                ),
+                1,
+            );
+            for input in [positional.to_string(), unknown.to_string(), duplicate] {
+                let rejected = plan(&input, 2);
+                assert_eq!(
+                    rejected["error"]["code"], "INVALID_CONFIG",
+                    "{pin} {pointer}"
+                );
+                assert!(rejected.get("data").is_none());
+            }
+        }
     }
 }
 
@@ -3743,6 +4294,19 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
         .unwrap();
     admin.query_drop("START TRANSACTION").unwrap();
     apply_fixture_sql(&mut admin, &projection, &manifest);
+    admin
+        .exec_drop(
+            "UPDATE issues SET acceptance_criteria = ? WHERE id = ?",
+            (FORM_FEED_CRITERIA, id(0x111)),
+        )
+        .unwrap();
+    let stored: Option<String> = admin
+        .exec_first(
+            "SELECT HEX(acceptance_criteria) FROM issues WHERE id = ?",
+            (id(0x111),),
+        )
+        .unwrap();
+    assert_eq!(stored.as_deref(), Some("410C42"));
     admin.query_drop("ROLLBACK").unwrap();
 
     assert_eq!(storage_state(&mut admin), base_state);

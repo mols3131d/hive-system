@@ -17,8 +17,10 @@ mod directive_artifact_intake;
 mod json_object;
 mod queen_assets;
 mod queen_preparation;
+mod reviewed_records;
 mod scope_plan;
 mod task_intake;
+mod task_provenance;
 pub(crate) use scope_plan::plan;
 
 const MAX_INVENTORY_BYTES: usize = 4 * 1024 * 1024;
@@ -93,6 +95,7 @@ impl InventoryEntry {
 #[serde(rename_all = "snake_case")]
 enum Reason {
     AmbiguousScopeOrCollision,
+    ConflictingTaskReview,
     DuplicateLegacyWorkId,
     ExecutionNeedsReconciliation,
     ExternalBackendOwned,
@@ -101,10 +104,12 @@ enum Reason {
     MissingOrConflictingTitle,
     MissingTaskEntrypoint,
     MissingTypedSubmissionEvidence,
+    TaskReviewBindingMismatch,
     UnresolvedCompletionObligation,
     UnresolvedTaskRelations,
     UnsplitLegacyScope,
     UnverifiedAcceptanceCriteria,
+    UnverifiedTaskLabels,
     UnsupportedTaskMetadata,
     NavigationOnly,
     DirectiveBundleSupport,
@@ -126,6 +131,8 @@ enum Reason {
     UnverifiedArtifactRetention,
     UnresolvedParentTask,
     MissingParentTaskEntrypoint,
+    UnsupportedReviewedRecord,
+    UnresolvedArtifactLinks,
 }
 
 fn verified_source<T>(
