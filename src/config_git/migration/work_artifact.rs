@@ -47,6 +47,15 @@ pub(super) struct WorkArtifactReview {
     issue_link: Option<IssueLinkDecision>,
     area_link: Option<String>,
     archive: ArchiveReview,
+    #[serde(default, deserialize_with = "json_object::optional_object")]
+    retention: Option<RetentionReview>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetentionReview {
+    #[serde(default, deserialize_with = "json_object::optional_object")]
+    parent_closed_at: Option<BodyRange>,
 }
 
 #[derive(Deserialize)]
@@ -87,10 +96,17 @@ impl IssueLink {
     }
 }
 
+#[derive(Serialize)]
+pub(super) struct TerminalRetention {
+    parent_closed_at: Timestamp,
+    effective_substantive_updated_at: String,
+}
+
 pub(crate) struct WorkScope {
     pub(crate) issue_link: IssueLink,
     pub(super) created_at: Timestamp,
     pub(super) substantive_updated_at: Timestamp,
+    pub(super) retention: Option<TerminalRetention>,
 }
 
 impl WorkArtifactReview {
@@ -127,9 +143,6 @@ impl WorkArtifactReview {
         if !actor_ref(&self.author_ref) {
             return Err(Reason::UnverifiedArtifactAuthor);
         }
-        if !matches!(actual.status, "backlog" | "todo") {
-            return Err(Reason::UnverifiedArtifactRetention);
-        }
         if !portable_reference(&self.source_ref) {
             return Err(Reason::IncompleteHistoricalProvenance);
         }
@@ -138,13 +151,35 @@ impl WorkArtifactReview {
                 .zip(Timestamp::select(self.substantive_updated_at, body))
                 .filter(|((_, created), (_, updated))| created <= updated)
                 .ok_or(Reason::IncompleteHistoricalProvenance)?;
+        let (updated_for_retention, retention) = match actual.status {
+            "backlog" | "todo" if self.retention.is_none() => (updated, None),
+            "done" | "cancelled" => {
+                let hold = Reason::UnverifiedArtifactRetention;
+                let range = self
+                    .retention
+                    .as_ref()
+                    .and_then(|review| review.parent_closed_at)
+                    .ok_or(hold)?;
+                let closure = actual.fields.closure.as_ref().ok_or(hold)?;
+                let parent_closed_at = closure.reviewed_closed_at(range).ok_or(hold)?;
+                let effective = updated.max(closure.closed_at);
+                (
+                    effective,
+                    Some(TerminalRetention {
+                        parent_closed_at: parent_closed_at.clone(),
+                        effective_substantive_updated_at: canonical_utc(effective),
+                    }),
+                )
+            }
+            _ => return Err(Reason::UnverifiedArtifactRetention),
+        };
         Ok(Fields::Artifact(ArtifactFields {
             kind,
             author_ref: self.author_ref.clone(),
             source_ref: self.source_ref.clone(),
             created_at: canonical_utc(created),
-            substantive_updated_at: canonical_utc(updated),
-            archive: self.archive.prepare(Some(body), updated)?,
+            substantive_updated_at: canonical_utc(updated_for_retention),
+            archive: self.archive.prepare(Some(body), updated_for_retention)?,
             work: Some(Box::new(WorkScope {
                 issue_link: IssueLink {
                     decision: "retain",
@@ -158,6 +193,7 @@ impl WorkArtifactReview {
                 },
                 created_at,
                 substantive_updated_at,
+                retention,
             })),
         }))
     }

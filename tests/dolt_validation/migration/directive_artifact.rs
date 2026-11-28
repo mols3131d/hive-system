@@ -6,6 +6,9 @@ use super::{
 #[path = "directive_history.rs"]
 mod directive_history;
 
+#[path = "terminal_artifact_retention.rs"]
+mod terminal_artifact_retention;
+
 #[path = "work_artifact.rs"]
 mod work_artifact;
 

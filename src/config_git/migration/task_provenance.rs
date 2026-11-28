@@ -99,7 +99,7 @@ struct ClosureReview {
 }
 
 /// Half-open UTF-8 byte range relative to the body after frontmatter.
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct BodyRange {
     start: u32,
@@ -246,7 +246,7 @@ struct PreparedClosure {
     resolution_note: BodyEvidence,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(super) struct Timestamp {
     value: String,
     body_range: BodyRange,
@@ -313,6 +313,13 @@ pub(crate) struct StagingClosure<'a> {
     pub(crate) closed_at: OffsetDateTime,
     pub(crate) closed_by_ref: &'a str,
     pub(crate) resolution_note: &'a str,
+    closed_at_evidence: &'a Timestamp,
+}
+
+impl StagingClosure<'_> {
+    pub(super) fn reviewed_closed_at(&self, range: BodyRange) -> Option<&Timestamp> {
+        (self.closed_at_evidence.body_range == range).then_some(self.closed_at_evidence)
+    }
 }
 
 pub(crate) struct ScopeAcceptance<'a> {
@@ -341,6 +348,7 @@ impl Prepared {
                 closed_at: closure.closed_at.instant,
                 closed_by_ref: selected(closure.closed_by_ref.body_range),
                 resolution_note: selected(closure.resolution_note.body_range),
+                closed_at_evidence: &closure.closed_at,
             }),
             parent: None,
             prerequisites: Vec::new(),
