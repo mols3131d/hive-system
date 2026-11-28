@@ -2714,3 +2714,192 @@ fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {
         .collect();
     assert_eq!(source_hashes_after, source_hashes_before);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_prepares_reviewed_queens_at_both_pins() {
+    for pin in [POLICY_PIN, "0fd0f8dbe632d14094a93599cb1b5f653789ac9c"] {
+        check_prepared_queen_plan(pin);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_prepared_queen_plan(pin: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("source");
+    let config = root.path().join("config");
+    init_source(&source, &home);
+    if pin != POLICY_PIN {
+        let policy_path = source.join("AGENTS.md");
+        let policy = fs::read_to_string(&policy_path).unwrap();
+        fs::write(policy_path, policy.replace(POLICY_PIN, pin)).unwrap();
+        fs::remove_file(source.join("hive.yml")).unwrap();
+    }
+    let exact_soul = "---\r\ndescription: \"Synthetic identity.\"\r\n---\r\n# Queen\r\n\r\n## Identity\r\n\r\n- ID: queen-example\r\n- Name: Source name sentinel\r\n- Layer: 1 — Manager\r\n\r\n## Purpose\r\n\r\nExact café sentinel.\r\n";
+    let other_soul = exact_soul.replace("queen-example", "other-queen");
+    let worker_soul = exact_soul
+        .replace("queen-example", "worker")
+        .replace("1 — Manager", "2 — Coordinator");
+    let write = |path: &str, content: &str| {
+        let path = source.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    };
+    write("bots/queen-example/SOUL.md", exact_soul);
+    write("bots/other-queen/SOUL.md", &other_soul);
+    write("bots/worker/SOUL.md", &worker_soul);
+    write("bots/queen-example/README.md", "Routing sentinel");
+    write("bots/queen-example/AGENTS.md", "Harness sentinel");
+    write(
+        "bots/queen-example/MEMORY.md",
+        "---\ndescription: \"Memory navigation.\"\n---\n# Memory\n\n- [_general](memory/_general/MEMORY.md)\n",
+    );
+    write(
+        "bots/queen-example/memory/_general/MEMORY.md",
+        "History sentinel",
+    );
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic preparation inputs"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let workspace = id(1);
+    let mapping_file = root.path().join("mapping.json");
+    let oid = |slug: &str| {
+        git_text(
+            &source,
+            &home,
+            &["rev-parse", &format!("HEAD:bots/{slug}/SOUL.md")],
+        )
+    };
+    let reviewed = |slug: &str| json!({"slug": slug, "source_git_blob_sha": oid(slug)});
+    let preparation = |slug: &str, soul: &str, bot_id: String| {
+        json!({
+            "slug": slug,
+            "source_git_blob_sha": oid(slug),
+            "source_raw_sha256": sha256_hex(soul.as_bytes()),
+            "bot_id": bot_id,
+            "display_name": "Reviewed display sentinel",
+        })
+    };
+    let queen = preparation("queen-example", exact_soul, id(2));
+    let other = preparation("other-queen", &other_soul, id(3));
+    let worker = preparation("worker", &worker_soul, id(4));
+    let mapping = json!({
+        "version": 1,
+        "source_commit": commit,
+        "policy_pin": pin,
+        "workspace_id": workspace,
+        "scopes": [],
+        "queen_assets": [reviewed("queen-example"), reviewed("other-queen"), reviewed("worker")],
+        "queen_preparation": [queen, other, worker],
+    });
+    let run = |mapping: &Value, status| {
+        fs::write(&mapping_file, serde_json::to_vec(mapping).unwrap()).unwrap();
+        migration_cli(
+            &home,
+            &config,
+            "migration-plan",
+            &[
+                "--source",
+                source.to_str().unwrap(),
+                "--source-commit",
+                &commit,
+                "--workspace-id",
+                &workspace,
+                "--mapping-file",
+                mapping_file.to_str().unwrap(),
+            ],
+            status,
+        )
+    };
+    let index_before = fs::read(source.join(".git/index")).unwrap();
+    let report = run(&mapping, 0);
+    let data = &report["data"];
+    let prepared = &data["queen_preparation"];
+    assert_eq!(
+        prepared[0],
+        json!({
+            "status": "prepared",
+            "slug": "queen-example",
+            "bot_id": id(2),
+            "source_git_blob_sha": oid("queen-example"),
+            "source_raw_sha256": sha256_hex(exact_soul.as_bytes()),
+        })
+    );
+    assert_eq!(prepared[1]["status"], "prepared");
+    assert_eq!(prepared[2]["reason"], "invalid_soul_or_slug");
+    assert_eq!(
+        data["queen_assets"]["navigation_only"][0]["reason"],
+        "navigation_only"
+    );
+    assert_eq!(
+        data["queen_assets"]["bot_memories_historical"][0]["reason"],
+        "curated_memory_deferred"
+    );
+    assert!(!report.to_string().contains("sentinel"));
+    for (key, value) in [
+        ("source_commit", json!("1".repeat(40))),
+        ("workspace_id", json!(id(8))),
+        ("policy_pin", json!("1".repeat(40))),
+        ("queen_preparation", Value::Null),
+        (
+            "scopes",
+            json!([{"scope": "absent", "decision": {"kind": "external"}}]),
+        ),
+    ] {
+        let mut changed = mapping.clone();
+        changed[key] = value;
+        let report = run(&changed, 2);
+        assert_eq!(report["error"]["code"], "INVALID_CONFIG");
+        assert!(report.get("data").is_none());
+    }
+    for (key, value) in [
+        ("role", json!("queen")),
+        ("bot_id", json!("018f0000-0000-4000-8000-000000000001")),
+        ("display_name", json!(" ")),
+        ("slug", json!("../queen-example")),
+    ] {
+        let mut changed = mapping.clone();
+        changed["queen_preparation"][0][key] = value;
+        assert_eq!(run(&changed, 2)["error"]["code"], "INVALID_CONFIG");
+    }
+    for (key, value) in [
+        ("source_git_blob_sha", json!("1".repeat(40))),
+        ("source_raw_sha256", json!("1".repeat(64))),
+    ] {
+        let mut changed = mapping.clone();
+        changed["queen_preparation"][0][key] = value;
+        assert_eq!(
+            run(&changed, 0)["data"]["queen_preparation"][0]["status"],
+            "held"
+        );
+    }
+    let mut changed = mapping.clone();
+    changed["queen_assets"] = json!([]);
+    assert_eq!(
+        run(&changed, 0)["data"]["queen_preparation"][0]["status"],
+        "held"
+    );
+
+    let mut changed = mapping.clone();
+    changed["queen_preparation"][1]["bot_id"] = json!(id(2));
+    let report = run(&changed, 0);
+    assert_eq!(report["data"]["queen_preparation"][0]["status"], "held");
+    assert_eq!(report["data"]["queen_preparation"][1]["status"], "held");
+
+    let mut changed = mapping.clone();
+    changed["queen_preparation"][1] = preparation("queen-example", exact_soul, id(5));
+    let report = run(&changed, 0);
+    assert_eq!(report["data"]["queen_preparation"][0]["status"], "held");
+    assert_eq!(report["data"]["queen_preparation"][1]["status"], "held");
+
+    assert_eq!(fs::read(source.join(".git/index")).unwrap(), index_before);
+    assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+    assert!(!config.exists());
+}

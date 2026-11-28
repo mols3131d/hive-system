@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
 use super::queen_assets::{self, SoulReview};
+use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
 use super::{AssetObjectReader, Inventory, Reason, snapshot_object, verified_source};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
@@ -23,6 +24,8 @@ struct Mapping {
     workspace_id: String,
     scopes: Vec<ScopeMapping>,
     queen_assets: Option<Vec<SoulReview>>,
+    #[serde(default, deserialize_with = "QueenMapping::optional_list")]
+    queen_preparation: Option<Vec<QueenMapping>>,
 }
 
 #[derive(Deserialize)]
@@ -111,6 +114,21 @@ pub(crate) fn plan(
     workspace_id: &str,
     mapping_file: &Path,
 ) -> Result<Value, HiveError> {
+    Ok(prepare_plan(source, revision, workspace_id, mapping_file)?.report)
+}
+
+struct MigrationPlan {
+    report: Value,
+    #[expect(dead_code, reason = "reserved for the later inactive staging step")]
+    queen_souls: Vec<PreparedQueen>,
+}
+
+fn prepare_plan(
+    source: &Path,
+    revision: &str,
+    workspace_id: &str,
+    mapping_file: &Path,
+) -> Result<MigrationPlan, HiveError> {
     if !is_uuid(workspace_id) {
         return Err(HiveError::new(
             ErrorCode::InvalidArgument,
@@ -146,10 +164,34 @@ pub(crate) fn plan(
             "target": {"workspace_id": workspace_id},
             "scopes": scopes.iter().map(Scope::report).collect::<Vec<_>>(),
         });
-        if let Some(reviews) = &mapping.queen_assets {
-            report["queen_assets"] = json!(queen_assets::classify(inventory, reader, reviews)?);
+        let mut preparation = mapping
+            .queen_preparation
+            .as_deref()
+            .map(Preparation::new)
+            .transpose()?;
+        if mapping.queen_assets.is_some() || preparation.is_some() {
+            report["queen_assets"] = json!(queen_assets::classify(
+                inventory,
+                reader,
+                mapping.queen_assets.as_deref().unwrap_or_default(),
+                |slug, oid, digest, bytes| {
+                    if let Some(preparation) = &mut preparation {
+                        preparation.accept_candidate(slug, oid, digest, bytes);
+                    }
+                },
+            )?);
         }
-        Ok(report)
+        let queen_souls = if let Some(preparation) = preparation {
+            let (summary, souls) = preparation.finish();
+            report["queen_preparation"] = summary;
+            souls
+        } else {
+            Vec::new()
+        };
+        Ok(MigrationPlan {
+            report,
+            queen_souls,
+        })
     })
 }
 

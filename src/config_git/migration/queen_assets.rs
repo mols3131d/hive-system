@@ -62,6 +62,7 @@ pub(super) fn classify<'a>(
     inventory: &'a Inventory,
     reader: &AssetObjectReader<'_>,
     reviews: &[SoulReview],
+    mut on_candidate: impl FnMut(&str, &str, &str, Vec<u8>),
 ) -> Result<QueenAssets<'a>, HiveError> {
     let entries = &inventory.entries;
     let mut slug_counts = BTreeMap::<String, usize>::new();
@@ -125,10 +126,12 @@ pub(super) fn classify<'a>(
                 {
                     let bytes = snapshot_object(&|| reader.command(), "blob", &soul.oid, size)?;
                     if valid_soul(&bytes, relative) {
+                        let source_raw_sha256 = digest(&bytes);
+                        on_candidate(relative, &soul.oid, &source_raw_sha256, bytes);
                         outcome = Outcome::Candidate {
                             slug: relative.into(),
                             target_path: format!("assets/{soul_path}"),
-                            source_raw_sha256: digest(&bytes),
+                            source_raw_sha256,
                         };
                     }
                 }
@@ -205,7 +208,7 @@ fn valid_slug(slug: &str) -> bool {
     slug.len() <= 100 && is_slug(slug)
 }
 
-fn portable_slug(slug: &str) -> bool {
+pub(super) fn portable_slug(slug: &str) -> bool {
     valid_slug(slug) && !device_name(slug)
 }
 

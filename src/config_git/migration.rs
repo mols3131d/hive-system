@@ -13,6 +13,7 @@ use super::*;
 use crate::config_file::{Coordination, ScopedDirectory};
 
 mod queen_assets;
+mod queen_preparation;
 mod scope_plan;
 pub(crate) use scope_plan::plan;
 
