@@ -3089,8 +3089,8 @@ fn check_prepared_queen_plan(pin: &str) {
             preparation("conflicting-role", &conflicting_role, id(7)),
         ],
     });
-    let run = |mapping: &Value, status| {
-        fs::write(&mapping_file, serde_json::to_vec(mapping).unwrap()).unwrap();
+    let run_json = |manifest: &str, status| {
+        fs::write(&mapping_file, manifest).unwrap();
         migration_cli(
             &home,
             &config,
@@ -3108,6 +3108,7 @@ fn check_prepared_queen_plan(pin: &str) {
             status,
         )
     };
+    let run = |mapping: &Value, status| run_json(&mapping.to_string(), status);
     let index_before = fs::read(source.join(".git/index")).unwrap();
     let report = run(&mapping, 0);
     let data = &report["data"];
@@ -3142,11 +3143,95 @@ fn check_prepared_queen_plan(pin: &str) {
         "curated_memory_deferred"
     );
     assert!(!report.to_string().contains("sentinel"));
+
+    let positional_manifest = json!([
+        mapping["version"],
+        mapping["source_commit"],
+        mapping["policy_pin"],
+        mapping["workspace_id"],
+        mapping["scopes"],
+        mapping["queen_assets"],
+        mapping["queen_preparation"],
+    ]);
+    let rejects_manifest = |label: &str, manifest: &str| {
+        let report = run_json(manifest, 2);
+        assert_eq!(report["error"]["code"], "INVALID_CONFIG", "{pin}: {label}");
+        assert!(report.get("data").is_none(), "{pin}: {label}");
+    };
+    rejects_manifest("positional manifest", &positional_manifest.to_string());
+    for (section, fields) in [
+        ("queen_assets", &["slug", "source_git_blob_sha"][..]),
+        (
+            "queen_preparation",
+            &[
+                "slug",
+                "source_git_blob_sha",
+                "source_raw_sha256",
+                "bot_id",
+                "display_name",
+            ][..],
+        ),
+    ] {
+        let entry = &mapping[section][0];
+        let mut changed = mapping.clone();
+        changed[section][0] = json!(
+            fields
+                .iter()
+                .map(|field| &entry[*field])
+                .collect::<Vec<_>>()
+        );
+        rejects_manifest(&format!("positional {section} entry"), &changed.to_string());
+
+        for (shape, invalid_list) in [
+            ("null", Value::Null),
+            ("object", entry.clone()),
+            ("array with a null entry", json!([null])),
+        ] {
+            let mut changed = mapping.clone();
+            changed[section] = invalid_list;
+            rejects_manifest(&format!("{section} is {shape}"), &changed.to_string());
+        }
+
+        let mut changed = mapping.clone();
+        changed[section][0]["unknown"] = json!(true);
+        rejects_manifest(
+            &format!("unknown member in {section}"),
+            &changed.to_string(),
+        );
+
+        // A Value cannot represent repeated JSON members, so supply the raw entry.
+        let entry_json = entry.to_string();
+        let repeated_slug = format!("{{\"slug\":{},{}", entry["slug"], &entry_json[1..]);
+        let manifest = format!(
+            "{{\"{section}\":[{entry_json}],{}",
+            &mapping.to_string()[1..]
+        );
+        rejects_manifest(&format!("repeated {section} manifest member"), &manifest);
+        let mut changed = mapping.clone();
+        changed[section] = json!([entry]);
+        let manifest = changed.to_string().replace(&entry_json, &repeated_slug);
+        rejects_manifest(&format!("repeated member in {section} entry"), &manifest);
+    }
+
+    let mut changed = mapping.clone();
+    changed.as_object_mut().unwrap().remove("queen_preparation");
+    let report = run(&changed, 0);
+    assert!(report["data"].get("queen_preparation").is_none());
+    assert!(report["data"].get("queen_assets").is_some());
+
+    let mut changed = mapping.clone();
+    changed.as_object_mut().unwrap().remove("queen_assets");
+    assert_eq!(
+        run(&changed, 0)["data"]["queen_preparation"][0]["status"],
+        "held"
+    );
+    changed["queen_preparation"] = json!([]);
+    assert_eq!(run(&changed, 0)["data"]["queen_preparation"], json!([]));
+
     for (key, value) in [
         ("source_commit", json!("1".repeat(40))),
         ("workspace_id", json!(id(8))),
         ("policy_pin", json!("1".repeat(40))),
-        ("queen_preparation", Value::Null),
         (
             "scopes",
             json!([{"scope": "absent", "decision": {"kind": "external"}}]),
@@ -3159,7 +3244,6 @@ fn check_prepared_queen_plan(pin: &str) {
         assert!(report.get("data").is_none());
     }
     for (key, value) in [
-        ("role", json!("queen")),
         ("bot_id", json!("018f0000-0000-4000-8000-000000000001")),
         ("display_name", json!(" ")),
         ("slug", json!("../queen-example")),

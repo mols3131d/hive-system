@@ -3,11 +3,12 @@ use std::ops::Range;
 use std::path::Path;
 
 use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag, TagEnd};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
+use super::json_object::{Object, deserialize_vec};
 use super::queen_assets::{self, SoulReview};
 use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
 use super::{
@@ -27,9 +28,18 @@ struct Mapping {
     policy_pin: String,
     workspace_id: String,
     scopes: Vec<ScopeMapping>,
+    #[serde(default, deserialize_with = "optional_object_list")]
     queen_assets: Option<Vec<SoulReview>>,
-    #[serde(default, deserialize_with = "QueenMapping::optional_list")]
+    #[serde(default, deserialize_with = "optional_object_list")]
     queen_preparation: Option<Vec<QueenMapping>>,
+}
+
+fn optional_object_list<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserialize_vec(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -142,7 +152,7 @@ fn prepare_plan(
     let input = read_regular(mapping_file)
         .map_err(|error| HiveError::new(error.code, "Could not read the scope mapping file."))?
         .ok_or_else(|| invalid("The scope mapping file is missing."))?;
-    let mapping: Mapping = serde_json::from_slice(&input)
+    let Object(mapping) = serde_json::from_slice::<Object<Mapping>>(&input)
         .map_err(|_| invalid("The scope mapping must match the versioned JSON format."))?;
     if mapping.version != 1 {
         return Err(invalid("The scope mapping version is unsupported."));

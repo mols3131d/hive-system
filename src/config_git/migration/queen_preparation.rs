@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::is_portable_bot_memory_locator;
@@ -19,12 +19,6 @@ pub(super) struct QueenMapping {
 }
 
 impl QueenMapping {
-    pub(super) fn optional_list<'de, D: Deserializer<'de>>(
-        de: D,
-    ) -> Result<Option<Vec<Self>>, D::Error> {
-        Vec::deserialize(de).map(Some)
-    }
-
     fn valid(&self) -> bool {
         is_portable_bot_memory_locator(&self.slug, None)
             && is_full_lowercase_oid(&self.source_git_blob_sha)
