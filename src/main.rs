@@ -145,10 +145,16 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
                 source_commit: _commit,
                 workspace_id: _workspace_id,
                 mapping_file: _mapping_file,
+                tasks: _tasks,
             } => {
                 #[cfg(target_os = "linux")]
-                let result =
-                    config_git::migration::plan(_source, _commit, _workspace_id, _mapping_file);
+                let result = config_git::migration::plan(
+                    _source,
+                    _commit,
+                    _workspace_id,
+                    _mapping_file,
+                    *_tasks,
+                );
                 #[cfg(not(target_os = "linux"))]
                 let result = Err(HiveError::new(
                     ErrorCode::NotImplemented,

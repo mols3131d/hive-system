@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{Inventory, verified_source};
+use super::{Inventory, Reason, task_intake, verified_source};
 use crate::cli::is_slug;
 use crate::config_file::read_regular;
 use crate::dolt::{is_uuid, is_uuid_v7};
@@ -41,8 +41,8 @@ enum Decision {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Area {
-    id: String,
+pub(super) struct Area {
+    pub(super) id: String,
     slug: String,
     name: String,
     parent_id: Option<String>,
@@ -55,11 +55,27 @@ struct ProjectEvidence {
     project_key: String,
 }
 
+#[derive(Serialize)]
+struct Scope<'a> {
+    scope: &'a str,
+    source_paths: Vec<&'a str>,
+    outcome: ScopeOutcome<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(super) enum ScopeOutcome<'a> {
+    Mapped { area: &'a Area },
+    Held { reason: Reason },
+    Excluded { reason: Reason },
+}
+
 pub(crate) fn plan(
     source: &Path,
     revision: &str,
     workspace_id: &str,
     mapping_file: &Path,
+    include_tasks: bool,
 ) -> Result<Value, HiveError> {
     if !is_uuid(workspace_id) {
         return Err(HiveError::new(
@@ -76,7 +92,7 @@ pub(crate) fn plan(
         return Err(invalid("The scope mapping version is unsupported."));
     }
 
-    let (source, inventory) = verified_source(source, revision)?;
+    let (source, inventory, tasks) = verified_source(source, revision, include_tasks)?;
     if mapping.source_commit != source.source_commit
         || mapping.policy_pin != source.policy_pin
         || mapping.workspace_id != workspace_id
@@ -87,7 +103,7 @@ pub(crate) fn plan(
     }
 
     let scopes = classify_scopes(&inventory, &mapping.scopes)?;
-    Ok(json!({
+    let mut report = json!({
         "mode": "scope_plan",
         "mapping_version": mapping.version,
         "mapping_sha256": format!("{:x}", Sha256::digest(input)),
@@ -95,16 +111,24 @@ pub(crate) fn plan(
         "inventory": inventory.summary,
         "target": {"workspace_id": workspace_id},
         "scopes": scopes,
-    }))
+    });
+    if include_tasks {
+        let outcomes = scopes
+            .iter()
+            .map(|scope| (scope.scope, &scope.outcome))
+            .collect();
+        report["task_intake"] = task_intake::report(tasks, &outcomes);
+    }
+    Ok(report)
 }
 
-fn classify_scopes(
-    inventory: &Inventory,
-    mappings: &[ScopeMapping],
-) -> Result<Vec<Value>, HiveError> {
+fn classify_scopes<'a>(
+    inventory: &'a Inventory,
+    mappings: &'a [ScopeMapping],
+) -> Result<Vec<Scope<'a>>, HiveError> {
     let mut scopes = BTreeMap::<&str, Vec<(&str, &str)>>::new();
-    for (path, (_, directory)) in &inventory.entries {
-        if !directory {
+    for (path, entry) in &inventory.entries {
+        if !entry.is_directory() {
             continue;
         }
         let components: Vec<_> = path.split('/').take(5).collect();
@@ -165,10 +189,12 @@ fn classify_scopes(
         .map(|(scope, origins)| {
             let decision = decisions.get(scope).map(Vec::as_slice);
             let outcome = match (scope, decision) {
-                ("_hive", _) => json!({"status": "held", "reason": "unsplit_legacy_scope"}),
-                (_, Some([Decision::External {}])) if !reserved(scope) => {
-                    json!({"status": "excluded", "reason": "external_backend_owned"})
-                }
+                ("_hive", _) => ScopeOutcome::Held {
+                    reason: Reason::UnsplitLegacyScope,
+                },
+                (_, Some([Decision::External {}])) if !reserved(scope) => ScopeOutcome::Excluded {
+                    reason: Reason::ExternalBackendOwned,
+                },
                 (
                     _,
                     Some(
@@ -184,15 +210,17 @@ fn classify_scopes(
                     && (reserved(scope)
                         || project_agrees(inventory, &origins, project_evidence)) =>
                 {
-                    json!({"status": "mapped", "area": area})
+                    ScopeOutcome::Mapped { area }
                 }
-                _ => json!({"status": "held", "reason": "ambiguous_scope_or_collision"}),
+                _ => ScopeOutcome::Held {
+                    reason: Reason::AmbiguousScopeOrCollision,
+                },
             };
-            json!({
-                "scope": scope,
-                "source_paths": origins.iter().map(|(path, _)| *path).collect::<Vec<_>>(),
-                "outcome": outcome,
-            })
+            Scope {
+                scope,
+                source_paths: origins.into_iter().map(|(path, _)| path).collect(),
+                outcome,
+            }
         })
         .collect())
 }
@@ -214,7 +242,10 @@ fn project_agrees(
         && origins.iter().all(|(directory, entrypoint)| {
             let path = format!("{directory}/{entrypoint}");
             paths.contains(path.as_str())
-                && inventory.entries.get(&path).is_some_and(|entry| !entry.1)
+                && inventory
+                    .entries
+                    .get(&path)
+                    .is_some_and(|entry| !entry.is_directory())
         })
 }
 

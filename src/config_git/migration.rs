@@ -9,6 +9,7 @@ use super::*;
 use crate::config_file::{Coordination, ScopedDirectory};
 
 mod scope_plan;
+mod task_intake;
 pub(crate) use scope_plan::plan;
 
 const MAX_INVENTORY_BYTES: usize = 4 * 1024 * 1024;
@@ -17,7 +18,7 @@ const MAX_TREE_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveError> {
-    let (source, inventory) = verified_source(source, revision)?;
+    let (source, inventory, _) = verified_source(source, revision, false)?;
     Ok(json!({
         "mode": "source_preflight",
         "source": source,
@@ -36,14 +37,46 @@ struct SourceSnapshot<'a> {
 }
 
 struct Inventory {
-    entries: BTreeMap<String, (String, bool)>,
+    entries: BTreeMap<String, InventoryEntry>,
     summary: Value,
+}
+
+struct InventoryEntry {
+    mode: &'static str,
+    oid: String,
+    size: Option<usize>,
+}
+
+impl InventoryEntry {
+    fn is_directory(&self) -> bool {
+        self.size.is_none()
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Reason {
+    AmbiguousScopeOrCollision,
+    DuplicateLegacyWorkId,
+    ExecutionNeedsReconciliation,
+    ExternalBackendOwned,
+    IncompleteHistoricalProvenance,
+    InvalidLegacyState,
+    MissingOrConflictingTitle,
+    MissingTypedSubmissionEvidence,
+    MissingTaskEntrypoint,
+    UnresolvedCompletionObligation,
+    UnresolvedTaskRelations,
+    UnsplitLegacyScope,
+    UnverifiedAcceptanceCriteria,
+    UnsupportedTaskMetadata,
 }
 
 fn verified_source<'a>(
     source: &Path,
     revision: &'a str,
-) -> Result<(SourceSnapshot<'a>, Inventory), HiveError> {
+    include_tasks: bool,
+) -> Result<(SourceSnapshot<'a>, Inventory, Vec<task_intake::Record>), HiveError> {
     if !source.is_absolute() || !is_full_lowercase_oid(revision) {
         return Err(HiveError::new(
             ErrorCode::InvalidArgument,
@@ -111,10 +144,16 @@ fn verified_source<'a>(
     let (policy_pin, coordination) = crate::config::parse_workspace_sources(|path| {
         read_committed_asset_blob(&git, revision, path)
     })?;
+    let claims_supported = coordination.is_some();
     let hive_yml = match coordination {
         Some(Coordination::Local) => json!({"version": 1, "mode": "local"}),
         Some(Coordination::Remote(_)) => json!({"version": 1, "mode": "remote"}),
         None => Value::Null,
+    };
+    let tasks = if include_tasks {
+        task_intake::read_records(&inventory, &git, claims_supported)?
+    } else {
+        Vec::new()
     };
 
     check_clean()?;
@@ -138,6 +177,7 @@ fn verified_source<'a>(
             root_tree_sha256: format!("{:x}", Sha256::digest(raw_tree)),
         },
         inventory,
+        tasks,
     ))
 }
 
@@ -242,24 +282,36 @@ fn inventory(
                     "The v1 source inventory exceeds 4 MiB.",
                 ));
             }
-            if entries.insert(path, (fields, size.is_none())).is_some() {
+            if entries
+                .insert(path, InventoryEntry { mode, oid, size })
+                .is_some()
+            {
                 return Err(invalid());
             }
         }
     }
     let mut digest = Sha256::new();
-    for (path, (fields, _)) in &entries {
+    for (path, entry) in &entries {
         digest.update(path);
         digest.update(b"\0");
-        digest.update(fields);
+        digest.update(entry.mode);
+        digest.update(b"\0");
+        digest.update(&entry.oid);
+        digest.update(b"\0");
+        digest.update(
+            entry
+                .size
+                .map_or_else(|| "-".into(), |size| size.to_string()),
+        );
+        digest.update(b"\0");
     }
     let summary = json!({
         "directory_count": directories,
         "file_count": entries.len() - directories,
         "blob_bytes": blob_bytes,
         "catalog_sha256": format!("{:x}", digest.finalize()),
-        "rulesync_directory": entries.get(".rulesync").is_some_and(|entry| entry.1),
-        "rulesync_config": entries.get("rulesync.jsonc").is_some_and(|entry| !entry.1),
+        "rulesync_directory": entries.get(".rulesync").is_some_and(InventoryEntry::is_directory),
+        "rulesync_config": entries.get("rulesync.jsonc").is_some_and(|entry| !entry.is_directory()),
     });
     Ok(Inventory { entries, summary })
 }
