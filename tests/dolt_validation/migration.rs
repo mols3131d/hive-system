@@ -1532,6 +1532,27 @@ fn check_queen_asset_intake(policy_pin: &str) {
     };
     let exact_soul = soul("queen-synth", "1 — Manager").replace('\n', "\r\n");
     write("bots/queen-synth/SOUL.md", exact_soul.as_bytes());
+    let compatible = [
+        (
+            "identity-steward",
+            soul("identity-steward", "1 — Manager")
+                .replace("# Synthetic Queen", "# Identity Steward")
+                .replace(
+                    "- Name: Synthetic Private Display",
+                    "- Name: Identity Steward",
+                ),
+        ),
+        (
+            "purpose-duties",
+            format!(
+                "{}\n- Role-specific review duties are described in [Agent Layout](https://example.invalid/agent-layout).\n- Role assignments follow the review policy.\n",
+                soul("purpose-duties", "1 — Manager")
+            ),
+        ),
+    ];
+    for (slug, contents) in &compatible {
+        write(&format!("bots/{slug}/SOUL.md"), contents.as_bytes());
+    }
     for (slug, layer) in [
         ("worker", "2 — Coordinator"),
         ("wrong-id", "1 — Manager"),
@@ -1561,6 +1582,7 @@ fn check_queen_asset_intake(policy_pin: &str) {
         ("conflict-empty-field", "* **Display Name**:"),
         ("conflict-empty-heading", "### **Bot ID**"),
         ("conflict-malformed-field", "* **Bot ID = different-queen"),
+        ("conflict-dash-field", "* Role - Coordinator"),
     ];
     for (slug, declaration) in conflicting {
         write(
@@ -1568,6 +1590,12 @@ fn check_queen_asset_intake(policy_pin: &str) {
             format!("{}\n{declaration}\n", soul(slug, "1 — Manager")).as_bytes(),
         );
     }
+    write(
+        "bots/conflict-leading/SOUL.md",
+        soul("conflict-leading", "1 — Manager")
+            .replace("# Synthetic Queen", "# Bot ID different-queen")
+            .as_bytes(),
+    );
     write(
         "bots/missing/README.md",
         b"Synthetic private routing sentinel.",
@@ -1703,13 +1731,16 @@ fn check_queen_asset_intake(policy_pin: &str) {
     mapping["queen_assets"] = json!([
         review("queen-synth"), review("worker"), review("wrong-id"), review("collision"),
         review("repeat-review"), review("repeat-review"), review("alias"), review("binary"),
-        review("bad-metadata"), review("aux"),
+        review("bad-metadata"), review("aux"), review("conflict-leading"),
         {"slug": "stale", "source_git_blob_sha": "1111111111111111111111111111111111111111"}
     ]);
-    mapping["queen_assets"]
-        .as_array_mut()
-        .unwrap()
-        .extend(conflicting.iter().map(|(slug, _)| review(slug)));
+    mapping["queen_assets"].as_array_mut().unwrap().extend(
+        conflicting
+            .iter()
+            .map(|(slug, _)| *slug)
+            .chain(compatible.iter().map(|(slug, _)| *slug))
+            .map(review),
+    );
     let report = run(&mapping, 0);
     let assets = &report["data"]["queen_assets"];
     let find = |surface: &str, path: &str| {
@@ -1732,6 +1763,18 @@ fn check_queen_asset_intake(policy_pin: &str) {
         candidate["source_raw_sha256"],
         sha256_hex(exact_soul.as_bytes())
     );
+    for (slug, contents) in &compatible {
+        let candidate = find("bots_soul", &format!("bots/{slug}/SOUL.md"));
+        assert_eq!(candidate["status"], "candidate", "{slug}");
+        assert_eq!(
+            candidate["source_git_blob_sha"],
+            review(slug)["source_git_blob_sha"]
+        );
+        assert_eq!(
+            candidate["source_raw_sha256"],
+            sha256_hex(contents.as_bytes())
+        );
+    }
     for slug in [
         "worker",
         "wrong-id",
@@ -1743,6 +1786,7 @@ fn check_queen_asset_intake(policy_pin: &str) {
         "alias",
         "binary",
         "bad-metadata",
+        "conflict-leading",
     ] {
         let record = find("bots_soul", &format!("bots/{slug}/SOUL.md"));
         assert_eq!(record["status"], "held", "{slug}");
@@ -1852,6 +1896,8 @@ fn check_queen_asset_intake(policy_pin: &str) {
     }
     for private in [
         "Synthetic Private Display",
+        "Identity Steward",
+        "Role-specific review duties",
         "Host:Path",
         device_bot_scope,
         device_memory_scope,

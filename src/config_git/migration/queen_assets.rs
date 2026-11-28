@@ -299,12 +299,16 @@ fn valid_soul(bytes: &[u8], slug: &str) -> bool {
             (offset, line.trim_end_matches(['\r', '\n']))
         })
         .filter(|(_, line)| !line.trim().is_empty());
-    if !lines.next().is_some_and(|(_, line)| {
-        line.strip_prefix("# ")
-            .is_some_and(|heading| !heading.trim().is_empty())
-            && !has_identity_declaration(line)
-    }) || !lines.next().is_some_and(|(_, line)| line == "## Identity")
-    {
+    let Some((_, title_line)) = lines.next().filter(|(_, line)| line.starts_with("# ")) else {
+        return false;
+    };
+    let mut title = String::new();
+    for event in Parser::new(title_line) {
+        if let Event::Text(text) | Event::Code(text) = event {
+            title.push_str(&text);
+        }
+    }
+    if title.trim().is_empty() || !lines.next().is_some_and(|(_, line)| line == "## Identity") {
         return false;
     }
     let mut fields = BTreeMap::new();
@@ -334,6 +338,7 @@ fn valid_soul(bytes: &[u8], slug: &str) -> bool {
             !name.trim().is_empty()
                 && name.chars().count() <= 255
                 && !name.chars().any(char::is_control)
+                && (title.trim() == name.trim() || !identity_declaration(&title, true))
         })
         && purpose
             .lines()
@@ -345,7 +350,6 @@ fn valid_soul(bytes: &[u8], slug: &str) -> bool {
 fn has_identity_declaration(markdown: &str) -> bool {
     let mut text = String::new();
     let mut heading = false;
-    let mut items = 0;
     for event in Parser::new(markdown) {
         match event {
             Event::Text(value) | Event::Code(value) => {
@@ -362,22 +366,20 @@ fn has_identity_declaration(markdown: &str) -> bool {
             | Event::HardBreak => {}
             _ => continue,
         }
-        if identity_declaration(&text, heading || items > 0) {
+        if identity_declaration(&text, heading) {
             return true;
         }
         text.clear();
         match event {
             Event::Start(Tag::Heading { .. }) => heading = true,
             Event::End(TagEnd::Heading(_)) => heading = false,
-            Event::Start(Tag::Item) => items += 1,
-            Event::End(TagEnd::Item) => items -= 1,
             _ => {}
         }
     }
-    identity_declaration(&text, heading || items > 0)
+    identity_declaration(&text, heading)
 }
 
-fn identity_declaration(text: &str, structured: bool) -> bool {
+fn identity_declaration(text: &str, heading: bool) -> bool {
     let label_text = text
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -400,10 +402,13 @@ fn identity_declaration(text: &str, structured: bool) -> bool {
     .into_iter()
     .any(|field| {
         label_text.strip_prefix(field).is_some_and(|rest| {
-            let value = rest.trim_start_matches(['*', '_', '`']).trim_start();
+            let rest = rest.trim_start_matches(['*', '_', '`']);
+            let value = rest.trim_start();
             value.is_empty()
-                || value.starts_with([':', '='])
-                || (structured && rest.starts_with([' ', '-', '–', '—', '*', '_', '`']))
+                || value.starts_with([':', '=', '–', '—'])
+                || value == "-"
+                || value.starts_with("- ")
+                || (heading && rest.starts_with(' '))
         })
     })
 }
