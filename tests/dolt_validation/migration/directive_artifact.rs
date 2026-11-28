@@ -1,7 +1,340 @@
 use super::{
-    AREA_APP, AREA_GENERAL, AREA_USERDATA, POLICY_PIN, Value, fs, git, git_text, id, init_source,
-    json, migration_cli, sha256_hex,
+    AREA_APP, AREA_GENERAL, AREA_USERDATA, POLICY_PIN, Value, fs, git, git_text, id, init_git,
+    init_source, json, migration_cli, sha256_hex,
 };
+
+#[test]
+fn cli_migration_plan_prepares_only_exact_reviewed_records_under_both_pins() {
+    const LEGACY_PIN: &str = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
+    const PROPOSAL: &str = "directives/_general/proposal.md";
+    const REPORT: &str = "artifacts/report.md";
+    const COPY: &str = "artifacts/other.md";
+    const UNCLASSIFIED: &str = "artifacts/unclassified.md";
+    const ACTIVE: &str = "directives/_general/active.md";
+    const WORK: &str = "tasks/_general/backlog/work/artifacts/report.md";
+    const REFERENCE: &str = "https://forge.example/synthetic/review/123";
+    const CREATED: &str = "2024-02-29T12:00:00Z";
+    const UPDATED: &str = "2024-03-01T12:00:00.000001Z";
+    const ISSUER: &str = "human:synthetic-issuer";
+    const AUTHOR: &str = "bot:synthetic-author";
+
+    for pin in [LEGACY_PIN, POLICY_PIN] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = root.path().join("config");
+        let source = root.path().join("source");
+        fs::create_dir(&home).unwrap();
+        init_git(
+            &source,
+            &home,
+            "Synthetic Git Committer",
+            "fixture@example.invalid",
+        );
+        fs::write(source.join("AGENTS.md"), format!("hive-system@{pin}\n")).unwrap();
+        if pin == POLICY_PIN {
+            fs::write(
+                source.join("hive.yml"),
+                "version: 1\ncoordination:\n  mode: local\n",
+            )
+            .unwrap();
+        }
+        let proposal_body = format!(
+            "\r\n# Synthetic proposal ###\r\n\r\nIssuer: {ISSUER}\r\nSource: {REFERENCE}\r\nCreated: {CREATED}\r\nUpdated: {UPDATED}\r\n"
+        );
+        let artifact_body =
+            "\n# Synthetic heading\n\nRetain café and trailing spaces.  \nNo final newline";
+        let proposal = format!(
+            "---\r\ndescription: Synthetic direction\r\nstatus: proposed\r\n---\r\n{proposal_body}"
+        );
+        let artifact = format!(
+            "---\ndescription: Synthetic evidence\ntitle: Reviewed synthetic artifact\nkind: report\nstatus: closed\n---\n{artifact_body}"
+        );
+        let active = proposal.replace("status: proposed", "status: active");
+        let unclassified = artifact.replace("kind: report\n", "");
+        let files = [
+            (PROPOSAL, &proposal),
+            (REPORT, &artifact),
+            (COPY, &artifact),
+            (UNCLASSIFIED, &unclassified),
+            (ACTIVE, &active),
+            (WORK, &artifact),
+        ];
+        for (path, contents) in files {
+            let path = source.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        git(&source, &home, &["add", "."]);
+        git(
+            &source,
+            &home,
+            &["commit", "-qm", "Reviewed synthetic records"],
+        );
+        let git_index = fs::read(source.join(".git/index")).unwrap();
+        let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+        let blob = |path| git_text(&source, &home, &["rev-parse", &format!("{commit}:{path}")]);
+        let workspace = id(1);
+        let area_id = id(AREA_GENERAL);
+        let mapping = json!({
+            "version": 1, "source_commit": commit, "policy_pin": pin, "workspace_id": workspace,
+            "scopes": [{"scope": "_general", "decision": {
+                "kind": "area", "area": {"id": area_id, "slug": "general", "name": "Synthetic general"}
+            }}],
+            "reviewed_records": [
+                {"source_path": PROPOSAL, "source_git_blob_sha": blob(PROPOSAL), "target_id": id(0x411),
+                 "provenance": {"kind": "proposed_directive", "area_id": area_id, "source_ref": REFERENCE,
+                     "issuer_ref": ISSUER, "created_at": CREATED, "updated_at": UPDATED,
+                     "supersession": "none", "approval_and_validity": "none"}},
+                {"source_path": REPORT, "source_git_blob_sha": blob(REPORT), "target_id": id(0x511),
+                 "provenance": {"kind": "standalone_artifact", "artifact_kind": "report", "source_ref": REFERENCE,
+                     "author_ref": AUTHOR, "created_at": CREATED, "substantive_updated_at": UPDATED,
+                     "links": "none", "archive": "none"}}
+            ]
+        });
+        let mapping_file = root.path().join("scope.json");
+        let args = [
+            "--source",
+            source.to_str().unwrap(),
+            "--source-commit",
+            &commit,
+            "--workspace-id",
+            &workspace,
+            "--mapping-file",
+            mapping_file.to_str().unwrap(),
+            "--include-directives-artifacts",
+        ];
+        let run = |mapping: &Value, status| {
+            fs::write(&mapping_file, serde_json::to_vec(mapping).unwrap()).unwrap();
+            migration_cli(&home, &config, "migration-plan", &args, status)
+        };
+        let report = run(&mapping, 0);
+        assert_eq!(report, run(&mapping, 0));
+        let data = &report["data"];
+        assert_eq!(
+            data["mapping_sha256"],
+            sha256_hex(&fs::read(&mapping_file).unwrap())
+        );
+        assert_eq!(data["source"]["source_commit"], commit);
+        assert_eq!(data["source"]["policy_pin"], pin);
+        assert_eq!(data["target"]["workspace_id"], workspace);
+        let intake = &data["directive_artifact_intake"];
+        assert_eq!(
+            intake["counts"],
+            json!({
+                "directives": {"inventoried": 2, "held": 1, "excluded": 0, "prepared": 1},
+                "artifacts_standalone": {"inventoried": 3, "held": 2, "excluded": 0, "prepared": 1},
+                "artifacts_work_scoped": {"inventoried": 1, "held": 1, "excluded": 0, "prepared": 0},
+            })
+        );
+        for (path, target, raw, body, title) in [
+            (
+                PROPOSAL,
+                0x411,
+                proposal.as_str(),
+                proposal_body.as_str(),
+                "Synthetic proposal",
+            ),
+            (
+                REPORT,
+                0x511,
+                artifact.as_str(),
+                artifact_body,
+                "Reviewed synthetic artifact",
+            ),
+        ] {
+            let row = reviewed_row(&report, path);
+            assert_eq!(row["source_git_blob_sha"], blob(path));
+            assert_eq!(row["source_raw_sha256"], sha256_hex(raw.as_bytes()));
+            let outcome = &row["outcome"];
+            assert_eq!(outcome["status"], "prepared");
+            assert_eq!(outcome["target_id"], id(target));
+            assert_eq!(outcome["target_title_sha256"], sha256_hex(title.as_bytes()));
+            assert_eq!(outcome["target_body_sha256"], sha256_hex(body.as_bytes()));
+            assert_eq!(
+                outcome["provenance"]["source_ref_sha256"],
+                sha256_hex(REFERENCE.as_bytes())
+            );
+            assert_eq!(outcome["provenance"]["created_at"], CREATED);
+        }
+        let proposal_plan = &reviewed_row(&report, PROPOSAL)["outcome"];
+        assert_eq!(
+            proposal_plan["candidate"],
+            json!({"record_type": "directive", "status": "proposed",
+            "scope_kind": "area", "area_id": area_id, "include_descendants": false})
+        );
+        assert_eq!(
+            proposal_plan["provenance"]["issuer_ref_sha256"],
+            sha256_hex(ISSUER.as_bytes())
+        );
+        assert_eq!(proposal_plan["provenance"]["updated_at"], UPDATED);
+        for field in ["supersedes_id", "approval_ref", "valid_from", "expires_at"] {
+            assert_eq!(proposal_plan["provenance"].get(field), Some(&Value::Null));
+        }
+        let artifact_plan = &reviewed_row(&report, REPORT)["outcome"];
+        assert_eq!(
+            artifact_plan["candidate"],
+            json!({"record_type": "artifact", "kind": "report", "legacy_status": "closed"})
+        );
+        assert_eq!(artifact_plan["provenance"]["scope"], "standalone");
+        assert_eq!(
+            artifact_plan["provenance"]["author_ref_sha256"],
+            sha256_hex(AUTHOR.as_bytes())
+        );
+        assert_eq!(
+            artifact_plan["provenance"]["substantive_updated_at"],
+            UPDATED
+        );
+        assert_eq!(reviewed_row(&report, COPY)["outcome"]["status"], "held");
+        let output = report.to_string();
+        for private in [
+            REFERENCE,
+            ISSUER,
+            AUTHOR,
+            "Retain café and trailing spaces",
+            "Reviewed synthetic artifact",
+            "Synthetic proposal",
+            mapping_file.to_str().unwrap(),
+        ] {
+            assert!(!output.contains(private), "{private}");
+        }
+
+        for (index, field, value, path, reason) in [
+            (
+                0,
+                "area_id",
+                json!(id(2)),
+                PROPOSAL,
+                "ambiguous_scope_or_collision",
+            ),
+            (
+                0,
+                "supersession",
+                json!("unresolved"),
+                PROPOSAL,
+                "unresolved_supersession_graph",
+            ),
+            (
+                0,
+                "approval_and_validity",
+                json!("unresolved"),
+                PROPOSAL,
+                "unverified_directive_validity",
+            ),
+            (
+                0,
+                "updated_at",
+                json!("2024-02-28T12:00:00Z"),
+                PROPOSAL,
+                "incomplete_historical_provenance",
+            ),
+            (
+                1,
+                "source_ref",
+                json!("file:///synthetic/path"),
+                REPORT,
+                "incomplete_historical_provenance",
+            ),
+            (
+                1,
+                "substantive_updated_at",
+                json!("2024-03-01T12:00:00.0000001Z"),
+                REPORT,
+                "incomplete_historical_provenance",
+            ),
+            (
+                1,
+                "author_ref",
+                json!("fixture@example.invalid"),
+                REPORT,
+                "unverified_artifact_author",
+            ),
+            (
+                1,
+                "artifact_kind",
+                json!("review"),
+                REPORT,
+                "unclassified_artifact_kind",
+            ),
+            (
+                1,
+                "links",
+                json!("unresolved"),
+                REPORT,
+                "unresolved_artifact_links",
+            ),
+            (
+                1,
+                "archive",
+                json!("unresolved"),
+                REPORT,
+                "unverified_artifact_retention",
+            ),
+        ] {
+            let mut changed = mapping.clone();
+            changed["reviewed_records"][index]["provenance"][field] = value;
+            let held = run(&changed, 0);
+            assert_eq!(
+                reviewed_row(&held, path)["outcome"]["reason_codes"],
+                json!([reason])
+            );
+            assert!(
+                reviewed_row(&held, path)["outcome"]
+                    .get("target_id")
+                    .is_none()
+            );
+        }
+        let mut changed = mapping.clone();
+        for (index, path) in [(0, ACTIVE), (1, WORK)] {
+            changed["reviewed_records"][index]["source_path"] = json!(path);
+            changed["reviewed_records"][index]["source_git_blob_sha"] = json!(blob(path));
+        }
+        let held = run(&changed, 0);
+        for path in [ACTIVE, WORK] {
+            assert_eq!(reviewed_row(&held, path)["outcome"]["status"], "held");
+        }
+        changed["reviewed_records"][1]["source_path"] = json!(UNCLASSIFIED);
+        changed["reviewed_records"][1]["source_git_blob_sha"] = json!(blob(UNCLASSIFIED));
+        assert_eq!(
+            reviewed_row(&run(&changed, 0), UNCLASSIFIED)["outcome"]["reason_codes"],
+            json!(["unclassified_artifact_kind"])
+        );
+        for (field, value) in [
+            ("source_commit", json!(blob(PROPOSAL))),
+            ("workspace_id", json!(id(2))),
+        ] {
+            let mut changed = mapping.clone();
+            changed[field] = value;
+            assert_eq!(run(&changed, 2)["error"]["code"], "INVALID_CONFIG");
+        }
+        for (field, value) in [
+            ("source_git_blob_sha", json!(blob(REPORT))),
+            ("target_id", json!(id(0x511))),
+            ("source_path", json!("directives/_general/missing.md")),
+        ] {
+            let mut changed = mapping.clone();
+            changed["reviewed_records"][0][field] = value;
+            let failure = run(&changed, 2);
+            assert_eq!(failure["error"]["code"], "INVALID_CONFIG");
+            assert!(failure.get("data").is_none());
+        }
+        assert_eq!(report, run(&mapping, 0));
+        let failure = migration_cli(&home, &config, "migration-plan", &args[..args.len() - 1], 2);
+        assert_eq!(failure["error"]["code"], "INVALID_CONFIG");
+        assert_eq!(fs::read(source.join(".git/index")).unwrap(), git_index);
+        assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
+        assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+        assert!(!config.exists());
+    }
+}
+
+fn reviewed_row<'a>(report: &'a Value, path: &str) -> &'a Value {
+    report["data"]["directive_artifact_intake"]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["source_path"] == path)
+        .unwrap()
+}
 
 #[test]
 fn cli_migration_plan_inventories_directives_and_artifacts_read_only() {

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::reviewed_records::{self, Review};
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
 use super::{AssetObjectReader, Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
@@ -22,7 +23,7 @@ enum Surface {
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum DirectiveStatus {
+pub(super) enum DirectiveStatus {
     Proposed,
     Active,
     Superseded,
@@ -31,15 +32,15 @@ enum DirectiveStatus {
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum ArtifactStatus {
+pub(super) enum ArtifactStatus {
     Active,
     Parked,
     Closed,
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-enum ArtifactKind {
+pub(super) enum ArtifactKind {
     Report,
     Research,
     Review,
@@ -76,11 +77,18 @@ enum Outcome {
     Excluded {
         reason: Reason,
     },
+    Prepared {
+        candidate: Candidate,
+        target_id: String,
+        target_title_sha256: String,
+        target_body_sha256: String,
+        provenance: Value,
+    },
 }
 
 #[derive(Serialize)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
-enum Candidate {
+pub(super) enum Candidate {
     Directive {
         status: DirectiveStatus,
         scope_kind: &'static str,
@@ -100,6 +108,40 @@ impl Outcome {
             candidate: None,
         }
     }
+
+    fn with_review(self, review: &Review, record: &InspectedRecord, single_file: bool) -> Self {
+        let Self::Held {
+            candidate: Some(candidate),
+            mut reason_codes,
+        } = self
+        else {
+            return self;
+        };
+        let provenance = if single_file {
+            review.prepare(&candidate)
+        } else {
+            Err(Reason::UnsupportedReviewedRecord)
+        };
+        match provenance {
+            Ok(provenance) => Self::Prepared {
+                candidate,
+                target_id: review.target_id.clone(),
+                target_title_sha256: record.title_sha256.clone(),
+                target_body_sha256: record.body_sha256.clone(),
+                provenance,
+            },
+            Err(reason) => {
+                if !matches!(reason, Reason::UnsupportedReviewedRecord) {
+                    reason_codes.clear();
+                }
+                reason_codes.push(reason);
+                Self::Held {
+                    reason_codes,
+                    candidate: Some(candidate),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default, Serialize)]
@@ -107,23 +149,38 @@ struct Counts {
     inventoried: usize,
     held: usize,
     excluded: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prepared: Option<usize>,
 }
 
 struct Inspection {
     raw_sha256: String,
-    metadata: Result<Metadata, Reason>,
+    record: Result<InspectedRecord, Reason>,
+}
+
+struct InspectedRecord {
+    metadata: Metadata,
+    title_sha256: String,
+    body_sha256: String,
 }
 
 pub(super) fn report(
     inventory: &Inventory,
     reader: &AssetObjectReader<'_>,
     scopes: &BTreeMap<&str, &ScopeOutcome<'_>>,
+    reviews: Option<&[Review]>,
 ) -> Result<Value, HiveError> {
+    let mut reviewed = reviewed_records::bind(reviews.unwrap_or_default(), inventory)?;
     let mut counts = BTreeMap::from([
         (Surface::Directives, Counts::default()),
         (Surface::ArtifactsStandalone, Counts::default()),
         (Surface::ArtifactsWorkScoped, Counts::default()),
     ]);
+    if reviews.is_some() {
+        for count in counts.values_mut() {
+            count.prepared = Some(0);
+        }
+    }
     let mut inspected = HashMap::new();
     let mut records = Vec::new();
     for (path, entry) in &inventory.entries {
@@ -162,6 +219,7 @@ pub(super) fn report(
                 _ => continue,
             };
         let root = &path[..path.len() - tail.len()];
+        let review = reviewed.remove(path.as_str());
         let shape = if surface == Surface::Directives {
             directive_shape(inventory, root, tail, scope.is_some())
         } else {
@@ -186,19 +244,30 @@ pub(super) fn report(
                                 snapshot_object(&|| reader.command(), "blob", &entry.oid, size)?;
                             cache.insert(Inspection {
                                 raw_sha256: format!("{:x}", Sha256::digest(&bytes)),
-                                metadata: inspect(&bytes, directive),
+                                record: inspect(&bytes, directive),
                             })
                         }
                     };
                     raw_sha256 = Some(inspection.raw_sha256.as_str());
-                    match inspection.metadata {
-                        Err(reason) => Outcome::held(reason),
-                        Ok(metadata) => candidate(
-                            metadata,
-                            mapped.copied(),
-                            parent.map(|(path, _)| path),
-                            inventory,
-                        ),
+                    match &inspection.record {
+                        Err(reason) => Outcome::held(*reason),
+                        Ok(record) => {
+                            let outcome = candidate(
+                                record.metadata,
+                                mapped.copied(),
+                                parent.map(|(path, _)| path),
+                                inventory,
+                            );
+                            match review {
+                                Some(review) => outcome.with_review(
+                                    review,
+                                    record,
+                                    parent.is_none()
+                                        && tail.strip_suffix(".md").is_some_and(is_slug),
+                                ),
+                                None => outcome,
+                            }
+                        }
                     }
                 }
             }
@@ -208,6 +277,7 @@ pub(super) fn report(
         match outcome {
             Outcome::Held { .. } => count.held += 1,
             Outcome::Excluded { .. } => count.excluded += 1,
+            Outcome::Prepared { .. } => *count.prepared.get_or_insert(0) += 1,
         }
         let mut record = json!({
             "surface": surface,
@@ -231,6 +301,11 @@ pub(super) fn report(
             }
         }
         records.push(record);
+    }
+    if !reviewed.is_empty() {
+        return Err(reviewed_records::invalid(
+            "Reviewed records must belong to the Directive or Artifact intake surfaces.",
+        ));
     }
     Ok(json!({"coverage": "partial", "counts": counts, "records": records}))
 }
@@ -381,7 +456,7 @@ struct Frontmatter {
     kind: Value,
 }
 
-fn inspect(bytes: &[u8], directive: bool) -> Result<Metadata, Reason> {
+fn inspect(bytes: &[u8], directive: bool) -> Result<InspectedRecord, Reason> {
     let invalid = if directive {
         Reason::UnsupportedDirectiveMetadata
     } else {
@@ -434,10 +509,13 @@ fn inspect(bytes: &[u8], directive: bool) -> Result<Metadata, Reason> {
             legacy_status,
         }
     };
-    if !has_title(fields.title.as_deref(), &fields.description, body) {
-        return Err(Reason::MissingOrConflictingTitle);
-    }
-    Ok(metadata)
+    let title = select_title(fields.title.as_deref(), &fields.description, body)
+        .ok_or(Reason::MissingOrConflictingTitle)?;
+    Ok(InspectedRecord {
+        metadata,
+        title_sha256: format!("{:x}", Sha256::digest(title)),
+        body_sha256: format!("{:x}", Sha256::digest(body)),
+    })
 }
 
 fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
@@ -457,14 +535,18 @@ fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn has_title(title: Option<&str>, description: &str, body: &str) -> bool {
+fn select_title<'a>(
+    title: Option<&'a str>,
+    description: &'a str,
+    body: &'a str,
+) -> Option<&'a str> {
     let valid = |value: &str| {
         !value.trim().is_empty()
             && value.chars().count() <= 255
             && !value.chars().any(char::is_control)
     };
-    if title.is_some_and(valid) {
-        return true;
+    if let Some(title) = title.filter(|value| valid(value)) {
+        return Some(title);
     }
     // Accept an unambiguous leading ATX H1. Other heading forms need Markdown review.
     let mut lines = body.lines().filter(|line| !line.trim().is_empty());
@@ -476,7 +558,7 @@ fn has_title(title: Option<&str>, description: &str, body: &str) -> bool {
             h1(line) || line.bytes().all(|byte| byte == b'=')
         })
     {
-        return false;
+        return None;
     }
     let heading = leading
         .strip_prefix('#')
@@ -490,5 +572,7 @@ fn has_title(title: Option<&str>, description: &str, body: &str) -> bool {
             value
         }
     });
-    heading.is_some_and(valid) || valid(description)
+    heading
+        .filter(|value| valid(value))
+        .or_else(|| valid(description).then_some(description))
 }

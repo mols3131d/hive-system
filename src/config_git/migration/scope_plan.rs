@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
+use super::reviewed_records::Review;
 use super::{
     AssetObjectReader, Inventory, Reason, directive_artifact_intake, snapshot_object,
     verified_source,
@@ -24,6 +25,7 @@ struct Mapping {
     policy_pin: String,
     workspace_id: String,
     scopes: Vec<ScopeMapping>,
+    reviewed_records: Option<Vec<Review>>,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +129,11 @@ pub(crate) fn plan(
     if mapping.version != 1 {
         return Err(invalid("The scope mapping version is unsupported."));
     }
+    if mapping.reviewed_records.is_some() && !include_directives_artifacts {
+        return Err(invalid(
+            "Reviewed records require --include-directives-artifacts.",
+        ));
+    }
 
     verified_source(source, revision, |source, inventory, reader| {
         if mapping.source_commit != source.source_commit
@@ -153,8 +160,12 @@ pub(crate) fn plan(
                 .iter()
                 .map(|scope| (scope.scope, &scope.outcome))
                 .collect();
-            report["directive_artifact_intake"] =
-                directive_artifact_intake::report(inventory, reader, &outcomes)?;
+            report["directive_artifact_intake"] = directive_artifact_intake::report(
+                inventory,
+                reader,
+                &outcomes,
+                mapping.reviewed_records.as_deref(),
+            )?;
         }
         Ok(report)
     })
@@ -410,7 +421,7 @@ fn prose_url(token: &str) -> &str {
     token
 }
 
-fn portable_reference(reference: &str) -> bool {
+pub(super) fn portable_reference(reference: &str) -> bool {
     if reference.len() > MAX_FILE_BYTES
         || !reference.starts_with("https://")
         || !reference.is_ascii()

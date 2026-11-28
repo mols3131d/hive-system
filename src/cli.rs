@@ -988,10 +988,10 @@ pub(crate) enum WorkspaceAction {
         /// Intended inactive v2 workspace identity.
         #[arg(long, value_name = "UUID")]
         workspace_id: String,
-        /// Reviewed versioned scope mapping JSON file.
+        /// Reviewed versioned scope and optional record mapping JSON file.
         #[arg(long, value_name = "FILE")]
         mapping_file: PathBuf,
-        /// Include read-only Directive and Artifact intake.
+        /// Include Directive and Artifact intake and any reviewed record plans.
         #[arg(long)]
         include_directives_artifacts: bool,
     },

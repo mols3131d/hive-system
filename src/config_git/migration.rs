@@ -13,6 +13,7 @@ use super::*;
 use crate::config_file::{Coordination, ScopedDirectory};
 
 mod directive_artifact_intake;
+mod reviewed_records;
 mod scope_plan;
 pub(crate) use scope_plan::plan;
 
@@ -95,6 +96,8 @@ enum Reason {
     UnverifiedArtifactRetention,
     UnresolvedParentTask,
     MissingParentTaskEntrypoint,
+    UnsupportedReviewedRecord,
+    UnresolvedArtifactLinks,
 }
 
 fn verified_source<T>(

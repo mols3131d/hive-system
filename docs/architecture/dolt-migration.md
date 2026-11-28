@@ -206,7 +206,7 @@ The workspace ID identifies the intended target for review. Actual target identi
 
 #### Read-only Directive and Artifact intake
 
-Add `--include-directives-artifacts` to `workspace migration-plan` to produce the partial `directive_artifact_intake` report. The CLI uses the same version 1 scope mapping and reads selected Markdown by verified Git blob ID during the same source checks. Each row gives a workspace-relative source locator, surface, Git blob ID, byte size, and outcome. `source_raw_sha256` is populated for blobs read for metadata inspection. Each surface count reconciles `inventoried` with `held` and `excluded`. Exit status zero means the requested classification completed.
+Add `--include-directives-artifacts` to `workspace migration-plan` to produce the partial `directive_artifact_intake` report. The CLI uses the same version 1 scope mapping and reads selected Markdown by verified Git blob ID during the same source checks. Each row gives a workspace-relative source locator, surface, Git blob ID, byte size, and outcome. `source_raw_sha256` is populated for blobs read for metadata inspection. Without reviewed records, each surface count reconciles `inventoried` with `held` and `excluded`. Exit status zero means the requested classification completed.
 
 Portable `source_path` and `parent_task_path` locators use lowercase kebab-case components, known reserved scope IDs and fixed entrypoint names, and lowercase alphanumeric file extensions. For a locator with any malformed component, the report emits `source_path_sha256` or `parent_task_path_sha256` in place of the path. Each digest covers the exact UTF-8 bytes of the full workspace-relative path. Held and excluded records follow the same rules.
 
@@ -215,7 +215,56 @@ Portable `source_path` and `parent_task_path` locators use lowercase kebab-case 
 - Directive candidates report the bounded v1 status and reviewed Area proposal without descendant inheritance. All require reviewed historical provenance. Active candidates also require verified approval and validity. Superseded candidates need graph reconciliation. The complete graph, including possible replacement endpoints of any status, needs a reviewed migration manifest before readiness can be established.
 - Artifact candidates report an explicit v1 kind and any bounded lifecycle label. Review still needs author and source provenance and the original retention clock. Work-scoped rows include the legacy parent bundle path and require a verified Task outcome before they can link to an Issue. Standalone candidates carry no inferred joins.
 
-The report contains only source locators, digests, bounded labels, proposed Directive Area IDs, and hold or exclusion codes. Bodies, titles, actor and approval text, raw timestamps, and resource references stay in the source. All candidates remain held for review. No target IDs are allocated and no Dolt target is contacted.
+Without reviewed records, the report contains only source locators, digests, bounded labels, proposed Directive Area IDs, and hold or exclusion codes. All candidates remain held for review.
+
+#### Preparing explicitly reviewed records
+
+Add a `reviewed_records` array to the version 1 mapping and pass `--include-directives-artifacts`. Each entry binds a committed `source_path` and its `source_git_blob_sha` to a distinct lowercase UUIDv7 `target_id` in the mapping's selected workspace. The mapping header binds this review to the exact verified source commit and policy pin. A mismatched path or blob, repeated path or target ID, or malformed declaration fails with `INVALID_CONFIG`.
+
+Two provenance forms can produce a prepared outcome. The following example shows the `reviewed_records` array for a synthetic source.
+
+```json
+[
+  {
+    "source_path": "directives/_general/proposal.md",
+    "source_git_blob_sha": "0000000000000000000000000000000000000001",
+    "target_id": "01900000-0000-7000-8000-000000000411",
+    "provenance": {
+      "kind": "proposed_directive",
+      "area_id": "01900000-0000-7000-8000-000000000101",
+      "issuer_ref": "human:synthetic-operator",
+      "source_ref": "https://forge.example/synthetic/review/1",
+      "created_at": "2024-02-29T12:00:00Z",
+      "updated_at": "2024-03-01T12:00:00Z",
+      "supersession": "none",
+      "approval_and_validity": "none"
+    }
+  },
+  {
+    "source_path": "artifacts/report.md",
+    "source_git_blob_sha": "0000000000000000000000000000000000000002",
+    "target_id": "01900000-0000-7000-8000-000000000511",
+    "provenance": {
+      "kind": "standalone_artifact",
+      "artifact_kind": "report",
+      "author_ref": "bot:synthetic-author",
+      "source_ref": "https://forge.example/synthetic/review/2",
+      "created_at": "2024-02-29T12:00:00Z",
+      "substantive_updated_at": "2024-03-01T12:00:00Z",
+      "links": "none",
+      "archive": "none"
+    }
+  }
+]
+```
+
+- A single-file proposed Directive requires the Area ID returned by scope planning and keeps `include_descendants` false. Set `supersession` to `none` only after reviewing possible incoming and outgoing edges in the exact snapshot, including references from other Directives. Set `approval_and_validity` to `none` only after confirming that approval and validity fields have no historical values to preserve. `unresolved` holds the record for either field.
+- A root-level standalone Markdown Artifact requires a reviewed kind identical to the explicit supported v1 kind. Set `links` to `none` only after confirming that the Artifact needs zero Area, Project, Issue, or Resource joins and no reference rewrites. Set `archive` to `none` after confirming that there is no historical archival decision to preserve. `unresolved` holds the record for either field. The legacy lifecycle label remains provenance metadata.
+- Each review supplies an actual historical source reference and the actor and timestamps it supports. Use a portable HTTPS reference with the same syntax as scope planning, and an actor identifier of up to 255 bytes in lowercase kebab-case with an optional `namespace:` prefix. Supply UTC RFC 3339 timestamps ending in `Z` with zero to six fractional digits, using years 1000–9999. Update and retention timestamps must be at or after creation. The CLI validates these fields and their binding to the source snapshot. The operator verifies historical facts and any referenced evidence during review.
+
+A qualifying row reports `outcome.status: prepared`, the selected target ID and scoped candidate metadata, the reviewed dates, and the SHA-256 digests of the source and actor references. `source_raw_sha256` covers the entire committed blob. `target_body_sha256` covers every byte after the closing frontmatter delimiter and its line ending, including leading blank lines, CRLF, trailing spaces, and any final newline. The content stays intact. `target_title_sha256` covers the UTF-8 title selected by intake. The report adds a `prepared` count per surface so `inventoried = prepared + held + excluded`.
+
+The preparation report is partial and read-only. Unreviewed candidates, bundles, work-scoped Artifacts, unresolved relationships, and other Directive statuses remain subject to the intake hold rules. Target identity and constraints still require a later inactive-target staging check.
 
 ### 6. Issue Counters and Number Non-Reuse
 
