@@ -126,7 +126,7 @@ fn validate_label(id: &str, name: &str, diagnostics: &mut Diagnostics) {
     }
 }
 
-pub(in crate::dolt) fn is_canonical_label_name(name: &str) -> bool {
+pub(crate) fn is_canonical_label_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().count() <= MAX_LABEL_NAME_CHARS
         && name.trim() == name

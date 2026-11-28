@@ -18,6 +18,7 @@ use crate::workspace_init::POLICY_REVISION;
 #[path = "migration_directive_artifact.rs"]
 mod directive_artifact;
 mod issue_resources;
+mod labels;
 mod resources;
 mod tasks;
 
@@ -97,26 +98,6 @@ fn prepare(
         })
         .ok_or_else(|| HiveError::new(ErrorCode::IoError, "Could not read the migration time."))?;
 
-    let task_plan = args.tasks.then(|| reviewed.prepare_tasks()).transpose()?;
-    let tasks = task_plan.as_ref().map(|plan| plan.staging_tasks());
-    let intake = reviewed.directive_artifacts_for_staging(tasks.as_deref())?;
-    let issue_resource_reviews = reviewed.prepare_issue_resources(tasks.as_deref())?;
-    let task_import = tasks.map(|tasks| TaskImport::new(tasks, now)).transpose()?;
-    let issue_resources =
-        IssueResources::new(issue_resource_reviews.as_deref(), task_import.as_ref())?;
-    let issue_count = task_import.as_ref().map_or(0, TaskImport::len);
-
-    let rows = ImportRows {
-        areas: &areas,
-        queens,
-        resources: reviewed.resources.as_ref(),
-        tasks: task_import.as_ref(),
-        issue_resources: &issue_resources,
-        records: intake
-            .as_ref()
-            .map_or(&[], |intake| intake.records.as_slice()),
-    };
-
     require_inactive_destination(&target.path)?;
     let (cleanup, stage) = target.stage(&args.workspace_id)?;
     let stage_path = fd_path(&stage);
@@ -131,6 +112,31 @@ fn prepare(
     let conversations = create_private_directory(&payload.join("conversations"))?;
     let installed = Installed::check(&scratch)?;
     let (base, _) = installed.initialize_db(&db, &args.workspace_id)?;
+    let task_plan = args
+        .tasks
+        .then(|| {
+            reviewed.prepare_tasks(Some(&|names| {
+                labels::collisions(&installed, &db, &scratch, names)
+            }))
+        })
+        .transpose()?;
+    let tasks = task_plan.as_ref().map(|plan| plan.staging_tasks());
+    let intake = reviewed.directive_artifacts_for_staging(tasks.as_deref())?;
+    let issue_resource_reviews = reviewed.prepare_issue_resources(tasks.as_deref())?;
+    let task_import = tasks.map(|tasks| TaskImport::new(tasks, now)).transpose()?;
+    let issue_resources =
+        IssueResources::new(issue_resource_reviews.as_deref(), task_import.as_ref())?;
+    let issue_count = task_import.as_ref().map_or(0, TaskImport::len);
+    let rows = ImportRows {
+        areas: &areas,
+        queens,
+        resources: reviewed.resources.as_ref(),
+        tasks: task_import.as_ref(),
+        issue_resources: &issue_resources,
+        records: intake
+            .as_ref()
+            .map_or(&[], |intake| intake.records.as_slice()),
+    };
     let (asset_base, _) = installed.initialize_assets(&assets)?;
     let asset_commit = stage_souls(&installed, &assets, &assets_dir, &asset_base, queens)?;
     let expected = apply_rows(&installed, &db, &scratch, &rows, now, dry_run)?;
@@ -139,6 +145,7 @@ fn prepare(
         installed.verify_db(&db, &args.workspace_id, Some(&base))?;
         verify_rows(&installed.query(&db, COUNTS)?, &counts(0, 0, 0, 0))?;
         verify_rows(&installed.query(&db, COUNTER)?, &counter(0))?;
+        labels::verify_empty(&installed, &db)?;
         StagedResources::verify_rollback(&installed, &db)?;
         verify_rows(
             &installed.query(&db, issue_resources::COUNT)?,

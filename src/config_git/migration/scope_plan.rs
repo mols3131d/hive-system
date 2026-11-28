@@ -173,7 +173,7 @@ pub(crate) fn plan(
         });
         let task_plan = (include_tasks
             || (include_directives_artifacts && reviewed.has_work_artifacts()))
-        .then(|| reviewed.prepare_tasks())
+        .then(|| reviewed.prepare_tasks(None))
         .transpose()?;
         let tasks = task_plan.as_ref().map(task_intake::TaskPlan::staging_tasks);
         if include_directives_artifacts {
@@ -236,7 +236,10 @@ impl ReviewedScopes<'_> {
             .map_or(&[], |(_, souls)| souls.as_slice())
     }
 
-    pub(crate) fn prepare_tasks(&self) -> Result<task_intake::TaskPlan<'_>, HiveError> {
+    pub(crate) fn prepare_tasks(
+        &self,
+        check_labels: Option<&task_intake::LabelCollisionCheck<'_>>,
+    ) -> Result<task_intake::TaskPlan<'_>, HiveError> {
         let outcomes = self
             .scopes
             .iter()
@@ -245,7 +248,13 @@ impl ReviewedScopes<'_> {
         let git = || self.reader.command();
         let claims_supported = !self.source.hive_yml.is_null();
         let records = task_intake::read_records(self.inventory, &git, claims_supported)?;
-        task_intake::prepare(records, &outcomes, &self.mapping.task_reviews, &git)
+        task_intake::prepare(
+            records,
+            &outcomes,
+            &self.mapping.task_reviews,
+            &git,
+            check_labels,
+        )
     }
 
     pub(crate) fn prepare_issue_resources(

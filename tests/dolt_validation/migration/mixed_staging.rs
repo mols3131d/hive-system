@@ -7,6 +7,7 @@ use super::{Command, POLICY_PIN, Value, fs, git, git_text, id, init_git, json, s
 #[ignore = "requires installed Hive and pinned Dolt and Git"]
 fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     const POLICY: &str = "c66b3c50150e18426485d134de92c6b311dac125";
+    const LABEL: &str = "synthetic-ready-label";
     const REPO_URL: &str = "https://forge.example/synthetic/mixed";
     const RECORD_REF: &str = "https://forge.example/synthetic/history";
     const TASK: &str = "tasks/synthetic-app/backlog/ready/README.md";
@@ -64,7 +65,9 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         ("tasks/_hive/README.md", "# Unsplit legacy scope\n".into()),
         (
             TASK,
-            format!("---\ndescription: Synthetic Task record\npriority: high\n---\n{task_body}"),
+            format!(
+                "---\ndescription: Synthetic Task record\npriority: high\ntags: [\"  {LABEL}  \"]\n---\n{task_body}"
+            ),
         ),
         (
             CLAIMED,
@@ -336,6 +339,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         "Exact café bytes",
         "Synthetic Soul content sentinel",
         "sample-holder",
+        LABEL,
         root.to_str().unwrap(),
     ] {
         assert!(!report.contains(redacted), "{redacted}");
@@ -358,17 +362,36 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["rows"].clone()
     };
     let task_path_sha256 = sha256_hex(TASK.as_bytes());
-    let issue = staged["id_map"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["kind"] == "task" && row["source_path_sha256"] == task_path_sha256)
-        .unwrap();
+    let issue_for = |report: &Value| {
+        report["id_map"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "task" && row["source_path_sha256"] == task_path_sha256)
+            .unwrap()
+            .clone()
+    };
+    let dry_issue = issue_for(&dry);
+    let issue = issue_for(&staged);
+    assert_eq!(dry_issue["label_ids"].as_array().unwrap().len(), 1);
+    let labels = issue["label_ids"].as_array().unwrap();
+    assert_eq!(labels.len(), 1);
+    let label = &labels[0];
     assert_eq!(
         sql(&format!(
             "SELECT id, number, area_id, status, priority, body FROM issues AS OF '{db}'"
         )),
         json!([{"id":issue["issue_id"], "number":1, "area_id":area, "status":"backlog", "priority":0, "body":task_body}])
+    );
+    assert_eq!(
+        sql(&format!("SELECT id, name FROM labels AS OF '{db}'")),
+        json!([{"id":label,"name":LABEL}])
+    );
+    assert_eq!(
+        sql(&format!(
+            "SELECT issue_id, label_id FROM issue_labels AS OF '{db}'"
+        )),
+        json!([{"issue_id":issue["issue_id"],"label_id":label}])
     );
     assert_eq!(
         sql(&format!(

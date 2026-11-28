@@ -5,7 +5,7 @@ mod directives;
 mod issue_updates;
 mod receipts;
 mod relations;
-pub(super) use relations::is_canonical_label_name;
+pub(crate) use relations::is_canonical_label_name;
 
 use std::collections::{BTreeSet, HashMap, VecDeque, hash_map::Entry};
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use super::task_provenance::{
 use super::{Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
 use crate::config_file::{parse_v2, parse_v2_projection, present};
+use crate::dolt::is_canonical_label_name;
 use crate::error::HiveError;
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize)]
@@ -185,11 +186,15 @@ pub(crate) struct StagingTask<'a> {
     pub(crate) fields: StagingFields<'a>,
 }
 
+pub(crate) type LabelCollisionCheck<'a> =
+    dyn Fn(&BTreeSet<&str>) -> Result<HashSet<String>, HiveError> + 'a;
+
 pub(super) fn prepare<'a>(
     records: Vec<Record>,
     scopes: &BTreeMap<&str, &ScopeOutcome<'a>>,
     task_reviews: &[TaskReview],
     git: &impl Fn() -> Result<Command, HiveError>,
+    check_labels: Option<&LabelCollisionCheck<'_>>,
 ) -> Result<TaskPlan<'a>, HiveError> {
     let mut counts = HashMap::new();
     for record in &records {
@@ -206,6 +211,7 @@ pub(super) fn prepare<'a>(
             &reviews,
             &mut source_bodies,
             git,
+            check_labels.is_some(),
         )?;
         let status = match outcome {
             Outcome::Prepared {
@@ -221,7 +227,48 @@ pub(super) fn prepare<'a>(
         outcomes.push(outcome);
     }
 
-    for (outcome, held) in outcomes.iter_mut().zip(held_nodes(&nodes)) {
+    let mut graph_holds = held_nodes(&nodes);
+    if let Some(check_labels) = check_labels {
+        let labels_at = |index: usize| {
+            let oid = records[index]
+                .blob_oid
+                .as_deref()
+                .expect("prepared Task blob");
+            &source_bodies[oid].labels
+        };
+        let names = nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, node)| node.status.is_some() && !graph_holds[*index])
+            .flat_map(|(index, _)| labels_at(index).iter().map(String::as_str))
+            .collect();
+        let collisions = check_labels(&names)?;
+        if !collisions.is_empty() {
+            for (index, (node, outcome)) in nodes.iter_mut().zip(&mut outcomes).enumerate() {
+                if let Outcome::Prepared {
+                    area_id,
+                    candidate_status,
+                    ..
+                } = *outcome
+                    && !graph_holds[index]
+                    && labels_at(index)
+                        .iter()
+                        .any(|label| collisions.contains(label))
+                {
+                    *outcome = Outcome::Held {
+                        reason_codes: vec![Reason::TaskLabelCollationCollision],
+                        candidate_status: Some(candidate_status),
+                        area_id: Some(area_id),
+                    };
+                    node.status = None;
+                }
+            }
+            for (held, after_labels) in graph_holds.iter_mut().zip(held_nodes(&nodes)) {
+                *held |= after_labels;
+            }
+        }
+    }
+    for (outcome, held) in outcomes.iter_mut().zip(graph_holds) {
         if held
             && let Outcome::Prepared {
                 area_id,
@@ -406,6 +453,7 @@ impl Record {
         reviews: &Reviews<'review>,
         source_bodies: &mut HashMap<String, SourceBody>,
         git: &impl Fn() -> Result<Command, HiveError>,
+        check_labels_at_staging: bool,
     ) -> Result<(Outcome<'a>, Option<&'review Relations>), HiveError> {
         if let ScopeOutcome::Excluded { reason } = scope {
             return Ok((Outcome::Excluded { reason: *reason }, None));
@@ -429,9 +477,14 @@ impl Record {
             .ok()
             .and_then(|review| review.and_then(|review| review.relations.as_ref()));
         let outcome = match self.classification.candidate {
-            Ok(status) if reason_codes.is_empty() => {
-                self.candidate_outcome(status, &area.id, binding, source_bodies, git)?
-            }
+            Ok(status) if reason_codes.is_empty() => self.candidate_outcome(
+                status,
+                &area.id,
+                binding,
+                source_bodies,
+                git,
+                check_labels_at_staging,
+            )?,
             _ => hold(reason_codes),
         };
         Ok((outcome, relations))
@@ -444,6 +497,7 @@ impl Record {
         review: Result<Option<&TaskReview>, Reason>,
         source_bodies: &mut HashMap<String, SourceBody>,
         git: &impl Fn() -> Result<Command, HiveError>,
+        check_labels_at_staging: bool,
     ) -> Result<Outcome<'a>, HiveError> {
         let held = |reason_codes| Outcome::Held {
             reason_codes,
@@ -460,14 +514,16 @@ impl Record {
                         entry.insert(SourceBody::from_verified_blob(bytes)?)
                     }
                 };
-                Ok(match review.prepare(body, status) {
-                    Ok(provenance) => Outcome::Prepared {
-                        area_id,
-                        candidate_status: status,
-                        provenance: Box::new(provenance),
+                Ok(
+                    match review.prepare(body, status, check_labels_at_staging) {
+                        Ok(provenance) => Outcome::Prepared {
+                            area_id,
+                            candidate_status: status,
+                            provenance: Box::new(provenance),
+                        },
+                        Err(reasons) => held(reasons),
                     },
-                    Err(reasons) => held(reasons),
-                })
+                )
             }
             Ok(None) => {
                 let mut reasons = vec![
@@ -630,10 +686,7 @@ fn validate_metadata(
         if tags.is_empty()
             || tags.iter().any(|tag| {
                 let tag = tag.trim();
-                tag.is_empty()
-                    || tag.chars().count() > 100
-                    || tag.chars().any(char::is_control)
-                    || !trimmed.insert(tag)
+                !is_canonical_label_name(tag) || !trimmed.insert(tag)
             })
         {
             return Err(Reason::UnsupportedTaskMetadata);
