@@ -1,15 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use std::path::Path;
 
-use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag};
+use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag, TagEnd};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
 use super::{
-    AssetObjectReader, Inventory, Reason, directive_artifact_intake, snapshot_object,
-    verified_source,
+    AssetObjectReader, Inventory, Reason, directive_artifact_intake,
+    is_portable_bot_memory_locator, snapshot_object, verified_source,
 };
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
@@ -87,7 +88,7 @@ impl Scope<'_> {
             .source_paths
             .iter()
             .copied()
-            .partition(|path| portable_scope && has_portable_bot_id(path));
+            .partition(|path| portable_scope && has_portable_memory_locator(path));
         let mut report = json!({"source_paths": paths, "outcome": outcome});
         if portable_scope {
             report["scope"] = json!(self.scope);
@@ -244,7 +245,9 @@ fn classify_scopes<'a>(
                     ),
                 ) if ids[area.id.as_str()] == 1
                     && siblings[&(area.parent_id.as_deref(), area.slug.as_str())] == 1
-                    && origins.iter().all(|(path, _)| has_portable_bot_id(path))
+                    && origins
+                        .iter()
+                        .all(|(path, _)| has_portable_memory_locator(path))
                     && (reserved(scope)
                         || project_agrees(
                             inventory,
@@ -332,9 +335,11 @@ fn entrypoint_reference(bytes: &[u8]) -> Option<&str> {
         body = &header[offset..];
     }
 
+    let events: Vec<_> = Parser::new(body).into_offset_iter().collect();
+    let html_blocks = prose_blocks_with_html(&events);
     let mut skipped = 0;
     let mut reference = None;
-    for (event, range) in Parser::new(body).into_offset_iter() {
+    for (event, range) in events {
         if skipped > 0 {
             match event {
                 Event::Start(_) => skipped += 1,
@@ -344,6 +349,11 @@ fn entrypoint_reference(bytes: &[u8]) -> Option<&str> {
             continue;
         }
         match event {
+            Event::Start(Tag::Paragraph | Tag::Heading { .. } | Tag::Item)
+                if html_blocks.contains(&range) =>
+            {
+                skipped = 1;
+            }
             Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock | Tag::Image { .. }) => skipped = 1,
             Event::Start(Tag::Link {
                 link_type,
@@ -362,20 +372,28 @@ fn entrypoint_reference(bytes: &[u8]) -> Option<&str> {
                 }
             }
             Event::Text(_) => {
-                let raw = &body[range.clone()];
-                for token in raw.split_whitespace().filter(|token| token.contains("://")) {
+                let mut cursor = range.start;
+                for token in body[range.clone()].split_whitespace() {
+                    let start = cursor + body[cursor..range.end].find(token)?;
+                    cursor = start + token.len();
+                    if !token.contains("://") {
+                        continue;
+                    }
                     // Markdown can split malformed syntax or escapes across text events.
-                    // Accept a URL only when the raw token is complete.
-                    if (raw.starts_with(token)
-                        && body[..range.start]
+                    // Require a complete raw token outside unresolved link syntax.
+                    let before = &body[..start];
+                    if before
+                        .chars()
+                        .next_back()
+                        .is_some_and(|ch| !ch.is_whitespace())
+                        || body[cursor..]
                             .chars()
-                            .next_back()
-                            .is_some_and(|ch| !ch.is_whitespace()))
-                        || (raw.ends_with(token)
-                            && body[range.end..]
-                                .chars()
-                                .next()
-                                .is_some_and(|ch| !ch.is_whitespace()))
+                            .next()
+                            .is_some_and(|ch| !ch.is_whitespace())
+                        || before
+                            .trim_end()
+                            .strip_suffix('(')
+                            .is_some_and(|prefix| prefix.trim_end().ends_with(']'))
                     {
                         return None;
                     }
@@ -386,6 +404,29 @@ fn entrypoint_reference(bytes: &[u8]) -> Option<&str> {
         }
     }
     reference
+}
+
+fn prose_blocks_with_html(events: &[(Event<'_>, Range<usize>)]) -> HashSet<Range<usize>> {
+    let mut prose = Vec::new();
+    let mut html_blocks = HashSet::new();
+    let mut image_depth = 0;
+    for (event, range) in events {
+        match event {
+            Event::Start(Tag::Image { .. }) => image_depth += 1,
+            Event::End(TagEnd::Image) => image_depth -= 1,
+            Event::Start(Tag::Paragraph | Tag::Heading { .. } | Tag::Item) => prose.push(range),
+            Event::End(TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item) => {
+                prose.pop();
+            }
+            Event::InlineHtml(html) if image_depth == 0 && !html.starts_with("<!--") => {
+                if let Some(&block) = prose.last() {
+                    html_blocks.insert(block.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    html_blocks
 }
 
 fn agree<'a>(reference: &mut Option<&'a str>, candidate: &'a str) -> Option<()> {
@@ -438,9 +479,11 @@ fn portable_reference(reference: &str) -> bool {
         && url.query().is_none()
         && url.fragment().is_none()
         && url.path() != "/"
+        && host.len() <= 253
         && host.contains('.')
         && host.split('.').all(|label| {
-            label.starts_with(|c: char| c.is_ascii_alphanumeric())
+            label.len() <= 63
+                && label.starts_with(|c: char| c.is_ascii_alphanumeric())
                 && label.ends_with(|c: char| c.is_ascii_alphanumeric())
                 && label
                     .bytes()
@@ -459,11 +502,40 @@ pub(super) fn is_portable_scope(scope: &str) -> bool {
     reserved(scope) || scope == "_hive" || is_slug(scope)
 }
 
-fn has_portable_bot_id(path: &str) -> bool {
-    path.strip_prefix("bots/")
-        .is_none_or(|rest| rest.split_once('/').is_some_and(|(bot, _)| is_slug(bot)))
+fn has_portable_memory_locator(path: &str) -> bool {
+    path.strip_prefix("bots/").is_none_or(|relative| {
+        relative
+            .split_once("/memory/")
+            .is_some_and(|(bot, scope)| is_portable_bot_memory_locator(bot, Some(scope)))
+    })
 }
 
 fn invalid(message: &'static str) -> HiveError {
     HiveError::new(ErrorCode::InvalidConfig, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::portable_reference;
+
+    #[test]
+    fn portable_reference_enforces_dns_length_limits() {
+        let label = "a".repeat(63);
+        let long_label = "b".repeat(64);
+        let max_host = format!("{label}.{label}.{label}.{}", "c".repeat(61));
+        assert_eq!(max_host.len(), 253);
+        for (host, expected) in [
+            (format!("{label}.example"), true),
+            (format!("{long_label}.example"), false),
+            (max_host.clone(), true),
+            (format!("{max_host}d"), false),
+            ("forge.example.".into(), false),
+        ] {
+            assert_eq!(
+                portable_reference(&format!("https://{host}/app")),
+                expected,
+                "{host}"
+            );
+        }
+    }
 }
