@@ -378,16 +378,26 @@ impl<'a> PinnedAssets<'a> {
 }
 
 #[cfg(target_os = "linux")]
-enum CleanWorktree {
+enum CleanWorktree<'a> {
     Assets { include_ignored: bool },
-    MigrationSource,
+    MigrationSource { index: &'a Path },
 }
 
 #[cfg(target_os = "linux")]
 impl AssetRepository {
-    fn check_clean(&self, revision: &str, worktree: CleanWorktree) -> Result<(), HiveError> {
-        let migration = matches!(worktree, CleanWorktree::MigrationSource);
-        let command = || self.status_command();
+    fn check_clean(
+        &self,
+        revision: &str,
+        worktree: CleanWorktree<'_>,
+    ) -> Result<Vec<u8>, HiveError> {
+        let migration = matches!(worktree, CleanWorktree::MigrationSource { .. });
+        let command = || {
+            let mut command = self.status_command()?;
+            if let CleanWorktree::MigrationSource { index } = worktree {
+                command.env("GIT_INDEX_FILE", index);
+            }
+            Ok::<_, HiveError>(command)
+        };
         let check_head = || {
             let head = execute_asset(command()?.args(["rev-parse", "--verify", "HEAD"]), 65, None)?;
             if !head.status.success() || git_line(&head.stdout) != Some(revision.as_bytes()) {
@@ -424,10 +434,6 @@ impl AssetRepository {
 
         let mut status = command()?;
         disable_status_filters(command()?, &mut status)?;
-        if migration {
-            // Permit .gitignore and .git/info/exclude independently of host settings.
-            status.args(["-c", "core.excludesFile=/dev/null"]);
-        }
         status.arg("status");
         if matches!(
             worktree,
@@ -441,7 +447,11 @@ impl AssetRepository {
             status.args([
                 "--porcelain=v1",
                 "-z",
-                "--untracked-files=normal",
+                if migration {
+                    "--untracked-files=no"
+                } else {
+                    "--untracked-files=normal"
+                },
                 if migration {
                     "--ignore-submodules=all"
                 } else {
@@ -463,7 +473,8 @@ impl AssetRepository {
                 "The selected asset worktree has staged, modified, or untracked entries.",
             ));
         }
-        check_head()
+        check_head()?;
+        Ok(index.stdout)
     }
 }
 
@@ -1416,6 +1427,9 @@ mod tests {
                     "user.name=Fixture",
                     "-c",
                     "user.email=fixture@example.invalid",
+                    // Detached maintenance can race with the fixture's object-store walk.
+                    "-c",
+                    "maintenance.auto=false",
                 ])
                 .args(args)
                 .output()
