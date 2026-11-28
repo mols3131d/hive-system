@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 use super::Reason;
+use super::artifact_archive::ArchiveReview;
 use super::directive_artifact_intake::ArtifactKind;
 use super::json_object;
 use super::prepared_records::{ArtifactFields, Fields};
-use super::reviewed_records::{AbsenceReview, actor_ref, sha256};
+use super::reviewed_records::{actor_ref, canonical_utc, sha256};
 use super::scope_plan::portable_reference;
 use super::task_intake::StagingTask;
 use super::task_provenance::{BodyRange, Key, LegacyKey, Timestamp};
@@ -34,7 +34,7 @@ impl<'a> TaskContext<'a> {
 #[serde(deny_unknown_fields)]
 pub(super) struct WorkArtifactReview {
     #[serde(deserialize_with = "json_object::string_enum")]
-    artifact_kind: ArtifactKind,
+    pub(super) artifact_kind: ArtifactKind,
     source_ref: String,
     author_ref: String,
     #[serde(default, deserialize_with = "json_object::optional_object")]
@@ -46,8 +46,7 @@ pub(super) struct WorkArtifactReview {
     #[serde(default, deserialize_with = "json_object::optional_string_enum")]
     issue_link: Option<IssueLinkDecision>,
     area_link: Option<String>,
-    #[serde(deserialize_with = "json_object::string_enum")]
-    archive: AbsenceReview,
+    archive: ArchiveReview,
 }
 
 #[derive(Deserialize)]
@@ -128,9 +127,7 @@ impl WorkArtifactReview {
         if !actor_ref(&self.author_ref) {
             return Err(Reason::UnverifiedArtifactAuthor);
         }
-        if matches!(self.archive, AbsenceReview::Unresolved)
-            || !matches!(actual.status, "backlog" | "todo")
-        {
+        if !matches!(actual.status, "backlog" | "todo") {
             return Err(Reason::UnverifiedArtifactRetention);
         }
         if !portable_reference(&self.source_ref) {
@@ -147,6 +144,7 @@ impl WorkArtifactReview {
             source_ref: self.source_ref.clone(),
             created_at: canonical_utc(created),
             substantive_updated_at: canonical_utc(updated),
+            archive: self.archive.prepare(Some(body), updated)?,
             work: Some(Box::new(WorkScope {
                 issue_link: IssueLink {
                     decision: "retain",
@@ -163,15 +161,4 @@ impl WorkArtifactReview {
             })),
         }))
     }
-}
-
-fn canonical_utc(value: OffsetDateTime) -> String {
-    format!(
-        "{}T{:02}:{:02}:{:02}.{:06}Z",
-        value.date(),
-        value.hour(),
-        value.minute(),
-        value.second(),
-        value.nanosecond() / 1000
-    )
 }

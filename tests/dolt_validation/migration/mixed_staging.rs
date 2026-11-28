@@ -17,13 +17,44 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     const DIRECTIVE: &str = "directives/synthetic-app/proposal.md";
     const UNAPPROVED: &str = "directives/synthetic-app/unapproved.md";
     const ARTIFACT: &str = "artifacts/report.md";
+    const ARCHIVED: &str = "artifacts/archived.md";
     const UNCLASSIFIED: &str = "artifacts/unclassified.md";
+    const INVALID_KINDS: &[(&str, &str, &str)] = &[
+        (
+            "artifacts/null-kind.md",
+            "kind: null",
+            "unclassified_artifact_kind",
+        ),
+        (
+            "artifacts/object-kind.md",
+            "kind: {report: null}",
+            "unclassified_artifact_kind",
+        ),
+        (
+            "artifacts/non-v1-kind.md",
+            "kind: design",
+            "unclassified_artifact_kind",
+        ),
+        (
+            "artifacts/repeated-kind.md",
+            "kind: report\r\nkind: report",
+            "unsupported_artifact_metadata",
+        ),
+        (
+            "artifacts/conflicting-kind.md",
+            "kind: research",
+            "unclassified_artifact_kind",
+        ),
+    ];
     const SOUL: &str = "bots/synthetic-queen/SOUL.md";
     const INVALID_SOUL: &str = "bots/invalid-queen/SOUL.md";
     const MEMORY: &str = "bots/synthetic-queen/memory/synthetic-app/MEMORY.md";
     const SOUL_TEXT: &str = "---\r\ndescription: Synthetic Manager Soul\r\n---\r\n# Queen\r\n\r\n## Identity\r\n\r\n- ID: synthetic-queen\r\n- Name: Synthetic Queen\r\n- Layer: 1 — Manager\r\n\r\n## Purpose\r\n\r\nSynthetic Soul content sentinel.\r\n";
     const CREATED: &str = "2024-02-01T12:00:00Z";
     const UPDATED: &str = "2024-02-02T12:00:00Z";
+    const ARCHIVED_AT: &str = "2024-02-04T13:20:30.1234+01:00";
+    const CANONICAL_ARCHIVED_AT: &str = "2024-02-04T12:20:30.123400Z";
+    const ARCHIVE_REASON: &str = "Synthetic archival rationale café.\r\nSecond reviewed line.  ";
     const RECORD_BODY: &str = "# Synthetic migrated content\r\n\r\nExact café bytes.  \r\n";
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -47,12 +78,18 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     let record = |fields| {
         format!("---\r\ndescription: Synthetic record\r\n{fields}\r\n---\r\n{RECORD_BODY}")
     };
-    let work_body = format!("{RECORD_BODY}Created: {CREATED}\r\nUpdated: {UPDATED}\r\n");
+    let archived_body = format!(
+        "{RECORD_BODY}Created: {CREATED}\r\nUpdated: {UPDATED}\r\nArchived: {ARCHIVED_AT}\r\n\r\n{ARCHIVE_REASON}\r\n"
+    );
+    let work_body = &archived_body;
     let work_record = format!(
-        "---\r\ndescription: Synthetic work evidence\r\nkind: report\r\n---\r\n{work_body}"
+        "---\r\ndescription: Synthetic work evidence\r\nstatus: parked\r\n---\r\n{work_body}"
+    );
+    let archived_record = format!(
+        "---\r\ndescription: Synthetic archived record\r\nstatus: parked\r\n---\r\n{archived_body}"
     );
     let reference_doc = format!("# Synthetic Project\n\n{REPO_URL}\n");
-    let fixtures = [
+    let mut fixtures = vec![
         ("AGENTS.md", format!("hive-system@{POLICY_PIN}\n")),
         (
             "hive.yml",
@@ -78,9 +115,15 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         (INVALID_SOUL, "# Missing Queen identity\n".into()),
         (DIRECTIVE, record("status: proposed")),
         (UNAPPROVED, record("status: active")),
-        (ARTIFACT, record("kind: report")),
-        (UNCLASSIFIED, record("status: parked")),
+        (ARTIFACT, record("kind: report\r\nstatus: closed")),
+        (ARCHIVED, archived_record.clone()),
+        (UNCLASSIFIED, archived_record),
     ];
+    fixtures.extend(
+        INVALID_KINDS
+            .iter()
+            .map(|&(path, fields, _)| (path, record(fields))),
+    );
     for (path, contents) in &fixtures {
         let file = source.join(path);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -106,21 +149,30 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     let directive = id(5);
     let artifact = id(6);
     let work_artifact = id(8);
+    let archived_artifact = id(10);
     let record_review = |path: &str, id: &str, provenance| json!({"source_path":path, "source_git_blob_sha":oid(path), "target_id":id, "provenance":provenance});
     let work_range = |value: &str| {
         let start = work_body.find(value).unwrap();
         json!({"start":start,"end":start + value.len()})
     };
+    let archive = json!({
+        "archived_at": work_range(ARCHIVED_AT),
+        "archive_reason": work_range(ARCHIVE_REASON),
+    });
     let work_provenance = |work_id, parent_path| {
-        json!({"kind":"work_scoped_artifact","artifact_kind":"report","author_ref":"bot:synthetic-author",
+        json!({"kind":"work_scoped_artifact","artifact_kind":"evidence","author_ref":"bot:synthetic-author",
             "source_ref":RECORD_REF,"created_at":work_range(CREATED),"substantive_updated_at":work_range(UPDATED),
             "parent_task":{"legacy_key":{"scope":"synthetic-app","work_id":work_id},
                 "source_path":parent_path,"source_git_blob_sha":oid(parent_path),"area_id":area,"workspace_id":workspace},
-            "issue_link":"retain","area_link":area,"archive":"none"})
+            "issue_link":"retain","area_link":area,"archive":archive})
     };
     let project_evidence = [README, "directives/synthetic-app/README.md", MEMORY]
         .map(|path| json!({"path":path, "canonical_ref": REPO_URL}));
-    let mapping = json!({
+    let standalone_provenance = |kind, archive| {
+        json!({"kind":"standalone_artifact","artifact_kind":kind,"author_ref":"bot:synthetic-author",
+            "source_ref":RECORD_REF,"created_at":CREATED,"substantive_updated_at":UPDATED,"links":"none","archive":archive})
+    };
+    let mut mapping = json!({
         "version": 1, "source_commit": commit, "policy_pin": POLICY_PIN, "workspace_id": workspace,
         "scopes": [{"scope":"synthetic-app","decision":{"kind":"area",
             "area":{"id":area,"slug":"synthetic-app","name":"Synthetic Area"},
@@ -147,12 +199,25 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         "reviewed_records":[
             record_review(DIRECTIVE, &directive, json!({"kind":"proposed_directive","area_id":area,"issuer_ref":"human:synthetic-operator",
                 "source_ref":RECORD_REF,"created_at":CREATED,"updated_at":UPDATED,"supersession":"none","approval_and_validity":"none"})),
-            record_review(ARTIFACT, &artifact, json!({"kind":"standalone_artifact","artifact_kind":"report","author_ref":"bot:synthetic-author",
-                "source_ref":RECORD_REF,"created_at":CREATED,"substantive_updated_at":UPDATED,"links":"none","archive":"none"})),
+            record_review(ARTIFACT, &artifact, standalone_provenance("report", json!("none"))),
             record_review(READY_WORK_ARTIFACT, &work_artifact, work_provenance("ready", TASK)),
-            record_review(HELD_WORK_ARTIFACT, &id(9), work_provenance("claimed", CLAIMED))
+            record_review(HELD_WORK_ARTIFACT, &id(9), work_provenance("claimed", CLAIMED)),
+            record_review(ARCHIVED, &archived_artifact, standalone_provenance("design", archive.clone()))
         ]
     });
+    let archived_review = mapping["reviewed_records"].as_array().unwrap().len() - 1;
+    mapping["reviewed_records"].as_array_mut().unwrap().extend(
+        INVALID_KINDS
+            .iter()
+            .enumerate()
+            .map(|(index, (path, _, _))| {
+                record_review(
+                    path,
+                    &id(20 + index as u32),
+                    standalone_provenance("report", json!("none")),
+                )
+            }),
+    );
     let mapping_bytes = serde_json::to_vec(&mapping).unwrap();
     fs::write(&mapping_file, &mapping_bytes).unwrap();
     fs::create_dir_all(config.join("hive/v2")).unwrap();
@@ -202,12 +267,107 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         assert!(output.stderr.is_empty(), "{output:?}");
         serde_json::from_slice::<Value>(&output.stdout).unwrap()
     };
+    let plan_for = |manifest: &Value, status| {
+        fs::write(&mapping_file, serde_json::to_vec(manifest).unwrap()).unwrap();
+        response(
+            migration("migration-plan").arg("--include-directives-artifacts"),
+            status,
+        )
+    };
+    let outcome = |report: &Value, path| {
+        report["data"]["directive_artifact_intake"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["source_path"] == path)
+            .unwrap()["outcome"]
+            .clone()
+    };
     let read_v1 = || response(cli("1").args(["config", "show", "--scope", "workspace"]), 0);
     let v1 = read_v1();
-    let plan = response(
-        migration("migration-plan").arg("--include-directives-artifacts"),
-        0,
+    let mut changed = mapping.clone();
+    changed.as_object_mut().unwrap().remove("reviewed_records");
+    let unreviewed = plan_for(&changed, 0);
+    assert_eq!(
+        outcome(&unreviewed, ARCHIVED),
+        json!({"status":"held","reason_codes":["unclassified_artifact_kind"]})
     );
+    assert!(
+        unreviewed["data"]["directive_artifact_intake"]["counts"]["artifacts_standalone"]
+            .get("prepared")
+            .is_none()
+    );
+    let mut changed = mapping.clone();
+    changed["reviewed_records"][archived_review]["source_git_blob_sha"] = json!(oid(ARTIFACT));
+    assert_eq!(plan_for(&changed, 2)["error"]["code"], "INVALID_CONFIG");
+
+    let mut changed = mapping.clone();
+    for bad_shape in [
+        Value::Null,
+        json!([work_range(ARCHIVED_AT), work_range(ARCHIVE_REASON)]),
+        json!({"archived_at":work_range(ARCHIVED_AT)}),
+        json!({"archive_reason":work_range(ARCHIVE_REASON)}),
+        json!({"archived_at":[0,1],"archive_reason":work_range(ARCHIVE_REASON)}),
+        json!({"archived_at":work_range(ARCHIVED_AT),"archive_reason":work_range(ARCHIVE_REASON),"unknown":true}),
+    ] {
+        changed["reviewed_records"][archived_review]["provenance"]["archive"] = bad_shape;
+        assert_eq!(plan_for(&changed, 2)["error"]["code"], "INVALID_CONFIG");
+    }
+    let duplicate = mapping.to_string().replacen(
+        "\"archive_reason\":",
+        "\"archive_reason\":{\"start\":0,\"end\":1},\"archive_reason\":",
+        1,
+    );
+    fs::write(&mapping_file, duplicate).unwrap();
+    assert_eq!(
+        response(
+            migration("migration-plan").arg("--include-directives-artifacts"),
+            2
+        )["error"]["code"],
+        "INVALID_CONFIG"
+    );
+    let mut changed = mapping.clone();
+    for bad_evidence in [
+        json!("unresolved"),
+        json!({"archived_at":work_range(CREATED),"archive_reason":work_range(ARCHIVE_REASON)}),
+        json!({"archived_at":work_range(ARCHIVED_AT),"archive_reason":{"start":0,"end":0}}),
+        json!({"archived_at":{"start":0,"end":1},"archive_reason":work_range(ARCHIVE_REASON)}),
+    ] {
+        changed["reviewed_records"][archived_review]["provenance"]["archive"] = bad_evidence;
+        let held = outcome(&plan_for(&changed, 0), ARCHIVED);
+        assert_eq!(held["status"], "held");
+        assert_eq!(
+            held["reason_codes"],
+            json!(["unverified_artifact_retention"])
+        );
+    }
+
+    let plan = plan_for(&mapping, 0);
+    for (path, _, reason) in INVALID_KINDS {
+        let held = outcome(&plan, *path);
+        assert_eq!(held["status"], "held", "{path}");
+        assert!(
+            held["reason_codes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(reason)),
+            "{held}"
+        );
+    }
+    assert_eq!(oid(ARCHIVED), oid(UNCLASSIFIED));
+    assert_eq!(outcome(&plan, UNCLASSIFIED), outcome(&unreviewed, ARCHIVED));
+    for (path, kind) in [(ARCHIVED, "design"), (READY_WORK_ARTIFACT, "evidence")] {
+        let prepared = outcome(&plan, path);
+        assert_eq!(prepared["status"], "prepared");
+        assert_eq!(prepared["candidate"]["kind"], kind);
+        assert_eq!(prepared["provenance"]["archived_at"], CANONICAL_ARCHIVED_AT);
+        assert_eq!(
+            prepared["provenance"]["archive_reason_sha256"],
+            sha256_hex(ARCHIVE_REASON.as_bytes())
+        );
+    }
+    assert!(outcome(&plan, ARTIFACT)["provenance"]["archived_at"].is_null());
+    assert!(!plan.to_string().contains("Synthetic archival rationale"));
     for key in [
         "task_intake",
         "queen_preparation",
@@ -276,11 +436,14 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         ("tasks", 1),
         ("resources", 1),
         ("directives", 1),
-        ("artifacts_standalone", 1),
     ] {
         assert_eq!(staged["counts"][key]["imported"], 1);
         assert_eq!(staged["counts"][key]["held"], held);
     }
+    assert_eq!(
+        staged["counts"]["artifacts_standalone"],
+        json!({"inventoried":3+INVALID_KINDS.len(),"imported":2,"held":1+INVALID_KINDS.len(),"excluded_non_record":0})
+    );
     assert_eq!(
         staged["counts"]["artifacts_work_scoped"],
         json!({"inventoried":2,"imported":1,"held":1,"excluded_non_record":0})
@@ -334,6 +497,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         REPO_URL,
         RECORD_REF,
         "Exact café bytes",
+        "Synthetic archival rationale",
         "Synthetic Soul content sentinel",
         "sample-holder",
         root.to_str().unwrap(),
@@ -396,9 +560,14 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     );
     assert_eq!(
         sql(&format!(
-            "SELECT id, body FROM artifacts AS OF '{db}' ORDER BY id"
+            "SELECT id, kind, body, COALESCE(DATE_FORMAT(archived_at, '%Y-%m-%dT%H:%i:%s.%fZ'), '') AS archived,
+             COALESCE(archive_reason, '') AS reason FROM artifacts AS OF '{db}' ORDER BY id"
         )),
-        json!([{"id":artifact,"body":RECORD_BODY},{"id":work_artifact,"body":work_body}])
+        json!([
+            {"id":artifact,"kind":"report","body":RECORD_BODY,"archived":"","reason":""},
+            {"id":work_artifact,"kind":"evidence","body":work_body,"archived":CANONICAL_ARCHIVED_AT,"reason":ARCHIVE_REASON},
+            {"id":archived_artifact,"kind":"design","body":archived_body,"archived":CANONICAL_ARCHIVED_AT,"reason":ARCHIVE_REASON}
+        ])
     );
     assert_eq!(
         sql(&format!(

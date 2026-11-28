@@ -107,7 +107,7 @@ pub(super) struct BodyRange {
 }
 
 impl BodyRange {
-    fn select(self, body: &str) -> Option<&str> {
+    pub(super) fn select(self, body: &str) -> Option<&str> {
         body.get(self.start as usize..self.end as usize)
     }
 }
@@ -381,7 +381,7 @@ impl BodyEvidence {
     }
 }
 
-fn fits_text_column(text: &str) -> bool {
+pub(super) fn fits_text_column(text: &str) -> bool {
     text.len() <= 65_535
         && !text
             .chars()

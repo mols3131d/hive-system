@@ -45,7 +45,7 @@ pub(super) enum ArtifactStatus {
     Closed,
 }
 
-#[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ArtifactKind {
     Report,
@@ -56,6 +56,15 @@ pub(crate) enum ArtifactKind {
     Checkpoint,
     WorkNote,
     Manifest,
+    Design,
+    Decision,
+    Evidence,
+}
+
+impl ArtifactKind {
+    fn is_v1(self) -> bool {
+        !matches!(self, Self::Design | Self::Decision | Self::Evidence)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -140,7 +149,8 @@ impl Outcome {
                 _ => Err(Reason::UnsupportedReviewedRecord),
             }
         } else if supported_shape && parent.is_none() {
-            review.prepare(&candidate, observed_at)
+            let body = record.content.as_ref().map(|content| content.body.as_str());
+            review.prepare(&candidate, observed_at, body)
         } else {
             Err(Reason::UnsupportedReviewedRecord)
         };
@@ -306,18 +316,20 @@ pub(super) fn scan(
                     Outcome::held(Reason::RecordMarkdownTooLarge)
                 } else {
                     let directive = surface == Surface::Directives;
-                    let capture = review.is_some_and(|review| {
-                        prepare_storage || (parent.is_some() && review.is_work_scoped())
-                    });
-                    let inspection = match inspected.entry((entry.oid.as_str(), directive, capture))
-                    {
+                    let direct_markdown = tail.strip_suffix(".md").is_some_and(is_slug);
+                    let reviewed_kind = review
+                        .filter(|_| !directive && direct_markdown)
+                        .and_then(|review| review.artifact_kind(parent.is_some()));
+                    let capture = review.is_some() && (prepare_storage || reviewed_kind.is_some());
+                    let key = (entry.oid.as_str(), directive, capture, reviewed_kind);
+                    let inspection = match inspected.entry(key) {
                         Entry::Occupied(cached) => cached.into_mut(),
                         Entry::Vacant(cache) => {
                             let bytes =
                                 snapshot_object(&|| reader.command(), "blob", &entry.oid, size)?;
                             cache.insert(Inspection {
                                 raw_sha256: format!("{:x}", Sha256::digest(&bytes)),
-                                record: inspect(&bytes, directive, capture),
+                                record: inspect(&bytes, directive, capture, reviewed_kind),
                             })
                         }
                     };
@@ -338,7 +350,7 @@ pub(super) fn scan(
                                     record,
                                     (surface == Surface::Directives
                                         && review.directive_edges().is_some())
-                                        || tail.strip_suffix(".md").is_some_and(is_slug),
+                                        || direct_markdown,
                                     observed_at,
                                     parent.map(|(path, _)| path),
                                     tasks,
@@ -591,7 +603,12 @@ fn scalar_label<T: DeserializeOwned>(value: Value) -> Option<T> {
     }
 }
 
-fn inspect(bytes: &[u8], directive: bool, capture: bool) -> Result<InspectedRecord, Reason> {
+fn inspect(
+    bytes: &[u8],
+    directive: bool,
+    capture: bool,
+    reviewed_kind: Option<ArtifactKind>,
+) -> Result<InspectedRecord, Reason> {
     let invalid = if directive {
         Reason::UnsupportedDirectiveMetadata
     } else {
@@ -637,10 +654,11 @@ fn inspect(bytes: &[u8], directive: bool, capture: bool) -> Result<InspectedReco
             .ok_or(Reason::InvalidDirectiveStatus)?;
         Metadata::Directive(status)
     } else {
-        let kind = fields
-            .kind
-            .and_then(scalar_label)
-            .ok_or(Reason::UnclassifiedArtifactKind)?;
+        let kind = match fields.kind {
+            Some(value) => scalar_label::<ArtifactKind>(value).filter(|kind| kind.is_v1()),
+            None => reviewed_kind,
+        }
+        .ok_or(Reason::UnclassifiedArtifactKind)?;
         let legacy_status = fields
             .status
             .map(|value| scalar_label(value).ok_or(Reason::InvalidArtifactStatus))

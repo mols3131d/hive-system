@@ -197,19 +197,19 @@ fn stages_reviewed_directives_and_standalone_artifacts_in_an_inactive_copy() {
     assert_eq!(data["checks"]["published_inactive"], true);
     assert_eq!(data["checks"]["committed_record_validation"], "passed");
     assert_eq!(data["checks"]["target_directive_rows"], 4);
-    assert_eq!(data["checks"]["target_artifact_rows"], 1);
+    assert_eq!(data["checks"]["target_artifact_rows"], 2);
     assert_eq!(data["checks"]["target_artifact_links"], 0);
     assert_eq!(
         data["counts"]["directives"],
         json!({"inventoried": 5, "imported": 4, "held": 1, "excluded_non_record": 0})
     );
-    assert_eq!(data["counts"]["artifacts_standalone"]["imported"], 1);
-    assert_eq!(data["counts"]["artifacts_standalone"]["held"], 1);
+    assert_eq!(data["counts"]["artifacts_standalone"]["imported"], 2);
+    assert_eq!(data["counts"]["artifacts_standalone"]["held"], 0);
     assert_eq!(data["counts"]["artifacts_work_scoped"]["held"], 1);
     for (entry, _) in entries
         .into_iter()
         .take(4)
-        .chain(entries.into_iter().skip(5).take(1))
+        .chain(entries.into_iter().skip(5).take(2))
     {
         let path_hash = sha256_hex(entry.as_bytes());
         let planned = data["id_map"]
@@ -254,11 +254,13 @@ fn stages_reviewed_directives_and_standalone_artifacts_in_an_inactive_copy() {
     assert_eq!(rows[2]["status"], "proposed");
     assert_eq!(rows[3]["status"], "withdrawn");
     let artifact = query(&format!("SELECT id, kind, body, source_ref, author_ref,
-        DATE_FORMAT(substantive_updated_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS retention FROM artifacts AS OF '{confirmed}'"));
+        DATE_FORMAT(substantive_updated_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS retention FROM artifacts AS OF '{confirmed}' ORDER BY id"));
     assert_eq!(
         artifact,
-        json!([{"id": id(0x705), "kind": "report", "body": BODY,
-        "source_ref": REFERENCE, "author_ref": "bot:synthetic-author", "retention": UPDATED}])
+        json!([0x705, 0x706].map(|number| json!({
+            "id": id(number), "kind": "report", "body": BODY,
+            "source_ref": REFERENCE, "author_ref": "bot:synthetic-author", "retention": UPDATED
+        })))
     );
     stage("staged-import", &target, &mapping, 5);
     assert!(

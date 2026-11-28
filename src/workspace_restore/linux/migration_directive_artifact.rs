@@ -87,7 +87,9 @@ impl Expected {
                 SHA2(author_ref, 256) AS author_ref_sha256, SHA2(source_ref, 256) AS source_ref_sha256, revision,
                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS created_at,
                 DATE_FORMAT(substantive_updated_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS substantive_updated_at,
-                archived_at, archive_reason FROM artifacts{snapshot} ORDER BY id"), self.artifacts.values().cloned().collect()),
+                DATE_FORMAT(archived_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS archived_at,
+                SHA2(archive_reason, 256) AS archive_reason_sha256
+                FROM artifacts{snapshot} ORDER BY id"), self.artifacts.values().cloned().collect()),
             (format!("SELECT artifact_id, issue_id FROM artifact_issues{snapshot} ORDER BY artifact_id, issue_id"),
                 self.issue_links.iter().map(|(artifact, issue)| json!({"artifact_id": artifact, "issue_id": issue})).collect()),
             (format!("SELECT artifact_id, area_id FROM artifact_areas{snapshot} ORDER BY artifact_id, area_id"),
@@ -151,10 +153,18 @@ pub(super) fn append(
                 row["source_ref_sha256"] = json!(digest(&fields.source_ref));
                 row["created_at"] = json!(report_time(&fields.created_at));
                 row["substantive_updated_at"] = json!(report_time(&fields.substantive_updated_at));
+                let archive = fields.archive.as_ref();
+                if let Some(archive) = archive {
+                    row["archived_at"] = json!(report_time(&archive.archived_at));
+                    row["archive_reason_sha256"] = json!(digest(&archive.reason));
+                }
                 writeln!(sql, "INSERT INTO artifacts (id, kind, title, body, author_ref, source_ref, revision,
-                    created_at, substantive_updated_at) VALUES ({id}, {}, {title}, {body}, {}, {}, {revision}, {}, {});",
+                    created_at, substantive_updated_at, archived_at, archive_reason)
+                    VALUES ({id}, {}, {title}, {body}, {}, {}, {revision}, {}, {}, {}, {});",
                     sql_text(kind), sql_text(&fields.author_ref), sql_text(&fields.source_ref),
-                    sql_time(&fields.created_at), sql_time(&fields.substantive_updated_at)).map_err(io_error)?;
+                    sql_time(&fields.created_at), sql_time(&fields.substantive_updated_at),
+                    nullable(archive.map(|entry| entry.archived_at.as_str()), sql_time),
+                    nullable(archive.map(|entry| entry.reason.as_str()), sql_text)).map_err(io_error)?;
                 if let Some(work) = &fields.work {
                     let link = &work.issue_link;
                     let issue = tasks.and_then(|tasks| tasks.issue_id(link)).ok_or_else(|| {
@@ -310,5 +320,8 @@ fn artifact_kind(value: ArtifactKind) -> &'static str {
         ArtifactKind::Checkpoint => "checkpoint",
         ArtifactKind::WorkNote => "work-note",
         ArtifactKind::Manifest => "manifest",
+        ArtifactKind::Design => "design",
+        ArtifactKind::Decision => "decision",
+        ArtifactKind::Evidence => "evidence",
     }
 }

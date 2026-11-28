@@ -3,6 +3,7 @@ use std::rc::Rc;
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
+use super::artifact_archive::ArtifactArchive;
 use super::reviewed_records::sha256;
 pub(crate) use super::work_artifact::IssueLink;
 use super::work_artifact::WorkScope;
@@ -49,6 +50,7 @@ pub(crate) struct ArtifactFields {
     pub(crate) source_ref: String,
     pub(crate) created_at: String,
     pub(crate) substantive_updated_at: String,
+    pub(crate) archive: Option<ArtifactArchive>,
     pub(crate) work: Option<Box<WorkScope>>,
 }
 
@@ -81,9 +83,14 @@ impl Serialize for Fields {
                 "created_at": row.created_at,
                 "substantive_updated_at": row.substantive_updated_at,
                 "scope": "standalone",
-                "archived_at": null,
-                "archive_reason": null,
                 });
+                if let Some(archive) = &row.archive {
+                    evidence["archived_at"] = json!(archive.archived_at);
+                    evidence["archive_reason_sha256"] = json!(sha256(&archive.reason));
+                } else {
+                    evidence["archived_at"] = Value::Null;
+                    evidence["archive_reason"] = Value::Null;
+                }
                 if let Some(work) = &row.work {
                     evidence["scope"] = json!("work_scoped");
                     evidence["issue_link"] = json!(work.issue_link);
