@@ -474,7 +474,9 @@ Both modes insert the selected rows inside one guarded Dolt transaction on a pri
 
 The report preserves the existing `coverage` value for Area-only and single-surface staging. Combined staging uses `coverage: mixed` and lists the selected surfaces in `included_surfaces`. It includes provenance, the mapping SHA-256, balanced counts, IDs, field digests and typed holds and exclusions. Queen asset holds include SHA-256 source locators in `queen_inventory`. Scope, Task and record paths appear as digests resolvable against the exact source commit. The Task key digest covers the scope, a NUL byte and the work ID. The report omits raw record payloads, approval references, and paths. In dry-run, `imported` describes the rows exercised inside the rolled-back transaction. The reported target row counts are zero, the retained Issue counter is 1, and `projected_issue_number_next_value` gives the exercised counter when Tasks are selected.
 
-[Issue #98](https://github.com/mols3131d/hive-system/issues/98) tracks the remaining staging coverage, including work-scoped Artifact joins and the full A15 report.
+The `reconciliation` section identifies whether counts and ID mappings came from the rolled-back transaction or the confirmed commit. It also identifies the verified disposable or published asset commit and lists surfaces that were inventoried without being selected for staging. Hold entries carry reason codes and reconciliation actions. Dry-run and staged import allocate their own Issue and Label UUIDs.
+
+The wider acceptance gate includes terminal-parent Artifact retention, further source-evidence review, and post-import counter and rollback scenarios. See [#98](https://github.com/mols3131d/hive-system/issues/98) and the [A15 acceptance matrix](dolt-mvp-contract.md#acceptance-matrix-and-evidence).
 
 ### 6. Issue Counters and Number Non-Reuse
 
