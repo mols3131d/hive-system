@@ -33,18 +33,23 @@ enum Provenance {
         issuer_ref: String,
         created_at: String,
         updated_at: String,
+        #[serde(deserialize_with = "super::json_object::string_enum")]
         supersession: AbsenceReview,
+        #[serde(deserialize_with = "super::json_object::string_enum")]
         approval_and_validity: AbsenceReview,
     },
     DirectiveHistory(DirectiveHistory),
     WorkScopedArtifact(WorkArtifactReview),
     StandaloneArtifact {
+        #[serde(deserialize_with = "super::json_object::string_enum")]
         artifact_kind: ArtifactKind,
         source_ref: String,
         author_ref: String,
         created_at: String,
         substantive_updated_at: String,
+        #[serde(deserialize_with = "super::json_object::string_enum")]
         links: AbsenceReview,
+        #[serde(deserialize_with = "super::json_object::string_enum")]
         archive: AbsenceReview,
     },
 }
@@ -229,7 +234,7 @@ pub(super) fn timestamp(value: &str) -> Option<OffsetDateTime> {
     let bytes = value.as_bytes();
     // DATETIME(6) stores UTC wall time to microseconds. Refuse any loss of precision.
     if !value.ends_with('Z')
-        || bytes.get(10) != Some(&b'T')
+        || !matches!(bytes.get(10), Some(b'T' | b't'))
         || bytes.get(17..19) == Some(b"60")
         || !(value.len() == 20
             || ((22..=27).contains(&value.len()) && bytes.get(19) == Some(&b'.')))

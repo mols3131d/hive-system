@@ -39,8 +39,9 @@ struct Mapping {
     workspace_id: String,
     #[serde(deserialize_with = "json_object::deserialize_vec")]
     scopes: Vec<ScopeMapping>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "json_object::deserialize_vec")]
     task_reviews: Vec<TaskReview>,
+    #[serde(default, deserialize_with = "optional_object_list")]
     queen_assets: Option<Vec<SoulReview>>,
     #[serde(default, deserialize_with = "QueenMapping::optional_list")]
     queen_preparation: Option<Vec<QueenMapping>>,
@@ -54,6 +55,14 @@ struct Mapping {
     )]
     reviewed_records: Option<Vec<Review>>,
     directive_observed_at: Option<String>,
+}
+
+fn optional_object_list<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    json_object::deserialize_vec(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -275,6 +284,16 @@ impl ReviewedScopes<'_> {
             .unwrap_or_default()
             .iter()
             .any(Review::is_work_scoped)
+    }
+
+    pub(crate) fn require_stage_task_selection(
+        &self,
+        include_tasks: bool,
+    ) -> Result<(), HiveError> {
+        if !include_tasks && !self.mapping.task_reviews.is_empty() && !self.has_work_artifacts() {
+            return Err(invalid("Task reviews require --tasks for staging."));
+        }
+        Ok(())
     }
 
     pub(crate) fn directive_artifacts_for_staging(

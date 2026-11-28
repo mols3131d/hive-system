@@ -278,8 +278,8 @@ fn nullable(value: Option<&str>, encode: fn(&str) -> String) -> String {
 }
 
 fn report_time(value: &str) -> String {
-    let value = value.trim_end_matches('Z');
-    let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
+    let value = value.trim_end_matches('Z').replace('t', "T");
+    let (seconds, fraction) = value.split_once('.').unwrap_or((&value, ""));
     format!("{seconds}.{fraction:0<6}Z")
 }
 

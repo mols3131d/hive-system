@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
-use super::{CommonOptions, DoltSuccess, IssueUpdateArgs};
+use super::{CommonOptions, DoltSuccess, IssueUpdateArgs, MAX_TEXT_BYTES, valid_text};
 use crate::dolt::{
     DoltTarget, Snapshot,
     context_evidence::read_evidence_bytes,
@@ -22,7 +22,6 @@ use crate::error::{ErrorCode, HiveError};
 
 pub(in crate::dolt) const KIND: &str = "issue.update";
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
-const MAX_TEXT_BYTES: usize = 65_535;
 const ARCHIVED_AREA: &str = "Issue updates require active Area ancestry.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,10 +257,6 @@ fn read_file(path: Option<&Path>, limit: usize) -> Result<Option<String>, HiveEr
         String::from_utf8(bytes).map_err(|_| invalid("Issue edit files must be UTF-8."))
     })
     .transpose()
-}
-
-fn valid_text(text: &str) -> bool {
-    !text.trim().is_empty() && text.len() <= MAX_TEXT_BYTES
 }
 
 fn valid_hold(reason: &str) -> bool {

@@ -9,7 +9,7 @@ use super::scope_plan::is_portable_scope;
 use super::task_intake::{CandidateStatus, TitleSource, parse_record, resolve_title};
 use super::{Reason, is_full_lowercase_oid};
 use crate::cli::is_slug;
-use crate::dolt::is_uuid_v7;
+use crate::dolt::{is_uuid_v7, issue_update::valid_text};
 use crate::error::{ErrorCode, HiveError};
 
 pub(super) type Key<'a> = (&'a str, &'a str);
@@ -17,13 +17,18 @@ pub(super) type Key<'a> = (&'a str, &'a str);
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TaskReview {
+    #[serde(deserialize_with = "super::json_object::deserialize")]
     legacy_key: LegacyKey,
     source_git_blob_sha: String,
     area_id: String,
     pub(super) relations: Option<Relations>,
+    #[serde(default, deserialize_with = "super::json_object::optional_object")]
     created_at: Option<BodyRange>,
+    #[serde(default, deserialize_with = "super::json_object::optional_object")]
     updated_at: Option<BodyRange>,
+    #[serde(default, deserialize_with = "super::json_object::optional_object")]
     acceptance_criteria: Option<BodyRange>,
+    #[serde(default, deserialize_with = "super::json_object::optional_object")]
     closure: Option<ClosureReview>,
 }
 
@@ -471,7 +476,7 @@ impl TaskReview {
             .and_then(|review| review.prepare(body, terminal));
         let criteria = self
             .acceptance_criteria
-            .and_then(|range| BodyEvidence::select(range, body, fits_text_column));
+            .and_then(|range| BodyEvidence::select(range, body, valid_text));
         let mut reasons = Vec::new();
         if dates.is_none()
             || (terminal && closure.is_none())

@@ -87,6 +87,7 @@ fn prepare(
     target: &InactiveTarget,
     reviewed: &ReviewedScopes<'_>,
 ) -> Result<(Value, Option<StagedPayload>), HiveError> {
+    reviewed.require_stage_task_selection(args.tasks)?;
     let areas = reviewed.areas_in_parent_order()?;
     let queens = reviewed.prepared_queens();
     let dry_run = matches!(args.mode, MigrationStageMode::DryRun);
