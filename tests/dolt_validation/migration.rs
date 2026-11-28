@@ -1666,6 +1666,73 @@ exec "$HOME/real-git" "$@"
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cli_preflight_detects_a_racy_tracked_edit_without_changing_source_metadata() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    init_source(&source, &home);
+    git(&source, &home, &["config", "core.trustctime", "false"]);
+    let tracked = source.join("synthetic-racy-task.md");
+    let index = source.join(".git/index");
+    let timestamp = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+    let set_mtime = |path: &Path| {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(timestamp)
+            .unwrap();
+    };
+    fs::write(&tracked, b"Synthetic task A\n").unwrap();
+    set_mtime(&tracked);
+    git(&source, &home, &["add", "synthetic-racy-task.md"]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic racy index entry"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    set_mtime(&index);
+
+    fs::write(&tracked, b"Synthetic task B\n").unwrap();
+    set_mtime(&tracked);
+    let snapshot = || {
+        [&index, &tracked].map(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                fs::read(path).unwrap(),
+                metadata.modified().unwrap(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        })
+    };
+    let before = snapshot();
+    assert_eq!(before[0].1, before[1].1);
+    assert_eq!(
+        git(
+            &source,
+            &home,
+            &["status", "--porcelain=v1", "--untracked-files=no"]
+        ),
+        b" M synthetic-racy-task.md\n",
+    );
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let report = migration_preflight(&home, &home, &args, 5);
+    assert_eq!(report["error"]["code"], "DIRTY_CONFLICT");
+    assert!(!report.to_string().contains("synthetic-racy-task"));
+    assert_eq!(snapshot(), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cli_preflight_refuses_a_split_index_without_refreshing_source_metadata() {
     use std::os::unix::fs::MetadataExt;
     use std::time::{Duration, UNIX_EPOCH};
