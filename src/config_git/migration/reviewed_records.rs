@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
 
-use serde::{Deserialize, Deserializer, de, de::value::StrDeserializer};
-use serde_json::{Value, json, value::RawValue};
+use serde::{Deserialize, Deserializer, de::value::StrDeserializer};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::directive_artifact_intake::{ArtifactKind, Candidate, DirectiveStatus};
+use super::json_object;
 use super::scope_plan::portable_reference;
 use super::{Inventory, Reason};
 use crate::cli::is_slug;
@@ -18,7 +19,7 @@ pub(super) struct Review {
     source_path: String,
     source_git_blob_sha: String,
     pub(super) target_id: String,
-    #[serde(deserialize_with = "deserialize_provenance")]
+    #[serde(deserialize_with = "json_object::deserialize")]
     provenance: Provenance,
 }
 
@@ -67,25 +68,7 @@ fn string_enum<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
 pub(super) fn deserialize_present<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Vec<Review>>, D::Error> {
-    Vec::<&RawValue>::deserialize(deserializer)?
-        .into_iter()
-        .map(parse_json_object)
-        .collect::<Result<_, _>>()
-        .map(Some)
-}
-
-fn deserialize_provenance<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Provenance, D::Error> {
-    parse_json_object(<&RawValue>::deserialize(deserializer)?)
-}
-
-fn parse_json_object<'de, T: Deserialize<'de>, E: de::Error>(value: &'de RawValue) -> Result<T, E> {
-    if !value.get().trim_start().starts_with('{') {
-        return Err(E::custom("Expected a JSON object."));
-    }
-    // Decode the original text to preserve duplicate-key checks.
-    serde_json::from_str(value.get()).map_err(E::custom)
+    json_object::deserialize_vec(deserializer).map(Some)
 }
 
 pub(super) fn bind<'a>(
