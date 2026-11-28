@@ -21,8 +21,28 @@ pub(super) struct Review {
     source_path: String,
     source_git_blob_sha: String,
     pub(super) target_id: String,
+    #[serde(default, deserialize_with = "deserialize_title")]
+    title: Option<TitleReview>,
     #[serde(deserialize_with = "super::json_object::deserialize")]
     provenance: Provenance,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+enum TitleReview {
+    Fallback { value: String },
+    Override { value: String },
+}
+
+pub(super) enum TitleProblem {
+    Unavailable,
+    Conflicting,
+}
+
+fn deserialize_title<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<TitleReview>, D::Error> {
+    super::json_object::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -94,6 +114,22 @@ pub(super) fn bind<'a>(
 }
 
 impl Review {
+    pub(super) fn selected_title<'a>(
+        &'a self,
+        source: Result<&'a str, &TitleProblem>,
+    ) -> Option<&'a str> {
+        match &self.title {
+            None => source.ok(),
+            Some(TitleReview::Override { value }) if valid_title(value) => Some(value),
+            Some(TitleReview::Fallback { value })
+                if matches!(source, Err(TitleProblem::Unavailable)) && valid_title(value) =>
+            {
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn is_work_scoped(&self) -> bool {
         matches!(self.provenance, Provenance::WorkScopedArtifact(_))
     }
@@ -219,6 +255,10 @@ impl Review {
             _ => Err(Reason::UnsupportedReviewedRecord),
         }
     }
+}
+
+pub(super) fn valid_title(value: &str) -> bool {
+    !value.trim().is_empty() && value.chars().count() <= 255 && !value.chars().any(char::is_control)
 }
 
 pub(super) fn validate_historical_source(

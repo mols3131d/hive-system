@@ -18,13 +18,13 @@ pub(crate) struct Intake {
 
 pub(crate) struct PreparedRecord {
     pub(crate) id: String,
-    pub(crate) content: Rc<Content>,
+    pub(crate) content: Content,
     pub(crate) fields: Fields,
 }
 
 pub(crate) struct Content {
     pub(crate) title: String,
-    pub(crate) body: String,
+    pub(crate) body: Rc<str>,
 }
 
 pub(crate) enum Fields {
