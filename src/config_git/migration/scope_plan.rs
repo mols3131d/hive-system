@@ -10,6 +10,8 @@ use url::{Host, Url};
 
 use super::json_object::{self, Object};
 use super::queen_assets::{self, SoulReview};
+use super::reviewed_records::Review;
+use super::task_provenance::TaskReview;
 use super::{
     AssetObjectReader, Inventory, Reason, SourceSnapshot, directive_artifact_intake,
     is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
@@ -28,6 +30,10 @@ struct Mapping {
     workspace_id: String,
     #[serde(deserialize_with = "json_object::deserialize_vec")]
     scopes: Vec<ScopeMapping>,
+    #[serde(default, deserialize_with = "json_object::deserialize_vec")]
+    task_reviews: Vec<TaskReview>,
+    #[serde(default, deserialize_with = "optional_object_list")]
+    reviewed_records: Option<Vec<Review>>,
     #[serde(default, deserialize_with = "optional_object_list")]
     queen_assets: Option<Vec<SoulReview>>,
 }
@@ -131,6 +137,11 @@ pub(crate) fn plan(
     include_directives_artifacts: bool,
 ) -> Result<Value, HiveError> {
     with_scope_mapping(source, revision, workspace_id, mapping_file, |reviewed| {
+        if reviewed.reviewed_records.is_some() && !include_directives_artifacts {
+            return Err(invalid(
+                "Reviewed records require --include-directives-artifacts.",
+            ));
+        }
         let mut report = json!({
             "mode": "scope_plan",
             "mapping_version": reviewed.mapping_version,
@@ -154,13 +165,17 @@ pub(crate) fn plan(
                     &|| reviewed.reader.command(),
                     claims_supported,
                 )?;
-                report["task_intake"] = task_intake::report(records, &outcomes);
+                report["task_intake"] =
+                    task_intake::report(records, &outcomes, reviewed.task_reviews, &|| {
+                        reviewed.reader.command()
+                    })?;
             }
             if include_directives_artifacts {
                 report["directive_artifact_intake"] = directive_artifact_intake::report(
                     reviewed.inventory,
                     reviewed.reader,
                     &outcomes,
+                    reviewed.reviewed_records,
                 )?;
             }
         }
@@ -183,10 +198,21 @@ pub(crate) struct ReviewedScopes<'a> {
     mapping_sha256: String,
     scopes: Vec<Scope<'a>>,
     queen_assets: Option<&'a [SoulReview]>,
+    task_reviews: &'a [TaskReview],
+    reviewed_records: Option<&'a [Review]>,
 }
 
 impl ReviewedScopes<'_> {
     pub(crate) fn areas_in_parent_order(&self) -> Result<Vec<&Area>, HiveError> {
+        if !self.task_reviews.is_empty()
+            || self
+                .reviewed_records
+                .is_some_and(|records| !records.is_empty())
+        {
+            return Err(invalid(
+                "Area staging requires a mapping without Task, Directive, or Artifact reviews.",
+            ));
+        }
         let mut ids = BTreeSet::new();
         let mut children = BTreeMap::<Option<&str>, Vec<&Area>>::new();
         for scope in &self.scopes {
@@ -314,6 +340,8 @@ pub(crate) fn with_scope_mapping<T>(
             mapping_sha256: format!("{:x}", Sha256::digest(input)),
             scopes,
             queen_assets: mapping.queen_assets.as_deref(),
+            task_reviews: &mapping.task_reviews,
+            reviewed_records: mapping.reviewed_records.as_deref(),
         })
     })
 }
@@ -668,7 +696,7 @@ fn prose_url(token: &str) -> &str {
     token
 }
 
-fn portable_reference(reference: &str) -> bool {
+pub(super) fn portable_reference(reference: &str) -> bool {
     if reference.len() > MAX_FILE_BYTES
         || !reference.starts_with("https://")
         || !reference.is_ascii()
