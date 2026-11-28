@@ -234,6 +234,15 @@ fn cli_migration_plan_inventories_directives_and_artifacts_read_only() {
 
     let report = run(&args, 0);
     assert_eq!(report, run(&args, 0));
+
+    let mut task_args = args;
+    *task_args.last_mut().unwrap() = "--tasks";
+    let task_report = run(&task_args, 0);
+    let combined = run(&[args.as_slice(), &["--tasks"]].concat(), 0);
+    let mut expected = report.clone();
+    expected["data"]["task_intake"] = task_report["data"]["task_intake"].clone();
+    assert!(expected["data"]["task_intake"].is_object());
+    assert_eq!(combined, expected);
     let intake = &report["data"]["directive_artifact_intake"];
     assert_eq!(intake["coverage"], "partial");
     let records = intake["records"].as_array().unwrap();
