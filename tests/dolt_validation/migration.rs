@@ -1188,6 +1188,17 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
 #[cfg(target_os = "linux")]
 #[test]
 fn cli_migration_plan_classifies_reviewed_queen_assets_without_writes() {
+    check_queen_asset_intake(POLICY_PIN);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_preserves_queen_asset_classification_under_legacy_pin() {
+    check_queen_asset_intake("0fd0f8dbe632d14094a93599cb1b5f653789ac9c");
+}
+
+#[cfg(target_os = "linux")]
+fn check_queen_asset_intake(policy_pin: &str) {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     fs::create_dir(&home).unwrap();
@@ -1200,6 +1211,14 @@ fn cli_migration_plan_classifies_reviewed_queen_assets_without_writes() {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, bytes).unwrap();
     };
+    if policy_pin != POLICY_PIN {
+        let policy = fs::read_to_string(source.join("AGENTS.md")).unwrap();
+        write(
+            "AGENTS.md",
+            policy.replace(POLICY_PIN, policy_pin).as_bytes(),
+        );
+        fs::remove_file(source.join("hive.yml")).unwrap();
+    }
     let soul = |slug: &str, layer: &str| {
         format!(
             "---\ndescription: \"Select the synthetic Queen identity.\"\n---\n# Synthetic Queen\n\n## Identity\n\n- ID: {slug}\n- Name: Synthetic Private Display\n- Layer: {layer}\n\n## Purpose\n\nSynthetic private persona sentinel.\n"
@@ -1216,11 +1235,27 @@ fn cli_migration_plan_classifies_reviewed_queen_assets_without_writes() {
         ("stale", "1 — Manager"),
         ("unreviewed", "1 — Manager"),
         ("alias", "1 — Manager"),
+        ("aux", "1 — Manager"),
     ] {
         let id = if slug == "wrong-id" { "other" } else { slug };
         write(&format!("bots/{slug}/SOUL.md"), soul(id, layer).as_bytes());
     }
     write("bots/alias/soul.md", b"Case alias.");
+    let conflicting = [
+        ("conflict-star", "* Layer: 2 — Coordinator"),
+        ("conflict-plus", "+ **Role:** Coordinator"),
+        ("conflict-ordered", "1) Bot ID: different-queen"),
+        ("conflict-nested", "- > * Layer: 2 — Coordinator"),
+        ("conflict-heading", "### Layer: 2 — Coordinator ###"),
+        ("conflict-heading-section", "### Role\n\nCoordinator"),
+        ("conflict-setext", "Role\n----\nCoordinator"),
+    ];
+    for (slug, declaration) in conflicting {
+        write(
+            &format!("bots/{slug}/SOUL.md"),
+            format!("{}\n{declaration}\n", soul(slug, "1 — Manager")).as_bytes(),
+        );
+    }
     write(
         "bots/missing/README.md",
         b"Synthetic private routing sentinel.",
@@ -1237,7 +1272,56 @@ fn cli_migration_plan_classifies_reviewed_queen_assets_without_writes() {
         b"Synthetic instructions.",
     );
     let nav = b"---\ndescription: \"Select memory navigation.\"\n---\n# Memory Navigation\n\n- [General](memory/_general/MEMORY.md)\n";
+    write("bots/queen-synth/MEMORY.md", nav);
     write("bots/unreviewed/MEMORY.md", nav);
+    let (header, navigation_body) = std::str::from_utf8(nav)
+        .unwrap()
+        .split_once("\n---\n")
+        .unwrap();
+    write(
+        "bots/missing/MEMORY.md",
+        format!(
+            "---\ndescription: \"Synthetic learned metadata sentinel.\"\n---\n{navigation_body}"
+        )
+        .as_bytes(),
+    );
+    write("bots/missing/memory/_general/MEMORY.md", nav);
+    write(
+        "bots/alias/MEMORY.md",
+        format!(
+            "{header}\ntitle: \"Synthetic learned metadata sentinel.\"\n---\n{navigation_body}"
+        )
+        .as_bytes(),
+    );
+    write("bots/alias/memory/_general/MEMORY.md", nav);
+    write(
+        "bots/stale/MEMORY.md",
+        format!("{header}\n# Synthetic learned metadata sentinel.\n---\n{navigation_body}")
+            .as_bytes(),
+    );
+    write("bots/stale/memory/_general/MEMORY.md", nav);
+    let nonportable_paths = [
+        (
+            "bot_memories_historical",
+            "bots/queen-synth/memory/Host:Path/MEMORY.md",
+        ),
+        (
+            "bot_memories_historical",
+            "bots/queen-synth/memory/_general/private topic.md",
+        ),
+        (
+            "bot_memories_historical",
+            "bots/queen-synth/memory/_general/con.md",
+        ),
+        ("bots_soul", "bots/queen-synth/Local Notes/AGENTS.md"),
+        (
+            "bots_soul",
+            "bots/queen-synth/memory/_general/nul/AGENTS.md",
+        ),
+    ];
+    for (_, path) in nonportable_paths {
+        write(path, b"Synthetic historical evidence.");
+    }
     let mut mixed = nav.to_vec();
     mixed.extend(b"\nSynthetic private memory sentinel.\n");
     write("bots/worker/MEMORY.md", &mixed);
@@ -1262,7 +1346,7 @@ fn cli_migration_plan_classifies_reviewed_queen_assets_without_writes() {
     let mut mapping = json!({
         "version": 1,
         "source_commit": commit,
-        "policy_pin": POLICY_PIN,
+        "policy_pin": policy_pin,
         "workspace_id": workspace_id,
         "scopes": [],
     });
@@ -1290,9 +1374,13 @@ fn cli_migration_plan_classifies_reviewed_queen_assets_without_writes() {
     mapping["queen_assets"] = json!([
         review("queen-synth"), review("worker"), review("wrong-id"), review("collision"),
         review("repeat-review"), review("repeat-review"), review("alias"), review("binary"),
-        review("bad-metadata"),
+        review("bad-metadata"), review("aux"),
         {"slug": "stale", "source_git_blob_sha": "1111111111111111111111111111111111111111"}
     ]);
+    mapping["queen_assets"]
+        .as_array_mut()
+        .unwrap()
+        .extend(conflicting.iter().map(|(slug, _)| review(slug)));
     let report = run(&mapping, 0);
     let assets = &report["data"]["queen_assets"];
     let find = |surface: &str, path: &str| {
@@ -1339,6 +1427,31 @@ fn cli_migration_plan_classifies_reviewed_queen_assets_without_writes() {
         .unwrap();
     assert_eq!(redacted["status"], "held");
     assert!(redacted.get("source_path").is_none());
+    let device_slug = assets["bots_soul"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["source_path_sha256"] == sha256_hex(b"bots/aux/SOUL.md"))
+        .unwrap();
+    assert_eq!(device_slug["reason"], "invalid_soul_or_slug");
+    assert!(device_slug.get("source_path").is_none());
+    for (surface, path) in nonportable_paths {
+        let record = assets[surface]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["source_path_sha256"] == sha256_hex(path.as_bytes()))
+            .unwrap();
+        assert!(record.get("source_path").is_none(), "{path}");
+        assert!(record["source_git_blob_sha"].is_string(), "{path}");
+        // Scope-array path reporting is covered by the scope planner's separate contract.
+        assert!(!assets.to_string().contains(path), "{path}");
+    }
+    for (slug, _) in conflicting {
+        let outcome = find("bots_soul", &format!("bots/{slug}/SOUL.md"));
+        assert_eq!(outcome["status"], "held", "{slug}");
+        assert_eq!(outcome["reason"], "invalid_soul_or_slug", "{slug}");
+    }
     for path in [
         "bots/queen-synth/README.md",
         "bots/queen-synth/memory/_general/AGENTS.md",
@@ -1357,6 +1470,9 @@ fn cli_migration_plan_classifies_reviewed_queen_assets_without_writes() {
         "bots/unreviewed/MEMORY.md",
         "bots/worker/MEMORY.md",
         "bots/worker/memory/_general/MEMORY.md",
+        "bots/missing/MEMORY.md",
+        "bots/alias/MEMORY.md",
+        "bots/stale/MEMORY.md",
     ] {
         assert_eq!(
             find("bot_memories_historical", path)["reason"],

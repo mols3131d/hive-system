@@ -115,7 +115,7 @@ pub(super) fn classify<'a>(
                 let mut outcome = Outcome::Held {
                     reason: Reason::InvalidSoulOrSlug,
                 };
-                if valid_slug(relative)
+                if portable_slug(relative)
                     && slug_counts[relative] == 1
                     && !soul_aliases.contains(relative)
                     && let Some((soul, size)) =
@@ -132,14 +132,11 @@ pub(super) fn classify<'a>(
                         };
                     }
                 }
-                report
-                    .bots_soul
-                    .push(record(&soul_path, soul, valid_slug(relative), outcome));
+                report.bots_soul.push(record(&soul_path, soul, outcome));
             } else if matches!(relative, "README.md" | "AGENTS.md") {
                 report.bots_soul.push(record(
                     path,
                     Some(entry),
-                    true,
                     Outcome::Excluded {
                         reason: Reason::ManagementOnly,
                     },
@@ -148,13 +145,12 @@ pub(super) fn classify<'a>(
             continue;
         };
         let Some(size) = entry.size else { continue };
-        let safe_id = valid_slug(id);
+        let safe_id = portable_slug(id);
         let leaf = child.rsplit('/').next().unwrap_or(child);
         if child == "README.md" || leaf == "AGENTS.md" {
             report.bots_soul.push(record(
                 path,
                 Some(entry),
-                safe_id,
                 Outcome::Excluded {
                     reason: Reason::ManagementOnly,
                 },
@@ -172,7 +168,6 @@ pub(super) fn classify<'a>(
                 report.navigation_only.push(record(
                     path,
                     Some(entry),
-                    true,
                     Outcome::Excluded {
                         reason: Reason::NavigationOnly,
                     },
@@ -181,7 +176,6 @@ pub(super) fn classify<'a>(
                 report.bot_memories_historical.push(record(
                     path,
                     Some(entry),
-                    safe_id,
                     Outcome::Held {
                         reason: Reason::CuratedMemoryDeferred,
                     },
@@ -192,14 +186,9 @@ pub(super) fn classify<'a>(
     Ok(report)
 }
 
-fn record<'a>(
-    path: &str,
-    entry: Option<&'a InventoryEntry>,
-    safe_id: bool,
-    outcome: Outcome,
-) -> Record<'a> {
+fn record<'a>(path: &str, entry: Option<&'a InventoryEntry>, outcome: Outcome) -> Record<'a> {
     Record {
-        source_path: safe_id.then(|| path.to_owned()),
+        source_path: portable_bot_path(path).then(|| path.to_owned()),
         source_path_sha256: digest(path.as_bytes()),
         source_git_blob_sha: entry
             .filter(|entry| !entry.is_directory())
@@ -214,6 +203,45 @@ fn digest(bytes: &[u8]) -> String {
 
 fn valid_slug(slug: &str) -> bool {
     slug.len() <= 100 && is_slug(slug)
+}
+
+fn portable_slug(slug: &str) -> bool {
+    valid_slug(slug) && !device_name(slug)
+}
+
+fn device_name(stem: &str) -> bool {
+    matches!(stem, "con" | "prn" | "aux" | "nul")
+        || stem
+            .strip_prefix("com")
+            .or_else(|| stem.strip_prefix("lpt"))
+            .is_some_and(|suffix| suffix.len() == 1 && suffix.as_bytes()[0].is_ascii_digit())
+}
+
+fn portable_bot_path(path: &str) -> bool {
+    let Some(relative) = path.strip_prefix("bots/") else {
+        return false;
+    };
+    let (directories, file) = relative.rsplit_once('/').unwrap_or(("", relative));
+    if !directories.is_empty() {
+        let mut components = directories.split('/');
+        if !components.next().is_some_and(portable_slug) {
+            return false;
+        }
+        let mut components = components.peekable();
+        if components.peek() == Some(&"memory") {
+            components.next();
+            if matches!(components.peek(), Some(&("_general" | "_hive-userdata"))) {
+                components.next();
+            }
+        }
+        if !components.all(portable_slug) {
+            return false;
+        }
+    }
+    matches!(file, "SOUL.md" | "README.md" | "AGENTS.md" | "MEMORY.md")
+        || (file.len() <= 255
+            && file.split('.').all(is_slug)
+            && !device_name(file.split('.').next().unwrap_or_default()))
 }
 
 #[derive(Deserialize)]
@@ -232,7 +260,7 @@ fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     T::deserialize(de).map(Some)
 }
 
-fn document_body(bytes: &[u8]) -> Option<&str> {
+fn split_document(bytes: &[u8]) -> Option<(&str, &str)> {
     let input = std::str::from_utf8(bytes).ok()?;
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     if input.contains('\0') {
@@ -244,20 +272,7 @@ fn document_body(bytes: &[u8]) -> Option<&str> {
     let mut offset = 0;
     for line in input.split_inclusive('\n') {
         if matches!(line, "---\n" | "---\r\n" | "---") {
-            let fields: CommonFields =
-                parse_v2(&input.as_bytes()[..offset], "v1 Bot frontmatter").ok()?;
-            let valid_tags = fields.tags.is_none_or(|tags| {
-                let unique = tags.iter().collect::<BTreeSet<_>>();
-                !tags.is_empty()
-                    && unique.len() == tags.len()
-                    && tags
-                        .iter()
-                        .all(|tag| tag.split(':').all(|segment| !segment.trim().is_empty()))
-            });
-            return (!fields.description.trim().is_empty()
-                && fields.title.is_none_or(|title| !title.trim().is_empty())
-                && valid_tags)
-                .then(|| &input[offset + line.len()..]);
+            return Some((&input[..offset], &input[offset + line.len()..]));
         }
         offset += line.len();
     }
@@ -265,13 +280,31 @@ fn document_body(bytes: &[u8]) -> Option<&str> {
 }
 
 fn valid_soul(bytes: &[u8], slug: &str) -> bool {
-    let Some(body) = document_body(bytes) else {
+    let Some((header, body)) = split_document(bytes) else {
         return false;
     };
+    let Ok(fields) = parse_v2::<CommonFields>(header.as_bytes(), "v1 Bot frontmatter") else {
+        return false;
+    };
+    let valid_tags = fields.tags.is_none_or(|tags| {
+        let unique = tags.iter().collect::<BTreeSet<_>>();
+        !tags.is_empty()
+            && unique.len() == tags.len()
+            && tags
+                .iter()
+                .all(|tag| tag.split(':').all(|segment| !segment.trim().is_empty()))
+    });
+    if fields.description.trim().is_empty()
+        || fields.title.is_some_and(|title| title.trim().is_empty())
+        || !valid_tags
+    {
+        return false;
+    }
     let mut lines = body.lines().filter(|line| !line.trim().is_empty());
     if !lines.next().is_some_and(|line| {
         line.strip_prefix("# ")
             .is_some_and(|heading| !heading.trim().is_empty())
+            && !identity_declaration(line)
     }) || lines.next() != Some("## Identity")
     {
         return false;
@@ -304,19 +337,69 @@ fn valid_soul(bytes: &[u8], slug: &str) -> bool {
                 && !name.chars().any(char::is_control)
         })
         && purpose_text.is_some_and(|line| !line.trim_start().starts_with('#'))
-        && !purpose_text.into_iter().chain(lines).any(|line| {
-            let line = line.trim();
-            matches!(line, "## Identity" | "## Purpose")
-                || ["- ID:", "- Name:", "- Layer:", "- Role:"]
-                    .iter()
-                    .any(|prefix| line.starts_with(prefix))
-        })
+        && !purpose_text
+            .into_iter()
+            .chain(lines)
+            .any(identity_declaration)
+}
+
+fn identity_declaration(line: &str) -> bool {
+    let mut text = line.trim();
+    loop {
+        if let Some(quoted) = text.strip_prefix('>') {
+            text = quoted.trim_start();
+            continue;
+        }
+        let Some((marker, content)) = text.split_once(char::is_whitespace) else {
+            break;
+        };
+        let ordered = marker
+            .strip_suffix(['.', ')'])
+            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+        if !matches!(marker, "-" | "+" | "*") && !ordered {
+            break;
+        }
+        text = content.trim_start();
+    }
+    let heading = text.trim_start_matches('#');
+    let is_heading = heading.len() != text.len() && heading.starts_with(char::is_whitespace);
+    if is_heading {
+        text = heading.trim().trim_end_matches('#').trim_end();
+    }
+    let key = text
+        .split_once(':')
+        .map_or(text, |(key, _)| key)
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '_' | '`'))
+        .to_ascii_lowercase();
+    identity_field(&key)
+        || matches!(key.as_str(), "identity" | "purpose")
+        || (is_heading
+            && key
+                .split_once(char::is_whitespace)
+                .is_some_and(|(field, _)| identity_field(field)))
+}
+
+fn identity_field(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "bot id" | "bot-id" | "bot_id" | "slug" | "name" | "display name" | "layer" | "role"
+    )
 }
 
 fn navigation_only(bytes: &[u8], directory: &str, inventory: &Inventory) -> bool {
-    let Some(body) = document_body(bytes) else {
+    let Some((header, body)) = split_document(bytes) else {
         return false;
     };
+    // Match the complete header so comments and free-form metadata remain held.
+    if !matches!(
+        header.trim_matches(['\r', '\n']),
+        "description: \"Select memory navigation.\""
+            | "description: \"Memory navigation.\""
+            | "description: 'Select memory navigation.'"
+            | "description: 'Memory navigation.'"
+    ) {
+        return false;
+    }
     let mut lines = body.lines().filter(|line| !line.trim().is_empty());
     if !matches!(lines.next(), Some("# Memory" | "# Memory Navigation")) {
         return false;
@@ -336,7 +419,7 @@ fn navigation_only(bytes: &[u8], directory: &str, inventory: &Inventory) -> bool
         else {
             return false;
         };
-        if !(valid_slug(scope) || matches!(scope, "_general" | "_hive-userdata"))
+        if !(portable_slug(scope) || matches!(scope, "_general" | "_hive-userdata"))
             || (label != scope
                 && label.replace(' ', "-").to_ascii_lowercase() != scope.trim_start_matches('_'))
             || !links.insert(target)
