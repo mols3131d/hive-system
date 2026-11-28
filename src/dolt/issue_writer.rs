@@ -206,6 +206,19 @@ pub(super) trait Mutation {
     fn identity(&self) -> WriteIdentity<'_>;
     fn verify_decision(&self, now: OffsetDateTime) -> Result<(), HiveError>;
     fn evidence(&self) -> Result<String, HiveError>;
+    // Runs under the writer lock at the new-write boundary.
+    fn write_evidence(&self, now: OffsetDateTime) -> Result<String, HiveError> {
+        self.verify_decision(now)?;
+        self.evidence()
+    }
+    // Runs under the writer lock before reading history and before returning a replay.
+    fn verify_locked_authorization(&self, now: OffsetDateTime) -> Result<(), HiveError> {
+        self.verify_decision(now)
+    }
+    // Revocable delegations must still match the staged receipt at commit time.
+    fn verify_commit_delegation(&self, _staged_evidence: &str) -> Result<(), HiveError> {
+        Ok(())
+    }
     fn check_scope(&self, snapshot: &mut Snapshot) -> Result<(), HiveError>;
     fn verify_replay_decision(
         &self,
@@ -248,6 +261,12 @@ fn deserialize_object<'de, D: serde::Deserializer<'de>, E: Deserialize<'de>>(
 pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<Decision<E>, HiveError> {
+    read_workflow_object(path)
+}
+
+pub(super) fn read_workflow_object<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<T, HiveError> {
     let bytes = read_evidence_bytes(path, workflow::MAX_DECLARATION_BYTES)?;
     workflow::parse_json_object::<_, serde_json::Error>(
         serde_json::from_slice(&bytes).map_err(|_| workflow::unverified())?,
@@ -335,8 +354,8 @@ impl Pending {
         Ok(marker)
     }
 
-    /// The caller must establish prior-session termination and open a fresh,
-    /// verified snapshot before resolving the marker.
+    /// The caller must establish that the prior transaction cannot still
+    /// publish and open a fresh, verified snapshot before resolving the marker.
     pub(crate) fn resolve(&self, snapshot: &mut Snapshot) -> Result<&'static str, HiveError> {
         if confirm(snapshot, self)?.is_some() {
             return Ok("confirmed");
@@ -466,7 +485,7 @@ pub(super) fn execute(
     let request = mutation.identity();
     mutation.verify_decision(observe_time()?)?;
     with_writer_runtime(workspace, target, |runtime, snapshot| {
-        mutation.verify_decision(observe_time()?)?;
+        mutation.verify_locked_authorization(observe_time()?)?;
         mutation.check_scope(snapshot)?;
         if let Some(recovered) = reconcile(runtime, workspace.workspace_id())? {
             *snapshot = recovered;
@@ -514,7 +533,7 @@ pub(super) fn execute(
             mutation.verify_replay_decision(snapshot, &receipt.base_commit)?;
             require_clean(&mut snapshot.connection, &commit)?;
             runtime.check()?;
-            mutation.verify_decision(observe_time()?)?;
+            mutation.verify_locked_authorization(observe_time()?)?;
             ("replayed", receipt.base_commit, introduced, result)
         } else {
             if has_receipt_history(snapshot, request.request_id).map_err(|_| uncertain())? {
@@ -592,7 +611,7 @@ fn apply(
     let now = observed
         .replace_nanosecond(observed.nanosecond() / 1000 * 1000)
         .expect("valid microsecond adjustment");
-    mutation.verify_decision(now)?;
+    let workflow_evidence = mutation.write_evidence(now)?;
     let timestamp = workflow::format_observed_at(now);
     let sql_time = timestamp[..26].replace('T', " ");
     let staged = mutation.stage(&mut tx, guard, now, &sql_time)?;
@@ -603,7 +622,7 @@ fn apply(
         kind: request.kind.name().to_owned(),
         authorization_ref: request.authorization_ref.to_owned(),
         actor_ref: request.actor.to_owned(),
-        workflow_evidence: mutation.evidence()?,
+        workflow_evidence,
         result: staged.result,
     };
     tx.exec_drop(
@@ -675,6 +694,18 @@ fn apply(
         .map_err(|_| uncertain())?;
     mutation.verify_decision(observe_time()?)?;
     runtime.check().map_err(|_| uncertain())?;
+    if let Err(error) = mutation.verify_commit_delegation(&receipt.workflow_evidence) {
+        // An acknowledged ROLLBACK ends this transaction. Keep its marker
+        // unless committed history and the authoritative working set agree.
+        tx.rollback().map_err(|_| uncertain())?;
+        drop(writer);
+        let mut rolled_back = runtime.open(false).map_err(|_| uncertain())?;
+        if marker.resolve(&mut rolled_back).map_err(|_| uncertain())? != "rolled_back" {
+            return Err(uncertain());
+        }
+        runtime.clear_pending(entry).map_err(|_| uncertain())?;
+        return Err(error);
+    }
     tx.commit().map_err(|_| uncertain())?;
     drop(writer);
 
