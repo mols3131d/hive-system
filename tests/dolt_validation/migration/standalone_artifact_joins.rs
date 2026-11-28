@@ -10,6 +10,12 @@ const MULTI: &str = "artifacts/multi.md";
 const ZERO: &str = "artifacts/zero.md";
 const HELD: &str = "artifacts/held.md";
 const STALE: &str = "artifacts/stale.md";
+const OVER_CAP: &str = "artifacts/over-cap.md";
+
+fn linked_project_ids() -> Vec<String> {
+    // These 95 Projects plus two Areas, two Issues and one Resource total 100.
+    (0x1000..0x105f).map(id).collect()
+}
 const ALPHA: &str = "tasks/app/backlog/alpha/README.md";
 const BETA: &str = "tasks/_general/backlog/beta/README.md";
 const README: &str = "tasks/app/README.md";
@@ -61,6 +67,7 @@ fn exercise(installed: bool) {
         (ZERO, artifact.clone()),
         (HELD, artifact.clone()),
         (STALE, artifact.clone()),
+        (OVER_CAP, artifact.clone()),
     ];
     for (path, text) in &files {
         let path = source.join(path);
@@ -82,7 +89,11 @@ fn exercise(installed: bool) {
     };
     let area_a = id(0x810);
     let area_b = id(0x811);
-    let project = id(0x812);
+    let project_ids = linked_project_ids();
+    let extra_project = id(0x105f);
+    let projects: Vec<_> = project_ids.iter().chain(std::iter::once(&extra_project)).enumerate()
+        .map(|(index, id)| json!({"id": id, "name": format!("Synthetic Project {index}"), "status": "active"}))
+        .collect();
     let resource = id(0x813);
     let held_resource = id(0x814);
     let workspace = id(1);
@@ -95,15 +106,22 @@ fn exercise(installed: bool) {
         json!({"legacy_key": {"scope": scope,"work_id": work},
         "source_path": path, "source_git_blob_sha": oid(path), "area_id": area})
     };
-    let links = json!({"area_ids": [area_b, area_a], "project_ids": [project],
+    let links = json!({"area_ids": [area_b, area_a], "project_ids": project_ids,
         "resource_ids": [resource], "issues": [issue("app", "alpha", ALPHA, &area_a), issue("_general", "beta", BETA, &area_b)]});
     let mut held = links.clone();
+    held["project_ids"] = json!([project_ids[0]]);
     held["resource_ids"]
         .as_array_mut()
         .unwrap()
         .push(json!(held_resource));
     let mut stale = links.clone();
+    stale["project_ids"] = json!([project_ids[0]]);
     stale["issues"][0]["source_path"] = json!(BETA);
+    let mut over_cap = links.clone();
+    over_cap["project_ids"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(extra_project));
     let review = |path, target_id, links| {
         json!({"source_path": path, "source_git_blob_sha": oid(path), "target_id": id(target_id),
         "provenance": {"kind": "standalone_artifact", "artifact_kind": "report", "author_ref": "bot:synthetic-author",
@@ -123,9 +141,9 @@ fn exercise(installed: bool) {
             {"scope":"app", "area_id":area_a, "resource":{"id":held_resource,"kind":"git-repo","name":"Stale Repo"},
                 "evidence_path":README,"evidence_blob_oid":"0".repeat(40)}
         ]},
-        "project_membership": {"projects": [{"id":project, "name":"Synthetic Delivery", "status":"active"}], "memberships":[]},
+        "project_membership": {"projects": projects, "memberships":[]},
         "reviewed_records": [review(MULTI, 0x901, links), review(ZERO, 0x902, json!("none")),
-            review(HELD, 0x903, held), review(STALE, 0x904, stale)]
+            review(HELD, 0x903, held), review(STALE, 0x904, stale), review(OVER_CAP, 0x905, over_cap)]
     });
     let plan = |value: &Value, status| {
         fs::write(&mapping_file, serde_json::to_vec(value).unwrap()).unwrap();
@@ -151,7 +169,7 @@ fn exercise(installed: bool) {
     let report = plan(&mapping, 0);
     assert_eq!(
         report["data"]["directive_artifact_intake"]["counts"]["artifacts_standalone"],
-        json!({"inventoried":4,"prepared":2,"held":2,"excluded":0})
+        json!({"inventoried":5,"prepared":2,"held":3,"excluded":0})
     );
     let row = reviewed_row(&report, MULTI);
     assert_eq!(
@@ -164,7 +182,7 @@ fn exercise(installed: bool) {
     );
     assert_eq!(
         row["outcome"]["provenance"]["links"]["project_ids"],
-        json!([project])
+        json!(project_ids)
     );
     assert_eq!(
         row["outcome"]["provenance"]["links"]["resource_ids"],
@@ -189,6 +207,7 @@ fn exercise(installed: bool) {
     };
     check_hold(&report, HELD);
     check_hold(&report, STALE);
+    check_hold(&report, OVER_CAP);
     for link_set in [
         json!({}),
         json!({"area_ids":[area_a,area_a]}),
@@ -295,11 +314,22 @@ fn verify_installed(root: &Path, mapping: &Value) {
     assert_eq!(staged["checks"]["published_inactive"], true);
     assert_eq!(staged["checks"]["committed_record_validation"], "passed");
     assert_eq!(staged["checks"]["target_artifact_rows"], 2);
-    assert_eq!(staged["checks"]["target_artifact_links"], 6);
+    assert_eq!(staged["checks"]["target_artifact_links"], 100);
     assert_eq!(
         staged["counts"]["artifacts_standalone"],
-        json!({"inventoried":4,"imported":2,"held":2,"excluded_non_record":0})
+        json!({"inventoried":5,"imported":2,"held":3,"excluded_non_record":0})
     );
+    let over_cap = staged["holds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["source_path_sha256"] == sha256_hex(OVER_CAP.as_bytes()))
+        .unwrap();
+    assert_eq!(
+        over_cap["outcome"]["reason_codes"],
+        json!(["unresolved_artifact_links"])
+    );
+    assert!(over_cap["outcome"].get("target_id").is_none());
     let entries = staged["id_map"].as_array().unwrap();
     let by_path = |path: &str| {
         entries
@@ -335,9 +365,24 @@ fn verify_installed(root: &Path, mapping: &Value) {
     };
     assert_eq!(query(&format!("SELECT id, body, SHA2(body, 256) AS digest FROM artifacts AS OF '{confirmed}' ORDER BY id")),
         json!([0x901, 0x902].map(|id_number| json!({"id": id(id_number), "body": BODY, "digest": sha256_hex(BODY.as_bytes())}))));
+    let project_ids = linked_project_ids();
+    let catalog = query(&format!(
+        "SELECT id FROM projects AS OF '{confirmed}' ORDER BY id"
+    ));
+    assert_eq!(
+        catalog,
+        json!(
+            project_ids
+                .iter()
+                .cloned()
+                .chain([id(0x105f)])
+                .map(|project| json!({"id": project}))
+                .collect::<Vec<_>>()
+        )
+    );
     for (table, column, ids) in [
         ("artifact_areas", "area_id", vec![id(0x810), id(0x811)]),
-        ("artifact_projects", "project_id", vec![id(0x812)]),
+        ("artifact_projects", "project_id", project_ids),
         ("artifact_resources", "resource_id", vec![id(0x813)]),
         (
             "artifact_issues",
