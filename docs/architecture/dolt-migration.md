@@ -202,6 +202,27 @@ A completed plan returns `mode: scope_plan`, the verified source and inventory s
 
 The workspace ID identifies the intended target for review. Actual target identity, Area ancestry, and target constraints require validation at the later staging step. Projects, resources, record mapping, staged writes, rollback, the A15 report, and live cutover are outside this command's scope.
 
+#### Read-only Queen Soul and historical Memory intake
+
+To include Bot assets in the same plan, add a `queen_assets` array to the version 1 mapping. Each entry binds a reviewed Bot identity to the committed Soul blob.
+
+```json
+{
+  "queen_assets": [
+    {
+      "slug": "example-queen",
+      "source_git_blob_sha": "2222222222222222222222222222222222222222"
+    }
+  ]
+}
+```
+
+Review the full committed Soul and its identity before listing the slug and blob ID. An empty array inventories the surfaces with no reviewed Souls. The planner accepts candidates with a single matching review, common v1 frontmatter, and the v1 Bot template's explicit identity and purpose sections. The ID must match the Bot directory and the Layer must be `1 — Manager`. The planner inspects up to 64 KiB per Soul or root Memory entrypoint. Absent, stale, or repeated reviews, missing or invalid Souls, and ambiguous source identities are held as `invalid_soul_or_slug`. A symlink or other unsupported Git entry invalidates source preflight.
+
+Bot routing README files and Bot-tree `AGENTS.md` files are excluded as `management_only`. Root `MEMORY.md` qualifies as `navigation_only` when its body is a Memory heading followed by a plain list of links to existing scoped `MEMORY.md` files, with labels matching their scopes. Other root Memory and files inside `memory/` are held as `curated_memory_deferred`, including scoped entrypoints.
+
+The plan reports candidates, holds, and exclusions under `queen_assets`. A candidate includes its Git blob ID, SHA-256 of the exact source bytes including frontmatter, and proposed asset path. References are repository-relative. A path with an invalid Bot slug is represented by its path digest. Target slug availability, asset commits, registry rows, and staged A15 verification require a later import step.
+
 ### 6. Issue Counters and Number Non-Reuse
 
 V1 identifies tasks by `(<project-id>, <work-id>)` with no workspace-wide numeric sequence. V2 assigns each imported Issue a fresh lowercase UUIDv7 (`issues.id`) and an immutable positive workspace-wide `issues.number` (`BIGINT UNSIGNED > 0`), backed by `workspace_counters` (`name = 'issue_number'`, `next_value`).

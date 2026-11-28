@@ -1163,6 +1163,224 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cli_migration_plan_classifies_reviewed_queen_assets_without_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("source");
+    let config = root.path().join("config");
+    init_source(&source, &home);
+
+    let write = |path: &str, bytes: &[u8]| {
+        let path = source.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    };
+    let soul = |slug: &str, layer: &str| {
+        format!(
+            "---\ndescription: \"Select the synthetic Queen identity.\"\n---\n# Synthetic Queen\n\n## Identity\n\n- ID: {slug}\n- Name: Synthetic Private Display\n- Layer: {layer}\n\n## Purpose\n\nSynthetic private persona sentinel.\n"
+        )
+    };
+    let exact_soul = soul("queen-synth", "1 — Manager").replace('\n', "\r\n");
+    write("bots/queen-synth/SOUL.md", exact_soul.as_bytes());
+    for (slug, layer) in [
+        ("worker", "2 — Coordinator"),
+        ("wrong-id", "1 — Manager"),
+        ("collision", "1 — Manager"),
+        ("Collision", "1 — Manager"),
+        ("repeat-review", "1 — Manager"),
+        ("stale", "1 — Manager"),
+        ("unreviewed", "1 — Manager"),
+        ("alias", "1 — Manager"),
+    ] {
+        let id = if slug == "wrong-id" { "other" } else { slug };
+        write(&format!("bots/{slug}/SOUL.md"), soul(id, layer).as_bytes());
+    }
+    write("bots/alias/soul.md", b"Case alias.");
+    write(
+        "bots/missing/README.md",
+        b"Synthetic private routing sentinel.",
+    );
+    write("bots/binary/SOUL.md", &[0xff]);
+    write(
+        "bots/bad-metadata/SOUL.md",
+        soul("bad-metadata", "1 — Manager")
+            .replacen("\n---\n", "\nrole: Manager\n---\n", 1)
+            .as_bytes(),
+    );
+    write(
+        "bots/queen-synth/memory/_general/AGENTS.md",
+        b"Synthetic instructions.",
+    );
+    let nav = b"---\ndescription: \"Select memory navigation.\"\n---\n# Memory Navigation\n\n- [General](memory/_general/MEMORY.md)\n";
+    write("bots/unreviewed/MEMORY.md", nav);
+    let mut mixed = nav.to_vec();
+    mixed.extend(b"\nSynthetic private memory sentinel.\n");
+    write("bots/worker/MEMORY.md", &mixed);
+    write("bots/worker/memory/_general/MEMORY.md", nav);
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic Queen and Memory assets"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let review = |slug: &str| {
+        let oid = git_text(
+            &source,
+            &home,
+            &["rev-parse", &format!("HEAD:bots/{slug}/SOUL.md")],
+        );
+        json!({"slug": slug, "source_git_blob_sha": oid})
+    };
+    let workspace_id = id(1);
+    let mapping_file = root.path().join("queen-mapping.json");
+    let mut mapping = json!({
+        "version": 1,
+        "source_commit": commit,
+        "policy_pin": POLICY_PIN,
+        "workspace_id": workspace_id,
+        "scopes": [],
+    });
+    let run = |mapping: &Value, status| {
+        fs::write(&mapping_file, serde_json::to_vec(mapping).unwrap()).unwrap();
+        migration_cli(
+            &home,
+            &config,
+            "migration-plan",
+            &[
+                "--source",
+                source.to_str().unwrap(),
+                "--source-commit",
+                mapping["source_commit"].as_str().unwrap(),
+                "--workspace-id",
+                &workspace_id,
+                "--mapping-file",
+                mapping_file.to_str().unwrap(),
+            ],
+            status,
+        )
+    };
+    assert!(run(&mapping, 0)["data"].get("queen_assets").is_none());
+    let index_before = fs::read(source.join(".git/index")).unwrap();
+    mapping["queen_assets"] = json!([
+        review("queen-synth"), review("worker"), review("wrong-id"), review("collision"),
+        review("repeat-review"), review("repeat-review"), review("alias"), review("binary"),
+        review("bad-metadata"),
+        {"slug": "stale", "source_git_blob_sha": "1111111111111111111111111111111111111111"}
+    ]);
+    let report = run(&mapping, 0);
+    let assets = &report["data"]["queen_assets"];
+    let find = |surface: &str, path: &str| {
+        assets[surface]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["source_path"] == path)
+            .unwrap_or_else(|| panic!("Missing {surface} outcome for {path}"))
+    };
+    let candidate = find("bots_soul", "bots/queen-synth/SOUL.md");
+    assert_eq!(candidate["status"], "candidate");
+    assert_eq!(candidate["slug"], "queen-synth");
+    assert_eq!(candidate["target_path"], "assets/bots/queen-synth/SOUL.md");
+    assert_eq!(
+        candidate["source_git_blob_sha"],
+        review("queen-synth")["source_git_blob_sha"]
+    );
+    assert_eq!(
+        candidate["source_raw_sha256"],
+        sha256_hex(exact_soul.as_bytes())
+    );
+    for slug in [
+        "worker",
+        "wrong-id",
+        "collision",
+        "repeat-review",
+        "stale",
+        "unreviewed",
+        "missing",
+        "alias",
+        "binary",
+        "bad-metadata",
+    ] {
+        let record = find("bots_soul", &format!("bots/{slug}/SOUL.md"));
+        assert_eq!(record["status"], "held", "{slug}");
+        assert_eq!(record["reason"], "invalid_soul_or_slug", "{slug}");
+    }
+    let redacted = assets["bots_soul"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["source_path_sha256"] == sha256_hex(b"bots/Collision/SOUL.md"))
+        .unwrap();
+    assert_eq!(redacted["status"], "held");
+    assert!(redacted.get("source_path").is_none());
+    for path in [
+        "bots/queen-synth/README.md",
+        "bots/queen-synth/memory/_general/AGENTS.md",
+    ] {
+        let record = find("bots_soul", path);
+        assert_eq!(record["status"], "excluded");
+        assert_eq!(record["reason"], "management_only");
+    }
+    assert_eq!(
+        find("navigation_only", "bots/queen-synth/MEMORY.md")["reason"],
+        "navigation_only"
+    );
+    for path in [
+        "bots/queen-synth/memory/_general/MEMORY.md",
+        "bots/queen-synth/memory/synth-app/architecture.md",
+        "bots/unreviewed/MEMORY.md",
+        "bots/worker/MEMORY.md",
+        "bots/worker/memory/_general/MEMORY.md",
+    ] {
+        assert_eq!(
+            find("bot_memories_historical", path)["reason"],
+            "curated_memory_deferred"
+        );
+    }
+    let serialized = report.to_string();
+    for private in [
+        "Synthetic Private Display",
+        "sentinel",
+        "memory/_general/MEMORY.md)",
+    ] {
+        assert!(!serialized.contains(private), "{private}");
+    }
+    assert_eq!(run(&mapping, 0), report);
+    mapping["queen_assets"] = json!([{"slug": "../invalid", "source_git_blob_sha": commit}]);
+    assert_eq!(run(&mapping, 2)["error"]["code"], "INVALID_CONFIG");
+    assert_eq!(fs::read(source.join(".git/index")).unwrap(), index_before);
+    assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        fs::read(source.join("bots/queen-synth/SOUL.md")).unwrap(),
+        exact_soul.as_bytes()
+    );
+    assert!(!source.join("assets").exists());
+    assert!(!config.exists());
+
+    let external = root.path().join("outside-soul.md");
+    let outside_bytes = soul("escape", "1 — Manager");
+    fs::write(&external, &outside_bytes).unwrap();
+    fs::create_dir(source.join("bots/escape")).unwrap();
+    std::os::unix::fs::symlink(&external, source.join("bots/escape/SOUL.md")).unwrap();
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic symlink escape"],
+    );
+    mapping["source_commit"] = json!(git_text(&source, &home, &["rev-parse", "HEAD"]));
+    mapping["queen_assets"] = json!([review("escape")]);
+    let rejected = run(&mapping, 4);
+    assert_eq!(rejected["error"]["code"], "INVALID_RECORD");
+    assert!(!rejected.to_string().contains(external.to_str().unwrap()));
+    assert_eq!(fs::read_to_string(&external).unwrap(), outside_bytes);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cli_migration_plan_rejects_unbound_inputs_and_unverified_source() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");

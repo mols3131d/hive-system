@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use super::*;
 use crate::config_file::{Coordination, ScopedDirectory};
 
+mod queen_assets;
 mod scope_plan;
 pub(crate) use scope_plan::plan;
 

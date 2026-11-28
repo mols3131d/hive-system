@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
+use super::queen_assets::{self, SoulReview};
 use super::{AssetObjectReader, Inventory, Reason, snapshot_object, verified_source};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
@@ -20,6 +21,7 @@ struct Mapping {
     policy_pin: String,
     workspace_id: String,
     scopes: Vec<ScopeMapping>,
+    queen_assets: Option<Vec<SoulReview>>,
 }
 
 #[derive(Deserialize)]
@@ -114,7 +116,7 @@ pub(crate) fn plan(
         }
 
         let scopes = classify_scopes(inventory, &mapping.scopes, reader)?;
-        Ok(json!({
+        let mut report = json!({
             "mode": "scope_plan",
             "mapping_version": mapping.version,
             "mapping_sha256": format!("{:x}", Sha256::digest(input)),
@@ -122,7 +124,11 @@ pub(crate) fn plan(
             "inventory": inventory.summary,
             "target": {"workspace_id": workspace_id},
             "scopes": scopes.iter().map(Scope::report).collect::<Vec<_>>(),
-        }))
+        });
+        if let Some(reviews) = &mapping.queen_assets {
+            report["queen_assets"] = json!(queen_assets::classify(inventory, reader, reviews)?);
+        }
+        Ok(report)
     })
 }
 
