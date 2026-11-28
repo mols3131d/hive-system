@@ -12,7 +12,7 @@ use crate::error::{ErrorCode, HiveError};
 
 use super::{invalid, normalized_root, require_version, source_error, validate_path, xdg_root};
 
-const FILE: &str = "bindings.yml";
+pub(super) const FILE: &str = "bindings.yml";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

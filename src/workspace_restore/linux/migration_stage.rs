@@ -8,7 +8,7 @@ use time::OffsetDateTime;
 use super::*;
 use crate::cli::{MigrationStageArgs, MigrationStageMode};
 use crate::config_git::migration::{Area, ReviewedScopes, with_scope_mapping};
-use crate::config_v2::verify_descriptor;
+use crate::config_v2::{require_inactive_destination, verify_descriptor};
 use crate::dolt::{INITIAL_SCHEMA, issue_writer::new_uuid_v7};
 use crate::workspace_init::POLICY_REVISION;
 
@@ -57,6 +57,7 @@ pub(crate) fn run(args: &MigrationStageArgs) -> Result<Value, HiveError> {
     )?;
     // The verified source callback rechecks source HEAD, identity, index and
     // worktree after all expensive preparation and before this rename.
+    require_inactive_destination(&target.path)?;
     if let Some(staged) = staged {
         target.publish(&args.workspace_id, &staged.stage, &staged.workspace)?;
     } else {
@@ -80,6 +81,7 @@ fn prepare(
         })
         .ok_or_else(|| HiveError::new(ErrorCode::IoError, "Could not read the migration time."))?;
 
+    require_inactive_destination(&target.path)?;
     let (cleanup, stage) = target.stage(&args.workspace_id)?;
     let stage_path = fd_path(&stage);
     let scratch = create_private_directory(&stage_path.join("scratch"))?;

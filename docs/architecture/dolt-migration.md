@@ -208,7 +208,7 @@ The workspace ID identifies the intended target for review. Actual target identi
 
 #### Disposable scope staging
 
-On Linux, use the installed CLI with the workspace initialization policy revision and the reviewed scope mapping. The target must be an absent absolute path under an existing local parent, separate from the source. The command refuses an occupied path or a path registered as the active root for the selected workspace ID.
+On Linux, use the installed CLI with the workspace initialization policy revision and the reviewed scope mapping. The target must be an absent absolute path under an existing local parent, separate from the source. The command refuses occupied paths, the active root for the selected workspace ID, the resolved v1 and v2 user configuration and v2 bindings paths, the v2 XDG default workspace path, and overlaps with the v2 runtime state directory.
 
 ```sh
 hive --contract 2 --json workspace migration-stage \

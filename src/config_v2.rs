@@ -8,7 +8,7 @@ mod unix {
     use serde_json::{Value, json};
 
     use crate::cli::{CommonOptions, ConfigScope, ConfigShowArgs, Format, View};
-    use crate::config::{absolute_env, current_dir, json_path, resolve_path};
+    use crate::config::{absolute_env, current_dir, json_path, resolve_path, xdg_base};
     use crate::config_file::{self, OutputFields, ScopedDirectory, parse_v2, present, untagged};
     use crate::dolt::{
         DoltTarget, STORAGE_SCHEMA_VERSION, ScopeRef, is_uuid, is_uuid_v7, verify_scope,
@@ -18,6 +18,9 @@ mod unix {
     use super::{BOOTSTRAP_LAYOUT, INIT_PENDING, MARKER, has_init_stage_component};
 
     mod bindings;
+
+    const USER_CONFIG: &str = "config.yml";
+    const DEFAULT_WORKSPACE: &str = "userdata";
 
     pub(crate) struct Selection {
         pub(crate) candidate: Candidate,
@@ -330,7 +333,7 @@ mod unix {
                 .map_err(|error| workspace_error("User workspace", error))?;
             (candidate, "user")
         } else {
-            let path = xdg_root("XDG_DATA_HOME", home, ".local/share")?.join("userdata");
+            let path = xdg_root("XDG_DATA_HOME", home, ".local/share")?.join(DEFAULT_WORKSPACE);
             let candidate = read_candidate(&path)
                 .map_err(|error| workspace_error("XDG default workspace", error))?;
             (candidate, "xdg-default")
@@ -425,14 +428,61 @@ mod unix {
         home: Option<&Path>,
         fallback: &str,
     ) -> Result<PathBuf, HiveError> {
-        absolute_env(variable)
-            .or_else(|| home.map(|path| path.join(fallback)))
-            .map(|path| path.join("hive/v2"))
+        versioned_xdg_root(variable, home, fallback)
             .ok_or_else(|| invalid("The v2 XDG fallback requires an absolute home directory."))
     }
 
+    fn versioned_xdg_root(variable: &str, home: Option<&Path>, fallback: &str) -> Option<PathBuf> {
+        xdg_base(variable, home, fallback).map(|path| path.join("hive/v2"))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn require_inactive_destination(target: &Path) -> Result<(), HiveError> {
+        let home = absolute_env("HOME");
+        let home = home.as_deref();
+        let targets_file = |path: &Path| {
+            target == path
+                || (target.file_name() == path.file_name()
+                    && path.parent().is_some_and(|parent| {
+                        // The user configuration loader follows links in the parent path.
+                        std::fs::canonicalize(parent)
+                            .is_ok_and(|resolved| Some(resolved.as_path()) == target.parent())
+                    }))
+        };
+        if crate::config::user_config_path(home).is_some_and(|path| targets_file(&path))
+            || versioned_xdg_root("XDG_CONFIG_HOME", home, ".config").is_some_and(|root| {
+                targets_file(&root.join(USER_CONFIG)) || targets_file(&root.join(bindings::FILE))
+            })
+        {
+            return Err(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "The inactive target is reserved for Hive configuration.",
+            ));
+        }
+
+        if versioned_xdg_root("XDG_DATA_HOME", home, ".local/share")
+            .is_some_and(|root| target == normalized_root(&root.join(DEFAULT_WORKSPACE)))
+        {
+            return Err(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "The inactive target is reserved for XDG default workspace discovery.",
+            ));
+        }
+
+        if versioned_xdg_root("XDG_STATE_HOME", home, ".local/state").is_some_and(|root| {
+            let state = normalized_root(&root);
+            target.starts_with(&state) || state.starts_with(target)
+        }) {
+            return Err(HiveError::new(
+                ErrorCode::InvalidArgument,
+                "The inactive target overlaps reserved v2 runtime state.",
+            ));
+        }
+        Ok(())
+    }
+
     fn read_user(home: Option<&Path>) -> Result<Option<UserSource>, HiveError> {
-        let path = xdg_root("XDG_CONFIG_HOME", home, ".config")?.join("config.yml");
+        let path = xdg_root("XDG_CONFIG_HOME", home, ".config")?.join(USER_CONFIG);
         let Some(bytes) = config_file::read_regular(&path).map_err(|error| {
             HiveError::new(
                 error.code,
@@ -621,7 +671,7 @@ mod unix {
 pub(crate) use unix::{Candidate, read_explicit, select_workspace, xdg_root};
 
 #[cfg(target_os = "linux")]
-pub(crate) use unix::verify_bootstrap_layout;
+pub(crate) use unix::{require_inactive_destination, verify_bootstrap_layout};
 
 use crate::cli::{CommonOptions, ConfigShowArgs, Format};
 use crate::error::HiveError;
