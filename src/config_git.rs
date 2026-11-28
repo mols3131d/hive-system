@@ -1325,6 +1325,9 @@ mod tests {
                     "user.name=Fixture",
                     "-c",
                     "user.email=fixture@example.invalid",
+                    // Detached maintenance can race with the fixture's object-store walk.
+                    "-c",
+                    "maintenance.auto=false",
                 ])
                 .args(args)
                 .output()
