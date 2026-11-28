@@ -13,6 +13,7 @@ use super::task_intake::{CandidateStatus, TitleSource, parse_record, resolve_tit
 use super::{Reason, is_full_lowercase_oid};
 use crate::cli::is_slug;
 use crate::dolt::is_uuid_v7;
+use crate::dolt::issue_update::valid_text;
 use crate::error::{ErrorCode, HiveError};
 
 pub(super) type Key<'a> = (&'a str, &'a str);
@@ -345,30 +346,36 @@ impl Timestamp {
     fn select(range: Option<BodyRange>, body: &str) -> Option<(Self, OffsetDateTime)> {
         let body_range = range?;
         let value = body_range.select(body)?;
-        // Require an explicit offset and precision representable by DATETIME(6).
-        // RFC 3339 permits an unknown offset and leap seconds, which aren't
-        // usable as exact timestamps in the target.
-        if value.len() > 32 || value.ends_with("-00:00") || value.get(17..19) == Some("60") {
-            return None;
-        }
-        if let Some((_, fraction)) = value.split_once('.')
-            && fraction.bytes().take_while(u8::is_ascii_digit).count() > 6
-        {
-            return None;
-        }
-        let instant = OffsetDateTime::parse(value, &Rfc3339)
-            .ok()?
-            .checked_to_offset(UtcOffset::UTC)?;
-        (1000..=9999).contains(&instant.year()).then(|| {
-            (
-                Self {
-                    value: value.to_owned(),
-                    body_range,
-                },
-                instant,
-            )
-        })
+        let instant = parse_historical_timestamp(value)?;
+        Some((
+            Self {
+                value: value.to_owned(),
+                body_range,
+            },
+            instant,
+        ))
     }
+}
+
+fn parse_historical_timestamp(value: &str) -> Option<OffsetDateTime> {
+    // The time parser accepts any separator byte. Require T or t, a known
+    // offset, and a timestamp representable by DATETIME(6).
+    if !matches!(value.as_bytes().get(10), Some(b'T' | b't'))
+        || value.len() > 32
+        || value.ends_with("-00:00")
+        || value.get(17..19) == Some("60")
+    {
+        return None;
+    }
+    if let Some((_, fraction)) = value.split_once('.')
+        && fraction.bytes().take_while(u8::is_ascii_digit).count() > 6
+    {
+        return None;
+    }
+    let instant = OffsetDateTime::parse(value, &Rfc3339)
+        .ok()?
+        .checked_to_offset(UtcOffset::UTC)?;
+    (1000..=9999).contains(&instant.year()).then_some(instant)
 }
 
 #[derive(Serialize)]
@@ -469,7 +476,7 @@ impl TaskReview {
             .and_then(|review| review.prepare(source, terminal));
         let criteria = self
             .acceptance_criteria
-            .and_then(|range| BodyEvidence::select(range, body, fits_text_column));
+            .and_then(|range| BodyEvidence::select(range, body, valid_text));
         let mut reasons = Vec::new();
         if dates.is_none()
             || (terminal && closure.is_none())

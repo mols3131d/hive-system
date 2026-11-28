@@ -977,7 +977,7 @@ pub(crate) enum WorkspaceAction {
         #[arg(long, value_name = "OID")]
         source_commit: String,
     },
-    /// Plan v1 scope mappings for an explicit v2 workspace ID.
+    /// Plan v1 migration for an explicit v2 workspace ID.
     MigrationPlan {
         /// Absolute path to a standalone v1 Git worktree.
         #[arg(long, value_name = "DIR")]
@@ -994,6 +994,9 @@ pub(crate) enum WorkspaceAction {
         /// Include v1 Task intake and preparation from bound reviews.
         #[arg(long)]
         tasks: bool,
+        /// Include read-only Directive and Artifact intake.
+        #[arg(long)]
+        include_directives_artifacts: bool,
     },
     #[command(flatten)]
     Runtime(WorkspaceCommand),
@@ -3565,7 +3568,7 @@ impl Command {
                         || !matches!(common.view, View::WorkingTree) =>
                 {
                     Err(
-                        "Migration plan accepts only --source, --source-commit, --workspace-id, --mapping-file, --tasks, and output selection.",
+                        "Migration plan accepts only --source, --source-commit, --workspace-id, --mapping-file, --tasks, --include-directives-artifacts, and output selection.",
                     )
                 }
                 Self::Backup(BackupCommand::Create { .. }) => {
