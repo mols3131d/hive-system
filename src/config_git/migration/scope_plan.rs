@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
-use super::reviewed_records::Review;
+use super::reviewed_records::{self, Review};
 use super::{
     AssetObjectReader, Inventory, Reason, directive_artifact_intake,
     is_portable_bot_memory_locator, snapshot_object, verified_source,
@@ -26,6 +26,7 @@ struct Mapping {
     policy_pin: String,
     workspace_id: String,
     scopes: Vec<ScopeMapping>,
+    #[serde(default, deserialize_with = "reviewed_records::deserialize_present")]
     reviewed_records: Option<Vec<Review>>,
 }
 

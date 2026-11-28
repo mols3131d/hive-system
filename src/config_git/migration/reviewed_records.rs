@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::value::StrDeserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -30,16 +30,21 @@ enum Provenance {
         issuer_ref: String,
         created_at: String,
         updated_at: String,
+        #[serde(deserialize_with = "string_enum")]
         supersession: AbsenceReview,
+        #[serde(deserialize_with = "string_enum")]
         approval_and_validity: AbsenceReview,
     },
     StandaloneArtifact {
+        #[serde(deserialize_with = "string_enum")]
         artifact_kind: ArtifactKind,
         source_ref: String,
         author_ref: String,
         created_at: String,
         substantive_updated_at: String,
+        #[serde(deserialize_with = "string_enum")]
         links: AbsenceReview,
+        #[serde(deserialize_with = "string_enum")]
         archive: AbsenceReview,
     },
 }
@@ -49,6 +54,19 @@ enum Provenance {
 enum AbsenceReview {
     None,
     Unresolved,
+}
+
+fn string_enum<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<T, D::Error> {
+    let label = String::deserialize(deserializer)?;
+    T::deserialize(StrDeserializer::new(&label))
+}
+
+pub(super) fn deserialize_present<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<Review>>, D::Error> {
+    Vec::deserialize(deserializer).map(Some)
 }
 
 pub(super) fn bind<'a>(

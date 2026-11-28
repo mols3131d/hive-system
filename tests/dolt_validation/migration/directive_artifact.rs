@@ -47,10 +47,10 @@ fn cli_migration_plan_prepares_only_exact_reviewed_records_under_both_pins() {
             "---\r\ndescription: Synthetic direction\r\nstatus: proposed\r\n---\r\n{proposal_body}"
         );
         let artifact = format!(
-            "---\ndescription: Synthetic evidence\ntitle: Reviewed synthetic artifact\nkind: report\nstatus: closed\n---\n{artifact_body}"
+            "---\ndescription: Synthetic evidence\ntitle: Reviewed synthetic artifact\nkind: review\nstatus: closed\n---\n{artifact_body}"
         );
         let active = proposal.replace("status: proposed", "status: active");
-        let unclassified = artifact.replace("kind: report\n", "");
+        let unclassified = artifact.replace("kind: review\n", "");
         let files = [
             (PROPOSAL, &proposal),
             (REPORT, &artifact),
@@ -86,7 +86,7 @@ fn cli_migration_plan_prepares_only_exact_reviewed_records_under_both_pins() {
                      "issuer_ref": ISSUER, "created_at": CREATED, "updated_at": UPDATED,
                      "supersession": "none", "approval_and_validity": "none"}},
                 {"source_path": REPORT, "source_git_blob_sha": blob(REPORT), "target_id": id(0x511),
-                 "provenance": {"kind": "standalone_artifact", "artifact_kind": "report", "source_ref": REFERENCE,
+                 "provenance": {"kind": "standalone_artifact", "artifact_kind": "review", "source_ref": REFERENCE,
                      "author_ref": AUTHOR, "created_at": CREATED, "substantive_updated_at": UPDATED,
                      "links": "none", "archive": "none"}}
             ]
@@ -103,10 +103,11 @@ fn cli_migration_plan_prepares_only_exact_reviewed_records_under_both_pins() {
             mapping_file.to_str().unwrap(),
             "--include-directives-artifacts",
         ];
-        let run = |mapping: &Value, status| {
-            fs::write(&mapping_file, serde_json::to_vec(mapping).unwrap()).unwrap();
+        let run_raw = |input: &str, status| {
+            fs::write(&mapping_file, input).unwrap();
             migration_cli(&home, &config, "migration-plan", &args, status)
         };
+        let run = |mapping: &Value, status| run_raw(&mapping.to_string(), status);
         let report = run(&mapping, 0);
         assert_eq!(report, run(&mapping, 0));
         let data = &report["data"];
@@ -173,7 +174,7 @@ fn cli_migration_plan_prepares_only_exact_reviewed_records_under_both_pins() {
         let artifact_plan = &reviewed_row(&report, REPORT)["outcome"];
         assert_eq!(
             artifact_plan["candidate"],
-            json!({"record_type": "artifact", "kind": "report", "legacy_status": "closed"})
+            json!({"record_type": "artifact", "kind": "review", "legacy_status": "closed"})
         );
         assert_eq!(artifact_plan["provenance"]["scope"], "standalone");
         assert_eq!(
@@ -251,7 +252,7 @@ fn cli_migration_plan_prepares_only_exact_reviewed_records_under_both_pins() {
             (
                 1,
                 "artifact_kind",
-                json!("review"),
+                json!("report"),
                 REPORT,
                 "unclassified_artifact_kind",
             ),
@@ -316,6 +317,49 @@ fn cli_migration_plan_prepares_only_exact_reviewed_records_under_both_pins() {
             let failure = run(&changed, 2);
             assert_eq!(failure["error"]["code"], "INVALID_CONFIG");
             assert!(failure.get("data").is_none());
+        }
+
+        let assert_invalid_format = |input: &str| {
+            let failure = run_raw(input, 2);
+            assert_eq!(failure["error"]["code"], "INVALID_CONFIG");
+            assert_eq!(
+                failure["error"]["message"],
+                "The scope mapping must match the versioned JSON format."
+            );
+            assert!(failure.get("data").is_none());
+        };
+        for (index, field, value) in [
+            (0, "supersession", json!({"none": null})),
+            (0, "approval_and_validity", json!({"none": null})),
+            (1, "links", json!({"none": null})),
+            (1, "archive", json!({"none": null})),
+            (1, "artifact_kind", json!({"review": null})),
+            (1, "created_at", json!(2024)),
+            (1, "unexpected", json!("synthetic")),
+        ] {
+            let mut changed = mapping.clone();
+            changed["reviewed_records"][index]["provenance"][field] = value;
+            assert_invalid_format(&changed.to_string());
+        }
+        let duplicate = mapping.to_string().replace(
+            r#""supersession":"none""#,
+            r#""supersession":"unresolved","supersession":"none""#,
+        );
+        assert_invalid_format(&duplicate);
+
+        let mut changed = mapping.clone();
+        for value in [Value::Null, json!({})] {
+            changed["reviewed_records"] = value;
+            assert_invalid_format(&changed.to_string());
+        }
+        changed.as_object_mut().unwrap().remove("reviewed_records");
+        let omitted = run(&changed, 0);
+        changed["reviewed_records"] = json!([]);
+        let empty = run(&changed, 0);
+        for result in [&omitted, &empty] {
+            for path in [PROPOSAL, REPORT] {
+                assert_eq!(reviewed_row(result, path)["outcome"]["status"], "held");
+            }
         }
         assert_eq!(report, run(&mapping, 0));
         let failure = migration_cli(&home, &config, "migration-plan", &args[..args.len() - 1], 2);
