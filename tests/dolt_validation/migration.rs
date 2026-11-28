@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 
 use super::{ADMIN, Fixture, id, storage_state};
 
+#[cfg(target_os = "linux")]
+#[path = "migration/directive_artifact.rs"]
+mod directive_artifact;
+
 const POLICY_PIN: &str = "0e584830a7eff314d85b7af8c6f8cd69e735730a";
 const REVISION: u32 = 4;
 const AREA_GENERAL: u32 = 0x101;

@@ -146,6 +146,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
                 workspace_id: _workspace_id,
                 mapping_file: _mapping_file,
                 tasks: _tasks,
+                include_directives_artifacts: _include_directives_artifacts,
             } => {
                 #[cfg(target_os = "linux")]
                 let result = config_git::migration::plan(
@@ -154,6 +155,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
                     _workspace_id,
                     _mapping_file,
                     *_tasks,
+                    *_include_directives_artifacts,
                 );
                 #[cfg(not(target_os = "linux"))]
                 let result = Err(HiveError::new(
