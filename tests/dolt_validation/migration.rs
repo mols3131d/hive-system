@@ -993,6 +993,26 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             "tasks/valid-spaced-link/README.md",
             "# Project navigation\n\nAn example <span hidden> https://forge.example/synthetic/other </span>\n\nProject: [Owner]( https://forge.example/synthetic/app )\n",
         ),
+        (
+            "tasks/valid-angle-link/README.md",
+            "[Owner]( <https://forge.example/synthetic/app> )\n\n<https://forge.example/synthetic/app>\n",
+        ),
+        (
+            "tasks/broken-angle-link/README.md",
+            "Owner]( <https://forge.example/synthetic/app> )\n",
+        ),
+        (
+            "tasks/hidden-across-blocks/README.md",
+            "<div hidden>\n\nProject: https://forge.example/synthetic/app\n\n</div>\n",
+        ),
+        (
+            "tasks/visible-after-html-block/README.md",
+            "<div hidden>\nhttps://forge.example/synthetic/other\n</div>\n\nProject: https://forge.example/synthetic/app\n",
+        ),
+        (
+            "tasks/apparent-html-close/README.md",
+            "<div title=\"</div>\">\n\nProject: https://forge.example/synthetic/app\n\n</div>\n",
+        ),
     ] {
         let file = source.join(path);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -1112,6 +1132,21 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             area("valid-spaced-link", 0x118, "valid-spaced", json!([
                 evidence("tasks/valid-spaced-link/README.md", app_ref)
             ])),
+            area("broken-angle-link", 0x119, "broken-angle", json!([
+                evidence("tasks/broken-angle-link/README.md", app_ref)
+            ])),
+            area("hidden-across-blocks", 0x11a, "hidden-blocks", json!([
+                evidence("tasks/hidden-across-blocks/README.md", app_ref)
+            ])),
+            area("visible-after-html-block", 0x11b, "visible-after-html", json!([
+                evidence("tasks/visible-after-html-block/README.md", app_ref)
+            ])),
+            area("apparent-html-close", 0x11c, "apparent-close", json!([
+                evidence("tasks/apparent-html-close/README.md", app_ref)
+            ])),
+            area("valid-angle-link", 0x11d, "valid-angle", json!([
+                evidence("tasks/valid-angle-link/README.md", app_ref)
+            ])),
         ]
     });
     mapping["scopes"][0]["decision"]["area"]["name"] = json!(local_path);
@@ -1134,7 +1169,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(data["source"], snapshot["data"]["source"]);
     assert_eq!(data["inventory"], snapshot["data"]["inventory"]);
     assert_eq!(data["target"], json!({"workspace_id": workspace}));
-    assert_eq!(data["scopes"].as_array().unwrap().len(), 26);
+    assert_eq!(data["scopes"].as_array().unwrap().len(), 31);
     let outcomes = |report: &Value| {
         report["scopes"]
             .as_array()
@@ -1154,6 +1189,8 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(mapped["hive-system"]["status"], "mapped");
     assert_eq!(mapped["good-percent"]["status"], "mapped");
     assert_eq!(mapped["valid-spaced-link"]["status"], "mapped");
+    assert_eq!(mapped["visible-after-html-block"]["status"], "mapped");
+    assert_eq!(mapped["valid-angle-link"]["status"], "mapped");
     assert_eq!(
         mapped["synth-app"],
         json!({"status": "mapped", "area": {
@@ -1188,6 +1225,9 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         "hidden-span",
         "hidden-image-alt",
         "broken-spaced-link",
+        "broken-angle-link",
+        "hidden-across-blocks",
+        "apparent-html-close",
     ] {
         assert_eq!(mapped[scope], held, "{scope}");
     }
