@@ -156,10 +156,32 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
                 ));
                 (format, result)
             }
+            WorkspaceAction::MigrationStage(_args) => {
+                #[cfg(target_os = "linux")]
+                let result = workspace_restore::stage_migration(_args);
+                #[cfg(not(target_os = "linux"))]
+                let result = Err(HiveError::new(
+                    ErrorCode::NotImplemented,
+                    "Migration staging requires Linux.",
+                ));
+                (format, result)
+            }
             WorkspaceAction::Runtime(command) => workspace_status::run(&invocation.common, command),
         };
         return match result {
-            Ok(data) => output::success(Contract::V2, format, name, None, &data),
+            Ok(data) => {
+                let status = output::success(Contract::V2, format, name, None, &data);
+                if status != ExitCode::SUCCESS
+                    && matches!(action, WorkspaceAction::MigrationStage(args)
+                        if matches!(args.mode, cli::MigrationStageMode::StagedImport))
+                {
+                    let _ = writeln!(
+                        std::io::stderr().lock(),
+                        "error: The inactive workspace was published, but its success response could not be written."
+                    );
+                }
+                status
+            }
             Err(error) => output::failure(Contract::V2, format, Some(name), None, error),
         };
     }

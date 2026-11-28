@@ -13,7 +13,7 @@ use super::*;
 use crate::config_file::{Coordination, ScopedDirectory};
 
 mod scope_plan;
-pub(crate) use scope_plan::plan;
+pub(crate) use scope_plan::{Area, ReviewedScopes, plan, with_scope_mapping};
 
 const MAX_INVENTORY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;

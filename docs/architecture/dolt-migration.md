@@ -204,6 +204,23 @@ The report emits portable legacy scope keys in `scope` and their portable relati
 
 The workspace ID identifies the intended target for review. Actual target identity, Area ancestry, and target constraints require validation at the later staging step. Projects, resources, record mapping, staged writes, rollback, the A15 report, and live cutover are outside this command's scope.
 
+#### Disposable scope staging
+
+On Linux, use the installed CLI with the workspace initialization policy revision and the reviewed scope mapping. The target must be an absent absolute path under an existing local parent, separate from the source. The command refuses an occupied path or a path registered as the active root for the selected workspace ID.
+
+```sh
+hive --contract 2 --json workspace migration-stage \
+  --source "$source_root" --source-commit "$source_commit" \
+  --workspace-id "$workspace_id" --mapping-file "$mapping_file" \
+  --target "$target_root" --policy-revision "$v2_policy_revision" --mode dry-run
+```
+
+The command classifies scopes from the verified commit and reviewed mapping. It omits scopes held or excluded by the planner. Every mapped parent must itself be eligible. Missing or held parents and cycles refuse the whole operation in either mode, before any target database is created. Reconcile those Area mappings before retrying.
+
+In `dry-run` mode, the CLI inserts the eligible Areas in parent order inside one transaction on a disposable copy. It checks the counts within the transaction, rolls back, and verifies zero Areas and the original clean Dolt baseline. In `staged-import` mode, it commits the transaction and records a Dolt commit extending the baseline. It verifies the committed schema, constraints, records and exact Area rows, and confirms the paired Git repository has the original empty asset commit. The CLI syncs the private payload and publishes it atomically to the inactive target. Both modes recheck the exact clean source after preparation. Neither mode registers or starts a workspace or changes either contract's XDG configuration.
+
+The report uses `coverage: scope_only`. It includes provenance, mapping SHA-256, balanced scope counts, an Area ID map, and hold and exclusion reasons. Resolve scope and directory SHA-256 locators against the reported source commit as for the plan. In a dry-run, `imported` counts Areas exercised inside the rolled-back transaction and `target_area_rows` reports the zero rows left behind. Committed record validation runs on staged import. The report omits raw scope keys, slugs, names, and paths. The paired descriptor and database store the reviewed target identity, and broader record and asset coverage remains open under [#98](https://github.com/mols3131d/hive-system/issues/98).
+
 ### 6. Issue Counters and Number Non-Reuse
 
 V1 identifies tasks by `(<project-id>, <work-id>)` with no workspace-wide numeric sequence. V2 assigns each imported Issue a fresh lowercase UUIDv7 (`issues.id`) and an immutable positive workspace-wide `issues.number` (`BIGINT UNSIGNED > 0`), backed by `workspace_counters` (`name = 'issue_number'`, `next_value`).

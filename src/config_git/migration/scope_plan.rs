@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::Path;
 
@@ -8,7 +8,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
-use super::{AssetObjectReader, Inventory, Reason, snapshot_object, verified_source};
+use super::{
+    AssetObjectReader, Inventory, Reason, SourceSnapshot, snapshot_object, verified_source,
+};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
 use crate::dolt::{is_uuid, is_uuid_v7};
@@ -44,11 +46,11 @@ enum Decision {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Area {
-    pub(super) id: String,
-    slug: String,
-    name: String,
-    parent_id: Option<String>,
+pub(crate) struct Area {
+    pub(crate) id: String,
+    pub(crate) slug: String,
+    pub(crate) name: String,
+    pub(crate) parent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +112,122 @@ pub(crate) fn plan(
     workspace_id: &str,
     mapping_file: &Path,
 ) -> Result<Value, HiveError> {
+    with_scope_mapping(source, revision, workspace_id, mapping_file, |reviewed| {
+        Ok(json!({
+            "mode": "scope_plan",
+            "mapping_version": reviewed.mapping_version,
+            "mapping_sha256": reviewed.mapping_sha256,
+            "source": reviewed.source,
+            "inventory": reviewed.inventory,
+            "target": {"workspace_id": workspace_id},
+            "scopes": reviewed.scopes.iter().map(Scope::report).collect::<Vec<_>>(),
+        }))
+    })
+}
+
+pub(crate) struct ReviewedScopes<'a> {
+    source: &'a SourceSnapshot<'a>,
+    inventory: &'a Value,
+    mapping_version: u32,
+    mapping_sha256: String,
+    scopes: Vec<Scope<'a>>,
+}
+
+impl ReviewedScopes<'_> {
+    pub(crate) fn areas_in_parent_order(&self) -> Result<Vec<&Area>, HiveError> {
+        let mut ids = BTreeSet::new();
+        let mut children = BTreeMap::<Option<&str>, Vec<&Area>>::new();
+        for scope in &self.scopes {
+            if let ScopeOutcome::Mapped { area } = scope.outcome {
+                ids.insert(area.id.as_str());
+                children
+                    .entry(area.parent_id.as_deref())
+                    .or_default()
+                    .push(area);
+            }
+        }
+        for parent in children.keys().flatten() {
+            if !ids.contains(parent) {
+                return Err(HiveError::new(
+                    ErrorCode::InvalidRecord,
+                    format!(
+                        "Mapped Area parent {parent} is missing or held. Review the scope mapping."
+                    ),
+                ));
+            }
+        }
+
+        let mut pending = VecDeque::from(children.remove(&None).unwrap_or_default());
+        let mut ordered = Vec::with_capacity(ids.len());
+        while let Some(area) = pending.pop_front() {
+            ordered.push(area);
+            if let Some(descendants) = children.remove(&Some(area.id.as_str())) {
+                pending.extend(descendants);
+            }
+        }
+        if !children.is_empty() {
+            return Err(HiveError::new(
+                ErrorCode::InvalidRecord,
+                "Mapped Area ancestry contains a cycle. Review the scope mapping.",
+            ));
+        }
+        Ok(ordered)
+    }
+
+    pub(crate) fn staging_evidence(&self) -> Value {
+        let mut id_map = Vec::new();
+        let mut holds = Vec::new();
+        let mut exclusions = Vec::new();
+        let hash = |value: &str| format!("{:x}", Sha256::digest(value));
+        for scope in &self.scopes {
+            let scope_sha256 = hash(scope.scope);
+            let source_path_sha256s = scope
+                .source_paths
+                .iter()
+                .map(|path| hash(path))
+                .collect::<Vec<_>>();
+            let mut entry =
+                json!({"scope_sha256": scope_sha256, "source_path_sha256s": source_path_sha256s});
+            match scope.outcome {
+                ScopeOutcome::Mapped { area } => {
+                    entry["area_id"] = json!(area.id);
+                    entry["parent_area_id"] = json!(area.parent_id);
+                    id_map.push(entry);
+                }
+                ScopeOutcome::Held { reason } => {
+                    entry["reason_code"] = json!(reason);
+                    holds.push(entry);
+                }
+                ScopeOutcome::Excluded { reason } => {
+                    entry["reason_code"] = json!(reason);
+                    exclusions.push(entry);
+                }
+            }
+        }
+        json!({
+            "coverage": "scope_only",
+            "mapping_version": self.mapping_version,
+            "mapping_sha256": self.mapping_sha256,
+            "source": self.source,
+            "inventory": self.inventory,
+            "counts": {"scopes": {
+                "inventoried": self.scopes.len(), "imported": id_map.len(), "held": holds.len(),
+                "excluded_non_record": exclusions.len(),
+            }},
+            "id_map": id_map,
+            "holds": holds,
+            "exclusions": exclusions,
+        })
+    }
+}
+
+pub(crate) fn with_scope_mapping<T>(
+    source: &Path,
+    revision: &str,
+    workspace_id: &str,
+    mapping_file: &Path,
+    inspect: impl FnOnce(ReviewedScopes<'_>) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
     if !is_uuid(workspace_id) {
         return Err(HiveError::new(
             ErrorCode::InvalidArgument,
@@ -136,15 +254,13 @@ pub(crate) fn plan(
         }
 
         let scopes = classify_scopes(inventory, &mapping.scopes, reader)?;
-        Ok(json!({
-            "mode": "scope_plan",
-            "mapping_version": mapping.version,
-            "mapping_sha256": format!("{:x}", Sha256::digest(input)),
-            "source": source,
-            "inventory": inventory.summary,
-            "target": {"workspace_id": workspace_id},
-            "scopes": scopes.iter().map(Scope::report).collect::<Vec<_>>(),
-        }))
+        inspect(ReviewedScopes {
+            source,
+            inventory: &inventory.summary,
+            mapping_version: mapping.version,
+            mapping_sha256: format!("{:x}", Sha256::digest(input)),
+            scopes,
+        })
     })
 }
 

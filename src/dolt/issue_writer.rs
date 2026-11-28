@@ -1109,7 +1109,7 @@ fn receipt_digest(receipt: &HistoricalReceipt) -> String {
     )
 }
 
-pub(super) fn new_uuid_v7(now: OffsetDateTime) -> Result<String, HiveError> {
+pub(crate) fn new_uuid_v7(now: OffsetDateTime) -> Result<String, HiveError> {
     let random = token()?;
     let millis = (now.unix_timestamp_nanos() / 1_000_000) as u64;
     let time = format!("{millis:012x}");
