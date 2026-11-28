@@ -292,15 +292,69 @@ fn entrypoint_reference(bytes: &[u8]) -> Option<&str> {
         lines.next();
         lines.by_ref().find(|line| *line == "---")?;
     }
-    // V1 uses prose for identity. Accept simple standalone URLs and hold when
-    // the text contains multiple distinct URL candidates.
-    let mut candidates = lines
-        .flat_map(str::split_whitespace)
-        .filter(|token| token.contains("://"))
-        .map(url_token);
-    let reference = candidates.next()?;
-    (portable_reference(reference) && candidates.all(|other| other == reference))
-        .then_some(reference)
+    let mut comment = false;
+    let mut fence = None;
+    let mut reference = None;
+    for line in lines {
+        if !comment {
+            let marker = fence_marker(line);
+            if let Some((open, width)) = fence {
+                if marker.is_some_and(|(ch, count, suffix)| {
+                    ch == open && count >= width && suffix.trim().is_empty()
+                }) {
+                    fence = None;
+                }
+                continue;
+            }
+            if let Some((ch, count, _)) = marker {
+                fence = Some((ch, count));
+                continue;
+            }
+        }
+        // V1 uses prose for identity. Hold distinct standalone URL candidates
+        // in the visible text rather than guessing which one owns the scope.
+        for candidate in uncommented(line, &mut comment)
+            .flat_map(str::split_whitespace)
+            .filter(|token| token.contains("://"))
+            .map(url_token)
+        {
+            match reference {
+                None if portable_reference(candidate) => reference = Some(candidate),
+                Some(previous) if previous == candidate => {}
+                _ => return None,
+            }
+        }
+    }
+    reference
+}
+
+fn fence_marker(line: &str) -> Option<(u8, usize, &str)> {
+    let line = line.trim_start();
+    let marker = *line.as_bytes().first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let count = line.bytes().take_while(|byte| *byte == marker).count();
+    (count >= 3).then(|| (marker, count, &line[count..]))
+}
+
+fn uncommented<'a>(mut line: &'a str, comment: &mut bool) -> impl Iterator<Item = &'a str> {
+    std::iter::from_fn(move || {
+        if *comment {
+            let (_, rest) = line.split_once("-->")?;
+            line = rest;
+            *comment = false;
+        }
+        if line.is_empty() {
+            return None;
+        }
+        if let Some((prose, rest)) = line.split_once("<!--") {
+            *comment = true;
+            line = rest;
+            return Some(prose);
+        }
+        Some(std::mem::take(&mut line))
+    })
 }
 
 fn url_token(token: &str) -> &str {

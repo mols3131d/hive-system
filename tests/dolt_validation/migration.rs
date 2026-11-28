@@ -905,11 +905,11 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     for (path, content) in [
         (
             "directives/synth-app/README.md",
-            "# Project direction\n\nProject: https://forge.example/synthetic/app\n",
+            "# Project direction\n\n<!-- hidden https://forge.example/synthetic/other --> Project: https://forge.example/synthetic/app <!-- hidden https://forge.example/synthetic/other -->\n",
         ),
         (
             "bots/queen-synth/memory/synth-app/MEMORY.md",
-            "# Project memory\n\nProject: https://forge.example/synthetic/app\n",
+            "# Project memory\n\n<!--\nhttps://forge.example/synthetic/other\n~~~\n-->\n\n~~~markdown\n<!--\nhttps://forge.example/synthetic/other\n~~~~\n\nProject: https://forge.example/synthetic/app\n",
         ),
         (
             "tasks/hive-system/README.md",
@@ -936,6 +936,18 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         (
             "tasks/frontmatter-only/README.md",
             "---\ndescription: https://forge.example/synthetic/app\n---\n# Project navigation\n",
+        ),
+        (
+            "tasks/inline-comment-only/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <!-- https://forge.example/synthetic/app -->\n",
+        ),
+        (
+            "tasks/multiline-comment-only/README.md",
+            "# Project navigation\n\n<!-- example\nhttps://forge.example/synthetic/app\n--> Project: /home/synthetic/private/app\n",
+        ),
+        (
+            "tasks/fenced-example-only/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app\n\n````markdown\n```\nhttps://forge.example/synthetic/app\n````\n",
         ),
     ] {
         let file = source.join(path);
@@ -1014,6 +1026,15 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             area("frontmatter-only", 0x10a, "frontmatter", json!([
                 evidence("tasks/frontmatter-only/README.md", app_ref)
             ])),
+            area("inline-comment-only", 0x10b, "inline-comment", json!([
+                evidence("tasks/inline-comment-only/README.md", app_ref)
+            ])),
+            area("multiline-comment-only", 0x10c, "multiline-comment", json!([
+                evidence("tasks/multiline-comment-only/README.md", app_ref)
+            ])),
+            area("fenced-example-only", 0x10d, "fenced-example", json!([
+                evidence("tasks/fenced-example-only/README.md", app_ref)
+            ])),
         ]
     });
     mapping["scopes"][0]["decision"]["area"]["name"] = json!(local_path);
@@ -1036,7 +1057,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(data["source"], snapshot["data"]["source"]);
     assert_eq!(data["inventory"], snapshot["data"]["inventory"]);
     assert_eq!(data["target"], json!({"workspace_id": workspace}));
-    assert_eq!(data["scopes"].as_array().unwrap().len(), 12);
+    assert_eq!(data["scopes"].as_array().unwrap().len(), 15);
     let outcomes = |report: &Value| {
         report["scopes"]
             .as_array()
@@ -1076,6 +1097,9 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         "conflicting-refs",
         "ambiguous-refs",
         "frontmatter-only",
+        "inline-comment-only",
+        "multiline-comment-only",
+        "fenced-example-only",
     ] {
         assert_eq!(mapped[scope], held, "{scope}");
     }
@@ -1856,6 +1880,73 @@ exec "$HOME/real-git" "$@"
         fs::read(&external).unwrap(),
         b"/synthetic-visible-file\n/safe-scratch\n"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_detects_a_racy_tracked_edit_without_changing_source_metadata() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    init_source(&source, &home);
+    git(&source, &home, &["config", "core.trustctime", "false"]);
+    let tracked = source.join("synthetic-racy-task.md");
+    let index = source.join(".git/index");
+    let timestamp = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+    let set_mtime = |path: &Path| {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(timestamp)
+            .unwrap();
+    };
+    fs::write(&tracked, b"Synthetic task A\n").unwrap();
+    set_mtime(&tracked);
+    git(&source, &home, &["add", "synthetic-racy-task.md"]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic racy index entry"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    set_mtime(&index);
+
+    fs::write(&tracked, b"Synthetic task B\n").unwrap();
+    set_mtime(&tracked);
+    let snapshot = || {
+        [&index, &tracked].map(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                fs::read(path).unwrap(),
+                metadata.modified().unwrap(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        })
+    };
+    let before = snapshot();
+    assert_eq!(before[0].1, before[1].1);
+    assert_eq!(
+        git(
+            &source,
+            &home,
+            &["status", "--porcelain=v1", "--untracked-files=no"]
+        ),
+        b" M synthetic-racy-task.md\n",
+    );
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let report = migration_preflight(&home, &home, &args, 5);
+    assert_eq!(report["error"]["code"], "DIRTY_CONFLICT");
+    assert!(!report.to_string().contains("synthetic-racy-task"));
+    assert_eq!(snapshot(), before);
 }
 
 #[cfg(target_os = "linux")]
