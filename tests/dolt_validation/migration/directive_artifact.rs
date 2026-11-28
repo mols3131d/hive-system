@@ -481,7 +481,7 @@ fn cli_migration_plan_redacts_nonportable_directive_and_artifact_locators() {
     for path in cases.iter().map(|(path, _, _)| *path).chain([
         "directives/_general/bundle/README.md",
         "artifacts/bundle/output.tar.gz",
-        "bots/Synthetic Bot/memory/_general/MEMORY.md",
+        "bots/Synthetic Bot/memory/_hive-userdata/MEMORY.md",
     ]) {
         let file = source.join(path);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -504,6 +504,9 @@ fn cli_migration_plan_redacts_nonportable_directive_and_artifact_locators() {
         "scopes": [
             {"scope": "_general", "decision": {
                 "kind": "area", "area": {"id": id(AREA_GENERAL), "slug": "general", "name": "General"}
+            }},
+            {"scope": "_hive-userdata", "decision": {
+                "kind": "area", "area": {"id": id(AREA_USERDATA), "slug": "workspace-operations", "name": "Synthetic Userdata"}
             }},
             {"scope": "external-team", "decision": {"kind": "external"}}
         ]
@@ -543,26 +546,34 @@ fn cli_migration_plan_redacts_nonportable_directive_and_artifact_locators() {
             "outcome": {"status": "held", "reason": "ambiguous_scope_or_collision"}
         })
     );
-    let general = scopes
+    let userdata = scopes
         .iter()
-        .find(|row| row["scope"] == "_general")
+        .find(|row| row["scope"] == "_hive-userdata")
         .unwrap();
     assert_eq!(
-        general["source_paths"],
-        json!([
-            "bots/queen-synth/memory/_general",
-            "directives/_general",
-            "tasks/_general"
-        ])
+        userdata["source_paths"],
+        json!(["directives/_hive-userdata", "tasks/_hive-userdata"])
     );
     assert_eq!(
-        general["source_path_sha256s"],
-        json!([sha256_hex(b"bots/Synthetic Bot/memory/_general")])
+        userdata["source_path_sha256s"],
+        json!([sha256_hex(b"bots/Synthetic Bot/memory/_hive-userdata")])
+    );
+    assert_eq!(
+        userdata["outcome"],
+        json!({"status": "held", "reason": "ambiguous_scope_or_collision"})
     );
 
     let records = report["data"]["directive_artifact_intake"]["records"]
         .as_array()
         .unwrap();
+    let blocked = records
+        .iter()
+        .find(|row| row["source_path"] == "directives/_hive-userdata/unapproved-active.md")
+        .unwrap();
+    assert_eq!(
+        blocked["outcome"],
+        json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision"]})
+    );
     let by_digest = |path: &str| {
         let digest = sha256_hex(path.as_bytes());
         records
