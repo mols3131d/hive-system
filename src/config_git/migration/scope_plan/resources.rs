@@ -1,52 +1,25 @@
 use std::collections::HashMap;
-use std::fmt;
-use std::marker::PhantomData;
 
-use serde::de::{self, MapAccess, Visitor, value::MapAccessDeserializer};
+use serde::de;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{Inventory, Scope, ScopeOutcome, invalid, is_portable_scope, is_uuid_v7};
+use super::{Inventory, Scope, ScopeOutcome, invalid, is_portable_scope, is_uuid_v7, json_object};
 use crate::error::HiveError;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Bindings {
     version: u32,
-    bindings: Vec<BindingObject>,
+    #[serde(deserialize_with = "json_object::deserialize_vec")]
+    bindings: Vec<Binding>,
 }
 
 pub(super) fn deserialize_section<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Bindings>, D::Error> {
-    deserialize_object(deserializer).map(Some)
-}
-
-#[derive(Deserialize)]
-#[serde(transparent)]
-struct BindingObject(#[serde(deserialize_with = "deserialize_object")] Binding);
-
-// Serde's derived struct visitors also accept positional sequences.
-// Require a map while retaining the derived field and duplicate checks.
-fn deserialize_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
-    deserializer: D,
-) -> Result<T, D::Error> {
-    struct ObjectVisitor<T>(PhantomData<T>);
-
-    impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
-        type Value = T;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a JSON object")
-        }
-
-        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
-            T::deserialize(MapAccessDeserializer::new(map))
-        }
-    }
-
-    deserializer.deserialize_map(ObjectVisitor(PhantomData))
+    json_object::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -54,7 +27,7 @@ fn deserialize_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
 struct Binding {
     scope: String,
     area_id: String,
-    #[serde(deserialize_with = "deserialize_object")]
+    #[serde(deserialize_with = "json_object::deserialize")]
     resource: Resource,
     evidence_path: String,
     evidence_blob_oid: String,
@@ -176,7 +149,7 @@ impl Bindings {
         let scopes: HashMap<_, _> = scopes.iter().map(|scope| (scope.scope, scope)).collect();
         let mut ids = HashMap::new();
         let mut names = HashMap::new();
-        for BindingObject(binding) in &self.bindings {
+        for binding in &self.bindings {
             let resource = &binding.resource;
             if !is_portable_scope(&binding.scope)
                 || !scopes.contains_key(binding.scope.as_str())
@@ -195,7 +168,7 @@ impl Bindings {
         let outcomes = self
             .bindings
             .iter()
-            .map(|BindingObject(binding)| {
+            .map(|binding| {
                 let scope = scopes[binding.scope.as_str()];
                 let result = binding.bind(inventory, scope).and_then(|prepared| {
                     let resource = &prepared.resource;

@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use url::{Host, Url};
 
+use super::issue_resources::{self, IssueResourceOutcome};
 use super::json_object::{self, Object};
 use super::prepared_records::Intake;
 use super::queen_assets::{self, QueenAssets, SoulReview};
@@ -43,6 +44,8 @@ struct Mapping {
     queen_preparation: Option<Vec<QueenMapping>>,
     #[serde(default, deserialize_with = "resources::deserialize_section")]
     resource_bindings: Option<resources::Bindings>,
+    #[serde(default, deserialize_with = "issue_resources::optional_list")]
+    issue_resource_bindings: Option<Vec<issue_resources::Binding>>,
     reviewed_records: Option<Vec<Review>>,
     directive_observed_at: Option<String>,
 }
@@ -168,8 +171,22 @@ pub(crate) fn plan(
                 report["directive_observed_at"] = json!(observed_at);
             }
         }
-        if include_tasks {
-            report["task_intake"] = reviewed.prepare_tasks()?.report();
+        let task_plan = include_tasks
+            .then(|| reviewed.prepare_tasks())
+            .transpose()?;
+        if reviewed.mapping.issue_resource_bindings.is_some() {
+            let tasks = task_plan.as_ref().map(task_intake::TaskPlan::staging_tasks);
+            if let Some(outcomes) = reviewed.prepare_issue_resources(tasks.as_deref())? {
+                report["issue_resource_bindings"] = json!(
+                    outcomes
+                        .iter()
+                        .map(IssueResourceOutcome::report)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        if let Some(plan) = task_plan {
+            report["task_intake"] = plan.report();
         }
         if let Some(assets) = &reviewed.queen_assets {
             report["queen_assets"] = json!(assets);
@@ -215,6 +232,17 @@ impl ReviewedScopes<'_> {
         let claims_supported = !self.source.hive_yml.is_null();
         let records = task_intake::read_records(self.inventory, &git, claims_supported)?;
         task_intake::prepare(records, &outcomes, &self.mapping.task_reviews, &git)
+    }
+
+    pub(crate) fn prepare_issue_resources(
+        &self,
+        tasks: Option<&[task_intake::StagingTask<'_>]>,
+    ) -> Result<Option<Vec<IssueResourceOutcome<'_>>>, HiveError> {
+        self.mapping
+            .issue_resource_bindings
+            .as_deref()
+            .map(|bindings| issue_resources::prepare(bindings, tasks, self.resources.as_ref()))
+            .transpose()
     }
 
     pub(crate) fn directive_artifacts_for_staging(&self) -> Result<Option<Intake>, HiveError> {

@@ -15,6 +15,7 @@ use crate::config_file::{Coordination, ScopedDirectory};
 
 mod directive_artifact_intake;
 mod directive_history;
+mod issue_resources;
 mod json_object;
 pub(crate) mod prepared_records;
 mod queen_assets;
@@ -26,6 +27,7 @@ mod task_provenance;
 pub(crate) use queen_preparation::PreparedQueen;
 pub(crate) use task_intake::StagingTask;
 mod scope_plan;
+pub(crate) use issue_resources::IssueResourceOutcome;
 pub(crate) use scope_plan::{
     Area, PreparedResources, ResourceHold, ReviewedScopes, plan, with_scope_mapping,
 };
