@@ -559,27 +559,33 @@ pub(super) fn resolve_title<'a>(
     if let Some(title) = title.filter(|title| valid(title)) {
         return Some((title, TitleSource::FrontmatterTitle));
     }
-    let mut headings = Parser::new(body)
-        .into_offset_iter()
-        .filter_map(|(event, range)| {
-            matches!(
-                event,
-                Event::Start(Tag::Heading {
-                    level: HeadingLevel::H1,
-                    ..
-                })
-            )
-            .then_some(range.start)
-        });
-    let heading = if let Some(start) = headings.next() {
+    let is_h1 = |event: &Event<'_>| {
+        matches!(
+            event,
+            Event::Start(Tag::Heading {
+                level: HeadingLevel::H1,
+                ..
+            })
+        )
+    };
+    let mut events = Parser::new(body).into_offset_iter();
+    let first_heading = events.next().filter(|(event, _)| is_h1(event));
+    if events.any(|(event, _)| is_h1(&event)) {
+        return None;
+    }
+    let heading = if let Some((_, range)) = first_heading {
         // Only a single leading unindented ATX H1 can supply the title.
-        let prefix = &body[..start];
-        let line = body[start..].lines().next()?.strip_prefix('#')?;
-        if !prefix.trim().is_empty()
-            || (!prefix.is_empty() && !prefix.ends_with('\n'))
-            || !(line.is_empty() || line.starts_with([' ', '\t']))
-            || headings.next().is_some()
+        // Reference definitions count as blocks but emit no parser events.
+        if (range.start > 0 && !matches!(body.as_bytes()[range.start - 1], b'\r' | b'\n'))
+            || events
+                .reference_definitions()
+                .iter()
+                .any(|(_, definition)| definition.span.start < range.start)
         {
+            return None;
+        }
+        let line = body[range].split(['\r', '\n']).next()?.strip_prefix('#')?;
+        if !line.is_empty() && !line.starts_with([' ', '\t']) {
             return None;
         }
         let value = line.trim();
