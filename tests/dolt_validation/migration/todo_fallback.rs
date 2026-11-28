@@ -66,6 +66,8 @@ fn check_fallback(binary: &Path, pin: &str, installed: bool) {
             "",
         ),
         ("graph-hold", "active", todo, ""),
+        ("missing-relations", "active", todo, ""),
+        ("unresolved-relations", "active", todo, ""),
         ("default-hold", "active", todo, ""),
         (
             "available-body",
@@ -159,6 +161,10 @@ fn check_fallback(binary: &Path, pin: &str, installed: bool) {
             "missing-dates" => review["created_at"] = Value::Null,
             "wrong-area" => review["area_id"] = json!(id(AREA_USERDATA)),
             "wrong-blob" => review["source_git_blob_sha"] = json!("e".repeat(oid.len())),
+            "missing-relations" => {
+                review.as_object_mut().unwrap().remove("relations");
+            }
+            "unresolved-relations" => review["relations"] = json!("unresolved"),
             _ => {}
         }
         let prerequisites = match name {
@@ -240,6 +246,8 @@ fn check_fallback(binary: &Path, pin: &str, installed: bool) {
         ("default-hold", "unverified_acceptance_criteria"),
         ("b-tagged", "unverified_task_labels"),
         ("graph-hold", "unresolved_task_relations"),
+        ("missing-relations", "unresolved_task_relations"),
+        ("unresolved-relations", "unresolved_task_relations"),
         ("available-body", "inapplicable_todo_fallback"),
         ("available-checklist", "inapplicable_todo_fallback"),
         ("available-range", "inapplicable_todo_fallback"),
@@ -285,20 +293,66 @@ fn check_fallback(binary: &Path, pin: &str, installed: bool) {
         );
     }
 
+    let mut simple = mapping.clone();
+    simple["task_reviews"][0]["relations"] = json!("no_edges");
+    let control = invoke("migration-plan", &args, &simple, 0);
+    let simple_task = control["data"]["task_intake"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["legacy_key"] == key("a-reviewed"))
+        .unwrap();
+    assert_eq!(simple_task["outcome"]["status"], "prepared");
+    assert_eq!(
+        simple_task["outcome"]["provenance"]["relations"],
+        "no_edges"
+    );
+
+    let mut stage_args = args.to_vec();
+    stage_args.extend([
+        "--target",
+        target.to_str().unwrap(),
+        "--policy-revision",
+        V2_POLICY,
+        "--mode",
+        "staged-import",
+    ]);
+    for malformed in [
+        json!({"no_edges":null}),
+        json!({"unresolved":null}),
+        json!([null, [], []]),
+        json!("No_Edges"),
+    ] {
+        let mut bad = mapping.clone();
+        bad["task_reviews"][0]["relations"] = malformed;
+        assert_eq!(
+            invoke("migration-plan", &args, &bad, 2)["error"]["code"],
+            "INVALID_CONFIG"
+        );
+        if installed {
+            assert_eq!(
+                invoke("migration-stage", &stage_args, &bad, 2)["error"]["code"],
+                "INVALID_CONFIG"
+            );
+            assert!(!target.exists());
+        }
+    }
+
     if installed {
-        let mut stage_args = args.to_vec();
-        stage_args.extend([
-            "--target",
-            target.to_str().unwrap(),
-            "--policy-revision",
-            V2_POLICY,
-            "--mode",
-            "staged-import",
-        ]);
         let report = invoke("migration-stage", &stage_args, &mapping, 0);
         let data = &report["data"];
         assert_eq!(data["counts"]["tasks"]["imported"], 3);
         assert_eq!(data["counts"]["tasks"]["held"], fixtures.len() - 3);
+        for name in ["missing-relations", "unresolved-relations"] {
+            let digest = sha256_hex(format!("tasks/_general/active/{name}/README.md").as_bytes());
+            let hold = data["holds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["source_path_sha256"] == digest)
+                .unwrap();
+            assert_eq!(hold["reason_codes"], json!(["unresolved_task_relations"]));
+        }
         assert_eq!(data["target"]["issue_number_next_value"], 4);
         assert_eq!(data["target"]["active_claims"], 0);
         assert_eq!(data["checks"]["published_inactive"], true);

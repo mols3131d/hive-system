@@ -115,7 +115,7 @@ impl LegacyKey {
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub(super) enum Relations {
-    Simple(RelationDeclaration),
+    Simple(#[serde(deserialize_with = "json_object::string_enum")] RelationDeclaration),
     Reviewed(Object<Obligations>),
 }
 
