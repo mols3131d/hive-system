@@ -900,6 +900,124 @@ fn migration_cli_with_path(
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cli_migration_plan_requires_named_json_objects_on_both_policy_pins() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    init_git(
+        &source,
+        &home,
+        "Synthetic Fixture",
+        "synthetic@example.invalid",
+    );
+    let mapping_file = root.path().join("mapping.json");
+    let workspace = id(1);
+    let area_id = id(AREA_APP);
+    let path = "tasks/synth-app/README.md";
+    let reference = "https://forge.example/synthetic/app";
+    fs::create_dir_all(source.join(path).parent().unwrap()).unwrap();
+    fs::write(
+        source.join(path),
+        format!("# Synthetic App\n\nProject: {reference}\n"),
+    )
+    .unwrap();
+
+    for pin in ["0fd0f8dbe632d14094a93599cb1b5f653789ac9c", POLICY_PIN] {
+        fs::write(source.join("AGENTS.md"), format!("hive-system@{pin}\n")).unwrap();
+        if pin == POLICY_PIN {
+            fs::write(
+                source.join("hive.yml"),
+                "version: 1\ncoordination:\n  mode: local\n",
+            )
+            .unwrap();
+        }
+        git(&source, &home, &["add", "."]);
+        git(&source, &home, &["commit", "-qm", "Synthetic policy pin"]);
+        let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+        let args = [
+            "--source",
+            source.to_str().unwrap(),
+            "--source-commit",
+            &commit,
+            "--workspace-id",
+            &workspace,
+            "--mapping-file",
+            mapping_file.to_str().unwrap(),
+        ];
+        let plan = |input: &str, status| {
+            fs::write(&mapping_file, input).unwrap();
+            migration_cli(&home, &config, "migration-plan", &args, status)
+        };
+
+        let evidence = json!({"path": path, "canonical_ref": reference});
+        let area = json!({"id": area_id, "slug": "application", "name": "Synthetic App", "parent_id": null});
+        let decision = json!({"kind": "area", "area": area, "project_evidence": [evidence]});
+        let entry = json!({"scope": "synth-app", "decision": decision});
+        let mapping = json!({
+            "version": 1,
+            "source_commit": commit,
+            "policy_pin": pin,
+            "workspace_id": workspace,
+            "scopes": [entry],
+        });
+        let named = mapping.to_string();
+        let report = plan(&named, 0);
+        assert_eq!(report["data"]["source"]["policy_pin"], pin);
+        assert_eq!(
+            report["data"]["scopes"][0]["outcome"],
+            json!({
+                "status": "mapped",
+                "area": {"id": area_id, "slug": "application", "parent_id": null},
+            })
+        );
+
+        let reject = |input: &str| {
+            let report = plan(input, 2);
+            assert_eq!(report["error"]["code"], "INVALID_CONFIG");
+            assert_eq!(
+                report["error"]["message"],
+                "The scope mapping must match the versioned JSON format."
+            );
+            assert!(report.get("data").is_none());
+        };
+        for (pointer, positional) in [
+            ("", json!([1, commit, pin, workspace, [entry]])),
+            ("/scopes/0", json!(["synth-app", decision])),
+            ("/scopes/0/decision", json!(["area", area, [evidence]])),
+            (
+                "/scopes/0/decision/area",
+                json!([area_id, "application", "Synthetic App", null]),
+            ),
+            (
+                "/scopes/0/decision/project_evidence/0",
+                json!([path, reference]),
+            ),
+            ("/scopes", entry),
+            ("/scopes/0/decision/project_evidence", evidence),
+        ] {
+            let mut changed = mapping.clone();
+            *changed.pointer_mut(pointer).unwrap() = positional;
+            reject(&changed.to_string());
+        }
+        for member in [
+            r#""version":1"#,
+            r#""scope":"synth-app""#,
+            r#""kind":"area""#,
+            r#""parent_id":null"#,
+            r#""canonical_ref":"https://forge.example/synthetic/app""#,
+        ] {
+            reject(&named.replacen(member, &format!("{member},{member}"), 1));
+            reject(&named.replacen(member, &format!(r#"{member},"unexpected":true"#), 1));
+        }
+        reject(&format!("{named}\n{{}}"));
+    }
+    assert!(!config.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
@@ -1781,8 +1899,8 @@ fn check_queen_asset_intake(policy_pin: &str) {
         "workspace_id": workspace_id,
         "scopes": [],
     });
-    let run = |mapping: &Value, status| {
-        fs::write(&mapping_file, serde_json::to_vec(mapping).unwrap()).unwrap();
+    let run_json = |manifest: &str, revision: &str, status| {
+        fs::write(&mapping_file, manifest).unwrap();
         migration_cli(
             &home,
             &config,
@@ -1791,7 +1909,7 @@ fn check_queen_asset_intake(policy_pin: &str) {
                 "--source",
                 source.to_str().unwrap(),
                 "--source-commit",
-                mapping["source_commit"].as_str().unwrap(),
+                revision,
                 "--workspace-id",
                 &workspace_id,
                 "--mapping-file",
@@ -1800,8 +1918,61 @@ fn check_queen_asset_intake(policy_pin: &str) {
             status,
         )
     };
+    let run = |mapping: &Value, status| {
+        run_json(
+            &mapping.to_string(),
+            mapping["source_commit"].as_str().unwrap(),
+            status,
+        )
+    };
     assert!(run(&mapping, 0)["data"].get("queen_assets").is_none());
     let index_before = fs::read(source.join(".git/index")).unwrap();
+    let mut changed = mapping.clone();
+    changed["queen_assets"] = json!([]);
+    let empty_intake = run(&changed, 0);
+    let souls = empty_intake["data"]["queen_assets"]["bots_soul"]
+        .as_array()
+        .unwrap();
+    assert!(!souls.is_empty());
+    assert!(souls.iter().all(|record| record["status"] != "candidate"));
+
+    let review_entry = review("queen-synth");
+    let reject_shape = |label: &str, manifest: &str| {
+        let report = run_json(manifest, &commit, 2);
+        assert_eq!(
+            report["error"]["code"], "INVALID_CONFIG",
+            "{policy_pin}: {label}"
+        );
+        assert!(report.get("data").is_none(), "{policy_pin}: {label}");
+    };
+    let mut unknown_member = review_entry.clone();
+    unknown_member["unknown"] = json!(true);
+    for (label, value) in [
+        (
+            "positional row",
+            json!([[review_entry["slug"], review_entry["source_git_blob_sha"]]]),
+        ),
+        ("null list", Value::Null),
+        ("bare object", review_entry.clone()),
+        ("null row", json!([null])),
+        ("unknown member", json!([unknown_member])),
+    ] {
+        changed["queen_assets"] = value;
+        reject_shape(label, &changed.to_string());
+    }
+    changed["queen_assets"] = json!([review_entry]);
+    let row = review_entry.to_string();
+    let repeated_slug = format!("{{\"slug\":{},{}", review_entry["slug"], &row[1..]);
+    let manifest = changed.to_string();
+    reject_shape(
+        "repeated row member",
+        &manifest.replace(&row, &repeated_slug),
+    );
+    reject_shape(
+        "repeated manifest member",
+        &format!("{{\"queen_assets\":[],{}", &manifest[1..]),
+    );
+
     mapping["queen_assets"] = json!([
         review("queen-synth"), review("worker"), review("wrong-id"), review("collision"),
         review("repeat-review"), review("repeat-review"), review("alias"), review("binary"),

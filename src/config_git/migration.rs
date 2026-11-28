@@ -14,6 +14,7 @@ use crate::cli::is_slug;
 use crate::config_file::{Coordination, ScopedDirectory};
 
 mod directive_artifact_intake;
+mod json_object;
 mod queen_assets;
 mod scope_plan;
 mod task_intake;
