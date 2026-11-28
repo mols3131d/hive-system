@@ -417,7 +417,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     );
     assert!(!plan.to_string().contains(UNCLASSIFIED));
     for (path, _, reason) in INVALID_KINDS {
-        let held = outcome(&plan, *path);
+        let held = outcome(&plan, path);
         assert_eq!(held["status"], "held", "{path}");
         assert!(
             held["reason_codes"]
