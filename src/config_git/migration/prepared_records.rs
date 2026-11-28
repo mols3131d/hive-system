@@ -102,6 +102,9 @@ impl Serialize for Fields {
                     evidence["issue_link"] = json!(work.issue_link);
                     evidence["created_at"] = json!(work.created_at);
                     evidence["substantive_updated_at"] = json!(work.substantive_updated_at);
+                    if let Some(retention) = &work.retention {
+                        evidence["retention"] = json!(retention);
+                    }
                 }
                 evidence
             }

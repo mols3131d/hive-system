@@ -406,7 +406,11 @@ Use `provenance.kind` of `work_scoped_artifact` for a reviewed Markdown file dir
 
 Supply `parent_task` with the qualified `legacy_key` (`scope` and `work_id`), the Task's committed `README.md` path in `source_path`, `source_git_blob_sha`, `area_id`, and `workspace_id`. The binding must match the actual owning Task and a prepared Task outcome under the same verified source and target selection. A held, unprepared, missing, or mismatched parent yields `parent_task_quarantined`. Supply `issue_link` of `retain`. An omitted or unresolved decision holds the Artifact. Omit `area_link` for an Issue-only join or name the same reviewed owning Area ID to retain the Area join as well.
 
-Select `created_at` and `substantive_updated_at` using half-open UTF-8 byte ranges within the committed Artifact body. Each range selects an actual RFC 3339 timestamp with a known offset and at most six fractional digits. The plan reports the original timestamp literal, its range, and the source and body digests. The importer stores the equivalent UTC instant. Current preparation covers ordinary unclaimed backlog or todo Tasks. A terminal parent's closure contribution to retention still requires reviewed handling.
+Select `created_at` and `substantive_updated_at` using half-open UTF-8 byte ranges within the committed Artifact body. Each range selects an actual RFC 3339 timestamp with a known offset and at most six fractional digits. The plan reports the original timestamp literal, its range, and the source and body digests. The importer stores the equivalent UTC instant. Ordinary unclaimed backlog or todo parents use the reviewed Artifact update for retention.
+
+For a prepared done or cancelled parent, supply `retention` with `parent_closed_at`. Use the exact named `{ "start": ..., "end": ... }` half-open range in the **Task** body that its independent Task review selected as `closure.closed_at`. A missing or conflicting range holds the Artifact as `unverified_artifact_retention`, even when another range contains the same timestamp. A held or mismatched parent continues to hold its Artifact as `parent_task_quarantined`.
+
+The imported `substantive_updated_at` is the later of the reviewed Artifact update and the verified Task closure. The report preserves the original Artifact timestamp and the reviewed retention proof. A historical archive date must be at or after the effective retention timestamp. Earlier or unresolved archive evidence holds the Artifact.
 
 #### Preparing Directive history and supersession
 

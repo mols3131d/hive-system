@@ -9,6 +9,9 @@ mod directive_history;
 #[path = "standalone_artifact_joins.rs"]
 mod standalone_artifact_joins;
 
+#[path = "terminal_artifact_retention.rs"]
+mod terminal_artifact_retention;
+
 #[path = "work_artifact.rs"]
 mod work_artifact;
 
