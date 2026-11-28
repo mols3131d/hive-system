@@ -830,6 +830,40 @@ fn row_count(admin: &mut Conn, table: &str) -> u64 {
 }
 
 #[cfg(target_os = "linux")]
+fn migration_preflight(home: &Path, config: &Path, args: &[&str], status: i32) -> Value {
+    let result = Command::new(env!("CARGO_BIN_EXE_hive"))
+        .current_dir(home)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", config)
+        // An inherited repository selection must not replace the explicit one.
+        .env("GIT_DIR", home.join("unrelated.git"))
+        .args([
+            "--contract",
+            "2",
+            "--json",
+            "workspace",
+            "migration-preflight",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(status), "{result:?}");
+    assert!(result.stderr.is_empty(), "{result:?}");
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["command"], "workspace migration-preflight");
+    assert_eq!(report["ok"], status == 0);
+    if let Some([_, path]) = args.windows(2).find(|pair| pair[0] == "--source")
+        && Path::new(path).is_absolute()
+    {
+        assert!(!String::from_utf8_lossy(&result.stdout).contains(path));
+    }
+    report
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn cli_preflights_only_a_clean_pinned_v1_source() {
     let root = tempfile::tempdir().unwrap();
@@ -839,34 +873,7 @@ fn cli_preflights_only_a_clean_pinned_v1_source() {
     let source = root.path().join("legacy-v1");
     let commit = init_source(&source, &home);
     let path = source.to_str().unwrap();
-    let cli = |args: &[&str], status| {
-        let result = Command::new(env!("CARGO_BIN_EXE_hive"))
-            .current_dir(&home)
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap())
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &config)
-            // An inherited repository selection must not replace the explicit one.
-            .env("GIT_DIR", home.join("unrelated.git"))
-            .args([
-                "--contract",
-                "2",
-                "--json",
-                "workspace",
-                "migration-preflight",
-            ])
-            .args(args)
-            .output()
-            .unwrap();
-        assert_eq!(result.status.code(), Some(status), "{result:?}");
-        assert!(result.stderr.is_empty(), "{result:?}");
-        let report: Value = serde_json::from_slice(&result.stdout).unwrap();
-        assert_eq!(report["schema_version"], 2);
-        assert_eq!(report["command"], "workspace migration-preflight");
-        assert_eq!(report["ok"], status == 0);
-        assert!(!String::from_utf8_lossy(&result.stdout).contains(path));
-        report
-    };
+    let cli = |args: &[&str], status| migration_preflight(&home, &config, args, status);
     let args = ["--source", path, "--source-commit", &commit];
     let original_git_files = [
         ".git/HEAD",
@@ -956,6 +963,20 @@ fn cli_preflights_only_a_clean_pinned_v1_source() {
     );
     let untracked = source.join("untracked");
     fs::write(&untracked, "dirty").unwrap();
+    refuse(&args, 5, "DIRTY_CONFLICT");
+    fs::create_dir_all(config.join("git")).unwrap();
+    let external_ignore = config.join("git/ignore");
+    fs::write(&external_ignore, "/untracked\n").unwrap();
+    refuse(&args, 5, "DIRTY_CONFLICT");
+    git(
+        &source,
+        &home,
+        &[
+            "config",
+            "core.excludesFile",
+            external_ignore.to_str().unwrap(),
+        ],
+    );
     refuse(&args, 5, "DIRTY_CONFLICT");
     fs::remove_file(untracked).unwrap();
     git(
@@ -1049,6 +1070,160 @@ fn cli_preflights_only_a_clean_pinned_v1_source() {
         7,
         "POLICY_UNAVAILABLE",
     );
+}
+
+#[cfg(target_os = "linux")]
+fn loose_object(repo: &Path, oid: &str) -> std::path::PathBuf {
+    repo.join(".git/objects").join(&oid[..2]).join(&oid[2..])
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_rejects_a_truncated_task_blob_with_readable_size() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    let commit = init_source(&source, &home);
+    let task = "tasks/synth-app/backlog/implement-widget/README.md";
+    let oid = git_text(&source, &home, &["rev-parse", &format!("HEAD:{task}")]);
+    let object = loose_object(&source, &oid);
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let preflight = |status| migration_preflight(&home, &home, &args, status);
+    let original = preflight(0);
+
+    // Keep the compressed header intact while discarding most of the body.
+    let bytes = fs::read(&object).unwrap();
+    let damaged = &bytes[..bytes.len() / 2];
+    let size = git_text(&source, &home, &["cat-file", "-s", &oid]);
+    fs::remove_file(&object).unwrap();
+    fs::write(&object, damaged).unwrap();
+    assert_eq!(git_text(&source, &home, &["cat-file", "-s", &oid]), size);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+
+    let report = preflight(7);
+    assert_eq!(report["error"]["code"], "OBJECT_UNAVAILABLE");
+    assert!(report.get("data").is_none_or(Value::is_null));
+    assert!(!report.to_string().contains(task));
+    assert!(!report.to_string().contains(&oid));
+    assert_eq!(fs::read(&object).unwrap(), damaged);
+    fs::write(&object, bytes).unwrap();
+    assert_eq!(preflight(0), original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_rejects_subtree_bytes_that_do_not_match_its_oid() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    let commit = init_source(&source, &home);
+    let oid = git_text(&source, &home, &["rev-parse", "HEAD:tasks"]);
+    let object = loose_object(&source, &oid);
+    let bytes = fs::read(&object).unwrap();
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let preflight = |status| migration_preflight(&home, &home, &args, status);
+    let original = preflight(0);
+
+    // An empty directory changes the committed catalog but adds no index entries.
+    let raw = home.join("raw-tree");
+    let write_tree = || {
+        git_text(
+            &source,
+            &home,
+            &["hash-object", "-w", "-t", "tree", raw.to_str().unwrap()],
+        )
+    };
+    fs::write(&raw, []).unwrap();
+    let empty = write_tree();
+    let mut tree = git(&source, &home, &["cat-file", "tree", &oid]);
+    tree.extend_from_slice(b"40000 z-synthetic-empty\0");
+    for offset in (0..empty.len()).step_by(2) {
+        tree.push(u8::from_str_radix(&empty[offset..offset + 2], 16).unwrap());
+    }
+    fs::write(&raw, &tree).unwrap();
+    let replacement = write_tree();
+    assert_ne!(replacement, oid);
+    let substituted = fs::read(loose_object(&source, &replacement)).unwrap();
+    fs::remove_file(&object).unwrap();
+    fs::write(&object, &substituted).unwrap();
+    assert_eq!(git(&source, &home, &["cat-file", "tree", &oid]), tree);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+
+    let report = preflight(7);
+    assert_eq!(report["error"]["code"], "OBJECT_UNAVAILABLE");
+    assert!(report.get("data").is_none_or(Value::is_null));
+    assert!(!report.to_string().contains("z-synthetic-empty"));
+    assert!(!report.to_string().contains(&oid));
+    assert_eq!(fs::read(&object).unwrap(), substituted);
+    fs::write(&object, bytes).unwrap();
+    assert_eq!(preflight(0), original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_preserves_legacy_policy_and_catalog_after_packing() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    for format in ["sha1", "sha256"] {
+        let source = root.path().join(format);
+        fs::create_dir(&source).unwrap();
+        git(
+            &source,
+            &home,
+            &["init", "-q", &format!("--object-format={format}")],
+        );
+        let policy = "hive-system@0fd0f8dbe632d14094a93599cb1b5f653789ac9c\n";
+        fs::write(source.join("AGENTS.md"), policy).unwrap();
+        fs::create_dir(source.join("tasks")).unwrap();
+        let body = "Synthetic duplicate blob";
+        fs::write(source.join("tasks/one.md"), body).unwrap();
+        fs::write(source.join("tasks/two.md"), body).unwrap();
+        git(&source, &home, &["add", "."]);
+        git(
+            &source,
+            &home,
+            &[
+                "-c",
+                "user.name=Synthetic Fixture",
+                "-c",
+                "user.email=synthetic@example.invalid",
+                "commit",
+                "-qm",
+                "Synthetic legacy workspace",
+            ],
+        );
+        let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+        let args = [
+            "--source",
+            source.to_str().unwrap(),
+            "--source-commit",
+            &commit,
+        ];
+        let report = migration_preflight(&home, &home, &args, 0);
+        assert_eq!(report["data"]["source"]["source_commit"], commit);
+        assert!(report["data"]["source"]["hive_yml"].is_null());
+        assert_eq!(report["data"]["inventory"]["file_count"], 3);
+        assert_eq!(
+            report["data"]["inventory"]["blob_bytes"],
+            policy.len() + 2 * body.len()
+        );
+        git(&source, &home, &["repack", "-ad"]);
+        assert!(!loose_object(&source, &commit).exists());
+        assert_eq!(migration_preflight(&home, &home, &args, 0), report);
+    }
 }
 
 #[test]

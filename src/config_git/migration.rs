@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -8,6 +9,8 @@ use crate::config_file::{Coordination, ScopedDirectory};
 
 const MAX_INVENTORY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
+const MAX_TREE_BYTES: usize = 1024 * 1024;
+const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveError> {
     if !source.is_absolute() || !is_full_lowercase_oid(revision) {
@@ -29,7 +32,7 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
     verify_layout()?;
     let check_clean = || {
         repository
-            .check_clean(revision, false, false)
+            .check_clean(revision, CleanWorktree::MigrationSource)
             .map_err(|error| {
                 let message = match error.code {
                     ErrorCode::StaleRevision => {
@@ -52,8 +55,8 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
     let reader = AssetObjectReader::new(&repository.objects, &config, revision.len())?;
     let git = || reader.command();
     let tree = committed_asset_tree(&git, revision)?;
-    let raw_tree = verified_asset_object(&git, "tree", &tree, 1024 * 1024)?;
-    let inventory = inventory(&git, &tree)?;
+    let raw_tree = snapshot_object(&git, "tree", &tree, MAX_TREE_BYTES)?;
+    let inventory = inventory(&git, &tree, &raw_tree)?;
     let (policy_pin, coordination) = crate::config::parse_workspace_sources(|path| {
         read_committed_asset_blob(&git, revision, path)
     })?;
@@ -88,9 +91,26 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
     }))
 }
 
+fn snapshot_object(
+    git: &impl Fn() -> Result<Command, HiveError>,
+    kind: &str,
+    oid: &str,
+    limit: usize,
+) -> Result<Vec<u8>, HiveError> {
+    verified_asset_object(git, kind, oid, limit).map_err(|error| {
+        let message = if matches!(error.code, ErrorCode::InvalidConfig) {
+            "The v1 source exceeds its Git object verification size limit."
+        } else {
+            "Could not read and verify a committed v1 source object locally."
+        };
+        HiveError::new(error.code, message)
+    })
+}
+
 fn inventory(
     git: &impl Fn() -> Result<Command, HiveError>,
-    tree: &str,
+    root_oid: &str,
+    root_tree: &[u8],
 ) -> Result<Value, HiveError> {
     let invalid = || {
         HiveError::new(
@@ -98,89 +118,97 @@ fn inventory(
             "The committed v1 source contains an unsupported or ambiguous Git tree entry.",
         )
     };
-    let unavailable = || {
-        HiveError::new(
-            ErrorCode::ObjectUnavailable,
-            "The committed v1 source tree or blob metadata is unavailable locally.",
-        )
-    };
-    let listing = execute_asset(
-        git()?.args(["ls-tree", "-r", "-t", "-z", "-l", "--full-tree", tree]),
-        MAX_INVENTORY_BYTES,
-        None,
-    )
-    .map_err(|error| {
-        if matches!(error.code, ErrorCode::InvalidConfig) {
-            HiveError::new(
-                ErrorCode::InvalidConfig,
-                "The v1 source inventory exceeds 4 MiB.",
-            )
-        } else {
-            unavailable()
-        }
-    })?;
-    if !listing.status.success() {
-        return Err(unavailable());
-    }
     let mut entries = BTreeMap::new();
+    let mut verified_blobs = HashMap::new();
     let mut directories = 0;
     let mut blob_bytes = 0_u64;
-    let mut records = listing.stdout.split(|byte| *byte == 0);
-    if records.next_back() != Some(&[][..]) {
-        return Err(invalid());
-    }
-    for entry in records {
-        if entries.len() == MAX_ENTRIES {
-            return Err(HiveError::new(
-                ErrorCode::InvalidConfig,
-                "The v1 source inventory exceeds 10,000 entries.",
-            ));
-        }
-        let entry = std::str::from_utf8(entry).map_err(|_| invalid())?;
-        let (fields, path) = entry.split_once('\t').ok_or_else(invalid)?;
-        let fields: Vec<_> = fields.split_ascii_whitespace().collect();
-        let [mode, kind, oid, size] = fields.as_slice() else {
-            return Err(invalid());
+    let mut catalog_bytes = 0;
+    let mut remaining = MAX_SNAPSHOT_BYTES - root_tree.len();
+    let mut pending = vec![(String::new(), root_oid.to_owned())];
+    while let Some((parent, oid)) = pending.pop() {
+        let tree = if parent.is_empty() {
+            Cow::Borrowed(root_tree)
+        } else {
+            let bytes = snapshot_object(git, "tree", &oid, remaining.min(MAX_TREE_BYTES))?;
+            remaining -= bytes.len();
+            Cow::Owned(bytes)
         };
-        if oid.len() != tree.len()
-            || !is_full_lowercase_oid(oid)
-            || path.chars().any(|c| c.is_control() || c == '\\')
-            || path
-                .split('/')
-                .any(|part| matches!(part, "" | "." | "..") || part.eq_ignore_ascii_case(".git"))
-        {
-            return Err(invalid());
-        }
-        let size = match (*mode, *kind, *size) {
-            ("040000", "tree", "-") => {
-                directories += 1;
-                None
+        let mut raw = tree.as_ref();
+        while !raw.is_empty() {
+            if entries.len() == MAX_ENTRIES {
+                return Err(HiveError::new(
+                    ErrorCode::InvalidConfig,
+                    "The v1 source inventory exceeds 10,000 entries.",
+                ));
             }
-            ("100644" | "100755", "blob", size) => {
-                let size = size.parse::<u64>().map_err(|_| unavailable())?;
-                blob_bytes = blob_bytes.checked_add(size).ok_or_else(invalid)?;
-                Some(size)
+            let entry =
+                take_asset_tree_entry(&mut raw, root_oid.len() / 2).map_err(|_| invalid())?;
+            let name = std::str::from_utf8(entry.name).map_err(|_| invalid())?;
+            if matches!(name, "" | "." | "..")
+                || name.eq_ignore_ascii_case(".git")
+                || name
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+            {
+                return Err(invalid());
             }
-            _ => return Err(invalid()),
-        };
-        if entries.insert(path, (*mode, *oid, size)).is_some() {
-            return Err(invalid());
+            let path = if parent.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{parent}/{name}")
+            };
+            let oid = entry.hex_oid();
+            let (mode, size) = match entry.mode {
+                b"40000" => {
+                    directories += 1;
+                    pending.push((path.clone(), oid.clone()));
+                    ("040000", None)
+                }
+                b"100644" | b"100755" => {
+                    let size = if let Some(&size) = verified_blobs.get(&oid) {
+                        size
+                    } else {
+                        let size = snapshot_object(git, "blob", &oid, remaining)?.len();
+                        remaining -= size;
+                        verified_blobs.insert(oid.clone(), size);
+                        size
+                    };
+                    blob_bytes += size as u64;
+                    let mode = if entry.mode == b"100644" {
+                        "100644"
+                    } else {
+                        "100755"
+                    };
+                    (mode, Some(size))
+                }
+                _ => return Err(invalid()),
+            };
+            let size_field = size.map_or_else(|| "-".into(), |size| size.to_string());
+            let fields = format!("{mode}\0{oid}\0{size_field}\0");
+            catalog_bytes += path.len() + 1 + fields.len();
+            if catalog_bytes > MAX_INVENTORY_BYTES {
+                return Err(HiveError::new(
+                    ErrorCode::InvalidConfig,
+                    "The v1 source inventory exceeds 4 MiB.",
+                ));
+            }
+            if entries.insert(path, (fields, size.is_none())).is_some() {
+                return Err(invalid());
+            }
         }
     }
     let mut digest = Sha256::new();
-    for (path, (mode, oid, size)) in &entries {
-        // Use NUL delimiters and path order, independent of Git's display padding.
-        digest.update(format!(
-            "{path}\0{mode}\0{oid}\0{}\0",
-            size.map_or_else(|| "-".into(), |n| n.to_string())
-        ));
+    for (path, (fields, _)) in &entries {
+        digest.update(path);
+        digest.update(b"\0");
+        digest.update(fields);
     }
     Ok(json!({
         "directory_count": directories,
         "file_count": entries.len() - directories,
         "blob_bytes": blob_bytes,
         "catalog_sha256": format!("{:x}", digest.finalize()),
-        "rulesync_directory": entries.get(".rulesync").is_some_and(|entry| entry.2.is_none()),
-        "rulesync_config": entries.get("rulesync.jsonc").is_some_and(|entry| entry.2.is_some()),
+        "rulesync_directory": entries.get(".rulesync").is_some_and(|entry| entry.1),
+        "rulesync_config": entries.get("rulesync.jsonc").is_some_and(|entry| !entry.1),
     }))
 }

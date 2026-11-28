@@ -372,19 +372,21 @@ impl<'a> PinnedAssets<'a> {
     fn check_status(&self, include_ignored: bool) -> Result<(), HiveError> {
         self.repository.verify_selection(self.root)?;
         self.repository
-            .check_clean(self.revision, include_ignored, true)?;
+            .check_clean(self.revision, CleanWorktree::Assets { include_ignored })?;
         self.repository.verify_selection(self.root)
     }
 }
 
 #[cfg(target_os = "linux")]
+enum CleanWorktree {
+    Assets { include_ignored: bool },
+    MigrationSource,
+}
+
+#[cfg(target_os = "linux")]
 impl AssetRepository {
-    fn check_clean(
-        &self,
-        revision: &str,
-        include_ignored: bool,
-        allow_submodules: bool,
-    ) -> Result<(), HiveError> {
+    fn check_clean(&self, revision: &str, worktree: CleanWorktree) -> Result<(), HiveError> {
+        let migration = matches!(worktree, CleanWorktree::MigrationSource);
         let command = || self.status_command();
         let check_head = || {
             let head = execute_asset(command()?.args(["rev-parse", "--verify", "HEAD"]), 65, None)?;
@@ -400,7 +402,7 @@ impl AssetRepository {
         check_head()?;
         let mut index = command()?;
         index.args(["ls-files", "-v", "-z"]);
-        if !allow_submodules {
+        if migration {
             index.arg("--stage");
         }
         let index = execute_asset(&mut index, 4 * 1024 * 1024, None)?;
@@ -411,8 +413,7 @@ impl AssetRepository {
                 .split(|byte| *byte == 0)
                 .filter(|entry| !entry.is_empty())
                 .any(|entry| {
-                    !entry.starts_with(b"H ")
-                        || (!allow_submodules && entry.starts_with(b"H 160000 "))
+                    !entry.starts_with(b"H ") || (migration && entry.starts_with(b"H 160000 "))
                 })
         {
             return Err(HiveError::new(
@@ -423,8 +424,17 @@ impl AssetRepository {
 
         let mut status = command()?;
         disable_status_filters(command()?, &mut status)?;
+        if migration {
+            // Permit .gitignore and .git/info/exclude independently of host settings.
+            status.args(["-c", "core.excludesFile=/dev/null"]);
+        }
         status.arg("status");
-        if include_ignored {
+        if matches!(
+            worktree,
+            CleanWorktree::Assets {
+                include_ignored: true
+            }
+        ) {
             status.arg("--ignored=matching");
         }
         let result = execute_asset(
@@ -432,10 +442,10 @@ impl AssetRepository {
                 "--porcelain=v1",
                 "-z",
                 "--untracked-files=normal",
-                if allow_submodules {
-                    "--ignore-submodules=none"
-                } else {
+                if migration {
                     "--ignore-submodules=all"
+                } else {
+                    "--ignore-submodules=none"
                 },
             ]),
             4 * 1024 * 1024,
@@ -881,18 +891,42 @@ fn verified_asset_object(
     oid: &str,
     limit: usize,
 ) -> Result<Vec<u8>, HiveError> {
-    let result = execute_asset(git()?.args(["cat-file", kind, oid]), limit, None)?;
+    // The batch response identifies the exact object and its type without
+    // peeling tags or interpreting a commit as a tree.
+    let mut result = execute_asset(
+        git()?.arg("cat-file").arg("--batch"),
+        limit + 96, // OID, type, decimal size, and line delimiters.
+        Some(format!("{oid}\n").as_bytes()),
+    )?;
     if !result.status.success() {
         return Err(unavailable_blob());
+    }
+    let mut response = result.stdout.splitn(2, |byte| *byte == b'\n');
+    let header = response.next().ok_or_else(unavailable_blob)?;
+    let body = response.next().ok_or_else(unavailable_blob)?;
+    let size = header
+        .strip_prefix(format!("{oid} {kind} ").as_bytes())
+        .and_then(|size| std::str::from_utf8(size).ok())
+        .and_then(|size| size.parse::<usize>().ok())
+        .ok_or_else(unavailable_blob)?;
+    let body = body.strip_suffix(b"\n").ok_or_else(unavailable_blob)?;
+    if body.len() != size {
+        return Err(unavailable_blob());
+    }
+    if size > limit {
+        return Err(asset_output_too_large());
     }
     let hash = execute_asset(
         git()?.args(["hash-object", "-t", kind, "--stdin", "--no-filters"]),
         65,
-        Some(&result.stdout),
+        Some(body),
     )?;
     if !hash.status.success() || git_line(&hash.stdout) != Some(oid.as_bytes()) {
         return Err(unavailable_blob());
     }
+    let start = header.len() + 1;
+    result.stdout.drain(..start);
+    result.stdout.pop();
     Ok(result.stdout)
 }
 
@@ -930,38 +964,64 @@ fn asset_config_value(
 }
 
 #[cfg(target_os = "linux")]
+struct AssetTreeEntry<'a> {
+    mode: &'a [u8],
+    name: &'a [u8],
+    oid: &'a [u8],
+}
+
+#[cfg(target_os = "linux")]
+impl AssetTreeEntry<'_> {
+    fn hex_oid(&self) -> String {
+        use std::fmt::Write;
+
+        let mut hex = String::with_capacity(2 * self.oid.len());
+        for byte in self.oid {
+            write!(hex, "{byte:02x}").expect("writing to a string cannot fail");
+        }
+        hex
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn take_asset_tree_entry<'a>(
+    tree: &mut &'a [u8],
+    oid_bytes: usize,
+) -> Result<AssetTreeEntry<'a>, HiveError> {
+    // Each raw tree entry is "<mode> <name>\0" plus a binary object ID.
+    let mut parts = tree.splitn(2, |byte| *byte == 0);
+    let header = parts.next().ok_or_else(unavailable_blob)?;
+    let rest = parts.next().ok_or_else(unavailable_blob)?;
+    let mut header = header.splitn(2, |byte| *byte == b' ');
+    let mode = header.next().ok_or_else(unavailable_blob)?;
+    let name = header.next().ok_or_else(unavailable_blob)?;
+    let (oid, rest) = rest
+        .split_at_checked(oid_bytes)
+        .ok_or_else(unavailable_blob)?;
+    *tree = rest;
+    Ok(AssetTreeEntry { mode, name, oid })
+}
+
+#[cfg(target_os = "linux")]
 fn asset_tree_child(
     mut tree: &[u8],
     name: &[u8],
     oid_bytes: usize,
     leaf: bool,
 ) -> Result<Option<String>, HiveError> {
-    use std::fmt::Write;
-
     let mut found = None;
     while !tree.is_empty() {
-        // Each raw tree entry is "<mode> <name>\0" plus a binary object ID.
-        let nul = tree
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or_else(unavailable_blob)?;
-        let mut header = tree[..nul].splitn(2, |byte| *byte == b' ');
-        let mode = header.next().ok_or_else(unavailable_blob)?;
-        let entry = header.next().ok_or_else(unavailable_blob)?;
-        let (oid, rest) = tree[nul + 1..]
-            .split_at_checked(oid_bytes)
-            .ok_or_else(unavailable_blob)?;
-        tree = rest;
-        if entry != name {
+        let entry = take_asset_tree_entry(&mut tree, oid_bytes)?;
+        if entry.name != name {
             continue;
         }
         if found.is_some() {
             return Err(unavailable_blob());
         }
         let matches_path_type = if leaf {
-            matches!(mode, b"100644" | b"100755")
+            matches!(entry.mode, b"100644" | b"100755")
         } else {
-            mode == b"40000"
+            entry.mode == b"40000"
         };
         if !matches_path_type {
             return Err(HiveError::new(
@@ -969,11 +1029,7 @@ fn asset_tree_child(
                 "The committed Soul path must use directories and end in a regular file.",
             ));
         }
-        let mut hex = String::with_capacity(2 * oid_bytes);
-        for byte in oid {
-            write!(hex, "{byte:02x}").expect("writing to a string cannot fail");
-        }
-        found = Some(hex);
+        found = Some(entry.hex_oid());
     }
     Ok(found)
 }
@@ -1036,7 +1092,7 @@ fn execute_asset(
     let mut stdout = Vec::new();
     let collected = (|| {
         if let Some(input) = input {
-            // hash-object consumes its input before writing a fixed-size object ID.
+            // These calls either consume all input first or send a single short OID.
             child.stdin.take().expect("piped stdin").write_all(input)?;
         }
         child
@@ -1053,16 +1109,21 @@ fn execute_asset(
     let status = child.wait().map_err(|_| io_error())?;
     collected.map_err(|_| io_error())?;
     if overflow {
-        return Err(HiveError::new(
-            ErrorCode::InvalidConfig,
-            "Git output for committed Soul inspection exceeds its size limit.",
-        ));
+        return Err(asset_output_too_large());
     }
     Ok(Output {
         status,
         stdout,
         stderr: Vec::new(),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn asset_output_too_large() -> HiveError {
+    HiveError::new(
+        ErrorCode::InvalidConfig,
+        "Git output for committed asset inspection exceeds its size limit.",
+    )
 }
 
 fn tree_blob_oid<'a>(entry: &'a [u8], path: &OsStr) -> Result<&'a str, HiveError> {
