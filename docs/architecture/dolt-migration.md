@@ -233,6 +233,27 @@ Portable `source_path` and `parent_task_path` locators use lowercase kebab-case 
 
 The report contains only source locators, digests, bounded labels, proposed Directive Area IDs, and hold or exclusion codes. Bodies, titles, actor and approval text, raw timestamps, and resource references stay in the source. All candidates remain held for review. No target IDs are allocated and no Dolt target is contacted.
 
+#### Read-only Queen Soul and historical Memory intake
+
+To include Bot assets in the same plan, add a `queen_assets` array to the version 1 mapping. Each entry binds a reviewed Bot identity to the committed Soul blob.
+
+```json
+{
+  "queen_assets": [
+    {
+      "slug": "example-queen",
+      "source_git_blob_sha": "2222222222222222222222222222222222222222"
+    }
+  ]
+}
+```
+
+Review the full committed Soul and its identity before listing the slug and blob ID. An empty array inventories the surfaces with no reviewed Souls. The planner accepts candidates with a single matching review, common v1 frontmatter, and the v1 Bot template's explicit identity and purpose sections. The ID must match the Bot directory and the Layer must be `1 — Manager`. Additional explicit identity declarations in headings or lists cause a hold. The planner inspects up to 64 KiB per Soul or root Memory entrypoint. Absent, stale, or repeated reviews, missing or invalid Souls, and ambiguous source identities are held as `invalid_soul_or_slug`. A symlink or other unsupported Git entry invalidates source preflight.
+
+Bot routing README files and Bot-tree `AGENTS.md` files are excluded as `management_only`. Root `MEMORY.md` qualifies as `navigation_only` when its frontmatter consists of a single quoted description, `Select memory navigation.` or `Memory navigation.`, and its body consists of a Memory heading followed by a plain list of links to existing scoped `MEMORY.md` files with labels matching their scopes. Other root Memory and files inside `memory/` are held as `curated_memory_deferred`, including scoped entrypoints.
+
+The plan reports candidates, holds, and exclusions under `queen_assets`. A candidate includes its Git blob ID, SHA-256 of the exact source bytes including frontmatter, and proposed asset path. The plan emits repository-relative paths when every component is portable. It retains the path digest for every record and uses it as the locator when any component is unportable. Target slug availability, asset commits, registry rows, and staged A15 verification require a later import step.
+
 ### 6. Issue Counters and Number Non-Reuse
 
 V1 identifies tasks by `(<project-id>, <work-id>)` with no workspace-wide numeric sequence. V2 assigns each imported Issue a fresh lowercase UUIDv7 (`issues.id`) and an immutable positive workspace-wide `issues.number` (`BIGINT UNSIGNED > 0`), backed by `workspace_counters` (`name = 'issue_number'`, `next_value`).
