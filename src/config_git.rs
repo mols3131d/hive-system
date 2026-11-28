@@ -378,16 +378,26 @@ impl<'a> PinnedAssets<'a> {
 }
 
 #[cfg(target_os = "linux")]
-enum CleanWorktree {
+enum CleanWorktree<'a> {
     Assets { include_ignored: bool },
-    MigrationSource,
+    MigrationSource { index: &'a Path },
 }
 
 #[cfg(target_os = "linux")]
 impl AssetRepository {
-    fn check_clean(&self, revision: &str, worktree: CleanWorktree) -> Result<Vec<u8>, HiveError> {
-        let migration = matches!(worktree, CleanWorktree::MigrationSource);
-        let command = || self.status_command();
+    fn check_clean(
+        &self,
+        revision: &str,
+        worktree: CleanWorktree<'_>,
+    ) -> Result<Vec<u8>, HiveError> {
+        let migration = matches!(worktree, CleanWorktree::MigrationSource { .. });
+        let command = || {
+            let mut command = self.status_command()?;
+            if let CleanWorktree::MigrationSource { index } = worktree {
+                command.env("GIT_INDEX_FILE", index);
+            }
+            Ok::<_, HiveError>(command)
+        };
         let check_head = || {
             let head = execute_asset(command()?.args(["rev-parse", "--verify", "HEAD"]), 65, None)?;
             if !head.status.success() || git_line(&head.stdout) != Some(revision.as_bytes()) {

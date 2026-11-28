@@ -14,6 +14,7 @@ const MAX_ENTRIES: usize = 10_000;
 const MAX_TREE_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EXCLUDE_BYTES: usize = 64 * 1024;
+const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveError> {
     if !source.is_absolute() || !is_full_lowercase_oid(revision) {
@@ -34,9 +35,37 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
     };
     verify_layout()?;
     let exclude = read_local_exclude(&repository.git_dir)?;
+    let source_index = read_local_index(&repository.git_dir)?;
+    let config = repository
+        .git_dir
+        .read(OsStr::new("config"))?
+        .unwrap_or_default();
+    let reader = AssetObjectReader::new(&repository.objects, &config, revision.len())?;
+    let git = || reader.command();
+    let index_path = reader.repository.path().join("index");
+    let unsupported_index = || {
+        HiveError::new(
+            ErrorCode::AuthorityUnverified,
+            "The v1 source must have a readable standalone Git index.",
+        )
+    };
+    fs::write(&index_path, &source_index).map_err(|_| unsupported_index())?;
+    // Decode the copy with no source Git directory or shared index available.
+    // A split index must fail here before status can refresh source metadata.
+    let index_probe = execute_asset(
+        git()?.args(["ls-files", "--stage", "-z"]),
+        4 * 1024 * 1024,
+        None,
+    )?;
+    if !index_probe.status.success() {
+        return Err(unsupported_index());
+    }
     let check_tracked = || {
         repository
-            .check_clean(revision, CleanWorktree::MigrationSource)
+            .check_clean(
+                revision,
+                CleanWorktree::MigrationSource { index: &index_path },
+            )
             .map_err(|error| {
                 let message = match error.code {
                     ErrorCode::StaleRevision => {
@@ -51,15 +80,7 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
             })
     };
     let index = check_tracked()?;
-
-    let config = repository
-        .git_dir
-        .read(OsStr::new("config"))?
-        .unwrap_or_default();
-    let reader = AssetObjectReader::new(&repository.objects, &config, revision.len())?;
-    let git = || reader.command();
-    let check_untracked =
-        prepare_untracked_check(&repository, &reader, &index, exclude.as_deref())?;
+    let check_untracked = prepare_untracked_check(&repository, &reader, exclude.as_deref())?;
     check_untracked()?;
     let tree = committed_asset_tree(&git, revision)?;
     let raw_tree = snapshot_object(&git, "tree", &tree, MAX_TREE_BYTES)?;
@@ -83,7 +104,9 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
         return Err(changed());
     }
     check_untracked()?;
-    if read_local_exclude(&repository.git_dir)? != exclude {
+    if read_local_exclude(&repository.git_dir)? != exclude
+        || read_local_index(&repository.git_dir)? != source_index
+    {
         return Err(changed());
     }
     verify_layout()?;
@@ -102,6 +125,23 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
         },
         "inventory": inventory,
     }))
+}
+
+fn read_local_index(git_dir: &ScopedDirectory) -> Result<Vec<u8>, HiveError> {
+    git_dir
+        .read_bounded(&[OsStr::new("index")], MAX_INDEX_BYTES)
+        .map_err(|error| {
+            HiveError::new(
+                error.code,
+                "Could not read the v1 source Git index within 16 MiB.",
+            )
+        })?
+        .ok_or_else(|| {
+            HiveError::new(
+                ErrorCode::AuthorityUnverified,
+                "The v1 source Git index is missing.",
+            )
+        })
 }
 
 fn read_local_exclude(git_dir: &ScopedDirectory) -> Result<Option<Vec<u8>>, HiveError> {
@@ -144,7 +184,6 @@ fn read_local_exclude(git_dir: &ScopedDirectory) -> Result<Option<Vec<u8>>, Hive
 fn prepare_untracked_check<'a>(
     repository: &'a AssetRepository,
     reader: &'a AssetObjectReader<'_>,
-    index: &[u8],
     exclude: Option<&[u8]>,
 ) -> Result<impl Fn() -> Result<(), HiveError> + 'a, HiveError> {
     let unverified = || {
@@ -159,20 +198,6 @@ fn prepare_untracked_check<'a>(
         fs::create_dir(&info)
             .and_then(|()| fs::write(info.join("exclude"), exclude))
             .map_err(|_| unverified())?;
-    }
-    let mut index_info = Vec::new();
-    for entry in index.split_inclusive(|byte| *byte == 0) {
-        index_info.extend_from_slice(entry.strip_prefix(b"H ").ok_or_else(unverified)?);
-    }
-    let index_setup = execute_asset(
-        reader
-            .command()?
-            .args(["update-index", "-z", "--index-info"]),
-        0,
-        Some(&index_info),
-    )?;
-    if !index_setup.status.success() {
-        return Err(unverified());
     }
     let setting = execute_asset(
         repository
@@ -194,6 +219,8 @@ fn prepare_untracked_check<'a>(
             command.env("GIT_WORK_TREE", worktree).args([
                 "-c",
                 "core.excludesFile=/dev/null",
+                "-c",
+                "core.untrackedCache=false",
                 "-c",
                 ignore_case,
                 "ls-files",

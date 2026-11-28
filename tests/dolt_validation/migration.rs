@@ -1259,6 +1259,61 @@ exec "$HOME/real-git" "$@"
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cli_preflight_refuses_a_split_index_without_refreshing_source_metadata() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    let commit = init_source(&source, &home);
+    git(&source, &home, &["update-index", "--split-index"]);
+    let git_dir = source.join(".git");
+    let shared = fs::read_dir(&git_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .as_encoded_bytes()
+                .starts_with(b"sharedindex.")
+        })
+        .unwrap();
+    let paths = [git_dir.join("index"), shared];
+    for path in &paths {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+            .unwrap();
+    }
+    let snapshot = || {
+        paths.each_ref().map(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                fs::read(path).unwrap(),
+                metadata.modified().unwrap(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        })
+    };
+    let before = snapshot();
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let report = migration_preflight(&home, &home, &args, 7);
+    assert_eq!(report["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert!(report.get("data").is_none_or(Value::is_null));
+    assert!(!report.to_string().contains("sharedindex."));
+    assert_eq!(snapshot(), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cli_preflight_rejects_a_truncated_task_blob_with_readable_size() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
