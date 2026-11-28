@@ -79,6 +79,7 @@ pub(super) struct Record {
 struct Classification {
     candidate: Result<CandidateStatus, Reason>,
     execution_needs_reconciliation: bool,
+    title_review_status: Option<CandidateStatus>,
 }
 
 pub(super) fn read_records(
@@ -120,6 +121,7 @@ pub(super) fn read_records(
             classification: Classification {
                 candidate: Err(Reason::MissingTaskEntrypoint),
                 execution_needs_reconciliation: false,
+                title_review_status: None,
             },
         };
         if let Some(blob) = inventory.entries.get(&readme)
@@ -402,7 +404,7 @@ impl Record {
         if let ScopeOutcome::Excluded { reason } = scope {
             return Ok((Outcome::Excluded { reason: *reason }, None));
         }
-        let reason_codes = self.hold_reasons(scope, !unique);
+        let mut reason_codes = self.hold_reasons(scope, !unique);
         let hold = |reason_codes| Outcome::Held {
             reason_codes,
             candidate_status: None,
@@ -420,9 +422,25 @@ impl Record {
             .as_ref()
             .ok()
             .and_then(|review| review.and_then(|review| review.relations.as_ref()));
-        let outcome = match self.classification.candidate {
-            Ok(status) if reason_codes.is_empty() => {
+        let outcome = match (
+            self.classification.candidate,
+            reason_codes.as_slice(),
+            binding,
+        ) {
+            (Ok(status), [], _) => {
                 self.candidate_outcome(status, &area.id, binding, source_bodies, git)?
+            }
+            (_, [Reason::MissingOrConflictingTitle], Ok(Some(review)))
+                if review.has_title()
+                    && let Some(status) = self.classification.title_review_status =>
+            {
+                self.candidate_outcome(status, &area.id, binding, source_bodies, git)?
+            }
+            (_, [Reason::MissingOrConflictingTitle], Err(reason))
+                if self.classification.title_review_status.is_some() =>
+            {
+                reason_codes.push(reason);
+                hold(reason_codes)
             }
             _ => hold(reason_codes),
         };
@@ -527,6 +545,7 @@ fn classify(bytes: &[u8], lifecycle: Lifecycle, claims_supported: bool) -> Class
     let mut classification = Classification {
         candidate: Err(Reason::UnsupportedTaskMetadata),
         execution_needs_reconciliation: false,
+        title_review_status: None,
     };
     let Some((header, body)) = split_record(bytes) else {
         return classification;
@@ -564,7 +583,13 @@ fn classify(bytes: &[u8], lifecycle: Lifecycle, claims_supported: bool) -> Class
     if !metadata.description.trim().is_empty() {
         classification.candidate = if state.is_ok() || classification.execution_needs_reconciliation
         {
-            validate_metadata(&metadata, body, lifecycle).and(state)
+            validate_metadata(&metadata, lifecycle).and_then(|()| {
+                if resolve_title(metadata.title.as_deref(), &metadata.description, body).is_err() {
+                    classification.title_review_status = state.ok();
+                    return Err(Reason::MissingOrConflictingTitle);
+                }
+                state
+            })
         } else {
             state
         };
@@ -606,11 +631,7 @@ fn classify_state(
     Ok(candidate)
 }
 
-fn validate_metadata(
-    metadata: &Frontmatter,
-    body: &str,
-    lifecycle: Lifecycle,
-) -> Result<(), Reason> {
+fn validate_metadata(metadata: &Frontmatter, lifecycle: Lifecycle) -> Result<(), Reason> {
     if metadata.priority.as_ref().is_some_and(|priority| {
         lifecycle == Lifecycle::Archive
             || !matches!(priority.as_str(), Some("high" | "normal" | "low"))
@@ -630,9 +651,6 @@ fn validate_metadata(
         {
             return Err(Reason::UnsupportedTaskMetadata);
         }
-    }
-    if resolve_title(metadata.title.as_deref(), &metadata.description, body).is_none() {
-        return Err(Reason::MissingOrConflictingTitle);
     }
     Ok(())
 }
@@ -667,20 +685,28 @@ pub(super) enum TitleSource {
     FrontmatterTitle,
     Heading,
     Description,
+    ReviewedFallback,
+    ReviewedOverride,
+}
+
+pub(super) enum TitleProblem {
+    Unavailable,
+    NeedsOverride,
+}
+
+pub(super) fn valid_title(value: &str) -> bool {
+    !value.trim().is_empty() && value.chars().count() <= 255 && !value.chars().any(char::is_control)
 }
 
 pub(super) fn resolve_title<'a>(
     title: Option<&'a str>,
     description: &'a str,
     body: &'a str,
-) -> Option<(&'a str, TitleSource)> {
-    let valid = |value: &str| {
-        !value.trim().is_empty()
-            && value.chars().count() <= 255
-            && !value.chars().any(char::is_control)
-    };
-    if let Some(title) = title.filter(|title| valid(title)) {
-        return Some((title, TitleSource::FrontmatterTitle));
+) -> Result<(&'a str, TitleSource), TitleProblem> {
+    if let Some(title) = title {
+        return valid_title(title)
+            .then_some((title, TitleSource::FrontmatterTitle))
+            .ok_or(TitleProblem::NeedsOverride);
     }
     // Recognize a leading ATX H1. Defer other plausible headings until full
     // Markdown parsing can distinguish headings from nested blocks and examples.
@@ -694,7 +720,7 @@ pub(super) fn resolve_title<'a>(
             h1(line) || (!line.is_empty() && line.bytes().all(|byte| byte == b'='))
         })
     {
-        return None;
+        return Err(TitleProblem::NeedsOverride);
     }
     let heading = first.get(1..).filter(|_| h1(first)).map(str::trim);
     let heading = heading.map(|value| {
@@ -706,7 +732,8 @@ pub(super) fn resolve_title<'a>(
         }
     });
     heading
-        .filter(|heading| valid(heading))
+        .filter(|heading| valid_title(heading))
         .map(|heading| (heading, TitleSource::Heading))
-        .or_else(|| valid(description).then_some((description, TitleSource::Description)))
+        .or_else(|| valid_title(description).then_some((description, TitleSource::Description)))
+        .ok_or(TitleProblem::Unavailable)
 }

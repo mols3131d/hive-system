@@ -6,9 +6,12 @@ use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use super::scope_plan::is_portable_scope;
-use super::task_intake::{CandidateStatus, TitleSource, parse_record, resolve_title};
+use super::task_intake::{
+    CandidateStatus, TitleProblem, TitleSource, parse_record, resolve_title, valid_title,
+};
 use super::{Reason, is_full_lowercase_oid};
 use crate::cli::is_slug;
+use crate::config_file::present;
 use crate::dolt::is_uuid_v7;
 use crate::error::{ErrorCode, HiveError};
 
@@ -20,11 +23,47 @@ pub(super) struct TaskReview {
     legacy_key: LegacyKey,
     source_git_blob_sha: String,
     area_id: String,
+    #[serde(default, deserialize_with = "present")]
+    issue_type: Option<IssueType>,
+    #[serde(default, deserialize_with = "present")]
+    title: Option<TitleReview>,
     pub(super) relations: Option<Relations>,
     created_at: Option<BodyRange>,
     updated_at: Option<BodyRange>,
     acceptance_criteria: Option<BodyRange>,
     closure: Option<ClosureReview>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum IssueType {
+    Epic,
+    Feature,
+    #[default]
+    Task,
+    Bug,
+}
+
+impl IssueType {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Task)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Epic => "epic",
+            Self::Feature => "feature",
+            Self::Task => "task",
+            Self::Bug => "bug",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+enum TitleReview {
+    Fallback { value: String },
+    Override { value: String },
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -166,10 +205,8 @@ impl<'a> Reviews<'a> {
 pub(super) struct SourceBody {
     text: String,
     body_start: usize,
-    title: String,
+    source_title: Result<(String, TitleSource), TitleProblem>,
     body_sha256: String,
-    title_source: TitleSource,
-    title_sha256: String,
     priority: Option<u8>,
     has_tags: bool,
 }
@@ -184,9 +221,8 @@ impl SourceBody {
         };
         let text = String::from_utf8(bytes).map_err(|_| invalid())?;
         let (metadata, body) = parse_record(&text).ok_or_else(invalid)?;
-        let (title, title_source) =
-            resolve_title(metadata.title.as_deref(), &metadata.description, body)
-                .ok_or_else(invalid)?;
+        let source_title = resolve_title(metadata.title.as_deref(), &metadata.description, body)
+            .map(|(title, source)| (title.to_owned(), source));
         let priority = match metadata.priority.as_ref().and_then(Value::as_str) {
             Some("high") => Some(0),
             Some("normal") => Some(1),
@@ -196,9 +232,7 @@ impl SourceBody {
         Ok(Self {
             body_start: text.len() - body.len(),
             body_sha256: format!("{:x}", Sha256::digest(body)),
-            title_source,
-            title_sha256: format!("{:x}", Sha256::digest(title)),
-            title: title.to_owned(),
+            source_title,
             priority,
             has_tags: metadata.tags.is_some(),
             text,
@@ -210,8 +244,12 @@ impl SourceBody {
 pub(super) struct Prepared {
     relations: PreparedRelations,
     body_sha256: String,
+    #[serde(skip)]
+    title: String,
     title_source: TitleSource,
     title_sha256: String,
+    #[serde(skip_serializing_if = "IssueType::is_default")]
+    issue_type: IssueType,
     priority: Option<u8>,
     created_at: Timestamp,
     updated_at: Timestamp,
@@ -293,6 +331,8 @@ struct BodyEvidence {
 
 pub(crate) struct StagingFields<'a> {
     pub(crate) title: &'a str,
+    pub(crate) title_sha256: &'a str,
+    pub(crate) issue_type: &'static str,
     pub(crate) body: &'a str,
     pub(crate) body_sha256: &'a str,
     pub(crate) criteria: Option<&'a str>,
@@ -323,7 +363,9 @@ impl Prepared {
         let body = &source.text[source.body_start..];
         let selected = |range: BodyRange| range.select(body).expect("verified Task body range");
         let mut fields = StagingFields {
-            title: &source.title,
+            title: &self.title,
+            title_sha256: &self.title_sha256,
+            issue_type: self.issue_type.as_str(),
             body,
             body_sha256: &self.body_sha256,
             criteria: self
@@ -439,6 +481,30 @@ impl Relations {
 }
 
 impl TaskReview {
+    pub(super) fn has_title(&self) -> bool {
+        self.title.is_some()
+    }
+
+    fn selected_title<'a>(&'a self, source: &'a SourceBody) -> Option<(&'a str, TitleSource)> {
+        match &self.title {
+            None => source
+                .source_title
+                .as_ref()
+                .ok()
+                .map(|(title, source)| (title.as_str(), *source)),
+            Some(TitleReview::Override { value }) if valid_title(value) => {
+                Some((value, TitleSource::ReviewedOverride))
+            }
+            Some(TitleReview::Fallback { value })
+                if matches!(source.source_title, Err(TitleProblem::Unavailable))
+                    && valid_title(value) =>
+            {
+                Some((value, TitleSource::ReviewedFallback))
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn prepare(
         &self,
         source: &SourceBody,
@@ -460,7 +526,11 @@ impl TaskReview {
         let criteria = self
             .acceptance_criteria
             .and_then(|range| BodyEvidence::select(range, body, fits_text_column));
+        let title = self.selected_title(source);
         let mut reasons = Vec::new();
+        if title.is_none() {
+            reasons.push(Reason::MissingOrConflictingTitle);
+        }
         if dates.is_none()
             || (terminal && closure.is_none())
             || (!terminal && self.closure.is_some())
@@ -482,11 +552,14 @@ impl TaskReview {
             return Err(reasons);
         }
         let ((created_at, _), (updated_at, _)) = dates.expect("validated dates");
+        let (title, title_source) = title.expect("validated Task title");
         Ok(Prepared {
             relations: relations.expect("validated Task relations"),
             body_sha256: source.body_sha256.clone(),
-            title_source: source.title_source,
-            title_sha256: source.title_sha256.clone(),
+            title: title.to_owned(),
+            title_source,
+            title_sha256: format!("{:x}", Sha256::digest(title)),
+            issue_type: self.issue_type.unwrap_or_default(),
             priority: source.priority,
             created_at,
             updated_at,
