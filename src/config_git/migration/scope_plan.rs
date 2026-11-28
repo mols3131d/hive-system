@@ -6,16 +6,25 @@ use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag, TagEnd};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 use url::{Host, Url};
 
+use super::prepared_records::Intake;
+use super::queen_assets::{self, QueenAssets, SoulReview};
+use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
+use super::reviewed_records::{Review, timestamp};
+use super::task_provenance::TaskReview;
 use super::{
-    AssetObjectReader, Inventory, Reason, SourceSnapshot, is_portable_bot_memory_locator,
-    snapshot_object, verified_source,
+    AssetObjectReader, Inventory, Reason, SourceSnapshot, directive_artifact_intake,
+    is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
 };
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
 use crate::dolt::{is_uuid, is_uuid_v7};
 use crate::error::{ErrorCode, HiveError};
+
+mod resources;
+pub(crate) use resources::{Hold as ResourceHold, PreparedResources};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +34,15 @@ struct Mapping {
     policy_pin: String,
     workspace_id: String,
     scopes: Vec<ScopeMapping>,
+    #[serde(default)]
+    task_reviews: Vec<TaskReview>,
+    queen_assets: Option<Vec<SoulReview>>,
+    #[serde(default, deserialize_with = "QueenMapping::optional_list")]
+    queen_preparation: Option<Vec<QueenMapping>>,
+    #[serde(default, deserialize_with = "resources::deserialize_section")]
+    resource_bindings: Option<resources::Bindings>,
+    reviewed_records: Option<Vec<Review>>,
+    directive_observed_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -56,7 +74,7 @@ pub(crate) struct Area {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProjectEvidence {
+pub(super) struct ProjectEvidence {
     path: String,
     canonical_ref: String,
 }
@@ -68,15 +86,22 @@ struct Scope<'a> {
 }
 
 pub(super) enum ScopeOutcome<'a> {
-    Mapped { area: &'a Area },
-    Held { reason: Reason },
-    Excluded { reason: Reason },
+    Mapped {
+        area: &'a Area,
+        evidence: &'a [ProjectEvidence],
+    },
+    Held {
+        reason: Reason,
+    },
+    Excluded {
+        reason: Reason,
+    },
 }
 
 impl Scope<'_> {
     fn report(&self) -> Value {
         let outcome = match self.outcome {
-            ScopeOutcome::Mapped { area } => json!({
+            ScopeOutcome::Mapped { area, .. } => json!({
                 "status": "mapped",
                 "area": {"id": area.id, "slug": area.slug, "parent_id": area.parent_id},
             }),
@@ -112,34 +137,115 @@ pub(crate) fn plan(
     revision: &str,
     workspace_id: &str,
     mapping_file: &Path,
+    include_tasks: bool,
+    include_directives_artifacts: bool,
 ) -> Result<Value, HiveError> {
     with_scope_mapping(source, revision, workspace_id, mapping_file, |reviewed| {
-        Ok(json!({
+        if !include_directives_artifacts
+            && (reviewed.mapping.reviewed_records.is_some()
+                || reviewed.directive_observed_at.is_some())
+        {
+            return Err(invalid(
+                "Reviewed records require --include-directives-artifacts.",
+            ));
+        }
+        let mut report = json!({
             "mode": "scope_plan",
-            "mapping_version": reviewed.mapping_version,
+            "mapping_version": reviewed.mapping.version,
             "mapping_sha256": reviewed.mapping_sha256,
             "source": reviewed.source,
-            "inventory": reviewed.inventory,
+            "inventory": reviewed.inventory.summary,
             "target": {"workspace_id": workspace_id},
             "scopes": reviewed.scopes.iter().map(Scope::report).collect::<Vec<_>>(),
-        }))
+        });
+        if include_directives_artifacts {
+            report["directive_artifact_intake"] = reviewed.scan_directive_artifacts(false)?.report;
+            if let Some(observed_at) = reviewed.directive_observation() {
+                report["directive_observed_at"] = json!(observed_at);
+            }
+        }
+        if include_tasks {
+            report["task_intake"] = reviewed.prepare_tasks()?.report();
+        }
+        if let Some(assets) = &reviewed.queen_assets {
+            report["queen_assets"] = json!(assets);
+        }
+        if let Some((summary, _)) = &reviewed.queen_preparation {
+            report["queen_preparation"] = summary.clone();
+        }
+        if let Some(resources) = &reviewed.resources {
+            report["resource_bindings"] = resources.report();
+        }
+        Ok(report)
     })
 }
 
 pub(crate) struct ReviewedScopes<'a> {
     source: &'a SourceSnapshot<'a>,
-    inventory: &'a Value,
-    mapping_version: u32,
+    inventory: &'a Inventory,
+    reader: &'a AssetObjectReader<'a>,
+    mapping: &'a Mapping,
+    pub(crate) resources: Option<PreparedResources<'a>>,
+    queen_assets: Option<QueenAssets<'a>>,
+    queen_preparation: Option<(Value, Vec<PreparedQueen>)>,
+
+    directive_observed_at: Option<OffsetDateTime>,
     mapping_sha256: String,
     scopes: Vec<Scope<'a>>,
 }
 
 impl ReviewedScopes<'_> {
+    pub(crate) fn prepared_queens(&self) -> &[PreparedQueen] {
+        self.queen_preparation
+            .as_ref()
+            .map_or(&[], |(_, souls)| souls.as_slice())
+    }
+
+    pub(crate) fn prepare_tasks(&self) -> Result<task_intake::TaskPlan<'_>, HiveError> {
+        let outcomes = self
+            .scopes
+            .iter()
+            .map(|scope| (scope.scope, &scope.outcome))
+            .collect();
+        let git = || self.reader.command();
+        let claims_supported = !self.source.hive_yml.is_null();
+        let records = task_intake::read_records(self.inventory, &git, claims_supported)?;
+        task_intake::prepare(records, &outcomes, &self.mapping.task_reviews, &git)
+    }
+
+    pub(crate) fn directive_artifacts_for_staging(&self) -> Result<Option<Intake>, HiveError> {
+        self.mapping
+            .reviewed_records
+            .as_ref()
+            .map(|_| self.scan_directive_artifacts(true))
+            .transpose()
+    }
+
+    pub(crate) fn directive_observation(&self) -> Option<&str> {
+        self.mapping.directive_observed_at.as_deref()
+    }
+
+    fn scan_directive_artifacts(&self, prepare_storage: bool) -> Result<Intake, HiveError> {
+        let scopes = self
+            .scopes
+            .iter()
+            .map(|scope| (scope.scope, &scope.outcome))
+            .collect();
+        directive_artifact_intake::scan(
+            self.inventory,
+            self.reader,
+            &scopes,
+            self.mapping.reviewed_records.as_deref(),
+            self.directive_observed_at,
+            prepare_storage,
+        )
+    }
+
     pub(crate) fn areas_in_parent_order(&self) -> Result<Vec<&Area>, HiveError> {
         let mut ids = BTreeSet::new();
         let mut children = BTreeMap::<Option<&str>, Vec<&Area>>::new();
         for scope in &self.scopes {
-            if let ScopeOutcome::Mapped { area } = scope.outcome {
+            if let ScopeOutcome::Mapped { area, .. } = scope.outcome {
                 ids.insert(area.id.as_str());
                 children
                     .entry(area.parent_id.as_deref())
@@ -190,7 +296,7 @@ impl ReviewedScopes<'_> {
             let mut entry =
                 json!({"scope_sha256": scope_sha256, "source_path_sha256s": source_path_sha256s});
             match scope.outcome {
-                ScopeOutcome::Mapped { area } => {
+                ScopeOutcome::Mapped { area, .. } => {
                     entry["area_id"] = json!(area.id);
                     entry["parent_area_id"] = json!(area.parent_id);
                     id_map.push(entry);
@@ -205,12 +311,12 @@ impl ReviewedScopes<'_> {
                 }
             }
         }
-        json!({
+        let mut report = json!({
             "coverage": "scope_only",
-            "mapping_version": self.mapping_version,
+            "mapping_version": self.mapping.version,
             "mapping_sha256": self.mapping_sha256,
             "source": self.source,
-            "inventory": self.inventory,
+            "inventory": self.inventory.summary,
             "counts": {"scopes": {
                 "inventoried": self.scopes.len(), "imported": id_map.len(), "held": holds.len(),
                 "excluded_non_record": exclusions.len(),
@@ -218,7 +324,15 @@ impl ReviewedScopes<'_> {
             "id_map": id_map,
             "holds": holds,
             "exclusions": exclusions,
-        })
+        });
+        if let Some((summary, _)) = &self.queen_preparation {
+            report["coverage"] = json!("scopes_and_queen_souls");
+            report["queen_preparation"] = summary.clone();
+        }
+        if let Some(assets) = &self.queen_assets {
+            report["queen_inventory"] = assets.staging_inventory();
+        }
+        report
     }
 }
 
@@ -243,6 +357,14 @@ pub(crate) fn with_scope_mapping<T>(
     if mapping.version != 1 {
         return Err(invalid("The scope mapping version is unsupported."));
     }
+    let directive_observed_at = mapping
+        .directive_observed_at
+        .as_deref()
+        .map(|value| {
+            timestamp(value)
+                .ok_or_else(|| invalid("Directive observation requires a UTC timestamp."))
+        })
+        .transpose()?;
 
     verified_source(source, revision, |source, inventory, reader| {
         if mapping.source_commit != source.source_commit
@@ -255,10 +377,39 @@ pub(crate) fn with_scope_mapping<T>(
         }
 
         let scopes = classify_scopes(inventory, &mapping.scopes, reader)?;
+        let mut preparation = mapping
+            .queen_preparation
+            .as_deref()
+            .map(Preparation::new)
+            .transpose()?;
+        let queen_assets = (mapping.queen_assets.is_some() || preparation.is_some())
+            .then(|| {
+                queen_assets::classify(
+                    inventory,
+                    reader,
+                    mapping.queen_assets.as_deref().unwrap_or_default(),
+                    |slug, oid, digest, bytes| {
+                        if let Some(preparation) = &mut preparation {
+                            preparation.accept_candidate(slug, oid, digest, bytes);
+                        }
+                    },
+                )
+            })
+            .transpose()?;
+        let resources = mapping
+            .resource_bindings
+            .as_ref()
+            .map(|bindings| bindings.prepare(inventory, &scopes))
+            .transpose()?;
         inspect(ReviewedScopes {
             source,
-            inventory: &inventory.summary,
-            mapping_version: mapping.version,
+            inventory,
+            reader,
+            mapping: &mapping,
+            directive_observed_at,
+            queen_assets,
+            queen_preparation: preparation.map(Preparation::finish),
+            resources,
             mapping_sha256: format!("{:x}", Sha256::digest(input)),
             scopes,
         })
@@ -361,7 +512,10 @@ fn classify_scopes<'a>(
                             &mut references,
                         )?) =>
                 {
-                    ScopeOutcome::Mapped { area }
+                    ScopeOutcome::Mapped {
+                        area,
+                        evidence: project_evidence,
+                    }
                 }
                 _ => ScopeOutcome::Held {
                     reason: Reason::AmbiguousScopeOrCollision,
@@ -615,7 +769,7 @@ fn prose_url(token: &str) -> &str {
     token
 }
 
-fn portable_reference(reference: &str) -> bool {
+pub(super) fn portable_reference(reference: &str) -> bool {
     if reference.len() > MAX_FILE_BYTES
         || !reference.starts_with("https://")
         || !reference.is_ascii()

@@ -204,11 +204,193 @@ A completed plan returns `mode: scope_plan`, the verified source and inventory s
 
 The report emits portable legacy scope keys in `scope` and their portable relative directories in `source_paths`. A malformed scope key appears as `scope_sha256`. Bot IDs and ordinary Memory scope components use lowercase kebab-case of up to 100 bytes and exclude Windows device names. Memory scopes also allow `_general` and `_hive-userdata`. The report lists paths with a nonportable component in `source_path_sha256s` in original path order. Each locator is the lowercase SHA-256 of the exact UTF-8 scope key or full relative directory path, with no separator, newline or normalization added. To resolve a locator locally, enumerate scope directories from the report's exact `source_commit` in the authorized v1 repository. Hash the matching kind of field from the committed tree and compare it with the locator.
 
-The workspace ID identifies the intended target for review. Actual target identity, Area ancestry, and target constraints require validation at the later staging step. Projects, resources, record mapping, staged writes, rollback, the A15 report, and live cutover are outside this command's scope.
+The workspace ID identifies the intended target for review. Actual target identity, Area ancestry, and target constraints require validation at staging.
 
-#### Disposable scope staging
+##### Optional Resource bindings
 
-On Linux, use the installed CLI with the workspace initialization policy revision and the reviewed scope mapping. The target must be an absent absolute path under an existing local parent, separate from the source. The command refuses an occupied path or a path registered as the active root for the selected workspace ID.
+Add the following top-level `resource_bindings` object to a version 1 scope mapping to prepare an explicit `resources` row and its `area_resources` link. Omit the object to leave Resource preparation out of the plan.
+
+```json
+{
+  "version": 1,
+  "bindings": [
+    {
+      "scope": "example-app",
+      "area_id": "00000000-0000-7000-8000-000000000002",
+      "resource": {
+        "id": "00000000-0000-7000-8000-000000000003",
+        "kind": "git-repo",
+        "name": "Example App Repository"
+      },
+      "evidence_path": "tasks/example-app/README.md",
+      "evidence_blob_oid": "2222222222222222222222222222222222222222"
+    }
+  ]
+}
+```
+
+Version 1 accepts the JSON string `"git-repo"` for `kind`. Supply the exact lowercase UUIDv7 of the reviewed Resource and the UUIDv7 of its mapped Area. Use a reviewed display name of 1–255 characters with no control characters or surrounding whitespace. Use the exact README path and committed Git blob OID from a `tasks/` or `directives/` entrypoint in that scope's verified project evidence. The same source commit, policy pin, and destination workspace bind both decisions. The planner uses the literal canonical HTTPS reference already verified for the scope and checks that it fits the schema's `TEXT` field. The binding accepts only the evidence locator. It performs no network access, URL rewriting, or link inference.
+
+The section requires a `bindings` array of objects. Each entry requires a `resource` object. The section rejects nulls, unknown fields, repeated members, unsupported versions or kinds, invalid IDs or names, and unknown scopes. A binding to a held or external scope, a different Area ID, or a missing or mismatched verified README or blob is held. The planner holds otherwise eligible bindings whose Resource ID or Unicode-lowercased name appears more than once in the section. Submit unique bindings. Resource deduplication, additional kinds, and evidence from Memory or record links are outside version 1.
+
+The report lists Resource outcomes in manifest order. A prepared outcome contains the Resource ID, Area ID and SHA-256 of the exact URI bytes. A held outcome contains the Resource ID and a reason code. Prepared rows remain internal, including the Resource name, kind, and URI. Preparing an Area link creates no Project membership, Issue link, or standalone Artifact link provenance.
+
+#### Read-only Task intake and preparation
+
+Add `--tasks` to the scope plan command to classify Task bundles in the same verified snapshot using the same scope decisions and mapping file. The result adds `task_intake` with `coverage: partial`, counts of inventoried, prepared, held, and excluded bundles, and outcomes sorted by `(scope, work_id, source_path)`. Prepared, held, and excluded counts sum to the inventoried count. It inventories immediate bundle directories in the three v1 lifecycle directories. Scope navigation and supporting files stay in the verified source inventory. An absent regular `README.md` yields the bundle path, null blob digests, and a `missing_task_entrypoint` hold when the bundle otherwise qualifies for inspection.
+
+Every outcome uses the report's exact `source.source_commit` and the entrypoint's source-relative path, Git blob ID, and raw SHA-256 when present. For a malformed scope or work ID, the Task row carries the exact path's UTF-8 SHA-256 in `source_path_sha256` and omits `legacy_key` and `source_path`. Row counts and ordering still use the full verified inventory.
+
+External ownership excludes the Task. For all other scopes, duplicate qualified keys across lifecycle directories hold every conflicting bundle, and unresolved scope decisions carry through to their Tasks even when a duplicate hold also applies. When the status and claim are independently readable under the committed pin, the planner retains an execution reconciliation hold alongside unrelated metadata errors, including repeated unrelated keys. A repeated status, claim, claim ID, or claim holder makes the execution evidence ambiguous. The planner supports both preflight policy pins and applies claim rules according to the committed pin. Titles, body and criteria text, claim details, and review or closure text stay in the source.
+
+The initial title check supports a valid frontmatter title, a leading unindented ATX H1, or the description fallback. Potential later, nested, or Setext H1s require title reconciliation when frontmatter supplies no valid title. Omission allows title fallback, and an explicit null title yields an `unsupported_task_metadata` hold. The current scope manifest has no title override. Invalid or unsupported frontmatter yields a typed hold.
+
+To prepare backlog, unclaimed todo, or terminal Tasks supported by intake, add an optional top-level `task_reviews` array to the version 1 scope mapping. First run intake to get each qualified key and its committed README blob ID. Each review uses the following fields.
+
+| Field | Reviewed input |
+| --- | --- |
+| `legacy_key` | Object with `scope` and `work_id` exactly as shown in intake. |
+| `source_git_blob_sha` | Full lowercase Git blob ID for that Task's committed README. |
+| `area_id` | The exact UUIDv7 from that scope's resolved Area mapping. The manifest header binds the reviews to the verified source commit, policy pin, and intended workspace ID. |
+| `relations` | Use the reviewed relation object below for terminal Tasks and for any Task with edges. For independent backlog and todo Tasks, `"no_edges"` remains available after reviewing all incident relations across the snapshot. Use `"unresolved"` or omit the field when obligations are uncertain or still under review. |
+| `created_at`, `updated_at` | Objects with integer `start` and `end` selecting the respective date values in the body. Use the exact RFC 3339 literals with a known offset and up to six fractional digits. Dates must fit the target UTC date range and the update must be at or after creation. Missing, malformed, unrepresentable, or reversed dates hold as `incomplete_historical_provenance`. |
+| `acceptance_criteria` | The same range format, selecting the exact nonblank criteria text. Required for todo and optional otherwise. A required but missing range or an invalid range holds as `unverified_acceptance_criteria`. The selected text must fit the target SQL `TEXT` byte limit. |
+| `closure` | Required for active or archived done and archived cancelled Tasks. Supply `closed_at`, `closed_by_ref`, and `resolution_note` as body ranges. Select a recorded closure date at or after creation, an explicit actor reference of at most 255 characters, and the exact nonblank outcome text within the SQL `TEXT` byte limit. Preserve a later recorded update after closure. A missing or invalid closure field holds as `incomplete_historical_provenance`. |
+
+Ranges are zero-based, half-open UTF-8 byte offsets from the first byte after the closing YAML delimiter line, including its newline when present. Count bytes in the exact source body and preserve its line endings. The reviewer selects evidence that actually establishes the timestamps and criteria, and checks for conflicts in the source. The planner verifies the selected bytes, types, and chronology. It uses no Git commit dates, timestamp defaults, or prose-derived graph edges.
+
+Review the entire snapshot for relations, including links across scopes and to held Tasks. The relation object requires `parent` (a qualified key or null), `prerequisites` (an array of qualified keys), and `children` (an array of objects with `legacy_key`) for preparation. Use empty arrays after reviewing that there are no obligations in those directions. The child and parent must agree on parentage. Each dependent declares its own prerequisites, and an incoming prerequisite reference conflicts with a `"no_edges"` declaration on its target.
+
+For each cancelled immediate child of a done parent, add `scope_acceptance` to that child entry in the parent's review. Select the exact text in the parent's committed README that records historical acceptance of the changed scope for that child. A new migration review by itself supplies no historical acceptance. Other child entries omit this field. Evidence outside the reviewed README remains held in this slice.
+
+The planner checks acyclicity across the combined dependent-to-prerequisite and parent-to-child graph. Every referenced endpoint must itself be prepared. Done requires done prerequisites and terminal children, plus the historical scope acceptance for cancelled children. Missing, contradictory, cyclic, or held obligations keep the affected done Task held as `unresolved_completion_obligation`. Other affected statuses hold as `unresolved_task_relations`. Holds propagate to dependents and parents and also to children that would otherwise lose their parent reference.
+
+An omitted review keeps the original provenance holds. Repeated reviews for the same key hold as `conflicting_task_review`, and a stale blob or different mapped Area holds as `task_review_binding_mismatch`. Unsupported keys and malformed review identifiers invalidate the mapping input. Tagged Tasks in this slice hold as `unverified_task_labels` pending label and collation checks.
+
+A `prepared` outcome records the candidate status and mapped Area ID, exact timestamp literals and their body ranges, the extracted body SHA-256, the resolved title's source and SHA-256, and the mapped priority for backlog and active records when present. Archive priority remains null. It records qualified parent, prerequisite, and child references, sorted by qualified key within each list. Criteria, closure actor, resolution, and cancellation scope acceptance selections appear only as body ranges and SHA-256. Digests cover the exact UTF-8 bytes of the extracted values. The report records preparation and assigns no Issue identity, operational status, or number. The planner reads the verified Git source and the manifest without opening a target workspace or modifying or deleting any legacy archive.
+
+Execution and unclaimed review holds still apply even when a Task has a review entry. Reconcile execution by verifying stop and ownership and review by supplying typed submission evidence. Title overrides and label projection remain downstream.
+
+#### Read-only Directive and Artifact intake
+
+Add `--include-directives-artifacts` to `workspace migration-plan` to produce the partial `directive_artifact_intake` report. The CLI uses the same version 1 scope mapping and reads selected Markdown by verified Git blob ID during the same source checks. Each row gives a workspace-relative source locator, surface, Git blob ID, byte size, and outcome. `source_raw_sha256` is populated for blobs read for metadata inspection. Without reviewed records, each surface count reconciles `inventoried` with `held` and `excluded`. Exit status zero means the requested classification completed.
+
+Portable `source_path` and `parent_task_path` locators use lowercase kebab-case components, known reserved scope IDs and fixed entrypoint names, and lowercase alphanumeric file extensions. For a locator with any malformed component, the report emits `source_path_sha256` or `parent_task_path_sha256` in place of the path. Each digest covers the exact UTF-8 bytes of the full workspace-relative path. Held and excluded records follow the same rules.
+
+- Intake inventories committed files below `directives/`, `artifacts/`, and `tasks/<scope>/<backlog|active|archive>/<work-id>/artifacts/`. Surface navigation and recognized Directive bundle support files are excluded. Single-file and bundle Directives with the same scope and slug are held. Artifact bundle members beyond the entrypoint need explicit review. Reviewed external scope exclusions and holds for unresolved or unsplit scopes apply to records under those scopes.
+- Candidate metadata comes from a direct Markdown file or a bundle `README.md`. Intake limits each inspected Markdown blob to 256 KiB and its YAML frontmatter to 64 KiB under the existing bounded YAML parser. Status and kind labels must be string scalars. Optional metadata fields may be omitted, and explicit nulls trigger holds. Title discovery uses Markdown structure to find top-level ATX and Setext H1 headings. It holds conflicting heading text when a valid frontmatter title is unavailable. Non-Markdown Artifact files, non-text Markdown, and Git LFS pointers need reviewed owner or Resource mappings. Intake uses only the committed snapshot and leaves referenced files and URLs unresolved.
+- Directive candidates report the bounded v1 status and reviewed Area proposal without descendant inheritance. All require reviewed historical provenance. Active candidates also require verified approval and validity. Superseded candidates need graph reconciliation. The complete graph, including possible replacement endpoints of any status, needs a reviewed migration manifest before readiness can be established.
+- Artifact candidates report an explicit v1 kind and any bounded lifecycle label. Review still needs author and source provenance and the original retention clock. Work-scoped rows include the legacy parent bundle path and require a verified Task outcome before they can link to an Issue. Standalone candidates carry no inferred joins.
+
+Without reviewed records, the report contains only source locators, digests, bounded labels, proposed Directive Area IDs, and hold or exclusion codes. All candidates remain held for review.
+
+#### Preparing explicitly reviewed records
+
+Add a `reviewed_records` array to the version 1 mapping and pass `--include-directives-artifacts`. Each entry binds a committed `source_path` and its `source_git_blob_sha` to a distinct lowercase UUIDv7 `target_id` in the mapping's selected workspace. The mapping header binds this review to the exact verified source commit and policy pin. A mismatched path or blob, repeated path or target ID, or malformed declaration fails with `INVALID_CONFIG`.
+
+The following example shows the `reviewed_records` array for a synthetic unlinked proposal and standalone Artifact.
+
+```json
+[
+  {
+    "source_path": "directives/_general/proposal.md",
+    "source_git_blob_sha": "0000000000000000000000000000000000000001",
+    "target_id": "01900000-0000-7000-8000-000000000411",
+    "provenance": {
+      "kind": "proposed_directive",
+      "area_id": "01900000-0000-7000-8000-000000000101",
+      "issuer_ref": "human:synthetic-operator",
+      "source_ref": "https://forge.example/synthetic/review/1",
+      "created_at": "2024-02-29T12:00:00Z",
+      "updated_at": "2024-03-01T12:00:00Z",
+      "supersession": "none",
+      "approval_and_validity": "none"
+    }
+  },
+  {
+    "source_path": "artifacts/report.md",
+    "source_git_blob_sha": "0000000000000000000000000000000000000002",
+    "target_id": "01900000-0000-7000-8000-000000000511",
+    "provenance": {
+      "kind": "standalone_artifact",
+      "artifact_kind": "report",
+      "author_ref": "bot:synthetic-author",
+      "source_ref": "https://forge.example/synthetic/review/2",
+      "created_at": "2024-02-29T12:00:00Z",
+      "substantive_updated_at": "2024-03-01T12:00:00Z",
+      "links": "none",
+      "archive": "none"
+    }
+  }
+]
+```
+
+- A single-file proposed Directive requires the Area ID returned by scope planning and keeps `include_descendants` false. Set `supersession` to `none` only after reviewing possible incoming and outgoing edges in the exact snapshot, including references from other Directives. Set `approval_and_validity` to `none` only after confirming that approval and validity fields have no historical values to preserve. `unresolved` holds the record for either field.
+- A root-level standalone Markdown Artifact requires a reviewed kind identical to the explicit supported v1 kind. Set `links` to `none` only after confirming that the Artifact needs zero Area, Project, Issue, or Resource joins and no reference rewrites. Set `archive` to `none` after confirming that there is no historical archival decision to preserve. `unresolved` holds the record for either field. The legacy lifecycle label remains provenance metadata.
+- Each review supplies an actual historical source reference and the actor and timestamps it supports. Use a portable HTTPS reference with the same syntax as scope planning, and an actor identifier of up to 255 bytes in lowercase kebab-case with an optional `namespace:` prefix. Supply UTC RFC 3339 timestamps ending in `Z` with zero to six fractional digits, using years 1000–9999. Update and retention timestamps must be at or after creation. The CLI validates these fields and their binding to the source snapshot. The operator verifies historical facts and any referenced evidence during review.
+
+A qualifying row reports `outcome.status: prepared`, the selected target ID and scoped candidate metadata, the reviewed dates, and the SHA-256 digests of the source and actor references. `source_raw_sha256` covers the entire committed blob. `target_body_sha256` covers every byte after the closing frontmatter delimiter and its line ending, including leading blank lines, CRLF, trailing spaces, and any final newline. The content stays intact. `target_title_sha256` covers the UTF-8 title selected by intake. The report adds a `prepared` count per surface so `inventoried = prepared + held + excluded`.
+
+The preparation report is partial and read-only. Unreviewed candidates, Artifact bundles, and work-scoped Artifacts remain subject to the intake hold rules. Target identity and constraints still require a later inactive-target staging check.
+
+#### Preparing Directive history and supersession
+
+Use `provenance.kind` of `directive_history` for reviewed Directive history. The same `source_path`, `source_git_blob_sha`, and `target_id` fields bind the review to a committed single file or bundle entrypoint. The provenance has `status`, `area_id`, `issuer_ref`, `source_ref`, `created_at`, and `updated_at` fields. The declared status must match committed v1 frontmatter, and the Area must match the scope outcome. All prepared Directives in this plan have `include_descendants` set to false.
+
+Supply `approval_and_validity` as an object with `state` of `reviewed` and optional `approval_ref`, `valid_from`, and `expires_at`. `reviewed` means the operator verified each value against the exact source and its historical evidence, including the absence of omitted fields. An approval reference uses a portable HTTPS URL or the same syntax as an actor identifier. The report hashes the reference. Use `state` of `unresolved` to hold a Directive whose historical approval or validity is uncertain.
+
+An `active` Directive requires an approval reference and `directive_observed_at` in the mapping header. The planner validates and reports that declared UTC timestamp and uses it for every active Directive in the plan. Validity includes `valid_from` and excludes `expires_at`. A verified absent bound leaves that end open. The observation must be at or after the source's reviewed update. A missing approval, unavailable or invalid validity, or an expired active Directive holds the record. Withdrawn and superseded Directives retain their reviewed historical fields, including past validity dates. The report supplies migration provenance. Runtime activation authority requires its own evidence.
+
+Supply `supersession` as an object with `state` of `reviewed` after reviewing possible edges across the committed snapshot. A superseded Directive can declare `replacement` as the legacy key `directives/<scope>/<slug>` without a filename extension or bundle entrypoint suffix. The replacement can optionally declare `replaces` as the predecessor's legacy key to confirm the same edge. Both keys resolve to exact entrypoints bound by their own reviews. Use `directive_history` for either endpoint, including a proposed replacement. A review with `state` of `unresolved` holds the record.
+
+The planner writes the predecessor's target ID into the replacement's reported `supersedes_id`. Replacement status does not affect edge direction. A missing, unreviewed, held, ambiguous, or self-referential endpoint, a cycle, or a conflicting or multiple edge holds the affected chain as `invalid_supersession_chain`. Excluded source records stay excluded. Counts reflect the holds after graph validation.
+
+#### Read-only Queen Soul and historical Memory intake
+
+To include Bot assets in the same plan, add a `queen_assets` array to the version 1 mapping. Each entry binds a reviewed Bot identity to the committed Soul blob.
+
+```json
+{
+  "queen_assets": [
+    {
+      "slug": "example-queen",
+      "source_git_blob_sha": "2222222222222222222222222222222222222222"
+    }
+  ]
+}
+```
+
+Review the full committed Soul and its identity before listing the slug and blob ID. An empty array inventories the surfaces with no reviewed Souls. The planner accepts candidates with a single matching review, common v1 frontmatter, and the v1 Bot template's explicit identity and purpose sections. The ID must match the Bot directory and the Layer must be `1 — Manager`. Additional explicit identity declarations in headings or lists cause a hold. The planner inspects up to 64 KiB per Soul or root Memory entrypoint. Absent, stale, or repeated reviews, missing or invalid Souls, and ambiguous source identities are held as `invalid_soul_or_slug`. A symlink or other unsupported Git entry invalidates source preflight.
+
+Bot routing README files and Bot-tree `AGENTS.md` files are excluded as `management_only`. Root `MEMORY.md` qualifies as `navigation_only` when its frontmatter consists of a single quoted description, `Select memory navigation.` or `Memory navigation.`, and its body consists of a Memory heading followed by a plain list of links to existing scoped `MEMORY.md` files with labels matching their scopes. Other root Memory and files inside `memory/` are held as `curated_memory_deferred`, including scoped entrypoints.
+
+The plan reports candidates, holds, and exclusions under `queen_assets`. A candidate includes its Git blob ID, SHA-256 of the exact source bytes including frontmatter, and proposed asset path. The plan emits repository-relative paths when every component is portable. It retains the path digest for every record and uses it as the locator when any component is unportable. The disposable staging command verifies prepared asset commits and registry rows in an empty inactive target. Broader A15 coverage remains open under [#98](https://github.com/mols3131d/hive-system/issues/98).
+
+#### Read-only Queen preparation
+
+Add the optional `queen_preparation` array alongside the intake reviews to supply reviewed registry identities for positive Soul candidates. Both arrays use the manifest's binding to the verified source commit, policy pin, and selected workspace UUID.
+
+```json
+{
+  "queen_preparation": [
+    {
+      "slug": "example-queen",
+      "source_git_blob_sha": "2222222222222222222222222222222222222222",
+      "source_raw_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "bot_id": "018f0000-0000-7000-8000-000000000001",
+      "display_name": "Example Queen"
+    }
+  ]
+}
+```
+
+The immutable slug must equal the portable legacy Manager Bot ID. Supply the reviewed display name and a registry UUIDv7. Preparation requires a positive intake candidate with both matching digests. A stale digest, missing candidate, repeated slug, or repeated registry UUID holds each affected entry as `invalid_soul_or_slug`. The report lists prepared identifiers and digests or hold reasons.
+
+The private preparation result retains the exact committed Soul bytes and the reviewed registry fields. Staging commits the Soul at `assets/bots/<slug>/SOUL.md` before inserting the Bot row and records the asset commit in migration provenance.
+
+#### Disposable migration staging
+
+On Linux, use the installed CLI with the workspace initialization policy revision and the reviewed mapping. The target must be an absent absolute path under an existing local parent, separate from the source. The command refuses an occupied path or a path registered as the active root for the selected workspace ID.
 
 ```sh
 hive --contract 2 --json workspace migration-stage \
@@ -217,11 +399,20 @@ hive --contract 2 --json workspace migration-stage \
   --target "$target_root" --policy-revision "$v2_policy_revision" --mode dry-run
 ```
 
-The command classifies scopes from the verified commit and reviewed mapping. It omits scopes held or excluded by the planner. Every mapped parent must itself be eligible. Missing or held parents and cycles refuse the whole operation in either mode, before any target database is created. Reconcile those Area mappings before retrying.
+The command classifies scopes from the verified commit and reviewed mapping. It omits held and excluded scopes. Every mapped Area parent must itself be eligible. Missing or held parents and cycles refuse either mode before any target database is created.
 
-In `dry-run` mode, the CLI inserts the eligible Areas in parent order inside one transaction on a disposable copy. It checks the counts within the transaction, rolls back, and verifies zero Areas and the original clean Dolt baseline. In `staged-import` mode, it commits the transaction and records a Dolt commit extending the baseline. It verifies the committed schema, constraints, records and exact Area rows, and confirms the paired Git repository has the original empty asset commit. The CLI syncs the private payload and publishes it atomically to the inactive target. Both modes recheck the exact clean source after preparation. Neither mode registers or starts a workspace or changes either contract's XDG configuration.
+Select additional surfaces in the same reviewed mapping against that source commit, policy pin, and intended target UUID.
 
-The report uses `coverage: scope_only`. It includes provenance, mapping SHA-256, balanced scope counts, an Area ID map, and hold and exclusion reasons. Resolve scope and directory SHA-256 locators against the reported source commit as for the plan. In a dry-run, `imported` counts Areas exercised inside the rolled-back transaction and `target_area_rows` reports the zero rows left behind. Committed record validation runs on staged import. The report omits raw scope keys, slugs, names, and paths. The paired descriptor and database store the reviewed target identity, and broader record and asset coverage remains open under [#98](https://github.com/mols3131d/hive-system/issues/98).
+- Pass `--tasks` to stage prepared Task rows. Issue numbers follow lexicographic `(scope, work_id)` order even when parent placement requires a different insertion order. The transaction inserts Issues in parent order, then their prerequisites, and advances the Issue counter. It preserves reviewed timestamps at UTC microsecond precision, and stores titles, body, criteria, closure actor and resolution from their reviewed source bytes. The transaction accepts up to 64 MiB of Task body bytes including repeated blobs.
+- Supply `resource_bindings` to stage prepared Resources and their explicit Area links.
+- Supply `queen_assets` and `queen_preparation` to stage prepared Queen Souls and Bot registry rows. The CLI commits the exact reviewed Soul bytes to the paired asset repository and verifies the commit before inserting any Bots. Historical Memory stays held and `bot_memories` remains empty.
+- Supply `reviewed_records` to stage prepared Directives in supersession order and prepared standalone Artifacts. The review preserves historical fields and committed title and body bytes. `--include-directives-artifacts` selects this intake in the read-only plan. Work-scoped Artifacts remain held and staging verifies zero Artifact links for this slice.
+
+Both modes insert the selected rows inside one guarded Dolt transaction on a private disposable copy. Dry-run checks the exercised rows and rolls back, then verifies the original clean Dolt baseline and empty import tables. Staged import creates one Dolt commit extending that baseline, compares the staged surfaces to their committed rows and validates the committed schema and records using the paired asset commit. The CLI verifies the exact clean source again after preparation. Staged import syncs and publishes the verified payload atomically to the inactive target. Neither mode registers or starts a workspace or changes either contract's XDG configuration.
+
+The report preserves the existing `coverage` value for Area-only and single-surface staging. Combined staging uses `coverage: mixed` and lists the selected surfaces in `included_surfaces`. It includes provenance, the mapping SHA-256, balanced counts, IDs, field digests and typed holds and exclusions. Queen asset holds include SHA-256 source locators in `queen_inventory`. Scope, Task and record paths appear as digests resolvable against the exact source commit. The Task key digest covers the scope, a NUL byte and the work ID. The report omits raw record payloads, approval references, and paths. In dry-run, `imported` describes the rows exercised inside the rolled-back transaction. The reported target row counts are zero, the retained Issue counter is 1, and `projected_issue_number_next_value` gives the exercised counter when Tasks are selected.
+
+[Issue #98](https://github.com/mols3131d/hive-system/issues/98) tracks the remaining staging coverage, including work-scoped Artifact joins and the full A15 report.
 
 ### 6. Issue Counters and Number Non-Reuse
 

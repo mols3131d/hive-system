@@ -977,7 +977,7 @@ pub(crate) enum WorkspaceAction {
         #[arg(long, value_name = "OID")]
         source_commit: String,
     },
-    /// Plan v1 scope mappings for an explicit v2 workspace ID.
+    /// Plan v1 migration for an explicit v2 workspace ID.
     MigrationPlan {
         /// Absolute path to a standalone v1 Git worktree.
         #[arg(long, value_name = "DIR")]
@@ -988,11 +988,17 @@ pub(crate) enum WorkspaceAction {
         /// Intended inactive v2 workspace identity.
         #[arg(long, value_name = "UUID")]
         workspace_id: String,
-        /// Reviewed versioned scope mapping JSON file.
+        /// Reviewed versioned scope and optional record mapping JSON file.
         #[arg(long, value_name = "FILE")]
         mapping_file: PathBuf,
+        /// Include v1 Task intake and preparation from bound reviews.
+        #[arg(long)]
+        tasks: bool,
+        /// Include Directive and Artifact intake and any reviewed record plans.
+        #[arg(long)]
+        include_directives_artifacts: bool,
     },
-    /// Rehearse or stage an inactive v1 scope-only migration.
+    /// Rehearse or stage an inactive v1 migration.
     MigrationStage(MigrationStageArgs),
     #[command(flatten)]
     Runtime(WorkspaceCommand),
@@ -1020,6 +1026,9 @@ pub(crate) struct MigrationStageArgs {
     pub(crate) policy_revision: String,
     #[arg(long, value_enum)]
     pub(crate) mode: MigrationStageMode,
+    /// Include reviewed v1 Tasks and their resolved links.
+    #[arg(long)]
+    pub(crate) tasks: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -3594,7 +3603,7 @@ impl Command {
                         || !matches!(common.view, View::WorkingTree) =>
                 {
                     Err(
-                        "Migration plan accepts only --source, --source-commit, --workspace-id, --mapping-file, and output selection.",
+                        "Migration plan accepts only --source, --source-commit, --workspace-id, --mapping-file, --tasks, --include-directives-artifacts, and output selection.",
                     )
                 }
                 Self::Workspace(WorkspaceAction::MigrationStage(_))
