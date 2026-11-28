@@ -1,6 +1,8 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 
-use serde::{Deserialize, Serialize};
+use pulldown_cmark::{Event, HeadingLevel, Parser, Tag};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -8,7 +10,7 @@ use super::reviewed_records::{self, Review};
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
 use super::{AssetObjectReader, Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
-use crate::config_file::{MAX_FILE_BYTES, parse_v2};
+use crate::config_file::{MAX_FILE_BYTES, parse_v2, present};
 use crate::error::HiveError;
 
 const MAX_MARKDOWN_BYTES: usize = 256 * 1024;
@@ -448,12 +450,23 @@ fn candidate(
 #[serde(deny_unknown_fields)]
 struct Frontmatter {
     description: String,
+    #[serde(default, deserialize_with = "present")]
     title: Option<String>,
+    #[serde(default, deserialize_with = "present")]
     tags: Option<Vec<String>>,
-    #[serde(default)]
-    status: Value,
-    #[serde(default)]
-    kind: Value,
+    #[serde(default, deserialize_with = "present")]
+    status: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    kind: Option<Value>,
+}
+
+fn scalar_label<T: DeserializeOwned>(value: Value) -> Option<T> {
+    // Serde enums also accept externally tagged objects. Only v1 scalar labels map.
+    if value.is_string() {
+        serde_json::from_value(value).ok()
+    } else {
+        None
+    }
 }
 
 fn inspect(bytes: &[u8], directive: bool) -> Result<InspectedRecord, Reason> {
@@ -493,17 +506,23 @@ fn inspect(bytes: &[u8], directive: bool) -> Result<InspectedRecord, Reason> {
         }
     }
     let metadata = if directive {
-        if !fields.kind.is_null() {
+        if fields.kind.is_some() {
             return Err(invalid);
         }
-        let status =
-            serde_json::from_value(fields.status).map_err(|_| Reason::InvalidDirectiveStatus)?;
+        let status = fields
+            .status
+            .and_then(scalar_label)
+            .ok_or(Reason::InvalidDirectiveStatus)?;
         Metadata::Directive(status)
     } else {
-        let kind =
-            serde_json::from_value(fields.kind).map_err(|_| Reason::UnclassifiedArtifactKind)?;
-        let legacy_status =
-            serde_json::from_value(fields.status).map_err(|_| Reason::InvalidArtifactStatus)?;
+        let kind = fields
+            .kind
+            .and_then(scalar_label)
+            .ok_or(Reason::UnclassifiedArtifactKind)?;
+        let legacy_status = fields
+            .status
+            .map(|value| scalar_label(value).ok_or(Reason::InvalidArtifactStatus))
+            .transpose()?;
         Metadata::Artifact {
             kind,
             legacy_status,
@@ -513,7 +532,7 @@ fn inspect(bytes: &[u8], directive: bool) -> Result<InspectedRecord, Reason> {
         .ok_or(Reason::MissingOrConflictingTitle)?;
     Ok(InspectedRecord {
         metadata,
-        title_sha256: format!("{:x}", Sha256::digest(title)),
+        title_sha256: format!("{:x}", Sha256::digest(title.as_bytes())),
         body_sha256: format!("{:x}", Sha256::digest(body)),
     })
 }
@@ -538,41 +557,63 @@ fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
 fn select_title<'a>(
     title: Option<&'a str>,
     description: &'a str,
-    body: &'a str,
-) -> Option<&'a str> {
+    body: &str,
+) -> Option<Cow<'a, str>> {
     let valid = |value: &str| {
         !value.trim().is_empty()
             && value.chars().count() <= 255
             && !value.chars().any(char::is_control)
     };
     if let Some(title) = title.filter(|value| valid(value)) {
-        return Some(title);
+        return Some(Cow::Borrowed(title));
     }
-    // Accept an unambiguous leading ATX H1. Other heading forms need Markdown review.
-    let mut lines = body.lines().filter(|line| !line.trim().is_empty());
-    let leading = lines.next().unwrap_or_default();
-    let h1 = |line: &str| line == "#" || line.starts_with("# ") || line.starts_with("#\t");
-    if (!h1(leading) && h1(leading.trim_start()))
-        || lines.any(|line| {
-            let line = line.trim();
-            h1(line) || line.bytes().all(|byte| byte == b'=')
-        })
-    {
-        return None;
-    }
-    let heading = leading
-        .strip_prefix('#')
-        .filter(|_| h1(leading))
-        .map(str::trim);
-    let heading = heading.map(|value| {
-        let unclosed = value.trim_end_matches('#');
-        if unclosed.is_empty() || unclosed.ends_with([' ', '\t']) {
-            unclosed.trim_end()
-        } else {
-            value
+    let mut depth = 0;
+    let mut heading = None;
+    let mut first_heading = None;
+    for event in Parser::new(body) {
+        match event {
+            Event::Start(tag) => {
+                if depth == 0
+                    && matches!(
+                        tag,
+                        Tag::Heading {
+                            level: HeadingLevel::H1,
+                            ..
+                        }
+                    )
+                {
+                    heading = Some(String::new());
+                }
+                depth += 1;
+            }
+            Event::End(_) => {
+                depth -= 1;
+                if depth == 0
+                    && let Some(text) = heading.take()
+                {
+                    let text = text.trim();
+                    match first_heading.as_deref() {
+                        None => first_heading = Some(text.to_owned()),
+                        Some(first) if first != text => return None,
+                        Some(_) => {}
+                    }
+                }
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some(heading) = &mut heading {
+                    heading.push_str(&text);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some(heading) = &mut heading {
+                    heading.push(' ');
+                }
+            }
+            _ => {}
         }
-    });
-    heading
-        .filter(|value| valid(value))
-        .or_else(|| valid(description).then_some(description))
+    }
+    first_heading
+        .filter(|text| valid(text))
+        .map(Cow::Owned)
+        .or_else(|| valid(description).then_some(Cow::Borrowed(description)))
 }
