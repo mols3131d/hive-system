@@ -344,7 +344,13 @@ fn entrypoint_reference(bytes: &[u8]) -> Option<&str> {
             {
                 skipped = 1;
             }
-            Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock | Tag::Image { .. }) => skipped = 1,
+            Event::Start(Tag::CodeBlock(_) | Tag::Image { .. }) => skipped = 1,
+            Event::Start(Tag::HtmlBlock) => {
+                if !closed_raw_html_block(&body[range]) {
+                    return None;
+                }
+                skipped = 1;
+            }
             Event::Start(Tag::Link {
                 link_type,
                 dest_url,
@@ -353,6 +359,11 @@ fn entrypoint_reference(bytes: &[u8]) -> Option<&str> {
                 skipped = 1;
                 if dest_url.contains("://") {
                     if !matches!(link_type, LinkType::Inline | LinkType::Autolink) {
+                        return None;
+                    }
+                    if link_type == LinkType::Autolink
+                        && unresolved_link_destination(&body[..range.start])
+                    {
                         return None;
                     }
                     let CowStr::Borrowed(destination) = dest_url else {
@@ -380,10 +391,7 @@ fn entrypoint_reference(bytes: &[u8]) -> Option<&str> {
                             .chars()
                             .next()
                             .is_some_and(|ch| !ch.is_whitespace())
-                        || before
-                            .trim_end()
-                            .strip_suffix('(')
-                            .is_some_and(|prefix| prefix.trim_end().ends_with(']'))
+                        || unresolved_link_destination(before)
                     {
                         return None;
                     }
@@ -394,6 +402,37 @@ fn entrypoint_reference(bytes: &[u8]) -> Option<&str> {
         }
     }
     reference
+}
+
+fn unresolved_link_destination(before: &str) -> bool {
+    before
+        .trim_end()
+        .strip_suffix('(')
+        .is_some_and(|prefix| prefix.trim_end().ends_with(']'))
+}
+
+fn closed_raw_html_block(raw: &str) -> bool {
+    let raw = raw.trim();
+    if raw.starts_with("<!--") {
+        let mut remaining = raw;
+        while let Some(comment) = remaining.strip_prefix("<!--") {
+            let Some((body, rest)) = comment.split_once("-->") else {
+                return false;
+            };
+            if comment.starts_with('>') || comment.starts_with("->") || body.contains("--!>") {
+                return false;
+            }
+            remaining = rest.trim_start();
+        }
+        return remaining.is_empty();
+    }
+
+    // An unknown block can enclose subsequent Markdown even when the parser
+    // emits that prose separately. Only skip a known self-contained wrapper.
+    raw.strip_prefix("<div>")
+        .or_else(|| raw.strip_prefix("<div hidden>"))
+        .and_then(|contents| contents.strip_suffix("</div>"))
+        .is_some_and(|contents| !contents.contains('<'))
 }
 
 fn prose_blocks_with_html(events: &[(Event<'_>, Range<usize>)]) -> HashSet<Range<usize>> {
