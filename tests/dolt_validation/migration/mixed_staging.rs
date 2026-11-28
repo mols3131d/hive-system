@@ -11,7 +11,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     const RECORD_REF: &str = "https://forge.example/synthetic/history";
     const TASK: &str = "tasks/synthetic-app/backlog/ready/README.md";
     const CLAIMED: &str = "tasks/synthetic-app/active/claimed/README.md";
-    const WORK_ARTIFACT: &str = "tasks/synthetic-app/active/claimed/artifacts/report.md";
+    const HELD_WORK_ARTIFACT: &str = "tasks/synthetic-app/active/claimed/artifacts/report.md";
     const README: &str = "tasks/synthetic-app/README.md";
     const DIRECTIVE: &str = "directives/synthetic-app/proposal.md";
     const UNAPPROVED: &str = "directives/synthetic-app/unapproved.md";
@@ -59,7 +59,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         ("tasks/_hive/README.md", "# Unsplit legacy scope\n".into()),
         (
             TASK,
-            format!("---\ndescription: Synthetic Task record\n---\n{task_body}"),
+            format!("---\ndescription: Synthetic Task record\npriority: high\n---\n{task_body}"),
         ),
         (
             CLAIMED,
@@ -67,7 +67,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
                 "---\ndescription: Synthetic claim\nstatus: todo\nclaim: {{id: sample-claim, holder: sample-holder}}\n---\n{task_body}"
             ),
         ),
-        (WORK_ARTIFACT, record("kind: report")),
+        (HELD_WORK_ARTIFACT, record("kind: report")),
         (SOUL, SOUL_TEXT.into()),
         (INVALID_SOUL, "# Missing Queen identity\n".into()),
         (DIRECTIVE, record("status: proposed")),
@@ -260,7 +260,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         (CLAIMED, "execution_needs_reconciliation"),
         (UNAPPROVED, "missing_directive_approval"),
         (UNCLASSIFIED, "unclassified_artifact_kind"),
-        (WORK_ARTIFACT, "unresolved_parent_task"),
+        (HELD_WORK_ARTIFACT, "unresolved_parent_task"),
     ] {
         let locator = sha256_hex(path.as_bytes());
         assert!(holds.iter().any(|row| row["source_path_sha256"] == locator && row.to_string().contains(reason)), "{path}: {holds:?}");
@@ -312,17 +312,18 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         assert!(output.status.success(), "{output:?}");
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["rows"].clone()
     };
+    let task_path_sha256 = sha256_hex(TASK.as_bytes());
     let issue = staged["id_map"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|row| row["kind"] == "task")
+        .find(|row| row["kind"] == "task" && row["source_path_sha256"] == task_path_sha256)
         .unwrap();
     assert_eq!(
         sql(&format!(
-            "SELECT id, number, area_id, status, body FROM issues AS OF '{db}'"
+            "SELECT id, number, area_id, status, priority, body FROM issues AS OF '{db}'"
         )),
-        json!([{"id":issue["issue_id"], "number":1, "area_id":area, "status":"backlog", "body":task_body}])
+        json!([{"id":issue["issue_id"], "number":1, "area_id":area, "status":"backlog", "priority":0, "body":task_body}])
     );
     assert_eq!(
         sql(&format!(
