@@ -10,6 +10,7 @@ use url::{Host, Url};
 
 use super::json_object::{self, Object};
 use super::queen_assets::{self, SoulReview};
+use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
 use super::reviewed_records::Review;
 use super::task_provenance::TaskReview;
 use super::{
@@ -36,6 +37,8 @@ struct Mapping {
     reviewed_records: Option<Vec<Review>>,
     #[serde(default, deserialize_with = "optional_object_list")]
     queen_assets: Option<Vec<SoulReview>>,
+    #[serde(default, deserialize_with = "optional_object_list")]
+    queen_preparation: Option<Vec<QueenMapping>>,
 }
 
 fn optional_object_list<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
@@ -136,6 +139,31 @@ pub(crate) fn plan(
     include_tasks: bool,
     include_directives_artifacts: bool,
 ) -> Result<Value, HiveError> {
+    Ok(prepare_plan(
+        source,
+        revision,
+        workspace_id,
+        mapping_file,
+        include_tasks,
+        include_directives_artifacts,
+    )?
+    .report)
+}
+
+struct MigrationPlan {
+    report: Value,
+    #[expect(dead_code, reason = "reserved for the later inactive staging step")]
+    queen_souls: Vec<PreparedQueen>,
+}
+
+fn prepare_plan(
+    source: &Path,
+    revision: &str,
+    workspace_id: &str,
+    mapping_file: &Path,
+    include_tasks: bool,
+    include_directives_artifacts: bool,
+) -> Result<MigrationPlan, HiveError> {
     with_scope_mapping(source, revision, workspace_id, mapping_file, |reviewed| {
         if reviewed.reviewed_records.is_some() && !include_directives_artifacts {
             return Err(invalid(
@@ -180,14 +208,33 @@ pub(crate) fn plan(
                 )?;
             }
         }
-        if let Some(reviews) = reviewed.queen_assets {
+        let mut preparation = reviewed
+            .queen_preparation
+            .map(Preparation::new)
+            .transpose()?;
+        if reviewed.queen_assets.is_some() || preparation.is_some() {
             report["queen_assets"] = json!(queen_assets::classify(
                 reviewed.inventory,
                 reviewed.reader,
-                reviews
+                reviewed.queen_assets.unwrap_or_default(),
+                |slug, oid, digest, bytes| {
+                    if let Some(preparation) = &mut preparation {
+                        preparation.accept_candidate(slug, oid, digest, bytes);
+                    }
+                },
             )?);
         }
-        Ok(report)
+        let queen_souls = if let Some(preparation) = preparation {
+            let (summary, souls) = preparation.finish();
+            report["queen_preparation"] = summary;
+            souls
+        } else {
+            Vec::new()
+        };
+        Ok(MigrationPlan {
+            report,
+            queen_souls,
+        })
     })
 }
 
@@ -199,6 +246,7 @@ pub(crate) struct ReviewedScopes<'a> {
     mapping_sha256: String,
     scopes: Vec<Scope<'a>>,
     queen_assets: Option<&'a [SoulReview]>,
+    queen_preparation: Option<&'a [QueenMapping]>,
     task_reviews: &'a [TaskReview],
     reviewed_records: Option<&'a [Review]>,
 }
@@ -212,6 +260,14 @@ impl ReviewedScopes<'_> {
         {
             return Err(invalid(
                 "Area staging requires a mapping without Task, Directive, or Artifact reviews.",
+            ));
+        }
+        if self
+            .queen_preparation
+            .is_some_and(|reviews| !reviews.is_empty())
+        {
+            return Err(invalid(
+                "Area staging requires a mapping without Queen preparation reviews.",
             ));
         }
         let mut ids = BTreeSet::new();
@@ -341,6 +397,7 @@ pub(crate) fn with_scope_mapping<T>(
             mapping_sha256: format!("{:x}", Sha256::digest(input)),
             scopes,
             queen_assets: mapping.queen_assets.as_deref(),
+            queen_preparation: mapping.queen_preparation.as_deref(),
             task_reviews: &mapping.task_reviews,
             reviewed_records: mapping.reviewed_records.as_deref(),
         })

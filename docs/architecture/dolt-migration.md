@@ -325,6 +325,28 @@ Bot routing README files and Bot-tree `AGENTS.md` files are excluded as `managem
 
 The plan reports candidates, holds, and exclusions under `queen_assets`. A candidate includes its Git blob ID, SHA-256 of the exact source bytes including frontmatter, and proposed asset path. The plan emits repository-relative paths when every component is portable. It retains the path digest for every record and uses it as the locator when any component is unportable. Target slug availability, asset commits, registry rows, and staged A15 verification require a later import step.
 
+#### Read-only Queen preparation
+
+Add the optional `queen_preparation` array alongside the intake reviews to supply reviewed registry identities for positive Soul candidates. Both arrays use the manifest's binding to the verified source commit, policy pin, and selected workspace UUID.
+
+```json
+{
+  "queen_preparation": [
+    {
+      "slug": "example-queen",
+      "source_git_blob_sha": "2222222222222222222222222222222222222222",
+      "source_raw_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "bot_id": "018f0000-0000-7000-8000-000000000001",
+      "display_name": "Example Queen"
+    }
+  ]
+}
+```
+
+The immutable slug must equal the portable legacy Manager Bot ID. Supply the reviewed display name and a registry UUIDv7. Preparation requires a positive intake candidate with both matching digests. A stale digest, missing candidate, repeated slug, or repeated registry UUID holds each affected entry as `invalid_soul_or_slug`. The report lists prepared identifiers and digests or hold reasons.
+
+The private preparation result retains the exact committed Soul bytes and the reviewed registry fields. Later staging must commit the Soul at `assets/bots/<slug>/SOUL.md` before inserting the Bot row and record the asset commit in migration provenance.
+
 #### Disposable scope staging
 
 On Linux, use the installed CLI with the workspace initialization policy revision and the reviewed scope mapping. The target must be an absent absolute path under an existing local parent, separate from the source. The command refuses occupied paths, the active root for the selected workspace ID, the resolved v1 and v2 user configuration and v2 bindings paths, the v2 XDG default workspace path, and overlaps with the v2 runtime state directory.
