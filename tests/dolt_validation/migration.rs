@@ -973,6 +973,26 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             "tasks/good-percent/README.md",
             "# Project navigation\n\n[Project](https://forge.example/synthetic/app%20one)\n",
         ),
+        (
+            "tasks/inline-code-tag/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <code> https://forge.example/synthetic/app </code>\n",
+        ),
+        (
+            "tasks/hidden-span/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <span hidden> https://forge.example/synthetic/app </span>\n",
+        ),
+        (
+            "tasks/hidden-image-alt/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app ![ https://forge.example/synthetic/app ](example.png)\n",
+        ),
+        (
+            "tasks/broken-spaced-link/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app Owner]( https://forge.example/synthetic/app )\n",
+        ),
+        (
+            "tasks/valid-spaced-link/README.md",
+            "# Project navigation\n\nAn example <span hidden> https://forge.example/synthetic/other </span>\n\nProject: [Owner]( https://forge.example/synthetic/app )\n",
+        ),
     ] {
         let file = source.join(path);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -1077,6 +1097,21 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             area("good-percent", 0x113, "good-percent", json!([
                 evidence("tasks/good-percent/README.md", "https://forge.example/synthetic/app%20one")
             ])),
+            area("inline-code-tag", 0x114, "inline-code", json!([
+                evidence("tasks/inline-code-tag/README.md", app_ref)
+            ])),
+            area("hidden-span", 0x115, "hidden-span", json!([
+                evidence("tasks/hidden-span/README.md", app_ref)
+            ])),
+            area("hidden-image-alt", 0x116, "hidden-image", json!([
+                evidence("tasks/hidden-image-alt/README.md", app_ref)
+            ])),
+            area("broken-spaced-link", 0x117, "broken-spaced", json!([
+                evidence("tasks/broken-spaced-link/README.md", app_ref)
+            ])),
+            area("valid-spaced-link", 0x118, "valid-spaced", json!([
+                evidence("tasks/valid-spaced-link/README.md", app_ref)
+            ])),
         ]
     });
     mapping["scopes"][0]["decision"]["area"]["name"] = json!(local_path);
@@ -1099,7 +1134,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(data["source"], snapshot["data"]["source"]);
     assert_eq!(data["inventory"], snapshot["data"]["inventory"]);
     assert_eq!(data["target"], json!({"workspace_id": workspace}));
-    assert_eq!(data["scopes"].as_array().unwrap().len(), 21);
+    assert_eq!(data["scopes"].as_array().unwrap().len(), 26);
     let outcomes = |report: &Value| {
         report["scopes"]
             .as_array()
@@ -1118,6 +1153,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(mapped["_hive-userdata"]["status"], "mapped");
     assert_eq!(mapped["hive-system"]["status"], "mapped");
     assert_eq!(mapped["good-percent"]["status"], "mapped");
+    assert_eq!(mapped["valid-spaced-link"]["status"], "mapped");
     assert_eq!(
         mapped["synth-app"],
         json!({"status": "mapped", "area": {
@@ -1148,6 +1184,10 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         "quoted-fence-only",
         "broken-link-only",
         "bad-percent",
+        "inline-code-tag",
+        "hidden-span",
+        "hidden-image-alt",
+        "broken-spaced-link",
     ] {
         assert_eq!(mapped[scope], held, "{scope}");
     }
@@ -1258,12 +1298,24 @@ fn cli_migration_plan_redacts_malformed_scope_and_bot_directories() {
         "bots/Synthetic Private Bot/memory/portable-scope",
         "bots/synthetic.private.bot/memory/portable-scope",
     ];
+    let device_bot_path = "bots/aux/memory/_general";
+    let device_scope_path = "bots/clean/memory/aux";
+    let general_memory = "bots/clean/memory/_general";
+    let userdata_memory = "bots/clean/memory/_hive-userdata";
+    let unsplit_memory = "bots/clean/memory/_hive";
     let reference = "https://forge.example/synthetic/portable";
     let mut evidence = Vec::new();
     for path in malformed_bot_paths
         .into_iter()
         .chain(portable_paths)
         .chain(malformed_scope_paths)
+        .chain([
+            device_bot_path,
+            device_scope_path,
+            general_memory,
+            userdata_memory,
+            unsplit_memory,
+        ])
         .rev()
     {
         let entrypoint = if path.starts_with("bots/") {
@@ -1292,34 +1344,55 @@ fn cli_migration_plan_redacts_malformed_scope_and_bot_directories() {
     let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
     let workspace = id(1);
     let map = root.path().join("mapping.json");
-    let input = json!({
+    let mut input = json!({
         "version": 1,
         "source_commit": commit,
         "policy_pin": POLICY_PIN,
         "workspace_id": workspace,
-        "scopes": [{
-            "scope": "portable-scope",
-            "decision": {
-                "kind": "area",
-                "area": {"id": id(AREA_APP), "slug": "portable", "name": "Portable project"},
-                "project_evidence": evidence,
-            }
-        }],
+        "scopes": [
+            {
+                "scope": "portable-scope",
+                "decision": {
+                    "kind": "area",
+                    "area": {"id": id(AREA_APP), "slug": "portable", "name": "Portable project"},
+                    "project_evidence": evidence,
+                }
+            },
+            {
+                "scope": "aux",
+                "decision": {
+                    "kind": "area",
+                    "area": {"id": id(0x104), "slug": "synthetic-device", "name": "Synthetic project"},
+                    "project_evidence": [{
+                        "path": format!("{device_scope_path}/MEMORY.md"),
+                        "canonical_ref": reference
+                    }]
+                }
+            },
+            {"scope": "_general", "decision": {"kind": "area", "area": {
+                "id": id(AREA_GENERAL), "slug": "general", "name": "General"
+            }}},
+            {"scope": "_hive-userdata", "decision": {"kind": "area", "area": {
+                "id": id(AREA_USERDATA), "slug": "operations", "name": "Workspace operations"
+            }}},
+        ],
     });
     fs::write(&map, serde_json::to_vec(&input).unwrap()).unwrap();
-    let args = [
-        "--source",
-        source.to_str().unwrap(),
-        "--source-commit",
-        &commit,
-        "--workspace-id",
-        &workspace,
-        "--mapping-file",
-        map.to_str().unwrap(),
-    ];
-    let plan = || migration_cli(&home, &config, "migration-plan", &args, 0);
-    let report = plan();
-    assert_eq!(report, plan());
+    let plan = |revision| {
+        let args = [
+            "--source",
+            source.to_str().unwrap(),
+            "--source-commit",
+            revision,
+            "--workspace-id",
+            &workspace,
+            "--mapping-file",
+            map.to_str().unwrap(),
+        ];
+        migration_cli(&home, &config, "migration-plan", &args, 0)
+    };
+    let report = plan(&commit);
+    assert_eq!(report, plan(&commit));
     let encoded = report.to_string();
     for private in [
         malformed_scope,
@@ -1327,6 +1400,9 @@ fn cli_migration_plan_redacts_malformed_scope_and_bot_directories() {
         "synthetic.private.bot",
     ] {
         assert!(!encoded.contains(private), "leaked {private}");
+    }
+    for path in [device_bot_path, device_scope_path, unsplit_memory] {
+        assert!(!encoded.contains(&json!(path).to_string()), "leaked {path}");
     }
     let scopes = report["data"]["scopes"].as_array().unwrap();
     let scope_digest = sha256_hex(malformed_scope.as_bytes());
@@ -1354,7 +1430,64 @@ fn cli_migration_plan_redacts_malformed_scope_and_bot_directories() {
             "outcome": held,
         })),
     );
+    let scope = |key| scopes.iter().find(|scope| scope["scope"] == key).unwrap();
+    assert_eq!(
+        scope("_general"),
+        &json!({
+            "scope": "_general",
+            "source_paths": [general_memory, "bots/queen-synth/memory/_general", "tasks/_general"],
+            "source_path_sha256s": [digest_path(device_bot_path)],
+            "outcome": held,
+        }),
+    );
+    assert_eq!(
+        scope("aux"),
+        &json!({
+            "scope": "aux",
+            "source_paths": [],
+            "source_path_sha256s": [digest_path(device_scope_path)],
+            "outcome": held,
+        }),
+    );
+    assert_eq!(
+        scope("_hive-userdata")["source_paths"],
+        json!([
+            userdata_memory,
+            "directives/_hive-userdata",
+            "tasks/_hive-userdata"
+        ]),
+    );
+    assert_eq!(scope("_hive-userdata")["outcome"]["status"], "mapped");
+    assert_eq!(scope("_hive")["source_paths"], json!(["tasks/_hive"]));
+    assert_eq!(
+        scope("_hive")["source_path_sha256s"],
+        json!([digest_path(unsplit_memory)]),
+    );
+    assert_eq!(scope("_hive")["outcome"]["reason"], "unsplit_legacy_scope");
     assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+
+    let older_pin = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
+    fs::write(
+        source.join("AGENTS.md"),
+        format!("hive-system@{older_pin}\n"),
+    )
+    .unwrap();
+    fs::remove_file(source.join("hive.yml")).unwrap();
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Use the older synthetic policy pin"],
+    );
+    let older_commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    input["source_commit"] = json!(older_commit);
+    input["policy_pin"] = json!(older_pin);
+    fs::write(&map, serde_json::to_vec(&input).unwrap()).unwrap();
+    assert_eq!(
+        plan(&older_commit)["data"]["scopes"],
+        report["data"]["scopes"]
+    );
     assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
 }
 
@@ -1479,7 +1612,24 @@ fn check_queen_asset_intake(policy_pin: &str) {
             .as_bytes(),
     );
     write("bots/stale/memory/_general/MEMORY.md", nav);
+    let device_bot_scope = "bots/aux/memory/_general";
+    let device_memory_scope = "bots/clean/memory/aux";
+    let reserved_memory = [
+        ("_general", "bots/clean/memory/_general"),
+        ("_hive-userdata", "bots/clean/memory/_hive-userdata"),
+    ];
+    for (_, directory) in reserved_memory {
+        write(&format!("{directory}/MEMORY.md"), nav);
+    }
+    let mut clean_nav = nav.to_vec();
+    clean_nav.extend(b"- [Hive Userdata](memory/_hive-userdata/MEMORY.md)\n");
+    write("bots/clean/MEMORY.md", &clean_nav);
     let nonportable_paths = [
+        (
+            "bot_memories_historical",
+            "bots/aux/memory/_general/MEMORY.md",
+        ),
+        ("bot_memories_historical", "bots/clean/memory/aux/MEMORY.md"),
         (
             "bot_memories_historical",
             "bots/queen-synth/memory/Host:Path/MEMORY.md",
@@ -1626,18 +1776,44 @@ fn check_queen_asset_intake(policy_pin: &str) {
         assert!(record["source_git_blob_sha"].is_string(), "{path}");
         assert!(!serialized.contains(path), "{path}");
     }
-    let scope_digest = sha256_hex(b"Host:Path");
-    let scope_outcome = report["data"]["scopes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|scope| scope["scope_sha256"] == scope_digest)
-        .unwrap();
-    assert_eq!(scope_outcome["source_paths"], json!([]));
-    assert_eq!(
-        scope_outcome["source_path_sha256s"],
-        json!([sha256_hex(b"bots/queen-synth/memory/Host:Path")])
-    );
+    let scopes = report["data"]["scopes"].as_array().unwrap();
+    let malformed_scope_digest = sha256_hex(b"Host:Path");
+    for (field, key, directory) in [
+        (
+            "scope_sha256",
+            malformed_scope_digest.as_str(),
+            "bots/queen-synth/memory/Host:Path",
+        ),
+        ("scope", "aux", device_memory_scope),
+    ] {
+        let scope = scopes.iter().find(|scope| scope[field] == key).unwrap();
+        assert_eq!(scope["outcome"]["status"], "held", "{directory}");
+        assert_eq!(scope["source_paths"], json!([]), "{directory}");
+        assert_eq!(
+            scope["source_path_sha256s"],
+            json!([sha256_hex(directory.as_bytes())]),
+            "{directory}"
+        );
+    }
+    for (key, directory) in reserved_memory {
+        let scope = scopes.iter().find(|scope| scope["scope"] == key).unwrap();
+        assert!(
+            scope["source_paths"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(directory))
+        );
+        assert_eq!(
+            find("bot_memories_historical", &format!("{directory}/MEMORY.md"))["reason"],
+            "curated_memory_deferred"
+        );
+        if key == "_general" {
+            assert_eq!(
+                scope["source_path_sha256s"],
+                json!([sha256_hex(device_bot_scope.as_bytes())])
+            );
+        }
+    }
     for (slug, _) in conflicting {
         let outcome = find("bots_soul", &format!("bots/{slug}/SOUL.md"));
         assert_eq!(outcome["status"], "held", "{slug}");
@@ -1653,6 +1829,10 @@ fn check_queen_asset_intake(policy_pin: &str) {
     }
     assert_eq!(
         find("navigation_only", "bots/queen-synth/MEMORY.md")["reason"],
+        "navigation_only"
+    );
+    assert_eq!(
+        find("navigation_only", "bots/clean/MEMORY.md")["reason"],
         "navigation_only"
     );
     for path in [
@@ -1673,6 +1853,8 @@ fn check_queen_asset_intake(policy_pin: &str) {
     for private in [
         "Synthetic Private Display",
         "Host:Path",
+        device_bot_scope,
+        device_memory_scope,
         "sentinel",
         "memory/_general/MEMORY.md)",
     ] {

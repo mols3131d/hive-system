@@ -4,7 +4,9 @@ use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{AssetObjectReader, Inventory, InventoryEntry, snapshot_object};
+use super::{
+    AssetObjectReader, Inventory, InventoryEntry, is_portable_bot_memory_locator, snapshot_object,
+};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, parse_v2};
 use crate::config_git::is_full_lowercase_oid;
@@ -116,7 +118,7 @@ pub(super) fn classify<'a>(
                 let mut outcome = Outcome::Held {
                     reason: Reason::InvalidSoulOrSlug,
                 };
-                if portable_slug(relative)
+                if is_portable_bot_memory_locator(relative, None)
                     && slug_counts[relative] == 1
                     && !soul_aliases.contains(relative)
                     && let Some((soul, size)) =
@@ -146,7 +148,6 @@ pub(super) fn classify<'a>(
             continue;
         };
         let Some(size) = entry.size else { continue };
-        let safe_id = portable_slug(id);
         let leaf = child.rsplit('/').next().unwrap_or(child);
         if child == "README.md" || leaf == "AGENTS.md" {
             report.bots_soul.push(record(
@@ -158,11 +159,11 @@ pub(super) fn classify<'a>(
             ));
         } else if child == "MEMORY.md" || child.starts_with("memory/") {
             let navigation = child == "MEMORY.md"
-                && safe_id
+                && is_portable_bot_memory_locator(id, None)
                 && size <= MAX_FILE_BYTES
                 && navigation_only(
                     &snapshot_object(&|| reader.command(), "blob", &entry.oid, size)?,
-                    &format!("bots/{id}"),
+                    id,
                     inventory,
                 );
             if navigation {
@@ -206,43 +207,32 @@ fn valid_slug(slug: &str) -> bool {
     slug.len() <= 100 && is_slug(slug)
 }
 
-fn portable_slug(slug: &str) -> bool {
-    valid_slug(slug) && !device_name(slug)
-}
-
-fn device_name(stem: &str) -> bool {
-    matches!(stem, "con" | "prn" | "aux" | "nul")
-        || stem
-            .strip_prefix("com")
-            .or_else(|| stem.strip_prefix("lpt"))
-            .is_some_and(|suffix| suffix.len() == 1 && suffix.as_bytes()[0].is_ascii_digit())
-}
-
 fn portable_bot_path(path: &str) -> bool {
     let Some(relative) = path.strip_prefix("bots/") else {
         return false;
     };
     let (directories, file) = relative.rsplit_once('/').unwrap_or(("", relative));
     if !directories.is_empty() {
-        let mut components = directories.split('/');
-        if !components.next().is_some_and(portable_slug) {
-            return false;
-        }
-        let mut components = components.peekable();
-        if components.peek() == Some(&"memory") {
+        let mut components = directories.split('/').peekable();
+        let bot = components.next().unwrap_or_default();
+        let memory_scope = if components.peek() == Some(&"memory") {
             components.next();
-            if matches!(components.peek(), Some(&("_general" | "_hive-userdata"))) {
-                components.next();
-            }
-        }
-        if !components.all(portable_slug) {
+            components.next()
+        } else {
+            None
+        };
+        if !is_portable_bot_memory_locator(bot, memory_scope)
+            || !components.all(|component| is_portable_bot_memory_locator(component, None))
+        {
             return false;
         }
     }
+    let stem = file.split('.').next().unwrap_or_default();
+    // Device stems are at most four bytes. File stems can exceed the Bot slug limit.
     matches!(file, "SOUL.md" | "README.md" | "AGENTS.md" | "MEMORY.md")
         || (file.len() <= 255
             && file.split('.').all(is_slug)
-            && !device_name(file.split('.').next().unwrap_or_default()))
+            && (stem.len() > 4 || is_portable_bot_memory_locator(stem, None)))
 }
 
 #[derive(Deserialize)]
@@ -418,7 +408,7 @@ fn identity_declaration(text: &str, structured: bool) -> bool {
     })
 }
 
-fn navigation_only(bytes: &[u8], directory: &str, inventory: &Inventory) -> bool {
+fn navigation_only(bytes: &[u8], bot: &str, inventory: &Inventory) -> bool {
     let Some((header, body)) = split_document(bytes) else {
         return false;
     };
@@ -451,13 +441,13 @@ fn navigation_only(bytes: &[u8], directory: &str, inventory: &Inventory) -> bool
         else {
             return false;
         };
-        if !(portable_slug(scope) || matches!(scope, "_general" | "_hive-userdata"))
+        if !is_portable_bot_memory_locator(bot, Some(scope))
             || (label != scope
                 && label.replace(' ', "-").to_ascii_lowercase() != scope.trim_start_matches('_'))
             || !links.insert(target)
             || !inventory
                 .entries
-                .get(&format!("{directory}/{target}"))
+                .get(&format!("bots/{bot}/{target}"))
                 .is_some_and(|entry| !entry.is_directory())
         {
             return false;
