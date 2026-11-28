@@ -977,6 +977,21 @@ pub(crate) enum WorkspaceAction {
         #[arg(long, value_name = "OID")]
         source_commit: String,
     },
+    /// Plan v1 scope mappings for an explicit v2 workspace ID.
+    MigrationPlan {
+        /// Absolute path to a standalone v1 Git worktree.
+        #[arg(long, value_name = "DIR")]
+        source: PathBuf,
+        /// Full lowercase Git commit ID matching the source HEAD.
+        #[arg(long, value_name = "OID")]
+        source_commit: String,
+        /// Intended inactive v2 workspace identity.
+        #[arg(long, value_name = "UUID")]
+        workspace_id: String,
+        /// Reviewed versioned scope mapping JSON file.
+        #[arg(long, value_name = "FILE")]
+        mapping_file: PathBuf,
+    },
     #[command(flatten)]
     Runtime(WorkspaceCommand),
 }
@@ -1944,8 +1959,8 @@ fn retry_workspace_conflict(
         .mut_subcommand("workspace", |workspace| {
             workspace.mut_subcommands(|leaf| {
                 leaf.mut_args(|arg| match arg.get_id().as_str() {
-                    "target" | "source" | "source_commit" | "workspace_id" | "database"
-                    | "port" | "dolt_bin" => arg.action(ArgAction::Append),
+                    "target" | "source" | "source_commit" | "workspace_id" | "mapping_file"
+                    | "database" | "port" | "dolt_bin" => arg.action(ArgAction::Append),
                     _ => arg,
                 })
             })
@@ -3538,6 +3553,16 @@ impl Command {
                 {
                     Err(
                         "Migration preflight accepts only --source, --source-commit, and output selection.",
+                    )
+                }
+                Self::Workspace(WorkspaceAction::MigrationPlan { .. })
+                    if common.workspace.is_some()
+                        || common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree) =>
+                {
+                    Err(
+                        "Migration plan accepts only --source, --source-commit, --workspace-id, --mapping-file, and output selection.",
                     )
                 }
                 Self::Backup(BackupCommand::Create { .. }) => {

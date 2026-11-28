@@ -5,11 +5,15 @@ use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::time::SystemTime;
 
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::config_file::{Coordination, ScopedDirectory};
+
+mod scope_plan;
+pub(crate) use scope_plan::plan;
 
 const MAX_INVENTORY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
@@ -19,6 +23,66 @@ const MAX_EXCLUDE_BYTES: usize = 64 * 1024;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveError> {
+    verified_source(source, revision, |source, inventory, _| {
+        Ok(json!({
+            "mode": "source_preflight",
+            "source": source,
+            "inventory": inventory.summary,
+        }))
+    })
+}
+
+#[derive(Serialize)]
+struct SourceSnapshot<'a> {
+    source_commit: &'a str,
+    source_clean: bool,
+    policy_pin: &'static str,
+    hive_yml: Value,
+    tree_oid: String,
+    root_tree_sha256: String,
+}
+
+struct Inventory {
+    entries: BTreeMap<String, InventoryEntry>,
+    summary: Value,
+}
+
+struct InventoryEntry {
+    mode: &'static str,
+    oid: String,
+    size: Option<usize>,
+}
+
+impl InventoryEntry {
+    fn is_directory(&self) -> bool {
+        self.size.is_none()
+    }
+
+    fn digest_fields(&self) -> String {
+        let size = self
+            .size
+            .map_or_else(|| "-".into(), |size| size.to_string());
+        format!("{}\0{}\0{size}\0", self.mode, self.oid)
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Reason {
+    AmbiguousScopeOrCollision,
+    ExternalBackendOwned,
+    UnsplitLegacyScope,
+}
+
+fn verified_source<T>(
+    source: &Path,
+    revision: &str,
+    inspect: impl FnOnce(
+        &SourceSnapshot<'_>,
+        &Inventory,
+        &AssetObjectReader<'_>,
+    ) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
     if !source.is_absolute() || !is_full_lowercase_oid(revision) {
         return Err(HiveError::new(
             ErrorCode::InvalidArgument,
@@ -109,6 +173,15 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
         Some(Coordination::Remote(_)) => json!({"version": 1, "mode": "remote"}),
         None => Value::Null,
     };
+    let snapshot = SourceSnapshot {
+        source_commit: revision,
+        source_clean: true,
+        policy_pin,
+        hive_yml,
+        tree_oid: tree,
+        root_tree_sha256: format!("{:x}", Sha256::digest(raw_tree)),
+    };
+    let result = inspect(&snapshot, &inventory, &reader);
 
     let changed = || {
         HiveError::new(
@@ -129,18 +202,7 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
     if !repository.same_worktree(&select().map_err(|_| changed())?)? {
         return Err(changed());
     }
-    Ok(json!({
-        "mode": "source_preflight",
-        "source": {
-            "source_commit": revision,
-            "source_clean": true,
-            "policy_pin": policy_pin,
-            "hive_yml": hive_yml,
-            "tree_oid": tree,
-            "root_tree_sha256": format!("{:x}", Sha256::digest(raw_tree)),
-        },
-        "inventory": inventory,
-    }))
+    result
 }
 
 #[derive(PartialEq, Eq)]
@@ -329,7 +391,7 @@ fn inventory(
     root_oid: &str,
     root_tree: &[u8],
     index: &[u8],
-) -> Result<Value, HiveError> {
+) -> Result<Inventory, HiveError> {
     let invalid = || {
         HiveError::new(
             ErrorCode::InvalidRecord,
@@ -401,15 +463,15 @@ fn inventory(
                 }
                 _ => return Err(invalid()),
             };
-            let size_field = size.map_or_else(|| "-".into(), |size| size.to_string());
-            catalog_bytes += path.len() + mode.len() + oid.len() + size_field.len() + 4;
+            let entry = InventoryEntry { mode, oid, size };
+            catalog_bytes += path.len() + 1 + entry.digest_fields().len();
             if catalog_bytes > MAX_INVENTORY_BYTES {
                 return Err(HiveError::new(
                     ErrorCode::InvalidConfig,
                     "The v1 source inventory exceeds 4 MiB.",
                 ));
             }
-            if entries.insert(path, (mode, oid, size_field)).is_some() {
+            if entries.insert(path, entry).is_some() {
                 return Err(invalid());
             }
         }
@@ -422,10 +484,12 @@ fn inventory(
         )
     };
     let mut index = index.split_inclusive(|byte| *byte == 0);
-    for (path, (mode, oid, size)) in &entries {
-        digest.update(format!("{path}\0{mode}\0{oid}\0{size}\0"));
-        if *mode != "040000" {
-            let expected = format!("H {mode} {oid} 0\t{path}\0");
+    for (path, entry) in &entries {
+        digest.update(path);
+        digest.update(b"\0");
+        digest.update(entry.digest_fields());
+        if !entry.is_directory() {
+            let expected = format!("H {} {} 0\t{path}\0", entry.mode, entry.oid);
             if index.next() != Some(expected.as_bytes()) {
                 return Err(inconsistent_index());
             }
@@ -434,12 +498,13 @@ fn inventory(
     if index.next().is_some() {
         return Err(inconsistent_index());
     }
-    Ok(json!({
+    let summary = json!({
         "directory_count": directories,
         "file_count": entries.len() - directories,
         "blob_bytes": blob_bytes,
         "catalog_sha256": format!("{:x}", digest.finalize()),
-        "rulesync_directory": entries.get(".rulesync").is_some_and(|entry| entry.0 == "040000"),
-        "rulesync_config": entries.get("rulesync.jsonc").is_some_and(|entry| entry.0 != "040000"),
-    }))
+        "rulesync_directory": entries.get(".rulesync").is_some_and(InventoryEntry::is_directory),
+        "rulesync_config": entries.get("rulesync.jsonc").is_some_and(|entry| !entry.is_directory()),
+    });
+    Ok(Inventory { entries, summary })
 }
