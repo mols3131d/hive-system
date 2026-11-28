@@ -18,10 +18,12 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     const DIRECTIVE: &str = "directives/synthetic-app/proposal.md";
     const UNAPPROVED: &str = "directives/synthetic-app/unapproved.md";
     const ARTIFACT: &str = "artifacts/report.md";
-    const UNCLASSIFIED: &str = "artifacts/unclassified.md";
+    const UNCLASSIFIED: &str = "artifacts/Private Locator Canary.md";
     const SOUL: &str = "bots/synthetic-queen/SOUL.md";
     const INVALID_SOUL: &str = "bots/invalid-queen/SOUL.md";
     const MEMORY: &str = "bots/synthetic-queen/memory/synthetic-app/MEMORY.md";
+    const MEMORY_MANAGEMENT: &str = "bots/synthetic-queen/memory/synthetic-app/AGENTS.md";
+    const NAVIGATION: &str = "bots/synthetic-queen/MEMORY.md";
     const SOUL_TEXT: &str = "---\r\ndescription: Synthetic Manager Soul\r\n---\r\n# Queen\r\n\r\n## Identity\r\n\r\n- ID: synthetic-queen\r\n- Name: Synthetic Queen\r\n- Layer: 1 — Manager\r\n\r\n## Purpose\r\n\r\nSynthetic Soul content sentinel.\r\n";
     const CREATED: &str = "2024-02-01T12:00:00Z";
     const UPDATED: &str = "2024-02-02T12:00:00Z";
@@ -62,11 +64,16 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         (README, reference_doc.clone()),
         ("directives/synthetic-app/README.md", reference_doc.clone()),
         (MEMORY, reference_doc),
+        (MEMORY_MANAGEMENT, "Synthetic private management canary\n".into()),
+        (
+            NAVIGATION,
+            "---\ndescription: \"Memory navigation.\"\n---\n# Memory\n\n- [synthetic-app](memory/synthetic-app/MEMORY.md)\n".into(),
+        ),
         ("tasks/_hive/README.md", "# Unsplit legacy scope\n".into()),
         (
             TASK,
             format!(
-                "---\ndescription: Synthetic Task record\npriority: high\ntags: [\"  {LABEL}  \"]\n---\n{task_body}"
+                "---\ndescription: Synthetic Task record\npriority: high\ntags: [\"\u{a0}{LABEL}\u{2003}\"]\n---\n{task_body}"
             ),
         ),
         (
@@ -151,7 +158,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
             record_review(DIRECTIVE, &directive, json!({"kind":"proposed_directive","area_id":area,"issuer_ref":"human:synthetic-operator",
                 "source_ref":RECORD_REF,"created_at":CREATED,"updated_at":UPDATED,"supersession":"none","approval_and_validity":"none"})),
             record_review(ARTIFACT, &artifact, json!({"kind":"standalone_artifact","artifact_kind":"report","author_ref":"bot:synthetic-author",
-                "source_ref":RECORD_REF,"created_at":CREATED,"substantive_updated_at":UPDATED,"links":"none","archive":"none"})),
+                "source_ref":RECORD_REF,"created_at":CREATED,"substantive_updated_at":UPDATED.replace('T', "t"),"links":"none","archive":"none"})),
             record_review(READY_WORK_ARTIFACT, &work_artifact, work_provenance("ready", TASK)),
             record_review(HELD_WORK_ARTIFACT, &id(9), work_provenance("claimed", CLAIMED))
         ]
@@ -177,10 +184,14 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
             .args(["--contract", contract, "--json"]);
         command
     };
-    let migration = |action| {
+    let migration = |action, tasks| {
         let mut command = cli("2");
+        command.args(["workspace", action]);
+        if tasks {
+            command.arg("--tasks");
+        }
         command
-            .args(["workspace", action, "--tasks", "--source"])
+            .arg("--source")
             .arg(&source)
             .args([
                 "--source-commit",
@@ -192,13 +203,14 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
             .arg(&mapping_file);
         command
     };
-    let stage = |mode| {
-        let mut command = migration("migration-stage");
+    let stage_with_tasks = |mode, tasks| {
+        let mut command = migration("migration-stage", tasks);
         command
             .args(["--mode", mode, "--policy-revision", POLICY, "--target"])
             .arg(&target);
         command
     };
+    let stage = |mode| stage_with_tasks(mode, true);
     let response = |command: &mut Command, status| {
         let output = command.output().unwrap();
         assert_eq!(output.status.code(), Some(status), "{output:?}");
@@ -208,7 +220,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     let read_v1 = || response(cli("1").args(["config", "show", "--scope", "workspace"]), 0);
     let v1 = read_v1();
     let plan = response(
-        migration("migration-plan").arg("--include-directives-artifacts"),
+        migration("migration-plan", true).arg("--include-directives-artifacts"),
         0,
     );
     for key in [
@@ -221,9 +233,59 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         assert!(plan["data"].get(key).is_some(), "{key}");
     }
 
+    let mut scope_only_mapping = mapping.clone();
+    for field in [
+        "task_reviews",
+        "resource_bindings",
+        "issue_resource_bindings",
+        "queen_assets",
+        "queen_preparation",
+        "reviewed_records",
+    ] {
+        scope_only_mapping.as_object_mut().unwrap().remove(field);
+    }
+    fs::write(&mapping_file, scope_only_mapping.to_string()).unwrap();
+    let scope_only = response(&mut stage_with_tasks("dry-run", false), 0)["data"].clone();
+    assert_eq!(scope_only["coverage"], "scope_only");
+    assert_eq!(
+        scope_only["reconciliation"]["inventory_only_surfaces"],
+        json!([
+            "tasks",
+            "directives",
+            "artifacts_standalone",
+            "artifacts_work_scoped",
+            "bots_soul"
+        ])
+    );
+    for surface in [
+        "tasks",
+        "directives",
+        "artifacts_standalone",
+        "artifacts_work_scoped",
+        "bots_soul",
+    ] {
+        assert!(
+            scope_only["counts"][surface]["inventoried"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(scope_only["counts"][surface]["imported"], 0, "{surface}");
+    }
+    assert_eq!(
+        scope_only["counts"]["navigation_only"]["excluded_non_record"],
+        1
+    );
+    assert_eq!(scope_only["counts"]["bot_memories_historical"]["held"], 1);
+    assert!(scope_only.get("queen_inventory").is_none());
+    assert!(!target.exists());
+    fs::write(&mapping_file, &mapping_bytes).unwrap();
+
     let dry = response(&mut stage("dry-run"), 0)["data"].clone();
     assert_eq!(dry["coverage"], "mixed");
     assert_eq!(dry["checks"]["transaction"], "rolled_back");
+    assert_eq!(dry["checks"]["task_rows_and_links"], "verified");
+    assert!(!dry.to_string().contains(LABEL));
     for surface in [
         "area",
         "issue",
@@ -239,6 +301,23 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     assert_eq!(dry["checks"]["target_artifact_links"], 0);
     assert_eq!(dry["target"]["issue_number_next_value"], 1);
     assert!(dry["target"]["confirmed_dolt_commit"].is_null());
+    assert_eq!(dry["target"]["projected_issue_number_next_value"], 2);
+    assert_eq!(
+        dry["reconciliation"]["counts_and_id_map_basis"],
+        "rolled_back_transaction"
+    );
+    assert_eq!(
+        dry["reconciliation"]["asset_commit_basis"],
+        "verified_disposable_commit"
+    );
+    assert_eq!(
+        dry["reconciliation"]["checks"]["committed_schema_constraints"],
+        "not_run"
+    );
+    assert_eq!(
+        dry["reconciliation"]["checks"]["committed_completion_obligations"],
+        "not_run"
+    );
     assert!(!target.exists());
 
     // Inject a source edit while verifying the private committed Dolt snapshot.
@@ -274,6 +353,37 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     assert_eq!(staged["checks"]["published_inactive"], true);
     assert_eq!(staged["mapping_sha256"], sha256_hex(&mapping_bytes));
     assert_eq!(staged["source"]["source_commit"], commit);
+    assert_eq!(staged["source"]["source_clean"], true);
+    assert_eq!(staged["source"]["policy_pin"], POLICY_PIN);
+    assert_eq!(staged["source"]["hive_yml_version"], 1);
+    assert_eq!(staged["source"]["hive_yml_mode"], "local");
+    assert!(staged["source"]["workspace_label"].is_null());
+    assert_eq!(staged["target"]["schema_version"], 1);
+    assert_eq!(staged["target"]["dolt_version"], "2.7.6");
+    assert_eq!(staged["target"]["workspace_id"], workspace);
+    assert_eq!(
+        staged["target"]["migration_digest"],
+        sha256_hex(include_bytes!(
+            "../../../assets/schema/dolt/0001_initial.sql"
+        ))
+    );
+    assert!(staged["observed_at"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(
+        staged["reconciliation"]["counts_and_id_map_basis"],
+        "confirmed_commit"
+    );
+    assert_eq!(
+        staged["reconciliation"]["asset_commit_basis"],
+        "verified_published_commit"
+    );
+    assert_eq!(
+        staged["reconciliation"]["checks"]["committed_schema_constraints"],
+        "passed"
+    );
+    assert_eq!(
+        staged["reconciliation"]["checks"]["committed_completion_obligations"],
+        "passed"
+    );
     for (key, held) in [
         ("scopes", 1),
         ("tasks", 1),
@@ -301,15 +411,98 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         assert_eq!(links[1]["reason_code"], "task_unprepared");
     }
     assert_eq!(staged["checks"]["target_issue_resource_rows"], 1);
+    assert_eq!(
+        staged["counts"]["bots_soul"],
+        json!({"inventoried":2,"imported":1,"held":1,"excluded_non_record":0})
+    );
+    assert_eq!(
+        staged["counts"]["bot_memories_historical"],
+        json!({"inventoried":2,"imported":0,"held":1,"excluded_non_record":1})
+    );
+    assert_eq!(
+        staged["counts"]["navigation_only"],
+        json!({"inventoried":1,"imported":0,"held":0,"excluded_non_record":1})
+    );
+    for surface in [
+        "scopes",
+        "tasks",
+        "resources",
+        "directives",
+        "artifacts_standalone",
+        "artifacts_work_scoped",
+        "bots_soul",
+        "bot_memories_historical",
+        "navigation_only",
+    ] {
+        let counts = &staged["counts"][surface];
+        let mut total = 0;
+        for (count, ledger) in [
+            ("imported", "id_map"),
+            ("held", "holds"),
+            ("excluded_non_record", "exclusions"),
+        ] {
+            let rows = staged[ledger]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["surface"] == surface)
+                .count();
+            assert_eq!(counts[count], rows, "{surface}.{count}");
+            total += rows;
+        }
+        assert_eq!(counts["inventoried"], total, "{surface}");
+    }
+    let tasks = &staged["counts"]["tasks"];
+    assert_eq!(
+        tasks["by_lifecycle"]["backlog"],
+        json!({"inventoried":1,"imported":1,"held":0,"excluded_non_record":0})
+    );
+    assert_eq!(
+        tasks["by_lifecycle"]["active"],
+        json!({"inventoried":1,"imported":0,"held":1,"excluded_non_record":0})
+    );
+    assert_eq!(
+        tasks["by_lifecycle"]["archive"],
+        json!({"inventoried":0,"imported":0,"held":0,"excluded_non_record":0})
+    );
+    assert_eq!(
+        tasks["imported_by_status"],
+        json!({"backlog":1,"todo":0,"done":0,"cancelled":0})
+    );
     let holds = staged["holds"].as_array().unwrap();
     for (path, reason) in [
         (CLAIMED, "execution_needs_reconciliation"),
         (UNAPPROVED, "missing_directive_approval"),
         (UNCLASSIFIED, "unclassified_artifact_kind"),
         (HELD_WORK_ARTIFACT, "parent_task_quarantined"),
+        (MEMORY, "curated_memory_deferred"),
+        (INVALID_SOUL, "invalid_soul_or_slug"),
     ] {
         let locator = sha256_hex(path.as_bytes());
-        assert!(holds.iter().any(|row| row["source_path_sha256"] == locator && row.to_string().contains(reason)), "{path}: {holds:?}");
+        let hold = holds
+            .iter()
+            .find(|row| row["source_path_sha256"] == locator)
+            .unwrap();
+        assert_eq!(hold["source_commit"], commit);
+        assert_eq!(hold["source_git_blob_sha"], oid(path));
+        assert!(hold["legacy_key_sha256"].is_string());
+        assert!(
+            hold["reason_codes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(reason))
+        );
+        assert!(
+            hold["reconciliation_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["reason_code"] == reason
+                    && row["action"]
+                        .as_str()
+                        .is_some_and(|action| !action.is_empty())),
+            "{path}: {hold:?}"
+        );
     }
     assert_eq!(
         staged["resource_bindings"]["outcomes"][1]["reason_code"],
@@ -330,6 +523,10 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         CLAIMED,
         SOUL,
         MEMORY,
+        MEMORY_MANAGEMENT,
+        NAVIGATION,
+        UNCLASSIFIED,
+        README,
         DIRECTIVE,
         ARTIFACT,
         READY_WORK_ARTIFACT,
@@ -338,6 +535,9 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         RECORD_REF,
         "Exact café bytes",
         "Synthetic Soul content sentinel",
+        "Synthetic private management canary",
+        "Private Locator Canary",
+        "Reviewed Synthetic Queen",
         "sample-holder",
         LABEL,
         root.to_str().unwrap(),
@@ -347,6 +547,69 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
 
     let db = staged["target"]["confirmed_dolt_commit"].as_str().unwrap();
     let assets = staged["target"]["asset_git_commit"].as_str().unwrap();
+    assert_ne!(db, staged["target"]["base_dolt_commit"]);
+    assert_eq!(staged["target"]["issue_number_next_value"], 2);
+    let id_map = staged["id_map"].as_array().unwrap();
+    for (path, kind, target, target_hash) in [
+        (
+            DIRECTIVE,
+            "directive",
+            &directive,
+            sha256_hex(RECORD_BODY.as_bytes()),
+        ),
+        (
+            ARTIFACT,
+            "artifact",
+            &artifact,
+            sha256_hex(RECORD_BODY.as_bytes()),
+        ),
+        (
+            READY_WORK_ARTIFACT,
+            "artifact",
+            &work_artifact,
+            sha256_hex(work_body.as_bytes()),
+        ),
+        (SOUL, "bot_soul", &queen, sha256_hex(SOUL_TEXT.as_bytes())),
+    ] {
+        let located = id_map
+            .iter()
+            .find(|row| row["source_path_sha256"] == sha256_hex(path.as_bytes()))
+            .unwrap();
+        let (_, contents) = fixtures.iter().find(|(file, _)| *file == path).unwrap();
+        assert_eq!(located["kind"], kind);
+        assert_eq!(located["target_id"], target.as_str());
+        assert_eq!(located["source_git_blob_sha"], oid(path));
+        assert_eq!(
+            located["source_raw_sha256"],
+            sha256_hex(contents.as_bytes())
+        );
+        assert_eq!(located["target_body_sha256"], target_hash);
+    }
+    let mapped_directive = id_map
+        .iter()
+        .find(|row| row["kind"] == "directive")
+        .unwrap();
+    assert_eq!(
+        mapped_directive["legacy_key_sha256"],
+        sha256_hex(b"directives/synthetic-app/proposal")
+    );
+    assert_eq!(mapped_directive["directive_id"], directive);
+    let soul = id_map.iter().find(|row| row["kind"] == "bot_soul").unwrap();
+    assert_eq!(soul["legacy_key_sha256"], sha256_hex(b"synthetic-queen"));
+    assert_eq!(
+        soul["asset_git_blob_sha"],
+        git_text(
+            &target.join("assets"),
+            &home,
+            &[
+                "rev-parse",
+                &format!("{assets}:bots/synthetic-queen/SOUL.md")
+            ]
+        )
+    );
+    let scope = id_map.iter().find(|row| row["kind"] == "scope").unwrap();
+    assert_eq!(scope["target_id"], area);
+    assert_eq!(scope["resource_ids"], json!([resource]));
     let sql = |query: &str| {
         let output = Command::new(&dolt)
             .env_clear()
@@ -377,6 +640,12 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     let labels = issue["label_ids"].as_array().unwrap();
     assert_eq!(labels.len(), 1);
     let label = &labels[0];
+    assert_eq!(issue["target_id"], issue["issue_id"]);
+    assert_eq!(issue["source_git_blob_sha"], oid(TASK));
+    assert_eq!(
+        issue["target_body_sha256"],
+        sha256_hex(task_body.as_bytes())
+    );
     assert_eq!(
         sql(&format!(
             "SELECT id, number, area_id, status, priority, body FROM issues AS OF '{db}'"

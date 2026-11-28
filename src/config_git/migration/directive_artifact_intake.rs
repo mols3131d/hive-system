@@ -350,15 +350,18 @@ pub(super) fn scan(
                 }
             }
         };
+        let legacy_key = if surface == Surface::Directives {
+            path.strip_suffix("/README.md")
+                .or_else(|| path.strip_suffix(".md"))
+                .unwrap_or(path)
+        } else {
+            path
+        };
         if surface == Surface::Directives
             && let Some(review) = review
         {
-            let key = path
-                .strip_suffix("/README.md")
-                .or_else(|| path.strip_suffix(".md"))
-                .unwrap_or(path);
             directives.push(ReviewedDirective {
-                key,
+                key: legacy_key,
                 row: records.len(),
                 review,
                 prepared: matches!(outcome, Outcome::Prepared { .. }),
@@ -369,6 +372,7 @@ pub(super) fn scan(
             "source_git_blob_sha": entry.oid,
             "source_raw_sha256": raw_sha256,
             "source_size": size,
+            "legacy_key_sha256": format!("{:x}", Sha256::digest(legacy_key)),
         });
         let portable_ancestry = scope.is_none_or(is_portable_scope)
             && parent.is_none_or(|(_, work_id)| is_slug(work_id));

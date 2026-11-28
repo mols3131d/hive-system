@@ -19,6 +19,7 @@ use crate::workspace_init::POLICY_REVISION;
 mod directive_artifact;
 mod issue_resources;
 mod labels;
+mod reconciliation_report;
 mod resources;
 mod tasks;
 
@@ -239,7 +240,7 @@ fn prepare(
         Some(confirmed)
     };
 
-    verify_asset_commit(
+    let soul_blobs = verify_asset_commit(
         &installed,
         &assets,
         &assets_dir,
@@ -303,23 +304,12 @@ fn prepare(
         report["counts"]["prepared_queens"] = json!(queens.len());
     }
     if let (Some(plan), Some(import)) = (&task_plan, &task_import) {
-        let mut ledger = plan.staging_ledger();
         report["coverage"] = json!("scopes_and_tasks");
-        report["counts"]["tasks"] = ledger["counts"].take();
+        reconciliation_report::add_task_ledger(&mut report, plan.staging_ledger());
         report["id_map"]
             .as_array_mut()
             .expect("scope ID map")
             .extend(import.id_map());
-        for key in ["holds", "exclusions"] {
-            let entries = ledger[key].as_array_mut().expect("Task ledger entries");
-            for entry in entries.iter_mut() {
-                entry["kind"] = json!("task");
-            }
-            report[key]
-                .as_array_mut()
-                .expect("scope ledger entries")
-                .append(entries);
-        }
         report["checks"]["task_rows_and_links"] = json!("verified");
         report["checks"]["target_issue_rows"] = json!(if dry_run { 0 } else { issue_count });
         report["target"]["projected_issue_number_next_value"] = json!(issue_count + 1);
@@ -330,7 +320,8 @@ fn prepare(
     issue_resources.add_report(&mut report, dry_run);
     let include_reviewed_records = intake.is_some();
     if let Some(intake) = intake {
-        directive_artifact::add_report(&mut report, intake, &expected.records);
+        report["coverage"] = json!("scopes_directives_artifacts");
+        directive_artifact::add_report(&mut report, intake, Some(&expected.records));
         let (directives, artifacts) = expected.records.counts();
         report["checks"]["target_directive_rows"] = json!(if dry_run { 0 } else { directives });
         report["checks"]["target_artifact_rows"] = json!(if dry_run { 0 } else { artifacts });
@@ -358,6 +349,7 @@ fn prepare(
         report["coverage"] = json!("mixed");
         report["included_surfaces"] = json!(surfaces);
     }
+    reconciliation_report::complete(&mut report, reviewed, &soul_blobs, dry_run)?;
     Ok((report, staged))
 }
 
@@ -401,7 +393,7 @@ fn verify_asset_commit(
     base: &str,
     commit: &str,
     queens: &[PreparedQueen],
-) -> Result<(), HiveError> {
+) -> Result<BTreeMap<String, String>, HiveError> {
     let invalid_assets =
         || unverified("The staged Git asset commit differs from the reviewed Queen Souls.");
     if commit.len() != 40 || !crate::config_git::is_full_lowercase_oid(commit) {
@@ -410,7 +402,8 @@ fn verify_asset_commit(
     installed.git(assets, &["fsck", "--full", "--no-reflogs", commit])?;
     if queens.is_empty() {
         installed.verify_initial_assets(assets, base)?;
-        return require_entries(assets_dir, &[".git"]);
+        require_entries(assets_dir, &[".git"])?;
+        return Ok(BTreeMap::new());
     }
     if installed.git(assets, &["symbolic-ref", "HEAD"])?.trim() != "refs/heads/main"
         || installed
@@ -438,6 +431,7 @@ fn verify_asset_commit(
         expected.insert(format!("bots/{slug}"), "040000 tree ");
         expected.insert(format!("bots/{slug}/SOUL.md"), "100644 blob ");
     }
+    let mut soul_blobs = BTreeMap::new();
     for entry in tree.split_terminator('\0') {
         let (metadata, path) = entry.split_once('\t').ok_or_else(invalid_assets)?;
         if !expected
@@ -445,6 +439,12 @@ fn verify_asset_commit(
             .is_some_and(|kind| metadata.starts_with(kind))
         {
             return Err(invalid_assets());
+        }
+        if let Some(oid) = metadata.strip_prefix("100644 blob ") {
+            if oid.len() != 40 || !crate::config_git::is_full_lowercase_oid(oid) {
+                return Err(invalid_assets());
+            }
+            soul_blobs.insert(path.to_owned(), oid.to_owned());
         }
     }
     if !expected.is_empty() {
@@ -467,7 +467,7 @@ fn verify_asset_commit(
             return Err(invalid_assets());
         }
     }
-    Ok(())
+    Ok(soul_blobs)
 }
 
 struct ImportRows<'a> {

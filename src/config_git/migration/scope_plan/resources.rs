@@ -85,27 +85,63 @@ pub(crate) struct PreparedBinding<'a> {
 
 pub(crate) struct PreparedResources<'a> {
     version: u32,
-    outcomes: Vec<(&'a str, Result<PreparedBinding<'a>, Hold>)>,
+    outcomes: Vec<(&'a Binding, Result<PreparedBinding<'a>, Hold>)>,
 }
 
 impl PreparedResources<'_> {
     pub(crate) fn outcomes(
         &self,
     ) -> impl Iterator<Item = (&str, Result<&PreparedBinding<'_>, Hold>)> {
-        self.outcomes
-            .iter()
-            .map(|(id, outcome)| (*id, outcome.as_ref().map_err(|reason| *reason)))
+        self.outcomes.iter().map(|(binding, outcome)| {
+            (
+                binding.resource.id.as_str(),
+                outcome.as_ref().map_err(|reason| *reason),
+            )
+        })
+    }
+
+    pub(crate) fn reconciliation_entries(&self) -> impl Iterator<Item = Value> {
+        self.outcomes.iter().map(|(binding, outcome)| {
+            let mut key = Sha256::new();
+            key.update(&binding.scope);
+            key.update(b"\0");
+            key.update(&binding.evidence_path);
+            let path_sha256 = format!("{:x}", Sha256::digest(&binding.evidence_path));
+            let mut row = json!({
+                "surface": "resources", "resource_id": binding.resource.id,
+                "scope_sha256": format!("{:x}", Sha256::digest(&binding.scope)),
+                "legacy_key_sha256": format!("{:x}", key.finalize()),
+                "evidence_path_sha256": path_sha256,
+            });
+            match outcome {
+                Ok(prepared) => {
+                    row["status"] = json!("imported");
+                    row["area_id"] = json!(prepared.link.area_id);
+                    row["source_path_sha256"] = json!(path_sha256);
+                    row["source_git_blob_sha"] = json!(binding.evidence_blob_oid);
+                }
+                Err(reason) => {
+                    row["status"] = json!(if matches!(reason, Hold::ScopeExcluded) {
+                        "excluded"
+                    } else {
+                        "held"
+                    });
+                    row["reason_code"] = json!(reason);
+                }
+            }
+            row
+        })
     }
 
     pub(super) fn report(&self) -> Value {
         let outcomes: Vec<_> = self
             .outcomes
             .iter()
-            .map(|(resource_id, outcome)| match outcome {
+            .map(|(binding, outcome)| match outcome {
                 Ok(prepared) => prepared.report(),
                 Err(reason) => json!({
                     "status": "held",
-                    "resource_id": resource_id,
+                    "resource_id": binding.resource.id,
                     "reason": reason,
                 }),
             })
@@ -177,7 +213,7 @@ impl Bindings {
                     }
                     Ok(prepared)
                 });
-                (binding.resource.id.as_str(), result)
+                (binding, result)
             })
             .collect();
         Ok(PreparedResources {
