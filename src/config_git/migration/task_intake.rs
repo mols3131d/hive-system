@@ -8,9 +8,7 @@ use sha2::{Digest, Sha256};
 
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
 use super::task_graph::{Node, held_nodes};
-use super::task_provenance::{
-    Key, Prepared, Relations, Reviews, SourceBody, StagingFields, TaskReview,
-};
+use super::task_provenance::{Key, Prepared, Reviews, SourceBody, StagingFields, TaskReview};
 use super::{Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
 use crate::config_file::{parse_v2, parse_v2_projection, present};
