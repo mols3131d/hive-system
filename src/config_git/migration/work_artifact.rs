@@ -18,6 +18,10 @@ pub(super) struct TaskContext<'a> {
 }
 
 impl<'a> TaskContext<'a> {
+    pub(super) fn task(&self, key: Key<'_>) -> Option<&StagingTask<'_>> {
+        self.prepared.get(&key).copied()
+    }
+
     pub(super) fn new(workspace_id: &'a str, tasks: Option<&'a [StagingTask<'a>]>) -> Self {
         Self {
             workspace_id,
@@ -147,6 +151,7 @@ impl WorkArtifactReview {
             source_ref: self.source_ref.clone(),
             created_at: canonical_utc(created),
             substantive_updated_at: canonical_utc(updated),
+            standalone_links: None,
             work: Some(Box::new(WorkScope {
                 issue_link: IssueLink {
                     decision: "retain",

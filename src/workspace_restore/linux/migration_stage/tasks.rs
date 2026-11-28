@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 
 use super::{io_error, sql_text, unverified};
 use crate::config_git::migration::StagingTask;
-use crate::config_git::migration::prepared_records::IssueLink;
+use crate::config_git::migration::prepared_records::{IssueLink, ReviewedIssue};
 use crate::dolt::issue_writer::new_uuid_v7;
 use crate::error::{ErrorCode, HiveError};
 
@@ -134,10 +134,34 @@ impl<'a> TaskImport<'a> {
     }
 
     pub(super) fn issue_id(&self, link: &IssueLink) -> Option<&str> {
-        let task = self.assigned(link.key())?;
-        (task.task.area_id == link.area_id
-            && task.task.source_path == link.source_path
-            && task.task.source_git_blob_sha == link.source_git_blob_sha)
+        self.verified_issue_id(
+            link.key(),
+            &link.area_id,
+            &link.source_path,
+            &link.source_git_blob_sha,
+        )
+    }
+
+    pub(super) fn standalone_issue_id(&self, link: &ReviewedIssue) -> Option<&str> {
+        self.verified_issue_id(
+            link.key(),
+            &link.area_id,
+            &link.source_path,
+            &link.source_git_blob_sha,
+        )
+    }
+
+    fn verified_issue_id(
+        &self,
+        key: (&str, &str),
+        area: &str,
+        path: &str,
+        blob: &str,
+    ) -> Option<&str> {
+        let task = self.assigned(key)?;
+        (task.task.area_id == area
+            && task.task.source_path == path
+            && task.task.source_git_blob_sha == blob)
             .then_some(task.id.as_str())
     }
 

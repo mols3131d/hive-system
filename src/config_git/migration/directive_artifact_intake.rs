@@ -12,7 +12,7 @@ use super::directive_history::{LinkDecision, ReviewedDirective, resolve_links};
 use super::prepared_records::{Content, Fields, Intake, PreparedRecord};
 use super::reviewed_records::{self, Review};
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
-use super::work_artifact::TaskContext;
+use super::standalone_artifact::JoinContext;
 use super::{AssetObjectReader, Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, parse_v2, present};
@@ -123,7 +123,7 @@ impl Outcome {
         supported_shape: bool,
         observed_at: Option<OffsetDateTime>,
         parent: Option<&str>,
-        tasks: &TaskContext<'_>,
+        ctx: &JoinContext<'_>,
     ) -> Self {
         let Self::Held {
             candidate: Some(candidate),
@@ -135,12 +135,12 @@ impl Outcome {
         let provenance = if review.is_work_scoped() {
             match (supported_shape, parent, &record.content) {
                 (true, Some(parent), Some(content)) => {
-                    review.prepare_work_scoped(&candidate, &content.body, parent, tasks)
+                    review.prepare_work_scoped(&candidate, &content.body, parent, &ctx.tasks)
                 }
                 _ => Err(Reason::UnsupportedReviewedRecord),
             }
         } else if supported_shape && parent.is_none() {
-            review.prepare(&candidate, observed_at)
+            review.prepare(&candidate, observed_at, ctx)
         } else {
             Err(Reason::UnsupportedReviewedRecord)
         };
@@ -227,7 +227,7 @@ pub(super) fn scan(
     reviews: Option<&[Review]>,
     observed_at: Option<OffsetDateTime>,
     prepare_storage: bool,
-    tasks: &TaskContext<'_>,
+    ctx: &JoinContext<'_>,
 ) -> Result<Intake, HiveError> {
     let mut reviewed = reviewed_records::bind(reviews.unwrap_or_default(), inventory)?;
     let mut counts = BTreeMap::from([
@@ -341,7 +341,7 @@ pub(super) fn scan(
                                         || tail.strip_suffix(".md").is_some_and(is_slug),
                                     observed_at,
                                     parent.map(|(path, _)| path),
-                                    tasks,
+                                    ctx,
                                 ),
                                 None => outcome,
                             }

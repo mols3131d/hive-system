@@ -15,9 +15,9 @@ use super::prepared_records::Intake;
 use super::queen_assets::{self, QueenAssets, SoulReview};
 use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
 use super::reviewed_records::{Review, timestamp};
+use super::standalone_artifact::JoinContext;
 use super::task_intake::StagingTask;
 use super::task_provenance::TaskReview;
-use super::work_artifact::TaskContext;
 use super::{
     AssetObjectReader, Inventory, Reason, SourceSnapshot, directive_artifact_intake,
     is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
@@ -172,7 +172,7 @@ pub(crate) fn plan(
             "scopes": reviewed.scopes.iter().map(Scope::report).collect::<Vec<_>>(),
         });
         let task_plan = (include_tasks
-            || (include_directives_artifacts && reviewed.has_work_artifacts()))
+            || (include_directives_artifacts && reviewed.artifact_reviews_need_tasks()))
         .then(|| reviewed.prepare_tasks())
         .transpose()?;
         let tasks = task_plan.as_ref().map(task_intake::TaskPlan::staging_tasks);
@@ -259,13 +259,13 @@ impl ReviewedScopes<'_> {
             .transpose()
     }
 
-    fn has_work_artifacts(&self) -> bool {
+    fn artifact_reviews_need_tasks(&self) -> bool {
         self.mapping
             .reviewed_records
             .as_deref()
             .unwrap_or_default()
             .iter()
-            .any(Review::is_work_scoped)
+            .any(Review::needs_tasks)
     }
 
     pub(crate) fn directive_artifacts_for_staging(
@@ -300,7 +300,13 @@ impl ReviewedScopes<'_> {
             self.mapping.reviewed_records.as_deref(),
             self.directive_observed_at,
             prepare_storage,
-            &TaskContext::new(&self.mapping.workspace_id, tasks),
+            &JoinContext::new(
+                &self.mapping.workspace_id,
+                tasks,
+                self.scopes.iter().map(|scope| &scope.outcome),
+                std::iter::empty(),
+                self.resources.as_ref(),
+            ),
         )
     }
 

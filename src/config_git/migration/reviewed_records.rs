@@ -8,6 +8,7 @@ use super::directive_artifact_intake::{ArtifactKind, Candidate, DirectiveStatus}
 use super::directive_history::{DirectiveHistory, Edges};
 use super::prepared_records::{ArtifactFields, DirectiveFields, Fields};
 use super::scope_plan::portable_reference;
+use super::standalone_artifact::{JoinContext, LinkReview};
 use super::work_artifact::{TaskContext, WorkArtifactReview};
 use super::{Inventory, Reason};
 use crate::cli::is_slug;
@@ -44,7 +45,7 @@ enum Provenance {
         author_ref: String,
         created_at: String,
         substantive_updated_at: String,
-        links: AbsenceReview,
+        links: LinkReview,
         archive: AbsenceReview,
     },
 }
@@ -97,6 +98,14 @@ impl Review {
         matches!(self.provenance, Provenance::WorkScopedArtifact(_))
     }
 
+    pub(super) fn needs_tasks(&self) -> bool {
+        match &self.provenance {
+            Provenance::WorkScopedArtifact(_) => true,
+            Provenance::StandaloneArtifact { links, .. } => links.needs_tasks(),
+            _ => false,
+        }
+    }
+
     pub(super) fn prepare_work_scoped(
         &self,
         candidate: &Candidate,
@@ -123,6 +132,7 @@ impl Review {
         &self,
         candidate: &Candidate,
         observed_at: Option<OffsetDateTime>,
+        ctx: &JoinContext<'_>,
     ) -> Result<Fields, Reason> {
         match (&self.provenance, candidate) {
             (
@@ -188,9 +198,7 @@ impl Review {
                 if artifact_kind != kind {
                     return Err(Reason::UnclassifiedArtifactKind);
                 }
-                if matches!(links, AbsenceReview::Unresolved) {
-                    return Err(Reason::UnresolvedArtifactLinks);
-                }
+                let standalone_links = links.prepare(ctx)?;
                 if !actor_ref(author_ref) {
                     return Err(Reason::UnverifiedArtifactAuthor);
                 }
@@ -205,6 +213,7 @@ impl Review {
                     created_at: created_at.clone(),
                     substantive_updated_at: substantive_updated_at.clone(),
                     work: None,
+                    standalone_links,
                 }))
             }
             _ => Err(Reason::UnsupportedReviewedRecord),

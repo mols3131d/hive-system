@@ -28,6 +28,7 @@ mod work_artifact;
 pub(crate) use queen_preparation::PreparedQueen;
 pub(crate) use task_intake::StagingTask;
 mod scope_plan;
+mod standalone_artifact;
 pub(crate) use issue_resources::IssueResourceOutcome;
 pub(crate) use scope_plan::{
     Area, PreparedResources, ResourceHold, ReviewedScopes, plan, with_scope_mapping,
