@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
 use super::task_graph::{Node, held_nodes};
-use super::task_provenance::{Key, Prepared, Relations, Reviews, SourceBody, TaskReview};
+use super::task_provenance::{Key, Prepared, Reviews, SourceBody, TaskReview};
 use super::{Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
 use crate::config_file::{parse_v2, parse_v2_projection, present};
@@ -168,8 +168,9 @@ pub(super) fn prepare<'a>(
     let mut outcomes = Vec::with_capacity(records.len());
     let mut nodes = Vec::with_capacity(records.len());
     for record in &records {
-        let (outcome, relations) = record.assess(
-            scopes[record.scope.as_str()],
+        let scope = scopes[record.scope.as_str()];
+        let outcome = record.assess(
+            scope,
             counts[&record.key()] == 1,
             &reviews,
             &mut source_bodies,
@@ -181,9 +182,15 @@ pub(super) fn prepare<'a>(
             } => Some(candidate_status),
             _ => None,
         };
+        // A verified declaration can veto preparation of another Task even
+        // when this Task has no usable Area, metadata, or provenance.
+        let source_reviews = match (scope, record.blob_oid.as_deref()) {
+            (ScopeOutcome::Excluded { .. }, _) | (_, None) => &[],
+            (_, Some(oid)) => reviews.source_bound(record.key(), oid),
+        };
         nodes.push(Node {
             key: record.key(),
-            relations,
+            source_reviews,
             status,
         });
         outcomes.push(outcome);
@@ -266,16 +273,16 @@ impl Record {
         reasons
     }
 
-    fn assess<'a, 'review, 'record>(
+    fn assess<'a, 'record>(
         &'record self,
         scope: &ScopeOutcome<'a>,
         unique: bool,
-        reviews: &Reviews<'review>,
+        reviews: &Reviews<'_>,
         source_bodies: &mut HashMap<&'record str, SourceBody>,
         git: &impl Fn() -> Result<Command, HiveError>,
-    ) -> Result<(Outcome<'a>, Option<&'review Relations>), HiveError> {
+    ) -> Result<Outcome<'a>, HiveError> {
         if let ScopeOutcome::Excluded { reason } = scope {
-            return Ok((Outcome::Excluded { reason: *reason }, None));
+            return Ok(Outcome::Excluded { reason: *reason });
         }
         let reason_codes = self.hold_reasons(scope, !unique);
         let hold = |reason_codes| Outcome::Held {
@@ -285,23 +292,17 @@ impl Record {
         };
         let area = match scope {
             ScopeOutcome::Mapped { area } if unique && is_slug(&self.work_id) => area,
-            _ => return Ok((hold(reason_codes), None)),
+            _ => return Ok(hold(reason_codes)),
         };
-        let binding = self
-            .blob_oid
-            .as_deref()
-            .map_or(Ok(None), |oid| reviews.get(self.key(), oid, &area.id));
-        let relations = binding
-            .as_ref()
-            .ok()
-            .and_then(|review| review.and_then(|review| review.relations.as_ref()));
-        let outcome = match self.classification.candidate {
+        let binding = self.blob_oid.as_deref().map_or(Ok(None), |oid| {
+            reviews.for_preparation(self.key(), oid, &area.id)
+        });
+        match self.classification.candidate {
             Ok(status) if reason_codes.is_empty() => {
-                self.candidate_outcome(status, &area.id, binding, source_bodies, git)?
+                self.candidate_outcome(status, &area.id, binding, source_bodies, git)
             }
-            _ => hold(reason_codes),
-        };
-        Ok((outcome, relations))
+            _ => Ok(hold(reason_codes)),
+        }
     }
 
     fn candidate_outcome<'a, 'record>(

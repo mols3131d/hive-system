@@ -8,10 +8,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
-use super::task_provenance::TaskReview;
 use super::{
     AssetObjectReader, Inventory, Reason, is_portable_bot_memory_locator, snapshot_object,
-    task_intake, verified_source,
+    task_intake, task_provenance::TaskReview, verified_source,
 };
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
@@ -26,7 +25,7 @@ struct Mapping {
     policy_pin: String,
     workspace_id: String,
     scopes: Vec<ScopeMapping>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::json_object::deserialize_vec")]
     task_reviews: Vec<TaskReview>,
 }
 
@@ -431,7 +430,7 @@ fn unresolved_link_destination(before: &str) -> bool {
         .is_some_and(|prefix| prefix.trim_end().ends_with(']'))
 }
 
-fn closed_raw_html_block(raw: &str) -> bool {
+pub(super) fn closed_raw_html_block(raw: &str) -> bool {
     let raw = raw.trim();
     if raw.starts_with("<!--") {
         let mut remaining = raw;
