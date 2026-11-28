@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -300,20 +301,27 @@ fn valid_soul(bytes: &[u8], slug: &str) -> bool {
     {
         return false;
     }
-    let mut lines = body.lines().filter(|line| !line.trim().is_empty());
-    if !lines.next().is_some_and(|line| {
+    let mut offset = 0;
+    let mut lines = body
+        .split_inclusive('\n')
+        .map(|line| {
+            offset += line.len();
+            (offset, line.trim_end_matches(['\r', '\n']))
+        })
+        .filter(|(_, line)| !line.trim().is_empty());
+    if !lines.next().is_some_and(|(_, line)| {
         line.strip_prefix("# ")
             .is_some_and(|heading| !heading.trim().is_empty())
-            && !identity_declaration(line)
-    }) || lines.next() != Some("## Identity")
+            && !has_identity_declaration(line)
+    }) || !lines.next().is_some_and(|(_, line)| line == "## Identity")
     {
         return false;
     }
     let mut fields = BTreeMap::new();
-    let mut purpose = false;
-    for line in lines.by_ref() {
+    let mut purpose = None;
+    for (end, line) in lines {
         if line == "## Purpose" {
-            purpose = true;
+            purpose = Some(&body[end..]);
             break;
         }
         let Some((key, value)) = line
@@ -326,9 +334,10 @@ fn valid_soul(bytes: &[u8], slug: &str) -> bool {
             return false;
         }
     }
-    let purpose_text = lines.next();
-    purpose
-        && fields.len() == 3
+    let Some(purpose) = purpose else {
+        return false;
+    };
+    fields.len() == 3
         && fields.get("ID") == Some(&slug)
         && fields.get("Layer") == Some(&"1 — Manager")
         && fields.get("Name").is_some_and(|name| {
@@ -336,54 +345,77 @@ fn valid_soul(bytes: &[u8], slug: &str) -> bool {
                 && name.chars().count() <= 255
                 && !name.chars().any(char::is_control)
         })
-        && purpose_text.is_some_and(|line| !line.trim_start().starts_with('#'))
-        && !purpose_text
-            .into_iter()
-            .chain(lines)
-            .any(identity_declaration)
+        && purpose
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| !line.trim_start().starts_with('#'))
+        && !has_identity_declaration(purpose)
 }
 
-fn identity_declaration(line: &str) -> bool {
-    let mut text = line.trim();
-    loop {
-        if let Some(quoted) = text.strip_prefix('>') {
-            text = quoted.trim_start();
-            continue;
+fn has_identity_declaration(markdown: &str) -> bool {
+    let mut text = String::new();
+    let mut heading = false;
+    let mut items = 0;
+    for event in Parser::new(markdown) {
+        match event {
+            Event::Text(value) | Event::Code(value) => {
+                text.push_str(&value);
+                continue;
+            }
+            Event::SoftBreak | Event::HardBreak if heading => {
+                text.push(' ');
+                continue;
+            }
+            Event::Start(Tag::Heading { .. } | Tag::Item | Tag::Paragraph)
+            | Event::End(TagEnd::Heading(_) | TagEnd::Item | TagEnd::Paragraph)
+            | Event::SoftBreak
+            | Event::HardBreak => {}
+            _ => continue,
         }
-        let Some((marker, content)) = text.split_once(char::is_whitespace) else {
-            break;
-        };
-        let ordered = marker
-            .strip_suffix(['.', ')'])
-            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
-        if !matches!(marker, "-" | "+" | "*") && !ordered {
-            break;
+        if identity_declaration(&text, heading || items > 0) {
+            return true;
         }
-        text = content.trim_start();
+        text.clear();
+        match event {
+            Event::Start(Tag::Heading { .. }) => heading = true,
+            Event::End(TagEnd::Heading(_)) => heading = false,
+            Event::Start(Tag::Item) => items += 1,
+            Event::End(TagEnd::Item) => items -= 1,
+            _ => {}
+        }
     }
-    let heading = text.trim_start_matches('#');
-    let is_heading = heading.len() != text.len() && heading.starts_with(char::is_whitespace);
-    if is_heading {
-        text = heading.trim().trim_end_matches('#').trim_end();
-    }
-    let key = text
-        .split_once(':')
-        .map_or(text, |(key, _)| key)
-        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '_' | '`'))
+    identity_declaration(&text, heading || items > 0)
+}
+
+fn identity_declaration(text: &str, structured: bool) -> bool {
+    let label_text = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
         .to_ascii_lowercase();
-    identity_field(&key)
-        || matches!(key.as_str(), "identity" | "purpose")
-        || (is_heading
-            && key
-                .split_once(char::is_whitespace)
-                .is_some_and(|(field, _)| identity_field(field)))
-}
-
-fn identity_field(key: &str) -> bool {
-    matches!(
-        key,
-        "id" | "bot id" | "bot-id" | "bot_id" | "slug" | "name" | "display name" | "layer" | "role"
-    )
+    let label_text = label_text.trim_start_matches(['*', '_', '`']).trim_start();
+    [
+        "id",
+        "bot id",
+        "bot-id",
+        "bot_id",
+        "slug",
+        "name",
+        "display name",
+        "layer",
+        "role",
+        "identity",
+        "purpose",
+    ]
+    .into_iter()
+    .any(|field| {
+        label_text.strip_prefix(field).is_some_and(|rest| {
+            let value = rest.trim_start_matches(['*', '_', '`']).trim_start();
+            value.is_empty()
+                || value.starts_with([':', '='])
+                || (structured && rest.starts_with([' ', '-', '–', '—', '*', '_', '`']))
+        })
+    })
 }
 
 fn navigation_only(bytes: &[u8], directory: &str, inventory: &Inventory) -> bool {

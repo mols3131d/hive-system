@@ -1422,6 +1422,12 @@ fn check_queen_asset_intake(policy_pin: &str) {
         ("conflict-heading", "### Layer: 2 — Coordinator ###"),
         ("conflict-heading-section", "### Role\n\nCoordinator"),
         ("conflict-setext", "Role\n----\nCoordinator"),
+        ("conflict-multiword-atx", "### Bot ID different-queen"),
+        ("conflict-bold-atx", "### **Bot ID** different-queen"),
+        ("conflict-multiword-setext", "Bot ID different-queen\n---"),
+        ("conflict-empty-field", "* **Display Name**:"),
+        ("conflict-empty-heading", "### **Bot ID**"),
+        ("conflict-malformed-field", "* **Bot ID = different-queen"),
     ];
     for (slug, declaration) in conflicting {
         write(
