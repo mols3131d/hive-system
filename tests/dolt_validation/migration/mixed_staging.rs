@@ -3,8 +3,11 @@ use std::path::Path;
 
 use super::{Command, POLICY_PIN, Value, fs, git, git_text, id, init_git, json, sha256_hex};
 
+#[path = "post_import.rs"]
+mod post_import;
+
 #[test]
-#[ignore = "requires installed Hive and pinned Dolt and Git"]
+#[ignore = "requires installed Hive, pinned Dolt and Git, local TCP and Linux pidfds"]
 fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     const POLICY: &str = "c66b3c50150e18426485d134de92c6b311dac125";
     const REPO_URL: &str = "https://forge.example/synthetic/mixed";
@@ -375,6 +378,21 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     assert_eq!(
         sql("SELECT DOLT_HASHOF('HEAD') AS head"),
         json!([{"head":db}])
+    );
+
+    post_import::exercise(
+        post_import::StagedTarget {
+            root,
+            home: &home,
+            target: &target,
+            workspace: &workspace,
+            area: &area,
+            dolt: &dolt,
+            report: &staged,
+        },
+        || cli("2"),
+        || stage("staged-import"),
+        sql,
     );
 
     assert_eq!(read_v1(), v1);
