@@ -829,6 +829,705 @@ fn row_count(admin: &mut Conn, table: &str) -> u64 {
         .unwrap()
 }
 
+#[cfg(target_os = "linux")]
+fn migration_preflight(home: &Path, config: &Path, args: &[&str], status: i32) -> Value {
+    let path = std::env::var_os("PATH").unwrap();
+    migration_preflight_with_path(home, config, args, status, &path)
+}
+
+#[cfg(target_os = "linux")]
+fn migration_preflight_with_path(
+    home: &Path,
+    config: &Path,
+    args: &[&str],
+    status: i32,
+    search_path: &std::ffi::OsStr,
+) -> Value {
+    let result = Command::new(env!("CARGO_BIN_EXE_hive"))
+        .current_dir(home)
+        .env_clear()
+        .env("PATH", search_path)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", config)
+        // An inherited repository selection must not replace the explicit one.
+        .env("GIT_DIR", home.join("unrelated.git"))
+        .args([
+            "--contract",
+            "2",
+            "--json",
+            "workspace",
+            "migration-preflight",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(status), "{result:?}");
+    assert!(result.stderr.is_empty(), "{result:?}");
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["command"], "workspace migration-preflight");
+    assert_eq!(report["ok"], status == 0);
+    if let Some([_, path]) = args.windows(2).find(|pair| pair[0] == "--source")
+        && Path::new(path).is_absolute()
+    {
+        assert!(!String::from_utf8_lossy(&result.stdout).contains(path));
+    }
+    report
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflights_only_a_clean_pinned_v1_source() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("xdg-config");
+    let source = root.path().join("legacy-v1");
+    let commit = init_source(&source, &home);
+    let path = source.to_str().unwrap();
+    let cli = |args: &[&str], status| migration_preflight(&home, &config, args, status);
+    let args = ["--source", path, "--source-commit", &commit];
+    let original_git_files = [
+        ".git/HEAD",
+        ".git/index",
+        ".git/config",
+        ".git/refs/heads/main",
+    ]
+    .map(|name| fs::read(source.join(name)).unwrap());
+    let report = cli(&args, 0);
+    assert_eq!(report, cli(&args, 0));
+    let data = &report["data"];
+    assert_eq!(data["mode"], "source_preflight");
+    assert_eq!(data["source"]["source_commit"], commit);
+    assert_eq!(data["source"]["source_clean"], true);
+    assert_eq!(data["source"]["policy_pin"], POLICY_PIN);
+    assert_eq!(
+        data["source"]["hive_yml"],
+        json!({"version": 1, "mode": "local"})
+    );
+    assert_eq!(data["inventory"]["file_count"], SYNTHETIC_V1_FILES.len());
+    assert_eq!(
+        data["inventory"]["blob_bytes"],
+        SYNTHETIC_V1_FILES
+            .iter()
+            .map(|(_, content)| content.len())
+            .sum::<usize>()
+    );
+    assert_eq!(data["inventory"]["rulesync_directory"], false);
+    assert_eq!(
+        data["source"]["root_tree_sha256"],
+        sha256_hex(&git(&source, &home, &["cat-file", "tree", "HEAD^{tree}"]))
+    );
+    let encoded = report.to_string();
+    assert!(!encoded.contains("tasks/synth-app/"));
+    assert!(!encoded.contains("Synthetic persona bytes."));
+    assert!(!config.exists());
+    assert_eq!(
+        [
+            ".git/HEAD",
+            ".git/index",
+            ".git/config",
+            ".git/refs/heads/main"
+        ]
+        .map(|name| fs::read(source.join(name)).unwrap()),
+        original_git_files
+    );
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+
+    let refuse =
+        |args: &[&str], status, code: &str| assert_eq!(cli(args, status)["error"]["code"], code);
+    refuse(&["--source", path], 2, "INVALID_ARGUMENT");
+    refuse(
+        &["--source", path, "--source-commit", "HEAD"],
+        2,
+        "INVALID_ARGUMENT",
+    );
+    refuse(
+        &["--source", "legacy-v1", "--source-commit", &commit],
+        2,
+        "INVALID_ARGUMENT",
+    );
+    let duplicate = [args.as_slice(), &["--source", path]].concat();
+    refuse(&duplicate, 2, "INVALID_ARGUMENT");
+    let blob = git_text(
+        &source,
+        &home,
+        &["rev-parse", "HEAD:bots/queen-synth/SOUL.md"],
+    );
+    let object = source
+        .join(".git/objects")
+        .join(&blob[..2])
+        .join(&blob[2..]);
+    let hidden_object = home.join("missing-object");
+    fs::rename(&object, &hidden_object).unwrap();
+    refuse(&args, 7, "OBJECT_UNAVAILABLE");
+    fs::rename(hidden_object, object).unwrap();
+    let nested = source.join("tasks");
+    refuse(
+        &[
+            "--source",
+            nested.to_str().unwrap(),
+            "--source-commit",
+            &commit,
+        ],
+        3,
+        "NOT_FOUND",
+    );
+    let untracked = source.join("untracked");
+    fs::write(&untracked, "dirty").unwrap();
+    refuse(&args, 5, "DIRTY_CONFLICT");
+    fs::create_dir_all(config.join("git")).unwrap();
+    let external_ignore = config.join("git/ignore");
+    fs::write(&external_ignore, "/untracked\n").unwrap();
+    refuse(&args, 5, "DIRTY_CONFLICT");
+    git(
+        &source,
+        &home,
+        &[
+            "config",
+            "core.excludesFile",
+            external_ignore.to_str().unwrap(),
+        ],
+    );
+    refuse(&args, 5, "DIRTY_CONFLICT");
+    fs::remove_file(untracked).unwrap();
+    git(
+        &source,
+        &home,
+        &["update-index", "--assume-unchanged", "hive.yml"],
+    );
+    refuse(&args, 7, "AUTHORITY_UNVERIFIED");
+    git(
+        &source,
+        &home,
+        &["update-index", "--no-assume-unchanged", "hive.yml"],
+    );
+
+    let yaml = source.join("hive.yml");
+    fs::write(
+        &yaml,
+        "version: 1\ncoordination:\n  mode: remote\n  remote: synthetic-private-alias\n",
+    )
+    .unwrap();
+    refuse(&args, 5, "DIRTY_CONFLICT");
+    git(&source, &home, &["add", "hive.yml"]);
+    refuse(&args, 5, "DIRTY_CONFLICT");
+    let commit_all = || {
+        git(&source, &home, &["add", "-A"]);
+        git(&source, &home, &["commit", "-qm", "Synthetic variation"]);
+        git_text(&source, &home, &["rev-parse", "HEAD"])
+    };
+    fs::create_dir(source.join(".rulesync")).unwrap();
+    fs::write(source.join(".rulesync/rule.md"), "Synthetic rule").unwrap();
+    fs::write(source.join("rulesync.jsonc"), "{}").unwrap();
+    fs::create_dir_all(source.join(".git/info")).unwrap();
+    fs::write(source.join(".git/info/exclude"), "/ignored-scratch\n").unwrap();
+    fs::write(source.join("ignored-scratch"), "Ignored local bytes").unwrap();
+    let current = commit_all();
+    refuse(&args, 5, "STALE_REVISION");
+    let current_report = cli(&["--source", path, "--source-commit", &current], 0);
+    assert_eq!(
+        current_report["data"]["source"]["hive_yml"]["mode"],
+        "remote"
+    );
+    assert_eq!(
+        current_report["data"]["inventory"]["rulesync_directory"],
+        true
+    );
+    assert_eq!(current_report["data"]["inventory"]["rulesync_config"], true);
+    assert_eq!(
+        current_report["data"]["inventory"]["file_count"],
+        SYNTHETIC_V1_FILES.len() + 2
+    );
+    assert_ne!(
+        current_report["data"]["inventory"]["catalog_sha256"],
+        data["inventory"]["catalog_sha256"]
+    );
+    assert!(
+        !current_report
+            .to_string()
+            .contains("synthetic-private-alias")
+    );
+
+    fs::write(&yaml, "version: 2\ncoordination:\n  mode: local\n").unwrap();
+    let current = commit_all();
+    refuse(
+        &["--source", path, "--source-commit", &current],
+        4,
+        "INCOMPATIBLE_POLICY",
+    );
+    fs::remove_file(yaml).unwrap();
+    let current = commit_all();
+    refuse(
+        &["--source", path, "--source-commit", &current],
+        2,
+        "INVALID_CONFIG",
+    );
+    let policy = source.join("AGENTS.md");
+    fs::write(
+        &policy,
+        format!("hive-system@{POLICY_PIN}\nhive-system@1111111111111111111111111111111111111111\n"),
+    )
+    .unwrap();
+    let current = commit_all();
+    refuse(
+        &["--source", path, "--source-commit", &current],
+        4,
+        "INCOMPATIBLE_POLICY",
+    );
+    fs::remove_file(policy).unwrap();
+    let current = commit_all();
+    refuse(
+        &["--source", path, "--source-commit", &current],
+        7,
+        "POLICY_UNAVAILABLE",
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn loose_object(repo: &Path, oid: &str) -> std::path::PathBuf {
+    repo.join(".git/objects").join(&oid[..2]).join(&oid[2..])
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_rejects_symlinked_repository_excludes() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    init_source(&source, &home);
+    fs::write(
+        source.join(".gitignore"),
+        "/ignored-by-gitignore\n!/visible-by-gitignore\n",
+    )
+    .unwrap();
+    git(&source, &home, &["add", ".gitignore"]);
+    git(&source, &home, &["commit", "-qm", "Synthetic ignore"]);
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    fs::write(source.join("ignored-by-gitignore"), "Local ignored bytes").unwrap();
+    let untracked = source.join("synthetic-untracked-probe");
+    fs::write(&untracked, "Synthetic untracked bytes").unwrap();
+
+    let info = source.join(".git/info");
+    fs::create_dir_all(&info).unwrap();
+    let exclude = info.join("exclude");
+    let external_info = home.join("synthetic-private-exclude-location");
+    fs::create_dir(&external_info).unwrap();
+    let external_exclude = external_info.join("exclude");
+    let rules =
+        b"# Synthetic private ignore contents\n/synthetic-untracked-probe\n/visible-by-gitignore\n";
+    fs::write(&external_exclude, rules).unwrap();
+    fs::write(&exclude, rules).unwrap();
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let preflight = |status| migration_preflight(&home, &home, &args, status);
+    let git_files = [
+        ".git/HEAD",
+        ".git/index",
+        ".git/config",
+        ".git/refs/heads/main",
+    ];
+    let git_before = git_files.map(|name| fs::read(source.join(name)).unwrap());
+    let original = preflight(0);
+    let visible = source.join("visible-by-gitignore");
+    fs::write(&visible, "Negated by .gitignore").unwrap();
+    assert_eq!(preflight(5)["error"]["code"], "DIRTY_CONFLICT");
+    fs::remove_file(visible).unwrap();
+
+    let refuse = || {
+        assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+        let report = preflight(2);
+        assert_eq!(report["error"]["code"], "INVALID_CONFIG");
+        assert!(report.get("data").is_none_or(Value::is_null));
+        let text = report.to_string();
+        for private in [
+            "synthetic-private-exclude-location",
+            "Synthetic private ignore contents",
+            "synthetic-untracked-probe",
+        ] {
+            assert!(!text.contains(private));
+        }
+        assert_eq!(fs::read(&external_exclude).unwrap(), rules);
+        assert_eq!(fs::read(&untracked).unwrap(), b"Synthetic untracked bytes");
+        assert_eq!(
+            git_files.map(|name| fs::read(source.join(name)).unwrap()),
+            git_before
+        );
+    };
+
+    fs::remove_file(&exclude).unwrap();
+    symlink(&external_exclude, &exclude).unwrap();
+    refuse();
+    assert_eq!(fs::read_link(&exclude).unwrap(), external_exclude);
+    fs::remove_file(&exclude).unwrap();
+    let saved_info = home.join("saved-info");
+    fs::rename(&info, &saved_info).unwrap();
+    symlink(&external_info, &info).unwrap();
+    refuse();
+    assert_eq!(fs::read_link(&info).unwrap(), external_info);
+    fs::remove_file(&info).unwrap();
+    fs::rename(&saved_info, &info).unwrap();
+
+    assert_eq!(preflight(5)["error"]["code"], "DIRTY_CONFLICT");
+    fs::remove_file(&untracked).unwrap();
+    assert_eq!(preflight(0), original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_uses_the_copied_exclude_during_untracked_enumeration() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    let commit = init_source(&source, &home);
+    let info = source.join(".git/info");
+    fs::create_dir_all(&info).unwrap();
+    let exclude = info.join("exclude");
+    fs::write(&exclude, "/safe-scratch\n").unwrap();
+    fs::write(source.join("safe-scratch"), "Ignored local bytes").unwrap();
+    let untracked = source.join("synthetic-visible-file");
+    fs::write(&untracked, "Untracked bytes").unwrap();
+    let external = home.join("external-exclude");
+    fs::write(&external, "/synthetic-visible-file\n/safe-scratch\n").unwrap();
+
+    let bin = home.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let path = std::env::var_os("PATH").unwrap();
+    let git_path = std::env::split_paths(&path)
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    symlink(git_path, home.join("real-git")).unwrap();
+    let wrapper = bin.join("git");
+    fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+set -eu
+for arg in "$@"; do
+    case "$arg" in
+        status|--others)
+            exclude="$HOME/../legacy-v1/.git/info/exclude"
+            mv "$exclude" "$exclude.saved"
+            trap 'rm -f "$exclude"; mv "$exclude.saved" "$exclude"' EXIT
+            ln -s "$HOME/external-exclude" "$exclude"
+            echo "$arg" >> "$HOME/swaps"
+            "$HOME/real-git" "$@"
+            exit
+            ;;
+    esac
+done
+exec "$HOME/real-git" "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let search_path =
+        std::env::join_paths([bin].into_iter().chain(std::env::split_paths(&path))).unwrap();
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let report = migration_preflight_with_path(&home, &home, &args, 5, &search_path);
+    assert_eq!(report["error"]["code"], "DIRTY_CONFLICT");
+    let text = report.to_string();
+    assert!(!text.contains("synthetic-visible-file"));
+    assert!(!text.contains("external-exclude"));
+    let swaps = fs::read_to_string(home.join("swaps")).unwrap();
+    assert_eq!(swaps, "status\n--others\n");
+    assert_eq!(fs::read(&exclude).unwrap(), b"/safe-scratch\n");
+    assert!(fs::symlink_metadata(exclude).unwrap().is_file());
+    assert_eq!(fs::read(&untracked).unwrap(), b"Untracked bytes");
+    assert_eq!(
+        fs::read(&external).unwrap(),
+        b"/synthetic-visible-file\n/safe-scratch\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_detects_a_racy_tracked_edit_without_changing_source_metadata() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    init_source(&source, &home);
+    git(&source, &home, &["config", "core.trustctime", "false"]);
+    let tracked = source.join("synthetic-racy-task.md");
+    let index = source.join(".git/index");
+    let timestamp = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+    let set_mtime = |path: &Path| {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(timestamp)
+            .unwrap();
+    };
+    fs::write(&tracked, b"Synthetic task A\n").unwrap();
+    set_mtime(&tracked);
+    git(&source, &home, &["add", "synthetic-racy-task.md"]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic racy index entry"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    set_mtime(&index);
+
+    fs::write(&tracked, b"Synthetic task B\n").unwrap();
+    set_mtime(&tracked);
+    let snapshot = || {
+        [&index, &tracked].map(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                fs::read(path).unwrap(),
+                metadata.modified().unwrap(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        })
+    };
+    let before = snapshot();
+    assert_eq!(before[0].1, before[1].1);
+    assert_eq!(
+        git(
+            &source,
+            &home,
+            &["status", "--porcelain=v1", "--untracked-files=no"]
+        ),
+        b" M synthetic-racy-task.md\n",
+    );
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let report = migration_preflight(&home, &home, &args, 5);
+    assert_eq!(report["error"]["code"], "DIRTY_CONFLICT");
+    assert!(!report.to_string().contains("synthetic-racy-task"));
+    assert_eq!(snapshot(), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_refuses_a_split_index_without_refreshing_source_metadata() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    let commit = init_source(&source, &home);
+    git(&source, &home, &["update-index", "--split-index"]);
+    let git_dir = source.join(".git");
+    let shared = fs::read_dir(&git_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .as_encoded_bytes()
+                .starts_with(b"sharedindex.")
+        })
+        .unwrap();
+    let paths = [git_dir.join("index"), shared];
+    for path in &paths {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+            .unwrap();
+    }
+    let snapshot = || {
+        paths.each_ref().map(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                fs::read(path).unwrap(),
+                metadata.modified().unwrap(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        })
+    };
+    let before = snapshot();
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let report = migration_preflight(&home, &home, &args, 7);
+    assert_eq!(report["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert!(report.get("data").is_none_or(Value::is_null));
+    assert!(!report.to_string().contains("sharedindex."));
+    assert_eq!(snapshot(), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_rejects_a_truncated_task_blob_with_readable_size() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    let commit = init_source(&source, &home);
+    let task = "tasks/synth-app/backlog/implement-widget/README.md";
+    let oid = git_text(&source, &home, &["rev-parse", &format!("HEAD:{task}")]);
+    let object = loose_object(&source, &oid);
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let preflight = |status| migration_preflight(&home, &home, &args, status);
+    let original = preflight(0);
+
+    // Keep the compressed header intact while discarding most of the body.
+    let bytes = fs::read(&object).unwrap();
+    let damaged = &bytes[..bytes.len() / 2];
+    let size = git_text(&source, &home, &["cat-file", "-s", &oid]);
+    fs::remove_file(&object).unwrap();
+    fs::write(&object, damaged).unwrap();
+    assert_eq!(git_text(&source, &home, &["cat-file", "-s", &oid]), size);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+
+    let report = preflight(7);
+    assert_eq!(report["error"]["code"], "OBJECT_UNAVAILABLE");
+    assert!(report.get("data").is_none_or(Value::is_null));
+    assert!(!report.to_string().contains(task));
+    assert!(!report.to_string().contains(&oid));
+    assert_eq!(fs::read(&object).unwrap(), damaged);
+    fs::write(&object, bytes).unwrap();
+    assert_eq!(preflight(0), original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_rejects_subtree_bytes_that_do_not_match_its_oid() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    let commit = init_source(&source, &home);
+    let oid = git_text(&source, &home, &["rev-parse", "HEAD:tasks"]);
+    let object = loose_object(&source, &oid);
+    let bytes = fs::read(&object).unwrap();
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let preflight = |status| migration_preflight(&home, &home, &args, status);
+    let original = preflight(0);
+
+    // An empty directory changes the committed catalog but adds no index entries.
+    let raw = home.join("raw-tree");
+    let write_tree = || {
+        git_text(
+            &source,
+            &home,
+            &["hash-object", "-w", "-t", "tree", raw.to_str().unwrap()],
+        )
+    };
+    fs::write(&raw, []).unwrap();
+    let empty = write_tree();
+    let mut tree = git(&source, &home, &["cat-file", "tree", &oid]);
+    tree.extend_from_slice(b"40000 z-synthetic-empty\0");
+    for offset in (0..empty.len()).step_by(2) {
+        tree.push(u8::from_str_radix(&empty[offset..offset + 2], 16).unwrap());
+    }
+    fs::write(&raw, &tree).unwrap();
+    let replacement = write_tree();
+    assert_ne!(replacement, oid);
+    let substituted = fs::read(loose_object(&source, &replacement)).unwrap();
+    fs::remove_file(&object).unwrap();
+    fs::write(&object, &substituted).unwrap();
+    assert_eq!(git(&source, &home, &["cat-file", "tree", &oid]), tree);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+
+    let report = preflight(7);
+    assert_eq!(report["error"]["code"], "OBJECT_UNAVAILABLE");
+    assert!(report.get("data").is_none_or(Value::is_null));
+    assert!(!report.to_string().contains("z-synthetic-empty"));
+    assert!(!report.to_string().contains(&oid));
+    assert_eq!(fs::read(&object).unwrap(), substituted);
+    fs::write(&object, bytes).unwrap();
+    assert_eq!(preflight(0), original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_preserves_legacy_policy_and_catalog_after_packing() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    for format in ["sha1", "sha256"] {
+        let source = root.path().join(format);
+        fs::create_dir(&source).unwrap();
+        git(
+            &source,
+            &home,
+            &["init", "-q", &format!("--object-format={format}")],
+        );
+        let policy = "hive-system@0fd0f8dbe632d14094a93599cb1b5f653789ac9c\n";
+        fs::write(source.join("AGENTS.md"), policy).unwrap();
+        fs::create_dir(source.join("tasks")).unwrap();
+        let body = "Synthetic duplicate blob";
+        fs::write(source.join("tasks/one.md"), body).unwrap();
+        fs::write(source.join("tasks/two.md"), body).unwrap();
+        git(&source, &home, &["add", "."]);
+        git(
+            &source,
+            &home,
+            &[
+                "-c",
+                "user.name=Synthetic Fixture",
+                "-c",
+                "user.email=synthetic@example.invalid",
+                "commit",
+                "-qm",
+                "Synthetic legacy workspace",
+            ],
+        );
+        let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+        let args = [
+            "--source",
+            source.to_str().unwrap(),
+            "--source-commit",
+            &commit,
+        ];
+        let report = migration_preflight(&home, &home, &args, 0);
+        assert_eq!(report["data"]["source"]["source_commit"], commit);
+        assert!(report["data"]["source"]["hive_yml"].is_null());
+        assert_eq!(report["data"]["inventory"]["file_count"], 3);
+        assert_eq!(
+            report["data"]["inventory"]["blob_bytes"],
+            policy.len() + 2 * body.len()
+        );
+        git(&source, &home, &["repack", "-ad"]);
+        assert!(!loose_object(&source, &commit).exists());
+        assert_eq!(migration_preflight(&home, &home, &args, 0), report);
+    }
+}
+
 #[test]
 #[ignore = "requires the pinned Dolt binary at HIVE_DOLT_BIN"]
 fn rehearses_v1_to_v2_migration_mapping_rollback_and_committed_validation() {

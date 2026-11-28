@@ -447,9 +447,20 @@ fn read_workspace(
     workspace: &GitWorkspace,
     revision: Option<&str>,
 ) -> Result<(&'static str, Option<Coordination>), HiveError> {
-    let policy = read_policy(workspace, revision)?;
-    let file = reviewed_file(workspace, revision, Path::new(WORKSPACE_FILE))
-        .map_err(|error| error.diagnostic(Some(WORKSPACE_FILE)))?;
+    let (policy, coordination) =
+        parse_workspace_sources(|path| reviewed_file(workspace, revision, path))?;
+    if let (None, Some(Coordination::Remote(remote))) = (revision, &coordination) {
+        git::verify_remote(&workspace.root, remote)?;
+    }
+    Ok((policy, coordination))
+}
+
+pub(crate) fn parse_workspace_sources(
+    read: impl Fn(&Path) -> Result<Option<Vec<u8>>, HiveError>,
+) -> Result<(&'static str, Option<Coordination>), HiveError> {
+    let policy = read_policy(&read)?;
+    let file =
+        read(Path::new(WORKSPACE_FILE)).map_err(|error| error.diagnostic(Some(WORKSPACE_FILE)))?;
     let coordination = match (policy, file) {
         (LEGACY_POLICY, None) => None,
         (LEGACY_POLICY, Some(_)) => {
@@ -469,17 +480,13 @@ fn read_workspace(
                 .coordination,
         ),
     };
-    if let (None, Some(Coordination::Remote(remote))) = (revision, &coordination) {
-        git::verify_remote(&workspace.root, remote)?;
-    }
     Ok((policy, coordination))
 }
 
 fn read_policy(
-    workspace: &GitWorkspace,
-    revision: Option<&str>,
+    read: impl Fn(&Path) -> Result<Option<Vec<u8>>, HiveError>,
 ) -> Result<&'static str, HiveError> {
-    let bytes = reviewed_file(workspace, revision, Path::new(POLICY_FILE))
+    let bytes = read(Path::new(POLICY_FILE))
         .map_err(|error| error.diagnostic(Some(POLICY_FILE)))?
         .ok_or_else(|| {
             failure(
