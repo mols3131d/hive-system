@@ -107,7 +107,7 @@ pub(super) struct BodyRange {
 }
 
 impl BodyRange {
-    fn select(self, body: &str) -> Option<&str> {
+    pub(super) fn select(self, body: &str) -> Option<&str> {
         body.get(self.start as usize..self.end as usize)
     }
 }

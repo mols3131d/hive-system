@@ -13,6 +13,7 @@ use super::*;
 use crate::cli::is_slug;
 use crate::config_file::{Coordination, ScopedDirectory};
 
+mod artifact_archive;
 mod directive_artifact_intake;
 mod directive_history;
 mod issue_resources;

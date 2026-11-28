@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use super::artifact_archive::ArchiveReview;
 use super::directive_artifact_intake::{ArtifactKind, Candidate, DirectiveStatus};
 use super::directive_history::{DirectiveHistory, Edges};
 use super::prepared_records::{ArtifactFields, DirectiveFields, Fields};
@@ -60,13 +61,14 @@ enum Provenance {
     DirectiveHistory(DirectiveHistory),
     WorkScopedArtifact(WorkArtifactReview),
     StandaloneArtifact {
+        #[serde(deserialize_with = "super::json_object::string_enum")]
         artifact_kind: ArtifactKind,
         source_ref: String,
         author_ref: String,
         created_at: String,
         substantive_updated_at: String,
         links: LinkReview,
-        archive: AbsenceReview,
+        archive: ArchiveReview,
     },
 }
 
@@ -142,6 +144,14 @@ impl Review {
         }
     }
 
+    pub(super) fn artifact_kind(&self, work_scoped: bool) -> Option<ArtifactKind> {
+        match (&self.provenance, work_scoped) {
+            (Provenance::StandaloneArtifact { artifact_kind, .. }, false) => Some(*artifact_kind),
+            (Provenance::WorkScopedArtifact(review), true) => Some(review.artifact_kind),
+            _ => None,
+        }
+    }
+
     pub(super) fn prepare_work_scoped(
         &self,
         candidate: &Candidate,
@@ -169,6 +179,7 @@ impl Review {
         candidate: &Candidate,
         observed_at: Option<OffsetDateTime>,
         ctx: &JoinContext<'_>,
+        body: Option<&str>,
     ) -> Result<Fields, Reason> {
         match (&self.provenance, candidate) {
             (
@@ -238,16 +249,15 @@ impl Review {
                 if !actor_ref(author_ref) {
                     return Err(Reason::UnverifiedArtifactAuthor);
                 }
-                if matches!(archive, AbsenceReview::Unresolved) {
-                    return Err(Reason::UnverifiedArtifactRetention);
-                }
-                validate_historical_source(source_ref, created_at, substantive_updated_at)?;
+                let updated =
+                    validate_historical_source(source_ref, created_at, substantive_updated_at)?;
                 Ok(Fields::Artifact(ArtifactFields {
                     kind: *kind,
                     source_ref: source_ref.clone(),
                     author_ref: author_ref.clone(),
                     created_at: created_at.clone(),
                     substantive_updated_at: substantive_updated_at.clone(),
+                    archive: archive.prepare(body, updated)?,
                     work: None,
                     standalone_links,
                 }))
@@ -265,13 +275,26 @@ pub(super) fn validate_historical_source(
     source_ref: &str,
     created: &str,
     updated: &str,
-) -> Result<(), Reason> {
-    if !portable_reference(source_ref)
-        || !matches!(timestamp(created).zip(timestamp(updated)), Some((created, updated)) if created <= updated)
-    {
+) -> Result<OffsetDateTime, Reason> {
+    if !portable_reference(source_ref) {
         return Err(Reason::IncompleteHistoricalProvenance);
     }
-    Ok(())
+    timestamp(created)
+        .zip(timestamp(updated))
+        .filter(|(created, updated)| created <= updated)
+        .map(|(_, updated)| updated)
+        .ok_or(Reason::IncompleteHistoricalProvenance)
+}
+
+pub(super) fn canonical_utc(value: OffsetDateTime) -> String {
+    format!(
+        "{}T{:02}:{:02}:{:02}.{:06}Z",
+        value.date(),
+        value.hour(),
+        value.minute(),
+        value.second(),
+        value.nanosecond() / 1000
+    )
 }
 
 pub(super) fn timestamp(value: &str) -> Option<OffsetDateTime> {
