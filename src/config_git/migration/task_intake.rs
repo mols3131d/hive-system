@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
 use super::{Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
-use crate::config_file::{parse_v2, present};
+use crate::config_file::{parse_v2, parse_v2_projection, present};
 use crate::error::HiveError;
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize)]
@@ -233,9 +233,9 @@ struct Frontmatter {
 #[derive(Deserialize)]
 struct ExecutionFields {
     #[serde(default, deserialize_with = "present")]
-    status: Option<Value>,
+    status: Option<String>,
     #[serde(default, deserialize_with = "present")]
-    claim: Option<Value>,
+    claim: Option<Claim>,
 }
 
 #[derive(Deserialize)]
@@ -254,28 +254,33 @@ fn classify(bytes: &[u8], lifecycle: Lifecycle, claims_supported: bool) -> Class
         return classification;
     };
     let Ok(metadata) = parse_v2::<Frontmatter>(header, "v1 Task frontmatter") else {
-        // A malformed unrelated field must not erase independently verified
-        // execution evidence. Use the same YAML and lifecycle checks.
+        // A malformed unrelated field must not erase independently readable
+        // execution evidence. The typed projection rejects duplicate execution fields.
         classification.execution_needs_reconciliation = lifecycle == Lifecycle::Active
-            && parse_v2::<ExecutionFields>(header, "v1 Task execution metadata").is_ok_and(
-                |fields| {
+            && parse_v2_projection::<ExecutionFields>(header, "v1 Task execution metadata")
+                .is_ok_and(|fields| {
                     classify_state(
-                        fields.status.as_ref(),
-                        fields.claim.as_ref(),
+                        Ok(fields.status.as_deref()),
+                        Ok(fields.claim),
                         lifecycle,
                         claims_supported,
                     )
                     .is_err_and(|reason| reason == Reason::ExecutionNeedsReconciliation)
-                },
-            );
+                });
         return classification;
     };
-    let state = classify_state(
-        metadata.status.as_ref(),
-        metadata.claim.as_ref(),
-        lifecycle,
-        claims_supported,
-    );
+    let status = metadata
+        .status
+        .as_ref()
+        .map(|status| status.as_str().ok_or(Reason::InvalidLegacyState))
+        .transpose();
+    let claim = metadata
+        .claim
+        .as_ref()
+        .map(Claim::deserialize)
+        .transpose()
+        .map_err(|_| Reason::InvalidLegacyState);
+    let state = classify_state(status, claim, lifecycle, claims_supported);
     classification.execution_needs_reconciliation =
         state.is_err_and(|reason| reason == Reason::ExecutionNeedsReconciliation);
     if !metadata.description.trim().is_empty() {
@@ -290,20 +295,21 @@ fn classify(bytes: &[u8], lifecycle: Lifecycle, claims_supported: bool) -> Class
 }
 
 fn classify_state(
-    status: Option<&Value>,
-    claim: Option<&Value>,
+    status: Result<Option<&str>, Reason>,
+    claim: Result<Option<Claim>, Reason>,
     lifecycle: Lifecycle,
     claims_supported: bool,
 ) -> Result<CandidateStatus, Reason> {
+    let status = status?;
+    let claim = claim?;
     let claimed = claim.is_some();
-    if let Some(claim) = claim {
-        let claim = Claim::deserialize(claim).map_err(|_| Reason::InvalidLegacyState)?;
-        if !claims_supported || claim.id.trim().is_empty() || claim.holder.trim().is_empty() {
-            return Err(Reason::InvalidLegacyState);
-        }
+    if let Some(claim) = claim
+        && (!claims_supported || claim.id.trim().is_empty() || claim.holder.trim().is_empty())
+    {
+        return Err(Reason::InvalidLegacyState);
     }
-    let candidate = match (lifecycle, status.and_then(Value::as_str), claimed) {
-        (Lifecycle::Backlog, None, false) if status.is_none() => CandidateStatus::Backlog,
+    let candidate = match (lifecycle, status, claimed) {
+        (Lifecycle::Backlog, None, false) => CandidateStatus::Backlog,
         (Lifecycle::Active, Some("todo"), false) => CandidateStatus::Todo,
         (Lifecycle::Active | Lifecycle::Archive, Some("done"), false) => CandidateStatus::Done,
         (Lifecycle::Archive, Some("cancelled"), false) => CandidateStatus::Cancelled,

@@ -1526,6 +1526,60 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
     )
     .unwrap();
     let claim = "claim: {id: private-claim-id, holder: private-claim-holder}\n";
+    let repeated_title = "title: Private first title\ntitle: Private second title\n";
+    // Expected execution hold on the adopted pin and the earlier pin.
+    let projection_cases = [
+        (
+            "repeat-title-claimed",
+            format!("status: in-progress\n{claim}{repeated_title}"),
+            [true, false],
+        ),
+        (
+            "repeat-title-unclaimed",
+            format!("status: in-progress\n{repeated_title}"),
+            [false, true],
+        ),
+        (
+            "repeat-title-todo",
+            format!("status: todo\n{repeated_title}"),
+            [false, false],
+        ),
+        (
+            "repeat-status-claimed",
+            format!("status: in-progress\nstatus: in-progress\n{claim}"),
+            [false, false],
+        ),
+        (
+            "repeat-status-unclaimed",
+            "status: in-progress\nstatus: in-progress\n".to_owned(),
+            [false, false],
+        ),
+        (
+            "repeat-claim",
+            format!("status: in-progress\n{claim}{claim}"),
+            [false, false],
+        ),
+        (
+            "repeat-claim-holder",
+            "status: in-progress\nclaim: {id: private-claim-id, holder: private-first, holder: private-second}\n".to_owned(),
+            [false, false],
+        ),
+        (
+            "repeat-claim-id",
+            "status: in-progress\nclaim: {id: private-first, id: private-second, holder: private-claim-holder}\n".to_owned(),
+            [false, false],
+        ),
+        (
+            "invalid-yaml",
+            format!("status: in-progress\n{claim}tags: [unterminated\n"),
+            [false, false],
+        ),
+        (
+            "invalid-yaml-unclaimed",
+            "status: in-progress\ntags: [unterminated\n".to_owned(),
+            [false, false],
+        ),
+    ];
     let invalid_work = "_general/backlog/Synthetic-Work@sample.invalid";
     let invalid_scope = "Synthetic-Scope@sample.invalid";
     let invalid_scope_work = format!("{invalid_scope}/backlog/item");
@@ -1684,6 +1738,15 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             fs::write(file, record).unwrap();
         }
     }
+    for (work_id, fields, _) in &projection_cases {
+        let bundle = source.join(format!("tasks/unmapped/active/{work_id}"));
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(
+            bundle.join("README.md"),
+            format!("---\ndescription: Private task description\n{fields}---\n"),
+        )
+        .unwrap();
+    }
     let missing = source.join("tasks/_general/backlog/no-readme");
     fs::create_dir_all(&missing).unwrap();
     fs::write(missing.join("notes.md"), "Private supporting note").unwrap();
@@ -1755,7 +1818,7 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
     let intake = &plan["task_intake"];
     assert_eq!(intake["coverage"], "partial");
     let tasks = intake["tasks"].as_array().unwrap();
-    assert_eq!(tasks.len(), fixtures.len() + 4);
+    assert_eq!(tasks.len(), fixtures.len() + projection_cases.len() + 4);
     assert_eq!(
         intake["counts"],
         json!({
@@ -2127,6 +2190,21 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
         assert_eq!(task["outcome"]["reason_codes"], json!([reason]));
     }
     let early_tasks = earlier["data"]["task_intake"]["tasks"].as_array().unwrap();
+    for (pin_index, rows) in [tasks, early_tasks].into_iter().enumerate() {
+        for (work_id, _, expected_execution) in &projection_cases {
+            let path = format!("tasks/unmapped/active/{work_id}/README.md");
+            let row = rows.iter().find(|row| row["source_path"] == path).unwrap();
+            let mut reasons = vec!["ambiguous_scope_or_collision", "unsupported_task_metadata"];
+            if expected_execution[pin_index] {
+                reasons.push("execution_needs_reconciliation");
+            }
+            assert_eq!(
+                row["outcome"],
+                json!({"status": "held", "reason_codes": reasons}),
+                "{path} under pin {pin_index}"
+            );
+        }
+    }
     for (path, expected) in [
         (
             "tasks/synth-app/backlog/null-title/README.md",
