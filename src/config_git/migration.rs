@@ -19,6 +19,7 @@ mod queen_assets;
 mod queen_preparation;
 mod reviewed_records;
 mod scope_plan;
+mod task_graph;
 mod task_intake;
 mod task_provenance;
 pub(crate) use scope_plan::{Area, ReviewedScopes, plan, with_scope_mapping};
