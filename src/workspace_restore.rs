@@ -83,20 +83,7 @@ mod linux {
     ) -> Result<Value, HiveError> {
         let source = ScopedDirectory::open_absolute(&absolute_path(source)?)?;
         require_local_filesystem(&source)?;
-        let target = absolute_path(target)?;
-        if target.starts_with(&source.path) || source.path.starts_with(&target) {
-            return Err(invalid("Select a target separate from the backup source."));
-        }
-        let target_json = json_path(&target)?;
-        let parent = inspect_target_parent(&target)?;
-        let name = target.file_name().expect("inspected target name");
-        let target_entry = fd_path(&parent).join(name);
-        let original = open_target(&target_entry)?;
-        if let Some(original) = &original {
-            verify_target_directory(&parent, original)?;
-            lock_target(original)?;
-            require_entries(original, &[])?;
-        }
+        let (target, target_json) = InactiveTarget::inspect(&source.path, target)?;
 
         let manifest = read_manifest(&source)?;
         let conversations = if include_conversations {
@@ -111,16 +98,7 @@ mod linux {
         } else {
             None
         };
-        require_inactive_target(&manifest.workspace_id, &target)?;
-        let stage = tempfile::Builder::new()
-            .prefix(crate::config_v2::INIT_STAGE_PREFIX)
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir_in(fd_path(&parent))
-            .map_err(io_error)?;
-        let stage_dir = open_target(stage.path())?.ok_or_else(changed_target)?;
-        stage_dir
-            .set_permissions(fs::Permissions::from_mode(0o700))
-            .map_err(io_error)?;
+        let (_stage, stage_dir) = target.stage(&manifest.workspace_id)?;
         let stage_path = fd_path(&stage_dir);
         let snapshot = stage_path.join("snapshot");
         let scratch = stage_path.join("scratch");
@@ -165,20 +143,12 @@ mod linux {
             None,
         )?;
         let db = payload.join("db");
-        // Pinned Dolt fsck walks the commit DAG and verifies each historical
-        // root and its referenced objects as well as the store's chunks.
-        installed.dolt(&db, &["fsck", "--quiet"], None)?;
-        if verify_db(&installed, &db, &manifest.workspace_id)? != manifest.dolt_commit {
-            return Err(unverified(
-                "The restored Dolt revision differs from the manifest.",
-            ));
-        }
-        installed.dolt(
+        verify_staged_db(
+            &installed,
             &db,
-            &["constraints", "verify", "--all", "--output-only"],
-            None,
+            &manifest.workspace_id,
+            &manifest.dolt_commit,
         )?;
-        restrict_db_modes(&db)?;
 
         let links = restore_assets(
             &installed,
@@ -205,53 +175,7 @@ mod linux {
         ).map_err(io_error)?;
         sync_tree_with_links(&payload_dir, Path::new(""), &links)?;
 
-        let current_parent = inspect_target_parent(&target)?;
-        require_inactive_target(&manifest.workspace_id, &target)?;
-        let staged_payload = open_target(&payload)?.ok_or_else(changed_target)?;
-        if !same_directory(&parent, &current_parent)?
-            || !same_directory(&payload_dir, &staged_payload)?
-        {
-            return Err(changed_target());
-        }
-        let flags = if let Some(original) = &original {
-            let current = open_target(&target_entry)?.ok_or_else(changed_target)?;
-            if !same_directory(original, &current)? {
-                return Err(changed_target());
-            }
-            verify_target_directory(&parent, &current)?;
-            require_entries(original, &[])?;
-            // Directory rename may replace only an empty directory. If a
-            // concurrent writer adds anything, the kernel refuses the move.
-            RenameFlags::empty()
-        } else {
-            RenameFlags::NOREPLACE
-        };
-        renameat_with(&stage_dir, "workspace", &parent, name, flags).map_err(|error| {
-            if matches!(
-                error,
-                rustix::io::Errno::EXIST | rustix::io::Errno::NOTEMPTY
-            ) {
-                HiveError::new(ErrorCode::AlreadyExists, "The restore target is occupied.")
-            } else {
-                io_error(error.into())
-            }
-        })?;
-        let uncertain = || {
-            HiveError::new(
-                ErrorCode::UnknownWriteOutcome,
-                "The restored workspace was published but its destination or durability could not be confirmed.",
-            )
-        };
-        parent.sync_all().map_err(|_| uncertain())?;
-        let current_parent = inspect_target_parent(&target).map_err(|_| uncertain())?;
-        let published = open_target(&target_entry)
-            .map_err(|_| uncertain())?
-            .ok_or_else(uncertain)?;
-        if !same_directory(&parent, &current_parent).map_err(|_| uncertain())?
-            || !same_directory(&published, &payload_dir).map_err(|_| uncertain())?
-        {
-            return Err(uncertain());
-        }
+        target.publish(&manifest.workspace_id, &stage_dir, &payload_dir)?;
 
         Ok(json!({
             "workspace_root": target_json,
@@ -265,6 +189,141 @@ mod linux {
             "conversations_restored": include_conversations,
         }))
     }
+
+    // Hold the original target lock from admission through verification and publication.
+    struct InactiveTarget {
+        path: PathBuf,
+        parent: File,
+        original: Option<File>,
+    }
+
+    impl InactiveTarget {
+        fn inspect(source: &Path, target: &Path) -> Result<(Self, String), HiveError> {
+            let path = absolute_path(target)?;
+            if path.starts_with(source) || source.starts_with(&path) {
+                return Err(invalid("Select a target separate from the backup source."));
+            }
+            let target_json = json_path(&path)?.to_owned();
+            let parent = inspect_target_parent(&path)?;
+            let name = path.file_name().expect("inspected target name");
+            let original = open_target(&fd_path(&parent).join(name))?;
+            if let Some(original) = &original {
+                verify_target_directory(&parent, original)?;
+                lock_target(original)?;
+                require_entries(original, &[])?;
+            }
+            Ok((
+                Self {
+                    path,
+                    parent,
+                    original,
+                },
+                target_json,
+            ))
+        }
+
+        fn verify_inactive(&self, workspace_id: &str) -> Result<(), HiveError> {
+            require_inactive_target(workspace_id, &self.path)
+        }
+
+        fn stage(&self, workspace_id: &str) -> Result<(tempfile::TempDir, File), HiveError> {
+            self.verify_inactive(workspace_id)?;
+            let stage = tempfile::Builder::new()
+                .prefix(crate::config_v2::INIT_STAGE_PREFIX)
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in(fd_path(&self.parent))
+                .map_err(io_error)?;
+            let directory = open_target(stage.path())?.ok_or_else(changed_target)?;
+            directory
+                .set_permissions(fs::Permissions::from_mode(0o700))
+                .map_err(io_error)?;
+            Ok((stage, directory))
+        }
+
+        // The caller verifies and syncs the payload before making it selectable.
+        fn publish(
+            &self,
+            workspace_id: &str,
+            stage: &File,
+            payload: &File,
+        ) -> Result<(), HiveError> {
+            let current_parent = inspect_target_parent(&self.path)?;
+            self.verify_inactive(workspace_id)?;
+            let name = self.path.file_name().expect("inspected target name");
+            let target_entry = fd_path(&self.parent).join(name);
+            let staged_payload =
+                open_target(&fd_path(stage).join("workspace"))?.ok_or_else(changed_target)?;
+            if !same_directory(&self.parent, &current_parent)?
+                || !same_directory(payload, &staged_payload)?
+            {
+                return Err(changed_target());
+            }
+            let flags = if let Some(original) = &self.original {
+                let current = open_target(&target_entry)?.ok_or_else(changed_target)?;
+                if !same_directory(original, &current)? {
+                    return Err(changed_target());
+                }
+                verify_target_directory(&self.parent, &current)?;
+                require_entries(original, &[])?;
+                // Directory rename replaces only an empty directory.
+                RenameFlags::empty()
+            } else {
+                RenameFlags::NOREPLACE
+            };
+            renameat_with(stage, "workspace", &self.parent, name, flags).map_err(|error| {
+                if matches!(
+                    error,
+                    rustix::io::Errno::EXIST | rustix::io::Errno::NOTEMPTY
+                ) {
+                    HiveError::new(ErrorCode::AlreadyExists, "The restore target is occupied.")
+                } else {
+                    io_error(error.into())
+                }
+            })?;
+            let uncertain = || {
+                HiveError::new(
+                    ErrorCode::UnknownWriteOutcome,
+                    "The restored workspace was published but its destination or durability could not be confirmed.",
+                )
+            };
+            self.parent.sync_all().map_err(|_| uncertain())?;
+            let current_parent = inspect_target_parent(&self.path).map_err(|_| uncertain())?;
+            let published = open_target(&target_entry)
+                .map_err(|_| uncertain())?
+                .ok_or_else(uncertain)?;
+            if !same_directory(&self.parent, &current_parent).map_err(|_| uncertain())?
+                || !same_directory(&published, payload).map_err(|_| uncertain())?
+            {
+                return Err(uncertain());
+            }
+            Ok(())
+        }
+    }
+
+    fn verify_staged_db(
+        installed: &Installed<'_>,
+        db: &Path,
+        workspace_id: &str,
+        revision: &str,
+    ) -> Result<(), HiveError> {
+        // Pinned Dolt fsck walks the commit DAG and verifies each historical
+        // root and its referenced objects as well as the store's chunks.
+        installed.dolt(db, &["fsck", "--quiet"], None)?;
+        if verify_db(installed, db, workspace_id)? != revision {
+            return Err(unverified(
+                "The restored Dolt revision differs from the manifest.",
+            ));
+        }
+        installed.dolt(
+            db,
+            &["constraints", "verify", "--all", "--output-only"],
+            None,
+        )?;
+        restrict_db_modes(db)
+    }
+
+    #[cfg(test)]
+    mod migration_staging_tests;
 
     fn absolute_path(path: &Path) -> Result<PathBuf, HiveError> {
         if path.as_os_str().is_empty() || path.components().any(|part| part == Component::ParentDir)
