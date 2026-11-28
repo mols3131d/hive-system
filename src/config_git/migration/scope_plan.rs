@@ -10,8 +10,8 @@ use url::{Host, Url};
 
 use super::json_object::{self, Object};
 use super::{
-    AssetObjectReader, Inventory, Reason, is_portable_bot_memory_locator, snapshot_object,
-    verified_source,
+    AssetObjectReader, Inventory, Reason, directive_artifact_intake,
+    is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
 };
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
@@ -116,6 +116,8 @@ pub(crate) fn plan(
     revision: &str,
     workspace_id: &str,
     mapping_file: &Path,
+    include_tasks: bool,
+    include_directives_artifacts: bool,
 ) -> Result<Value, HiveError> {
     if !is_uuid(workspace_id) {
         return Err(HiveError::new(
@@ -143,7 +145,7 @@ pub(crate) fn plan(
         }
 
         let scopes = classify_scopes(inventory, &mapping.scopes, reader)?;
-        Ok(json!({
+        let mut report = json!({
             "mode": "scope_plan",
             "mapping_version": mapping.version,
             "mapping_sha256": format!("{:x}", Sha256::digest(input)),
@@ -151,7 +153,25 @@ pub(crate) fn plan(
             "inventory": inventory.summary,
             "target": {"workspace_id": workspace_id},
             "scopes": scopes.iter().map(Scope::report).collect::<Vec<_>>(),
-        }))
+        });
+        if include_tasks || include_directives_artifacts {
+            let outcomes = scopes
+                .iter()
+                .map(|scope| (scope.scope, &scope.outcome))
+                .collect();
+            if include_tasks {
+                // Verified v1 coordination exists only under the pin that defines claims.
+                let claims_supported = !source.hive_yml.is_null();
+                let records =
+                    task_intake::read_records(inventory, &|| reader.command(), claims_supported)?;
+                report["task_intake"] = task_intake::report(records, &outcomes);
+            }
+            if include_directives_artifacts {
+                report["directive_artifact_intake"] =
+                    directive_artifact_intake::report(inventory, reader, &outcomes)?;
+            }
+        }
+        Ok(report)
     })
 }
 
