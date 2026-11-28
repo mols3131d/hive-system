@@ -315,13 +315,14 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
             status,
         )
     };
-    let outcome = |report: &Value, path| {
+    let outcome = |report: &Value, path: &str| {
+        let path_sha256 = sha256_hex(path.as_bytes());
         report["data"]["directive_artifact_intake"]["records"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|row| row["source_path"] == path)
-            .unwrap()["outcome"]
+            .find(|row| row["source_path"] == path || row["source_path_sha256"] == path_sha256)
+            .unwrap_or_else(|| panic!("missing synthetic plan row for {path}"))["outcome"]
             .clone()
     };
     let read_v1 = || response(cli("1").args(["config", "show", "--scope", "workspace"]), 0);
@@ -386,6 +387,35 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     }
 
     let plan = plan_for(&mapping, 0);
+    let planned = &plan["data"];
+    let ready = planned["task_intake"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["source_path"] == TASK)
+        .unwrap();
+    assert_eq!(ready["outcome"]["status"], "held");
+    assert_eq!(
+        ready["outcome"]["reason_codes"],
+        json!(["unverified_task_labels"])
+    );
+    assert_eq!(
+        planned["project_membership"]["counts"]["projects"]["prepared"],
+        1
+    );
+    assert_eq!(
+        planned["project_membership"]["counts"]["project_issues"]["held"],
+        2
+    );
+    assert_eq!(
+        planned["resource_bindings"]["outcomes"][0]["status"],
+        "prepared"
+    );
+    assert_eq!(
+        planned["resource_bindings"]["outcomes"][0]["resource_id"],
+        resource
+    );
+    assert!(!plan.to_string().contains(UNCLASSIFIED));
     for (path, _, reason) in INVALID_KINDS {
         let held = outcome(&plan, *path);
         assert_eq!(held["status"], "held", "{path}");
