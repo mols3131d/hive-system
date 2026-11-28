@@ -1409,6 +1409,12 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             &format!("status: todo\n{claim}"),
             "Duplicated across areas.\n",
         ),
+        ("_general/backlog/shared-malformed", "", ""),
+        (
+            "_general/active/shared-malformed",
+            &format!("status: in-progress\n{claim}tags: null\n"),
+            "",
+        ),
         (
             "_general/active/waiting",
             "status: todo\n",
@@ -1457,6 +1463,18 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
         ("_general/backlog/claimed-backlog", "claim: null\n", ""),
         ("_general/backlog/null-status", "status: null\n", ""),
         ("_general/backlog/null-tags", "tags: null\n", ""),
+        ("synth-app/backlog/null-title", "title: null\n", ""),
+        ("synth-app/backlog/description-fallback", "", ""),
+        (
+            "synth-app/active/malformed-claim",
+            "status: in-progress\nclaim: null\ntags: null\n",
+            "",
+        ),
+        (
+            "synth-app/active/malformed-tags",
+            &format!("status: in-progress\n{claim}tags: null\n"),
+            "",
+        ),
         (
             "_general/backlog/conflict",
             "",
@@ -1498,8 +1516,28 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
         ),
         ("_hive/backlog/legacy", "", ""),
         (
+            "_hive/active/legacy",
+            &format!("status: in-progress\n{claim}"),
+            "",
+        ),
+        (
             "unmapped/active/uncertain",
             &format!("status: in-progress\n{claim}"),
+            "",
+        ),
+        (
+            "unmapped/active/uncertain-malformed",
+            &format!("status: in-progress\n{claim}tags: null\n"),
+            "",
+        ),
+        (
+            "unmapped/active/unclaimed-malformed",
+            "status: in-progress\ntags: null\n",
+            "",
+        ),
+        (
+            "unmapped/active/ambiguous-status",
+            &format!("status: in-progress\nstatus: done\n{claim}tags: null\n"),
             "",
         ),
     ];
@@ -1712,8 +1750,15 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             "_general/backlog/null-tags/README.md",
             "unsupported_task_metadata",
         ),
+        (
+            "synth-app/backlog/null-title/README.md",
+            "unsupported_task_metadata",
+        ),
+        (
+            "synth-app/active/malformed-claim/README.md",
+            "unsupported_task_metadata",
+        ),
         ("_general/backlog/no-readme", "missing_task_entrypoint"),
-        ("_hive/backlog/legacy/README.md", "unsplit_legacy_scope"),
     ] {
         assert_eq!(
             outcome(format!("tasks/{path}")),
@@ -1730,8 +1775,36 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "execution_needs_reconciliation"]}),
         ),
         (
+            "tasks/_general/active/shared-malformed/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "unsupported_task_metadata", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/synth-app/active/malformed-tags/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["unsupported_task_metadata", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/_hive/backlog/legacy/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "unsplit_legacy_scope"]}),
+        ),
+        (
+            "tasks/_hive/active/legacy/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "unsplit_legacy_scope", "execution_needs_reconciliation"]}),
+        ),
+        (
             "tasks/unmapped/active/uncertain/README.md".to_owned(),
             json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/unmapped/active/uncertain-malformed/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "unsupported_task_metadata", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/unmapped/active/unclaimed-malformed/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "unsupported_task_metadata"]}),
+        ),
+        (
+            "tasks/unmapped/active/ambiguous-status/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "unsupported_task_metadata"]}),
         ),
         (
             redacted_paths[0].clone(),
@@ -1769,6 +1842,12 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
         json!([sha256_hex(malformed_bot_origin.as_bytes())])
     );
     for (path, status, area, reasons) in [
+        (
+            "synth-app/backlog/description-fallback",
+            "backlog",
+            AREA_APP,
+            vec!["unresolved_task_relations"],
+        ),
         (
             "synth-app/backlog/implement-widget",
             "backlog",
@@ -1913,6 +1992,42 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             .find(|task| task["legacy_key"]["work_id"] == id)
             .unwrap();
         assert_eq!(task["outcome"]["reason_codes"], json!([reason]));
+    }
+    let early_tasks = earlier["data"]["task_intake"]["tasks"].as_array().unwrap();
+    for (path, expected) in [
+        (
+            "tasks/synth-app/backlog/null-title/README.md",
+            json!({"status": "held", "reason_codes": ["unsupported_task_metadata"]}),
+        ),
+        (
+            "tasks/_general/active/shared-malformed/README.md",
+            json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "unsupported_task_metadata"]}),
+        ),
+        (
+            "tasks/_hive/active/legacy/README.md",
+            json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "unsplit_legacy_scope", "invalid_legacy_state"]}),
+        ),
+        (
+            "tasks/unmapped/active/uncertain-malformed/README.md",
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "unsupported_task_metadata"]}),
+        ),
+        (
+            "tasks/unmapped/active/unclaimed-malformed/README.md",
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "unsupported_task_metadata", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/synth-app/backlog/description-fallback/README.md",
+            json!({
+                "status": "held", "candidate_status": "backlog", "area_id": id(AREA_APP),
+                "reason_codes": ["incomplete_historical_provenance", "unresolved_task_relations"],
+            }),
+        ),
+    ] {
+        let task = early_tasks
+            .iter()
+            .find(|task| task["source_path"] == path)
+            .unwrap();
+        assert_eq!(task["outcome"], expected, "{path}");
     }
 }
 

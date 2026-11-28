@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
 use super::{Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
-use crate::config_file::parse_v2;
+use crate::config_file::{parse_v2, present};
 use crate::error::HiveError;
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize)]
@@ -35,7 +35,13 @@ pub(super) struct Record {
     path: String,
     blob_oid: Option<String>,
     raw_sha256: Option<String>,
-    classification: Result<CandidateStatus, Reason>,
+    classification: Classification,
+}
+
+#[derive(Clone, Copy)]
+struct Classification {
+    candidate: Result<CandidateStatus, Reason>,
+    execution_needs_reconciliation: bool,
 }
 
 pub(super) fn read_records(
@@ -73,7 +79,10 @@ pub(super) fn read_records(
             path: path.clone(),
             blob_oid: None,
             raw_sha256: None,
-            classification: Err(Reason::MissingTaskEntrypoint),
+            classification: Classification {
+                candidate: Err(Reason::MissingTaskEntrypoint),
+                execution_needs_reconciliation: false,
+            },
         };
         if let Some(blob) = inventory.entries.get(&readme)
             && let Some(size) = blob.size
@@ -126,52 +135,12 @@ pub(super) fn report(records: Vec<Record>, scopes: &BTreeMap<&str, &ScopeOutcome
         .iter()
         .map(|record| {
             let scope = scopes[record.scope.as_str()];
-            let hold = |reason| {
-                let mut reason_codes = vec![reason];
-                if !matches!(reason, Reason::ExecutionNeedsReconciliation)
-                    && matches!(
-                        record.classification,
-                        Err(Reason::ExecutionNeedsReconciliation)
-                    )
-                {
-                    reason_codes.push(Reason::ExecutionNeedsReconciliation);
-                }
-                Outcome::Held {
-                    reason_codes,
-                    candidate_status: None,
-                    area_id: None,
-                }
-            };
             let outcome = match scope {
                 ScopeOutcome::Excluded { reason } => {
                     excluded += 1;
                     Outcome::Excluded { reason: *reason }
                 }
-                _ if counts[&(&record.scope, &record.work_id)] > 1 => {
-                    hold(Reason::DuplicateLegacyWorkId)
-                }
-                _ if !is_slug(&record.work_id) => hold(Reason::InvalidLegacyState),
-                ScopeOutcome::Held { reason } => hold(*reason),
-                ScopeOutcome::Mapped { area } => match record.classification {
-                    Err(reason) => hold(reason),
-                    Ok(status) => {
-                        // The v1 policies keep dates, acceptance, closure and relations
-                        // in free-form records. A scope mapping cannot verify that evidence.
-                        let mut reasons = vec![Reason::IncompleteHistoricalProvenance];
-                        reasons.push(match status {
-                            CandidateStatus::Done => Reason::UnresolvedCompletionObligation,
-                            _ => Reason::UnresolvedTaskRelations,
-                        });
-                        if matches!(status, CandidateStatus::Todo) {
-                            reasons.push(Reason::UnverifiedAcceptanceCriteria);
-                        }
-                        Outcome::Held {
-                            reason_codes: reasons,
-                            candidate_status: Some(status),
-                            area_id: Some(&area.id),
-                        }
-                    }
-                },
+                _ => held_outcome(record, scope, counts[&(&record.scope, &record.work_id)] > 1),
             };
             let mut task = json!({
                 "lifecycle": record.lifecycle,
@@ -199,26 +168,74 @@ pub(super) fn report(records: Vec<Record>, scopes: &BTreeMap<&str, &ScopeOutcome
     })
 }
 
+fn held_outcome<'a>(record: &Record, scope: &ScopeOutcome<'a>, duplicate: bool) -> Outcome<'a> {
+    let mut reasons = Vec::new();
+    if duplicate {
+        reasons.push(Reason::DuplicateLegacyWorkId);
+    }
+    if !is_slug(&record.work_id) {
+        reasons.push(Reason::InvalidLegacyState);
+    }
+    if let ScopeOutcome::Held { reason } = scope {
+        reasons.push(*reason);
+    }
+
+    let mut candidate_status = None;
+    let mut area_id = None;
+    match record.classification.candidate {
+        Ok(status)
+            if reasons.is_empty()
+                && let ScopeOutcome::Mapped { area } = scope =>
+        {
+            candidate_status = Some(status);
+            area_id = Some(area.id.as_str());
+            // The v1 policies keep these fields in free-form records.
+            reasons.push(Reason::IncompleteHistoricalProvenance);
+            reasons.push(match status {
+                CandidateStatus::Done => Reason::UnresolvedCompletionObligation,
+                _ => Reason::UnresolvedTaskRelations,
+            });
+            if matches!(status, CandidateStatus::Todo) {
+                reasons.push(Reason::UnverifiedAcceptanceCriteria);
+            }
+        }
+        Err(reason) if !reasons.contains(&reason) => reasons.push(reason),
+        _ => {}
+    }
+    if record.classification.execution_needs_reconciliation
+        && !reasons.contains(&Reason::ExecutionNeedsReconciliation)
+    {
+        reasons.push(Reason::ExecutionNeedsReconciliation);
+    }
+    Outcome::Held {
+        reason_codes: reasons,
+        candidate_status,
+        area_id,
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Frontmatter {
     description: String,
+    #[serde(default, deserialize_with = "present")]
     title: Option<String>,
-    #[serde(default, deserialize_with = "present_value")]
+    #[serde(default, deserialize_with = "present")]
     status: Option<Value>,
-    #[serde(default, deserialize_with = "present_value")]
+    #[serde(default, deserialize_with = "present")]
     claim: Option<Value>,
-    #[serde(default, deserialize_with = "present_value")]
+    #[serde(default, deserialize_with = "present")]
     priority: Option<Value>,
-    #[serde(default, deserialize_with = "present_value")]
+    #[serde(default, deserialize_with = "present")]
     tags: Option<Vec<String>>,
 }
 
-fn present_value<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
-    deserializer: D,
-) -> Result<Option<T>, D::Error> {
-    // Present fields are decoded as their declared type, including explicit null.
-    T::deserialize(deserializer).map(Some)
+#[derive(Deserialize)]
+struct ExecutionFields {
+    #[serde(default, deserialize_with = "present")]
+    status: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    claim: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -228,22 +245,65 @@ struct Claim {
     holder: String,
 }
 
-fn classify(
-    bytes: &[u8],
+fn classify(bytes: &[u8], lifecycle: Lifecycle, claims_supported: bool) -> Classification {
+    let mut classification = Classification {
+        candidate: Err(Reason::UnsupportedTaskMetadata),
+        execution_needs_reconciliation: false,
+    };
+    let Some((header, body)) = split_record(bytes) else {
+        return classification;
+    };
+    let Ok(metadata) = parse_v2::<Frontmatter>(header, "v1 Task frontmatter") else {
+        // A malformed unrelated field must not erase independently verified
+        // execution evidence. Use the same YAML and lifecycle checks.
+        classification.execution_needs_reconciliation = lifecycle == Lifecycle::Active
+            && parse_v2::<ExecutionFields>(header, "v1 Task execution metadata").is_ok_and(
+                |fields| {
+                    classify_state(
+                        fields.status.as_ref(),
+                        fields.claim.as_ref(),
+                        lifecycle,
+                        claims_supported,
+                    )
+                    .is_err_and(|reason| reason == Reason::ExecutionNeedsReconciliation)
+                },
+            );
+        return classification;
+    };
+    let state = classify_state(
+        metadata.status.as_ref(),
+        metadata.claim.as_ref(),
+        lifecycle,
+        claims_supported,
+    );
+    classification.execution_needs_reconciliation =
+        state.is_err_and(|reason| reason == Reason::ExecutionNeedsReconciliation);
+    if !metadata.description.trim().is_empty() {
+        classification.candidate = if state.is_ok() || classification.execution_needs_reconciliation
+        {
+            validate_metadata(&metadata, body, lifecycle).and(state)
+        } else {
+            state
+        };
+    }
+    classification
+}
+
+fn classify_state(
+    status: Option<&Value>,
+    claim: Option<&Value>,
     lifecycle: Lifecycle,
     claims_supported: bool,
 ) -> Result<CandidateStatus, Reason> {
-    let (metadata, body) = parse_record(bytes).ok_or(Reason::UnsupportedTaskMetadata)?;
-    let claimed = metadata.claim.is_some();
-    if let Some(claim) = metadata.claim {
-        let claim: Claim = serde_json::from_value(claim).map_err(|_| Reason::InvalidLegacyState)?;
+    let claimed = claim.is_some();
+    if let Some(claim) = claim {
+        let claim = Claim::deserialize(claim).map_err(|_| Reason::InvalidLegacyState)?;
         if !claims_supported || claim.id.trim().is_empty() || claim.holder.trim().is_empty() {
             return Err(Reason::InvalidLegacyState);
         }
     }
-    let status = metadata.status.as_ref().and_then(Value::as_str);
-    let candidate = match (lifecycle, status, claimed) {
-        (Lifecycle::Backlog, None, false) if metadata.status.is_none() => CandidateStatus::Backlog,
+    let candidate = match (lifecycle, status.and_then(Value::as_str), claimed) {
+        (Lifecycle::Backlog, None, false) if status.is_none() => CandidateStatus::Backlog,
         (Lifecycle::Active, Some("todo"), false) => CandidateStatus::Todo,
         (Lifecycle::Active | Lifecycle::Archive, Some("done"), false) => CandidateStatus::Done,
         (Lifecycle::Archive, Some("cancelled"), false) => CandidateStatus::Cancelled,
@@ -259,6 +319,14 @@ fn classify(
         }
         _ => return Err(Reason::InvalidLegacyState),
     };
+    Ok(candidate)
+}
+
+fn validate_metadata(
+    metadata: &Frontmatter,
+    body: &str,
+    lifecycle: Lifecycle,
+) -> Result<(), Reason> {
     if metadata.priority.as_ref().is_some_and(|priority| {
         lifecycle == Lifecycle::Archive
             || !matches!(priority.as_str(), Some("high" | "normal" | "low"))
@@ -282,10 +350,10 @@ fn classify(
     if !has_title(metadata.title.as_deref(), &metadata.description, body) {
         return Err(Reason::MissingOrConflictingTitle);
     }
-    Ok(candidate)
+    Ok(())
 }
 
-fn parse_record(bytes: &[u8]) -> Option<(Frontmatter, &str)> {
+fn split_record(bytes: &[u8]) -> Option<(&[u8], &str)> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut lines = text.split_inclusive('\n');
     let delimiter = |line: &str| matches!(line, "---\n" | "---\r\n" | "---");
@@ -293,9 +361,7 @@ fn parse_record(bytes: &[u8]) -> Option<(Frontmatter, &str)> {
     let mut end = start;
     for line in lines {
         if delimiter(line) {
-            let metadata: Frontmatter = parse_v2(&bytes[start..end], "v1 Task frontmatter").ok()?;
-            return (!metadata.description.trim().is_empty())
-                .then_some((metadata, &text[end + line.len()..]));
+            return Some((&bytes[start..end], &text[end + line.len()..]));
         }
         end += line.len();
         if end - start > crate::config_file::MAX_FILE_BYTES {
