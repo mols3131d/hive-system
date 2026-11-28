@@ -16,6 +16,7 @@ use crate::config_file::{Coordination, ScopedDirectory};
 mod directive_artifact_intake;
 mod json_object;
 mod queen_assets;
+mod reviewed_records;
 mod scope_plan;
 mod task_intake;
 mod task_provenance;
@@ -129,6 +130,8 @@ enum Reason {
     UnverifiedArtifactRetention,
     UnresolvedParentTask,
     MissingParentTaskEntrypoint,
+    UnsupportedReviewedRecord,
+    UnresolvedArtifactLinks,
 }
 
 fn verified_source<T>(
