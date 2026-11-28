@@ -206,6 +206,17 @@ impl ReviewedScopes<'_> {
     }
 
     pub(crate) fn prepare_tasks(&self) -> Result<task_intake::TaskPlan<'_>, HiveError> {
+        self.task_inventory(&self.mapping.task_reviews)
+    }
+
+    pub(crate) fn unselected_task_ledger(&self) -> Result<Value, HiveError> {
+        Ok(self.task_inventory(&[])?.staging_ledger())
+    }
+
+    fn task_inventory(
+        &self,
+        reviews: &[TaskReview],
+    ) -> Result<task_intake::TaskPlan<'_>, HiveError> {
         let outcomes = self
             .scopes
             .iter()
@@ -214,7 +225,7 @@ impl ReviewedScopes<'_> {
         let git = || self.reader.command();
         let claims_supported = !self.source.hive_yml.is_null();
         let records = task_intake::read_records(self.inventory, &git, claims_supported)?;
-        task_intake::prepare(records, &outcomes, &self.mapping.task_reviews, &git)
+        task_intake::prepare(records, &outcomes, reviews, &git)
     }
 
     pub(crate) fn directive_artifacts_for_staging(&self) -> Result<Option<Intake>, HiveError> {
@@ -223,6 +234,19 @@ impl ReviewedScopes<'_> {
             .as_ref()
             .map(|_| self.scan_directive_artifacts(true))
             .transpose()
+    }
+
+    pub(crate) fn unselected_directive_artifact_inventory(&self) -> Result<Intake, HiveError> {
+        self.scan_directive_artifacts(false)
+    }
+
+    pub(crate) fn asset_reconciliation(&self) -> Result<Value, HiveError> {
+        let queens = self.prepared_queens();
+        if let Some(assets) = &self.queen_assets {
+            return Ok(assets.reconciliation(queens));
+        }
+        let assets = queen_assets::classify(self.inventory, self.reader, &[], |_, _, _, _| {})?;
+        Ok(assets.reconciliation(queens))
     }
 
     pub(crate) fn directive_observation(&self) -> Option<&str> {

@@ -184,11 +184,10 @@ fn in_insert_order(records: &[PreparedRecord]) -> Result<Vec<&PreparedRecord>, H
 }
 
 pub(super) fn add_report(report: &mut Value, mut intake: Intake) {
-    report["coverage"] = json!("scopes_directives_artifacts");
     if let Some(counts) = intake.report["counts"].as_object() {
         for (surface, counts) in counts {
             report["counts"][surface] = json!({"inventoried": counts["inventoried"],
-                "imported": counts["prepared"], "held": counts["held"], "excluded_non_record": counts["excluded"]});
+                "imported": counts["prepared"].as_u64().unwrap_or(0), "held": counts["held"], "excluded_non_record": counts["excluded"]});
         }
     }
     if let Some(records) = intake.report["records"].as_array_mut() {
