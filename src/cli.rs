@@ -991,7 +991,7 @@ pub(crate) enum WorkspaceAction {
         /// Reviewed versioned scope and optional record mapping JSON file.
         #[arg(long, value_name = "FILE")]
         mapping_file: PathBuf,
-        /// Include partial v1 Task intake and its reconciliation holds.
+        /// Include v1 Task intake and preparation from bound reviews.
         #[arg(long)]
         tasks: bool,
         /// Include Directive and Artifact intake and any reviewed record plans.

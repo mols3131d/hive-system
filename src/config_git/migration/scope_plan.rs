@@ -11,6 +11,7 @@ use url::{Host, Url};
 use super::json_object::{self, Object};
 use super::queen_assets::{self, SoulReview};
 use super::reviewed_records::Review;
+use super::task_provenance::TaskReview;
 use super::{
     AssetObjectReader, Inventory, Reason, directive_artifact_intake,
     is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
@@ -29,6 +30,8 @@ struct Mapping {
     workspace_id: String,
     #[serde(deserialize_with = "json_object::deserialize_vec")]
     scopes: Vec<ScopeMapping>,
+    #[serde(default, deserialize_with = "json_object::deserialize_vec")]
+    task_reviews: Vec<TaskReview>,
     #[serde(default, deserialize_with = "optional_object_list")]
     reviewed_records: Option<Vec<Review>>,
     #[serde(default, deserialize_with = "optional_object_list")]
@@ -183,7 +186,10 @@ pub(crate) fn plan(
                 let claims_supported = !source.hive_yml.is_null();
                 let records =
                     task_intake::read_records(inventory, &|| reader.command(), claims_supported)?;
-                report["task_intake"] = task_intake::report(records, &outcomes);
+                report["task_intake"] =
+                    task_intake::report(records, &outcomes, &mapping.task_reviews, &|| {
+                        reader.command()
+                    })?;
             }
             if include_directives_artifacts {
                 report["directive_artifact_intake"] = directive_artifact_intake::report(

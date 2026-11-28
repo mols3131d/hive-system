@@ -4,6 +4,14 @@ use crate::cli::{CommonOptions, IssueUpdateArgs};
 
 use super::{DoltFailure, DoltSuccess};
 
+#[cfg(target_os = "linux")]
+const MAX_TEXT_BYTES: usize = 65_535;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn valid_text(text: &str) -> bool {
+    !text.trim().is_empty() && text.len() <= MAX_TEXT_BYTES
+}
+
 pub(crate) fn write(
     common: &CommonOptions,
     args: &IssueUpdateArgs,
