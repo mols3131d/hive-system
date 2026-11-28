@@ -200,7 +200,18 @@ The command repeats source preflight and plans directly from its verified invent
 
 A completed plan returns `mode: scope_plan`, the verified source and inventory summary, the declared target workspace ID, the mapping version and its raw SHA-256, and scope outcomes ordered by legacy key. Each outcome lists committed scope directories and either the proposed Area's ID, slug and parent ID or a hold or exclusion reason. Exit status zero means classification completed, including when some scopes are held. The report omits record bodies, canonical references, free-form Area names and host-local file paths.
 
-The workspace ID identifies the intended target for review. Actual target identity, Area ancestry, and target constraints require validation at the later staging step. Projects, resources, record mapping, staged writes, rollback, the A15 report, and live cutover are outside this command's scope.
+The workspace ID identifies the intended target for review. Actual target identity, Area ancestry, and target constraints require validation at the later staging step. Projects, resources, staged writes, rollback, the A15 report, and live cutover are outside this command's scope.
+
+#### Read-only Directive and Artifact intake
+
+Add `--include-directives-artifacts` to `workspace migration-plan` to produce the partial `directive_artifact_intake` report. The CLI uses the same version 1 scope mapping and reads selected Markdown by verified Git blob ID during the same source checks. Each row gives the exact workspace-relative file path, surface, Git blob ID, byte size, and outcome. `source_raw_sha256` is populated for blobs read for metadata inspection. Each surface count reconciles `inventoried` with `held` and `excluded`. Exit status zero means the requested classification completed.
+
+- Intake inventories committed files below `directives/`, `artifacts/`, and `tasks/<scope>/<backlog|active|archive>/<work-id>/artifacts/`. Surface navigation and recognized Directive bundle support files are excluded. Single-file and bundle Directives with the same scope and slug are held. Artifact bundle members beyond the entrypoint need explicit review. Reviewed external scope exclusions and holds for unresolved or unsplit scopes apply to records under those scopes.
+- Candidate metadata comes from a direct Markdown file or a bundle `README.md`. Intake limits each inspected Markdown blob to 256 KiB and its YAML frontmatter to 64 KiB under the existing bounded YAML parser. Title discovery recognizes a leading ATX H1 and holds ambiguous heading forms when a valid frontmatter title is unavailable. Non-Markdown Artifact files, non-text Markdown, and Git LFS pointers need reviewed owner or Resource mappings. Intake uses only the committed snapshot and leaves referenced files and URLs unresolved.
+- Directive candidates report the bounded v1 status and reviewed Area proposal without descendant inheritance. All require reviewed historical provenance. Active candidates also require verified approval and validity. Superseded candidates need graph reconciliation. The complete graph, including possible replacement endpoints of any status, needs a reviewed migration manifest before readiness can be established.
+- Artifact candidates report an explicit v1 kind and any bounded lifecycle label. Review still needs author and source provenance and the original retention clock. Work-scoped rows include the legacy parent bundle path and require a verified Task outcome before they can link to an Issue. Standalone candidates carry no inferred joins.
+
+The report contains only source locators, digests, bounded labels, proposed Directive Area IDs, and hold or exclusion codes. Bodies, titles, actor and approval text, raw timestamps, and resource references stay in the source. All candidates remain held for review. No target IDs are allocated and no Dolt target is contacted.
 
 ### 6. Issue Counters and Number Non-Reuse
 

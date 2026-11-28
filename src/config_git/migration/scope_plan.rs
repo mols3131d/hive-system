@@ -6,7 +6,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
-use super::{AssetObjectReader, Inventory, Reason, snapshot_object, verified_source};
+use super::{
+    AssetObjectReader, Inventory, Reason, directive_artifact_intake, snapshot_object,
+    verified_source,
+};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
 use crate::dolt::{is_uuid, is_uuid_v7};
@@ -87,6 +90,7 @@ pub(crate) fn plan(
     revision: &str,
     workspace_id: &str,
     mapping_file: &Path,
+    include_directives_artifacts: bool,
 ) -> Result<Value, HiveError> {
     if !is_uuid(workspace_id) {
         return Err(HiveError::new(
@@ -114,7 +118,7 @@ pub(crate) fn plan(
         }
 
         let scopes = classify_scopes(inventory, &mapping.scopes, reader)?;
-        Ok(json!({
+        let mut report = json!({
             "mode": "scope_plan",
             "mapping_version": mapping.version,
             "mapping_sha256": format!("{:x}", Sha256::digest(input)),
@@ -122,7 +126,16 @@ pub(crate) fn plan(
             "inventory": inventory.summary,
             "target": {"workspace_id": workspace_id},
             "scopes": scopes.iter().map(Scope::report).collect::<Vec<_>>(),
-        }))
+        });
+        if include_directives_artifacts {
+            let outcomes = scopes
+                .iter()
+                .map(|scope| (scope.scope, &scope.outcome))
+                .collect();
+            report["directive_artifact_intake"] =
+                directive_artifact_intake::report(inventory, reader, &outcomes)?;
+        }
+        Ok(report)
     })
 }
 

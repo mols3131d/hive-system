@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use super::*;
 use crate::config_file::{Coordination, ScopedDirectory};
 
+mod directive_artifact_intake;
 mod scope_plan;
 pub(crate) use scope_plan::plan;
 
@@ -70,6 +71,28 @@ enum Reason {
     AmbiguousScopeOrCollision,
     ExternalBackendOwned,
     UnsplitLegacyScope,
+    NavigationOnly,
+    DirectiveBundleSupport,
+    UnsupportedDirectiveShape,
+    DuplicateLegacyDirective,
+    UnsupportedArtifactShape,
+    UnresolvedArtifactBundleMember,
+    UnresolvedBinaryOrExternalOwner,
+    RecordMarkdownTooLarge,
+    UnsupportedDirectiveMetadata,
+    UnsupportedArtifactMetadata,
+    InvalidDirectiveStatus,
+    UnclassifiedArtifactKind,
+    InvalidArtifactStatus,
+    MissingOrConflictingTitle,
+    IncompleteHistoricalProvenance,
+    MissingDirectiveApproval,
+    UnverifiedDirectiveValidity,
+    UnresolvedSupersessionGraph,
+    UnverifiedArtifactAuthor,
+    UnverifiedArtifactRetention,
+    UnresolvedParentTask,
+    MissingParentTaskEntrypoint,
 }
 
 fn verified_source<T>(

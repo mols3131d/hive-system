@@ -974,7 +974,7 @@ pub(crate) enum WorkspaceAction {
         #[arg(long, value_name = "OID")]
         source_commit: String,
     },
-    /// Plan v1 scope mappings for an explicit v2 workspace ID.
+    /// Plan v1 migration for an explicit v2 workspace ID.
     MigrationPlan {
         /// Absolute path to a standalone v1 Git worktree.
         #[arg(long, value_name = "DIR")]
@@ -988,6 +988,9 @@ pub(crate) enum WorkspaceAction {
         /// Reviewed versioned scope mapping JSON file.
         #[arg(long, value_name = "FILE")]
         mapping_file: PathBuf,
+        /// Include read-only Directive and Artifact intake.
+        #[arg(long)]
+        include_directives_artifacts: bool,
     },
     #[command(flatten)]
     Runtime(WorkspaceCommand),
