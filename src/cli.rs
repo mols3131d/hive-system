@@ -977,7 +977,7 @@ pub(crate) enum WorkspaceAction {
         #[arg(long, value_name = "OID")]
         source_commit: String,
     },
-    /// Plan v1 scope mappings for an explicit v2 workspace ID.
+    /// Plan v1 migration for an explicit v2 workspace ID.
     MigrationPlan {
         /// Absolute path to a standalone v1 Git worktree.
         #[arg(long, value_name = "DIR")]
@@ -991,6 +991,12 @@ pub(crate) enum WorkspaceAction {
         /// Reviewed versioned scope mapping JSON file.
         #[arg(long, value_name = "FILE")]
         mapping_file: PathBuf,
+        /// Include partial v1 Task intake and its reconciliation holds.
+        #[arg(long)]
+        tasks: bool,
+        /// Include read-only Directive and Artifact intake.
+        #[arg(long)]
+        include_directives_artifacts: bool,
     },
     /// Rehearse or stage an inactive v1 scope-only migration.
     MigrationStage(MigrationStageArgs),
@@ -3594,7 +3600,7 @@ impl Command {
                         || !matches!(common.view, View::WorkingTree) =>
                 {
                     Err(
-                        "Migration plan accepts only --source, --source-commit, --workspace-id, --mapping-file, and output selection.",
+                        "Migration plan accepts only --source, --source-commit, --workspace-id, --mapping-file, --tasks, --include-directives-artifacts, and output selection.",
                     )
                 }
                 Self::Workspace(WorkspaceAction::MigrationStage(_))

@@ -10,8 +10,8 @@ use url::{Host, Url};
 
 use super::json_object::{self, Object};
 use super::{
-    AssetObjectReader, Inventory, Reason, SourceSnapshot, is_portable_bot_memory_locator,
-    snapshot_object, verified_source,
+    AssetObjectReader, Inventory, Reason, SourceSnapshot, directive_artifact_intake,
+    is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
 };
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
@@ -116,23 +116,51 @@ pub(crate) fn plan(
     revision: &str,
     workspace_id: &str,
     mapping_file: &Path,
+    include_tasks: bool,
+    include_directives_artifacts: bool,
 ) -> Result<Value, HiveError> {
     with_scope_mapping(source, revision, workspace_id, mapping_file, |reviewed| {
-        Ok(json!({
+        let mut report = json!({
             "mode": "scope_plan",
             "mapping_version": reviewed.mapping_version,
             "mapping_sha256": reviewed.mapping_sha256,
             "source": reviewed.source,
-            "inventory": reviewed.inventory,
+            "inventory": reviewed.inventory.summary,
             "target": {"workspace_id": workspace_id},
             "scopes": reviewed.scopes.iter().map(Scope::report).collect::<Vec<_>>(),
-        }))
+        });
+        if include_tasks || include_directives_artifacts {
+            let outcomes = reviewed
+                .scopes
+                .iter()
+                .map(|scope| (scope.scope, &scope.outcome))
+                .collect();
+            if include_tasks {
+                // Verified v1 coordination exists only under the pin that defines claims.
+                let claims_supported = !reviewed.source.hive_yml.is_null();
+                let records = task_intake::read_records(
+                    reviewed.inventory,
+                    &|| reviewed.reader.command(),
+                    claims_supported,
+                )?;
+                report["task_intake"] = task_intake::report(records, &outcomes);
+            }
+            if include_directives_artifacts {
+                report["directive_artifact_intake"] = directive_artifact_intake::report(
+                    reviewed.inventory,
+                    reviewed.reader,
+                    &outcomes,
+                )?;
+            }
+        }
+        Ok(report)
     })
 }
 
 pub(crate) struct ReviewedScopes<'a> {
     source: &'a SourceSnapshot<'a>,
-    inventory: &'a Value,
+    inventory: &'a Inventory,
+    reader: &'a AssetObjectReader<'a>,
     mapping_version: u32,
     mapping_sha256: String,
     scopes: Vec<Scope<'a>>,
@@ -214,7 +242,7 @@ impl ReviewedScopes<'_> {
             "mapping_version": self.mapping_version,
             "mapping_sha256": self.mapping_sha256,
             "source": self.source,
-            "inventory": self.inventory,
+            "inventory": self.inventory.summary,
             "counts": {"scopes": {
                 "inventoried": self.scopes.len(), "imported": id_map.len(), "held": holds.len(),
                 "excluded_non_record": exclusions.len(),
@@ -261,7 +289,8 @@ pub(crate) fn with_scope_mapping<T>(
         let scopes = classify_scopes(inventory, &mapping.scopes, reader)?;
         inspect(ReviewedScopes {
             source,
-            inventory: &inventory.summary,
+            inventory,
+            reader,
             mapping_version: mapping.version,
             mapping_sha256: format!("{:x}", Sha256::digest(input)),
             scopes,
