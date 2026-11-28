@@ -13,7 +13,7 @@ use super::{DoltFailure, DoltSuccess, Snapshot, is_uuid_v7};
 pub(super) const SUMMARY_COLUMNS: &str = "a.id, a.kind, a.title, a.revision";
 
 const MAX_LIMIT: u32 = 100;
-const MAX_SCOPES: usize = 100;
+pub(crate) const MAX_SCOPES: usize = 100;
 const MAX_BODY_BYTES: u32 = 64 * 1024;
 
 #[cfg(target_os = "linux")]

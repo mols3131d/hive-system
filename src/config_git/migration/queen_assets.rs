@@ -2,10 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    AssetObjectReader, Inventory, InventoryEntry, is_portable_bot_memory_locator, snapshot_object,
+    AssetObjectReader, Inventory, InventoryEntry, PreparedQueen, is_portable_bot_memory_locator,
+    snapshot_object,
 };
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, parse_v2};
@@ -26,12 +28,112 @@ pub(super) struct QueenAssets<'a> {
     navigation_only: Vec<Record<'a>>,
 }
 
+impl QueenAssets<'_> {
+    pub(super) fn reconciliation(&self, queens: &[PreparedQueen]) -> Value {
+        let approved: BTreeSet<_> = queens
+            .iter()
+            .map(|queen| queen.registry.slug.as_str())
+            .collect();
+        let mut counts = BTreeMap::from([
+            ("bots_soul", [0; 3]),
+            ("bot_memories_historical", [0; 3]),
+            ("navigation_only", [0; 3]),
+        ]);
+        let mut holds = Vec::new();
+        let mut exclusions = Vec::new();
+        let records = self
+            .bots_soul
+            .iter()
+            .map(|record| {
+                let surface = if record.memory_management {
+                    "bot_memories_historical"
+                } else {
+                    "bots_soul"
+                };
+                (surface, record)
+            })
+            .chain(
+                self.bot_memories_historical
+                    .iter()
+                    .map(|record| ("bot_memories_historical", record)),
+            )
+            .chain(
+                self.navigation_only
+                    .iter()
+                    .map(|record| ("navigation_only", record)),
+            );
+        for (surface, record) in records {
+            let partition = counts.get_mut(surface).expect("known Bot asset surface");
+            let (index, ledger, reason) = match &record.outcome {
+                Outcome::Candidate { slug, .. } if approved.contains(slug.as_str()) => {
+                    partition[0] += 1;
+                    continue;
+                }
+                Outcome::Candidate { .. } => (1, &mut holds, Reason::UnverifiedQueenPreparation),
+                Outcome::Held { reason } => (1, &mut holds, *reason),
+                Outcome::Excluded { reason } => (2, &mut exclusions, *reason),
+            };
+            partition[index] += 1;
+            ledger.push(json!({
+                "surface": surface, "reason_code": reason,
+                "legacy_key_sha256": record.legacy_key_sha256,
+                "source_path_sha256": record.source_path_sha256,
+                "source_git_blob_sha": record.source_git_blob_sha,
+            }));
+        }
+        let counts: BTreeMap<_, _> = counts
+            .into_iter()
+            .map(|(surface, [imported, held, excluded])| {
+                (
+                    surface,
+                    json!({"inventoried": imported + held + excluded, "imported": imported,
+                "held": held, "excluded_non_record": excluded}),
+                )
+            })
+            .collect();
+        json!({"counts": counts, "holds": holds, "exclusions": exclusions})
+    }
+
+    pub(super) fn staging_inventory(&self) -> serde_json::Value {
+        let holds = self
+            .bots_soul
+            .iter()
+            .chain(&self.bot_memories_historical)
+            .filter_map(|record| {
+                let Outcome::Held { reason } = &record.outcome else {
+                    return None;
+                };
+                Some(serde_json::json!({
+                    "reason_code": reason,
+                    "source_path_sha256": record.source_path_sha256,
+                    "source_git_blob_sha": record.source_git_blob_sha,
+                }))
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "holds": holds,
+            "soul_candidates": self.bots_soul.iter().filter(|record| {
+                matches!(record.outcome, Outcome::Candidate { .. })
+            }).count(),
+            "soul_held": self.bots_soul.iter().filter(|record| {
+                matches!(record.outcome, Outcome::Held { .. })
+            }).count(),
+            "curated_memory_deferred": self.bot_memories_historical.len(),
+            "navigation_only": self.navigation_only.len(),
+        })
+    }
+}
+
 #[derive(Serialize)]
 struct Record<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     source_path: Option<String>,
     source_path_sha256: String,
     source_git_blob_sha: Option<&'a str>,
+    #[serde(skip)]
+    memory_management: bool,
+    #[serde(skip)]
+    legacy_key_sha256: String,
     #[serde(flatten)]
     outcome: Outcome,
 }
@@ -52,10 +154,11 @@ enum Outcome {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Reason {
     InvalidSoulOrSlug,
+    UnverifiedQueenPreparation,
     CuratedMemoryDeferred,
     ManagementOnly,
     NavigationOnly,
@@ -192,8 +295,18 @@ pub(super) fn classify<'a>(
 }
 
 fn record<'a>(path: &str, entry: Option<&'a InventoryEntry>, outcome: Outcome) -> Record<'a> {
+    let bot = path
+        .strip_prefix("bots/")
+        .and_then(|relative| relative.split_once('/'));
+    let memory_management = bot.is_some_and(|(_, child)| child.starts_with("memory/"));
+    let legacy_key = match bot {
+        Some((slug, "SOUL.md")) => slug,
+        _ => path,
+    };
     Record {
         source_path: portable_bot_path(path).then(|| path.to_owned()),
+        memory_management,
+        legacy_key_sha256: digest(legacy_key.as_bytes()),
         source_path_sha256: digest(path.as_bytes()),
         source_git_blob_sha: entry
             .filter(|entry| !entry.is_directory())

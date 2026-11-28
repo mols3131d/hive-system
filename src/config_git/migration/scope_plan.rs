@@ -6,12 +6,19 @@ use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag, TagEnd};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 use url::{Host, Url};
 
+use super::directive_scope::DirectiveContext;
+use super::issue_resources::{self, IssueResourceOutcome};
 use super::json_object::{self, Object};
-use super::queen_assets::{self, SoulReview};
+use super::prepared_records::Intake;
+use super::projects::{self, PreparedProjects};
+use super::queen_assets::{self, QueenAssets, SoulReview};
 use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
-use super::reviewed_records::Review;
+use super::reviewed_records::{Review, timestamp};
+use super::standalone_artifact::JoinContext;
+use super::task_intake::StagingTask;
 use super::task_provenance::TaskReview;
 use super::{
     AssetObjectReader, Inventory, Reason, SourceSnapshot, directive_artifact_intake,
@@ -21,6 +28,9 @@ use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
 use crate::dolt::{is_uuid, is_uuid_v7};
 use crate::error::{ErrorCode, HiveError};
+
+mod resources;
+pub(crate) use resources::{Hold as ResourceHold, PreparedResources};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,11 +44,21 @@ struct Mapping {
     #[serde(default, deserialize_with = "json_object::deserialize_vec")]
     task_reviews: Vec<TaskReview>,
     #[serde(default, deserialize_with = "optional_object_list")]
-    reviewed_records: Option<Vec<Review>>,
-    #[serde(default, deserialize_with = "optional_object_list")]
     queen_assets: Option<Vec<SoulReview>>,
     #[serde(default, deserialize_with = "optional_object_list")]
     queen_preparation: Option<Vec<QueenMapping>>,
+    #[serde(default, deserialize_with = "resources::deserialize_section")]
+    resource_bindings: Option<resources::Bindings>,
+    #[serde(default, deserialize_with = "projects::deserialize_section")]
+    project_membership: Option<projects::Mapping>,
+    #[serde(default, deserialize_with = "issue_resources::optional_list")]
+    issue_resource_bindings: Option<Vec<issue_resources::Binding>>,
+    #[serde(
+        default,
+        deserialize_with = "super::reviewed_records::deserialize_present"
+    )]
+    reviewed_records: Option<Vec<Review>>,
+    directive_observed_at: Option<String>,
 }
 
 fn optional_object_list<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
@@ -80,7 +100,7 @@ pub(crate) struct Area {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProjectEvidence {
+pub(super) struct ProjectEvidence {
     path: String,
     canonical_ref: String,
 }
@@ -92,15 +112,22 @@ struct Scope<'a> {
 }
 
 pub(super) enum ScopeOutcome<'a> {
-    Mapped { area: &'a Area },
-    Held { reason: Reason },
-    Excluded { reason: Reason },
+    Mapped {
+        area: &'a Area,
+        evidence: &'a [ProjectEvidence],
+    },
+    Held {
+        reason: Reason,
+    },
+    Excluded {
+        reason: Reason,
+    },
 }
 
 impl Scope<'_> {
     fn report(&self) -> Value {
         let outcome = match self.outcome {
-            ScopeOutcome::Mapped { area } => json!({
+            ScopeOutcome::Mapped { area, .. } => json!({
                 "status": "mapped",
                 "area": {"id": area.id, "slug": area.slug, "parent_id": area.parent_id},
             }),
@@ -139,102 +166,73 @@ pub(crate) fn plan(
     include_tasks: bool,
     include_directives_artifacts: bool,
 ) -> Result<Value, HiveError> {
-    Ok(prepare_plan(
-        source,
-        revision,
-        workspace_id,
-        mapping_file,
-        include_tasks,
-        include_directives_artifacts,
-    )?
-    .report)
-}
-
-struct MigrationPlan {
-    report: Value,
-    #[expect(dead_code, reason = "reserved for the later inactive staging step")]
-    queen_souls: Vec<PreparedQueen>,
-}
-
-fn prepare_plan(
-    source: &Path,
-    revision: &str,
-    workspace_id: &str,
-    mapping_file: &Path,
-    include_tasks: bool,
-    include_directives_artifacts: bool,
-) -> Result<MigrationPlan, HiveError> {
     with_scope_mapping(source, revision, workspace_id, mapping_file, |reviewed| {
-        if reviewed.reviewed_records.is_some() && !include_directives_artifacts {
+        if !include_directives_artifacts
+            && (reviewed.mapping.reviewed_records.is_some()
+                || reviewed.directive_observed_at.is_some())
+        {
             return Err(invalid(
                 "Reviewed records require --include-directives-artifacts.",
             ));
         }
         let mut report = json!({
             "mode": "scope_plan",
-            "mapping_version": reviewed.mapping_version,
+            "mapping_version": reviewed.mapping.version,
             "mapping_sha256": reviewed.mapping_sha256,
             "source": reviewed.source,
             "inventory": reviewed.inventory.summary,
             "target": {"workspace_id": workspace_id},
             "scopes": reviewed.scopes.iter().map(Scope::report).collect::<Vec<_>>(),
         });
-        if include_tasks || include_directives_artifacts {
-            let outcomes = reviewed
-                .scopes
-                .iter()
-                .map(|scope| (scope.scope, &scope.outcome))
-                .collect();
-            if include_tasks {
-                // Verified v1 coordination exists only under the pin that defines claims.
-                let claims_supported = !reviewed.source.hive_yml.is_null();
-                let records = task_intake::read_records(
-                    reviewed.inventory,
-                    &|| reviewed.reader.command(),
-                    claims_supported,
-                )?;
-                report["task_intake"] =
-                    task_intake::prepare(records, &outcomes, reviewed.task_reviews, &|| {
-                        reviewed.reader.command()
-                    })?
-                    .report();
-            }
-            if include_directives_artifacts {
-                report["directive_artifact_intake"] = directive_artifact_intake::report(
-                    reviewed.inventory,
-                    reviewed.reader,
-                    &outcomes,
-                    reviewed.reviewed_records,
-                )?;
-            }
-        }
-        let mut preparation = reviewed
-            .queen_preparation
-            .map(Preparation::new)
-            .transpose()?;
-        if reviewed.queen_assets.is_some() || preparation.is_some() {
-            report["queen_assets"] = json!(queen_assets::classify(
-                reviewed.inventory,
-                reviewed.reader,
-                reviewed.queen_assets.unwrap_or_default(),
-                |slug, oid, digest, bytes| {
-                    if let Some(preparation) = &mut preparation {
-                        preparation.accept_candidate(slug, oid, digest, bytes);
-                    }
-                },
-            )?);
-        }
-        let queen_souls = if let Some(preparation) = preparation {
-            let (summary, souls) = preparation.finish();
-            report["queen_preparation"] = summary;
-            souls
+        let task_plan = (include_tasks
+            || (include_directives_artifacts && reviewed.artifact_reviews_need_tasks()))
+        .then(|| reviewed.prepare_tasks(None))
+        .transpose()?;
+        let projects = reviewed.prepare_projects(if include_tasks {
+            task_plan.as_ref()
         } else {
-            Vec::new()
-        };
-        Ok(MigrationPlan {
-            report,
-            queen_souls,
-        })
+            None
+        })?;
+        let tasks = task_plan.as_ref().map(task_intake::TaskPlan::staging_tasks);
+        if let Some(projects) = &projects {
+            report["project_membership"] = projects.report(None);
+        }
+        if include_directives_artifacts {
+            report["directive_artifact_intake"] = reviewed
+                .scan_directive_artifacts(false, tasks.as_deref(), projects.as_ref())?
+                .report;
+            if let Some(observed_at) = reviewed.directive_observation() {
+                report["directive_observed_at"] = json!(observed_at);
+            }
+        }
+        if reviewed.mapping.issue_resource_bindings.is_some() {
+            let selected_tasks = if include_tasks {
+                tasks.as_deref()
+            } else {
+                None
+            };
+            if let Some(outcomes) = reviewed.prepare_issue_resources(selected_tasks)? {
+                report["issue_resource_bindings"] = json!(
+                    outcomes
+                        .iter()
+                        .map(IssueResourceOutcome::report)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        if include_tasks && let Some(plan) = task_plan {
+            report["task_intake"] = plan.report();
+        }
+        if let Some(assets) = &reviewed.queen_assets {
+            report["queen_assets"] = json!(assets);
+        }
+        if let Some((summary, _)) = &reviewed.queen_preparation {
+            report["queen_preparation"] = summary.clone();
+        }
+        if let Some(resources) = &reviewed.resources {
+            report["resource_bindings"] = resources.report();
+        }
+        Ok(report)
     })
 }
 
@@ -242,38 +240,163 @@ pub(crate) struct ReviewedScopes<'a> {
     source: &'a SourceSnapshot<'a>,
     inventory: &'a Inventory,
     reader: &'a AssetObjectReader<'a>,
-    mapping_version: u32,
+    mapping: &'a Mapping,
+    pub(crate) resources: Option<PreparedResources<'a>>,
+    queen_assets: Option<QueenAssets<'a>>,
+    queen_preparation: Option<(Value, Vec<PreparedQueen>)>,
+
+    directive_observed_at: Option<OffsetDateTime>,
     mapping_sha256: String,
     scopes: Vec<Scope<'a>>,
-    queen_assets: Option<&'a [SoulReview]>,
-    queen_preparation: Option<&'a [QueenMapping]>,
-    task_reviews: &'a [TaskReview],
-    reviewed_records: Option<&'a [Review]>,
 }
 
 impl ReviewedScopes<'_> {
+    pub(crate) fn prepared_queens(&self) -> &[PreparedQueen] {
+        self.queen_preparation
+            .as_ref()
+            .map_or(&[], |(_, souls)| souls.as_slice())
+    }
+
+    pub(crate) fn prepare_tasks(
+        &self,
+        check_labels: Option<&task_intake::LabelCollisionCheck<'_>>,
+    ) -> Result<task_intake::TaskPlan<'_>, HiveError> {
+        self.task_inventory(&self.mapping.task_reviews, check_labels)
+    }
+
+    pub(crate) fn unselected_task_ledger(&self) -> Result<Value, HiveError> {
+        Ok(self.task_inventory(&[], None)?.staging_ledger())
+    }
+
+    fn task_inventory(
+        &self,
+        reviews: &[TaskReview],
+        check_labels: Option<&task_intake::LabelCollisionCheck<'_>>,
+    ) -> Result<task_intake::TaskPlan<'_>, HiveError> {
+        let outcomes = self
+            .scopes
+            .iter()
+            .map(|scope| (scope.scope, &scope.outcome))
+            .collect();
+        let git = || self.reader.command();
+        let claims_supported = !self.source.hive_yml.is_null();
+        let records = task_intake::read_records(self.inventory, &git, claims_supported)?;
+        task_intake::prepare(records, &outcomes, reviews, &git, check_labels)
+    }
+
+    pub(crate) fn prepare_projects(
+        &self,
+        tasks: Option<&task_intake::TaskPlan<'_>>,
+    ) -> Result<Option<PreparedProjects<'_>>, HiveError> {
+        self.mapping
+            .project_membership
+            .as_ref()
+            .map(|mapping| mapping.prepare(tasks))
+            .transpose()
+    }
+
+    pub(crate) fn prepare_issue_resources(
+        &self,
+        tasks: Option<&[task_intake::StagingTask<'_>]>,
+    ) -> Result<Option<Vec<IssueResourceOutcome<'_>>>, HiveError> {
+        self.mapping
+            .issue_resource_bindings
+            .as_deref()
+            .map(|bindings| issue_resources::prepare(bindings, tasks, self.resources.as_ref()))
+            .transpose()
+    }
+
+    fn artifact_reviews_need_tasks(&self) -> bool {
+        self.mapping
+            .reviewed_records
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(Review::needs_tasks)
+    }
+
+    pub(crate) fn require_stage_task_selection(
+        &self,
+        include_tasks: bool,
+    ) -> Result<(), HiveError> {
+        if !include_tasks
+            && !self.mapping.task_reviews.is_empty()
+            && !self.artifact_reviews_need_tasks()
+            && self.mapping.project_membership.is_none()
+        {
+            return Err(invalid("Task reviews require --tasks for staging."));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn directive_artifacts_for_staging(
+        &self,
+        tasks: Option<&[StagingTask<'_>]>,
+        projects: Option<&PreparedProjects<'_>>,
+    ) -> Result<Option<Intake>, HiveError> {
+        self.mapping
+            .reviewed_records
+            .as_ref()
+            .map(|_| self.scan_directive_artifacts(true, tasks, projects))
+            .transpose()
+    }
+
+    pub(crate) fn unselected_directive_artifact_inventory(&self) -> Result<Intake, HiveError> {
+        self.scan_directive_artifacts(false, None, None)
+    }
+
+    pub(crate) fn asset_reconciliation(&self) -> Result<Value, HiveError> {
+        let queens = self.prepared_queens();
+        if let Some(assets) = &self.queen_assets {
+            return Ok(assets.reconciliation(queens));
+        }
+        let assets = queen_assets::classify(self.inventory, self.reader, &[], |_, _, _, _| {})?;
+        Ok(assets.reconciliation(queens))
+    }
+
+    pub(crate) fn directive_observation(&self) -> Option<&str> {
+        self.mapping.directive_observed_at.as_deref()
+    }
+
+    fn scan_directive_artifacts(
+        &self,
+        prepare_storage: bool,
+        tasks: Option<&[StagingTask<'_>]>,
+        projects: Option<&PreparedProjects<'_>>,
+    ) -> Result<Intake, HiveError> {
+        let scopes = self
+            .scopes
+            .iter()
+            .map(|scope| (scope.scope, &scope.outcome))
+            .collect();
+        directive_artifact_intake::scan(
+            self.inventory,
+            self.reader,
+            &scopes,
+            self.mapping.reviewed_records.as_deref(),
+            &DirectiveContext {
+                observed_at: self.directive_observed_at,
+                project_ids: projects
+                    .into_iter()
+                    .flat_map(PreparedProjects::project_ids)
+                    .collect(),
+            },
+            prepare_storage,
+            &JoinContext::new(
+                &self.mapping.workspace_id,
+                tasks,
+                self.scopes.iter().map(|scope| &scope.outcome),
+                projects.into_iter().flat_map(PreparedProjects::project_ids),
+                self.resources.as_ref(),
+            ),
+        )
+    }
+
     pub(crate) fn areas_in_parent_order(&self) -> Result<Vec<&Area>, HiveError> {
-        if !self.task_reviews.is_empty()
-            || self
-                .reviewed_records
-                .is_some_and(|records| !records.is_empty())
-        {
-            return Err(invalid(
-                "Area staging requires a mapping without Task, Directive, or Artifact reviews.",
-            ));
-        }
-        if self
-            .queen_preparation
-            .is_some_and(|reviews| !reviews.is_empty())
-        {
-            return Err(invalid(
-                "Area staging requires a mapping without Queen preparation reviews.",
-            ));
-        }
         let mut ids = BTreeSet::new();
         let mut children = BTreeMap::<Option<&str>, Vec<&Area>>::new();
         for scope in &self.scopes {
-            if let ScopeOutcome::Mapped { area } = scope.outcome {
+            if let ScopeOutcome::Mapped { area, .. } = scope.outcome {
                 ids.insert(area.id.as_str());
                 children
                     .entry(area.parent_id.as_deref())
@@ -324,7 +447,7 @@ impl ReviewedScopes<'_> {
             let mut entry =
                 json!({"scope_sha256": scope_sha256, "source_path_sha256s": source_path_sha256s});
             match scope.outcome {
-                ScopeOutcome::Mapped { area } => {
+                ScopeOutcome::Mapped { area, .. } => {
                     entry["area_id"] = json!(area.id);
                     entry["parent_area_id"] = json!(area.parent_id);
                     id_map.push(entry);
@@ -339,9 +462,9 @@ impl ReviewedScopes<'_> {
                 }
             }
         }
-        json!({
+        let mut report = json!({
             "coverage": "scope_only",
-            "mapping_version": self.mapping_version,
+            "mapping_version": self.mapping.version,
             "mapping_sha256": self.mapping_sha256,
             "source": self.source,
             "inventory": self.inventory.summary,
@@ -352,7 +475,15 @@ impl ReviewedScopes<'_> {
             "id_map": id_map,
             "holds": holds,
             "exclusions": exclusions,
-        })
+        });
+        if let Some((summary, _)) = &self.queen_preparation {
+            report["coverage"] = json!("scopes_and_queen_souls");
+            report["queen_preparation"] = summary.clone();
+        }
+        if let Some(assets) = &self.queen_assets {
+            report["queen_inventory"] = assets.staging_inventory();
+        }
+        report
     }
 }
 
@@ -377,6 +508,14 @@ pub(crate) fn with_scope_mapping<T>(
     if mapping.version != 1 {
         return Err(invalid("The scope mapping version is unsupported."));
     }
+    let directive_observed_at = mapping
+        .directive_observed_at
+        .as_deref()
+        .map(|value| {
+            timestamp(value)
+                .ok_or_else(|| invalid("Directive observation requires a UTC timestamp."))
+        })
+        .transpose()?;
 
     verified_source(source, revision, |source, inventory, reader| {
         if mapping.source_commit != source.source_commit
@@ -389,17 +528,41 @@ pub(crate) fn with_scope_mapping<T>(
         }
 
         let scopes = classify_scopes(inventory, &mapping.scopes, reader)?;
+        let mut preparation = mapping
+            .queen_preparation
+            .as_deref()
+            .map(Preparation::new)
+            .transpose()?;
+        let queen_assets = (mapping.queen_assets.is_some() || preparation.is_some())
+            .then(|| {
+                queen_assets::classify(
+                    inventory,
+                    reader,
+                    mapping.queen_assets.as_deref().unwrap_or_default(),
+                    |slug, oid, digest, bytes| {
+                        if let Some(preparation) = &mut preparation {
+                            preparation.accept_candidate(slug, oid, digest, bytes);
+                        }
+                    },
+                )
+            })
+            .transpose()?;
+        let resources = mapping
+            .resource_bindings
+            .as_ref()
+            .map(|bindings| bindings.prepare(inventory, &scopes))
+            .transpose()?;
         inspect(ReviewedScopes {
             source,
             inventory,
             reader,
-            mapping_version: mapping.version,
+            mapping: &mapping,
+            directive_observed_at,
+            queen_assets,
+            queen_preparation: preparation.map(Preparation::finish),
+            resources,
             mapping_sha256: format!("{:x}", Sha256::digest(input)),
             scopes,
-            queen_assets: mapping.queen_assets.as_deref(),
-            queen_preparation: mapping.queen_preparation.as_deref(),
-            task_reviews: &mapping.task_reviews,
-            reviewed_records: mapping.reviewed_records.as_deref(),
         })
     })
 }
@@ -500,7 +663,10 @@ fn classify_scopes<'a>(
                             &mut references,
                         )?) =>
                 {
-                    ScopeOutcome::Mapped { area }
+                    ScopeOutcome::Mapped {
+                        area,
+                        evidence: project_evidence,
+                    }
                 }
                 _ => ScopeOutcome::Held {
                     reason: Reason::AmbiguousScopeOrCollision,

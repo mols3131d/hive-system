@@ -1,17 +1,20 @@
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
-use pulldown_cmark::{Event, Parser, Tag};
-use serde::{Deserialize, Deserializer, Serialize};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use super::json_object::{self, Object};
 use super::scope_plan::{closed_raw_html_block, is_portable_scope};
-use super::task_intake::{CandidateStatus, TitleSource, parse_record, resolve_title};
+use super::task_intake::{
+    CandidateStatus, TitleProblem, TitleSource, parse_record, resolve_title, valid_title,
+};
 use super::{Reason, is_full_lowercase_oid};
 use crate::cli::is_slug;
+use crate::config_file::present;
 use crate::dolt::is_uuid_v7;
 use crate::dolt::issue_update::valid_text;
 use crate::error::{ErrorCode, HiveError};
@@ -25,15 +28,75 @@ pub(super) struct TaskReview {
     legacy_key: LegacyKey,
     source_git_blob_sha: String,
     area_id: String,
+    #[serde(default, deserialize_with = "present")]
+    issue_type: Option<IssueType>,
+    #[serde(default, deserialize_with = "present")]
+    title: Option<Object<TitleReview>>,
     pub(super) relations: Option<Relations>,
     #[serde(default, deserialize_with = "optional_object")]
     created_at: Option<BodyRange>,
     #[serde(default, deserialize_with = "optional_object")]
     updated_at: Option<BodyRange>,
-    #[serde(default, deserialize_with = "optional_object")]
-    acceptance_criteria: Option<BodyRange>,
+    #[serde(default, deserialize_with = "supplied_object")]
+    acceptance_criteria: Option<Option<BodyRange>>,
+    #[serde(default, deserialize_with = "present")]
+    todo_fallback: Option<Object<TodoFallback>>,
     #[serde(default, deserialize_with = "optional_object")]
     closure: Option<ClosureReview>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum TodoFallback {
+    BacklogWithoutCriteria {},
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum IssueType {
+    Epic,
+    Feature,
+    #[default]
+    Task,
+    Bug,
+}
+
+impl<'de> Deserialize<'de> for IssueType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let kind = String::deserialize(deserializer)?;
+        match kind.as_str() {
+            "epic" => Ok(Self::Epic),
+            "feature" => Ok(Self::Feature),
+            "task" => Ok(Self::Task),
+            "bug" => Ok(Self::Bug),
+            _ => Err(de::Error::unknown_variant(
+                &kind,
+                &["epic", "feature", "task", "bug"],
+            )),
+        }
+    }
+}
+
+impl IssueType {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Task)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Epic => "epic",
+            Self::Feature => "feature",
+            Self::Task => "task",
+            Self::Bug => "bug",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+enum TitleReview {
+    Fallback { value: String },
+    Override { value: String },
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -52,7 +115,7 @@ impl LegacyKey {
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub(super) enum Relations {
-    Simple(RelationDeclaration),
+    Simple(#[serde(deserialize_with = "json_object::string_enum")] RelationDeclaration),
     Reviewed(Object<Obligations>),
 }
 
@@ -66,7 +129,7 @@ pub(super) enum RelationDeclaration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Obligations {
-    #[serde(default, deserialize_with = "declared_parent")]
+    #[serde(default, deserialize_with = "supplied_object")]
     parent: Option<Option<LegacyKey>>,
     #[serde(default, deserialize_with = "optional_objects")]
     prerequisites: Option<Vec<LegacyKey>>,
@@ -74,9 +137,9 @@ pub(super) struct Obligations {
     children: Option<Vec<ChildReview>>,
 }
 
-fn declared_parent<'de, D: Deserializer<'de>>(
+fn supplied_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
-) -> Result<Option<Option<LegacyKey>>, D::Error> {
+) -> Result<Option<Option<T>>, D::Error> {
     optional_object(deserializer).map(Some)
 }
 
@@ -136,7 +199,7 @@ pub(super) struct BodyRange {
 }
 
 impl BodyRange {
-    fn select(self, body: &str) -> Option<&str> {
+    pub(super) fn select(self, body: &str) -> Option<&str> {
         body.get(self.start as usize..self.end as usize)
     }
 }
@@ -212,12 +275,12 @@ impl<'a> Reviews<'a> {
 pub(super) struct SourceBody {
     text: String,
     body_start: usize,
+    source_title: Result<(String, TitleSource), TitleProblem>,
     body_sha256: String,
-    title_source: TitleSource,
-    title_sha256: String,
     priority: Option<u8>,
-    has_tags: bool,
+    pub(super) labels: Vec<String>,
     scope_acceptance: OnceCell<HashSet<BodyRange>>,
+    criteria_indicators: OnceCell<bool>,
 }
 
 impl SourceBody {
@@ -230,9 +293,8 @@ impl SourceBody {
         };
         let text = String::from_utf8(bytes).map_err(|_| invalid())?;
         let (metadata, body) = parse_record(&text).ok_or_else(invalid)?;
-        let (title, title_source) =
-            resolve_title(metadata.title.as_deref(), &metadata.description, body)
-                .ok_or_else(invalid)?;
+        let source_title = resolve_title(metadata.title.as_deref(), &metadata.description, body)
+            .map(|(title, source)| (title.to_owned(), source));
         let priority = match metadata.priority.as_ref().and_then(Value::as_str) {
             Some("high") => Some(0),
             Some("normal") => Some(1),
@@ -242,11 +304,16 @@ impl SourceBody {
         Ok(Self {
             body_start: text.len() - body.len(),
             body_sha256: format!("{:x}", Sha256::digest(body)),
-            title_source,
-            title_sha256: format!("{:x}", Sha256::digest(title)),
+            source_title,
             priority,
-            has_tags: metadata.tags.is_some(),
+            labels: metadata
+                .tags
+                .into_iter()
+                .flatten()
+                .map(|tag| tag.trim().to_owned())
+                .collect(),
             scope_acceptance: OnceCell::new(),
+            criteria_indicators: OnceCell::new(),
             text,
         })
     }
@@ -296,17 +363,94 @@ fn acceptance_paragraphs(body: &str) -> HashSet<BodyRange> {
     ranges
 }
 
+// The bound review attests that the Task has no applicable criteria, which
+// can be written in free prose or kept in a referenced source. Refuse known
+// criteria markers in the README even when the review omitted a body range.
+fn has_criteria_indicators(body: &str) -> bool {
+    let mut blocks = Vec::new();
+    let mut rendered = String::new();
+    for event in Parser::new_ext(body, Options::ENABLE_TASKLISTS) {
+        match event {
+            Event::TaskListMarker(_) => return true,
+            Event::Text(text) | Event::Code(text) => {
+                if criteria_marker(&text) {
+                    return true;
+                }
+                if blocks.last() == Some(&true) {
+                    rendered.push_str(&text);
+                }
+                continue;
+            }
+            Event::Html(text) | Event::InlineHtml(text) if criteria_marker(&text) => return true,
+            Event::SoftBreak | Event::HardBreak if blocks.last() == Some(&true) => {
+                rendered.push('\n');
+                continue;
+            }
+            Event::Start(tag) => {
+                let Some(render_text) = criteria_block(tag.to_end()) else {
+                    continue;
+                };
+                blocks.push(render_text);
+            }
+            Event::End(tag) if criteria_block(tag).is_some() => {
+                blocks.pop();
+            }
+            Event::Rule => {}
+            _ => continue,
+        }
+
+        // Containers separate prose runs. Tight list items can supply their
+        // own inline text without a paragraph, including in nested lists.
+        if !rendered.is_empty() && criteria_marker(&rendered) {
+            return true;
+        }
+        rendered.clear();
+    }
+    false
+}
+
+fn criteria_block(tag: TagEnd) -> Option<bool> {
+    match tag {
+        TagEnd::Heading(_) | TagEnd::Paragraph | TagEnd::Item => Some(true),
+        TagEnd::BlockQuote(_) | TagEnd::CodeBlock | TagEnd::HtmlBlock | TagEnd::List(_) => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn criteria_marker(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.contains("acceptance criteria")
+        || normalized.contains("completion criteria")
+        || normalized.contains("definition of done")
+        || text.lines().any(|line| {
+            let line = line.trim();
+            line == "acceptance"
+                || line.starts_with("acceptance:")
+                || line == "criteria"
+                || line.starts_with("criteria:")
+        })
+}
+
 #[derive(Serialize)]
 pub(super) struct Prepared {
     relations: PreparedRelations,
     body_sha256: String,
+    #[serde(skip)]
+    title: String,
     title_source: TitleSource,
     title_sha256: String,
+    #[serde(skip_serializing_if = "IssueType::is_default")]
+    issue_type: IssueType,
     priority: Option<u8>,
     created_at: Timestamp,
     updated_at: Timestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
     acceptance_criteria: Option<BodyEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    todo_fallback: Option<TodoFallback>,
     #[serde(skip_serializing_if = "Option::is_none")]
     closure: Option<PreparedClosure>,
 }
@@ -336,14 +480,16 @@ struct PreparedClosure {
     resolution_note: BodyEvidence,
 }
 
-#[derive(Serialize)]
-struct Timestamp {
+#[derive(Clone, Serialize)]
+pub(super) struct Timestamp {
     value: String,
     body_range: BodyRange,
+    #[serde(skip)]
+    instant: OffsetDateTime,
 }
 
 impl Timestamp {
-    fn select(range: Option<BodyRange>, body: &str) -> Option<(Self, OffsetDateTime)> {
+    pub(super) fn select(range: Option<BodyRange>, body: &str) -> Option<(Self, OffsetDateTime)> {
         let body_range = range?;
         let value = body_range.select(body)?;
         let instant = parse_historical_timestamp(value)?;
@@ -351,6 +497,7 @@ impl Timestamp {
             Self {
                 value: value.to_owned(),
                 body_range,
+                instant,
             },
             instant,
         ))
@@ -384,6 +531,106 @@ struct BodyEvidence {
     sha256: String,
 }
 
+pub(crate) struct StagingFields<'a> {
+    pub(crate) title: &'a str,
+    pub(crate) title_sha256: &'a str,
+    pub(crate) issue_type: &'static str,
+    pub(crate) body: &'a str,
+    pub(crate) body_sha256: &'a str,
+    pub(crate) criteria: Option<&'a str>,
+    pub(crate) todo_fallback: Option<TodoFallback>,
+    pub(crate) priority: Option<u8>,
+    pub(crate) labels: &'a [String],
+    pub(crate) created_at: OffsetDateTime,
+    pub(crate) updated_at: OffsetDateTime,
+    pub(crate) closure: Option<StagingClosure<'a>>,
+    pub(crate) parent: Option<Key<'a>>,
+    pub(crate) prerequisites: Vec<Key<'a>>,
+    pub(crate) scope_acceptance: Vec<ScopeAcceptance<'a>>,
+}
+
+pub(crate) struct StagingClosure<'a> {
+    pub(crate) closed_at: OffsetDateTime,
+    pub(crate) closed_by_ref: &'a str,
+    pub(crate) resolution_note: &'a str,
+    closed_at_evidence: &'a Timestamp,
+}
+
+impl StagingClosure<'_> {
+    pub(super) fn reviewed_closed_at(&self, range: BodyRange) -> Option<&Timestamp> {
+        (self.closed_at_evidence.body_range == range).then_some(self.closed_at_evidence)
+    }
+}
+
+pub(crate) struct ScopeAcceptance<'a> {
+    pub(crate) child: Key<'a>,
+    pub(crate) sha256: &'a str,
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+}
+
+impl Prepared {
+    pub(super) fn target_status(&self, source_status: CandidateStatus) -> CandidateStatus {
+        if self.todo_fallback.is_some() {
+            CandidateStatus::Backlog
+        } else {
+            source_status
+        }
+    }
+
+    pub(super) fn staging_fields<'a>(&'a self, source: &'a SourceBody) -> StagingFields<'a> {
+        let body = &source.text[source.body_start..];
+        let selected = |range: BodyRange| range.select(body).expect("verified Task body range");
+        let mut fields = StagingFields {
+            title: &self.title,
+            title_sha256: &self.title_sha256,
+            issue_type: self.issue_type.as_str(),
+            body,
+            body_sha256: &self.body_sha256,
+            criteria: self
+                .acceptance_criteria
+                .as_ref()
+                .map(|evidence| selected(evidence.body_range)),
+            todo_fallback: self.todo_fallback,
+            priority: self.priority,
+            labels: &source.labels,
+            created_at: self.created_at.instant,
+            updated_at: self.updated_at.instant,
+            closure: self.closure.as_ref().map(|closure| StagingClosure {
+                closed_at: closure.closed_at.instant,
+                closed_by_ref: selected(closure.closed_by_ref.body_range),
+                resolution_note: selected(closure.resolution_note.body_range),
+                closed_at_evidence: &closure.closed_at,
+            }),
+            parent: None,
+            prerequisites: Vec::new(),
+            scope_acceptance: Vec::new(),
+        };
+        if let PreparedRelations::Reviewed {
+            parent,
+            prerequisites,
+            children,
+        } = &self.relations
+        {
+            fields.parent = parent.as_ref().map(LegacyKey::key);
+            fields.prerequisites = prerequisites.iter().map(LegacyKey::key).collect();
+            fields.scope_acceptance = children
+                .iter()
+                .filter_map(|child| {
+                    let proof = child.scope_acceptance.as_ref()?;
+                    Some(ScopeAcceptance {
+                        child: child.legacy_key.key(),
+                        sha256: &proof.sha256,
+                        start: proof.body_range.start,
+                        end: proof.body_range.end,
+                    })
+                })
+                .collect();
+        }
+        fields
+    }
+}
+
 impl BodyEvidence {
     fn select(body_range: BodyRange, body: &str, valid: impl FnOnce(&str) -> bool) -> Option<Self> {
         let text = body_range.select(body)?;
@@ -394,7 +641,7 @@ impl BodyEvidence {
     }
 }
 
-fn fits_text_column(text: &str) -> bool {
+pub(super) fn fits_text_column(text: &str) -> bool {
     text.len() <= 65_535
         && !text
             .chars()
@@ -456,10 +703,35 @@ impl Relations {
 }
 
 impl TaskReview {
+    pub(super) fn has_title(&self) -> bool {
+        self.title.is_some()
+    }
+
+    fn selected_title<'a>(&'a self, source: &'a SourceBody) -> Option<(&'a str, TitleSource)> {
+        match self.title.as_ref().map(|title| &title.0) {
+            None => source
+                .source_title
+                .as_ref()
+                .ok()
+                .map(|(title, source)| (title.as_str(), *source)),
+            Some(TitleReview::Override { value }) if valid_title(value) => {
+                Some((value, TitleSource::ReviewedOverride))
+            }
+            Some(TitleReview::Fallback { value })
+                if matches!(source.source_title, Err(TitleProblem::Unavailable))
+                    && valid_title(value) =>
+            {
+                Some((value, TitleSource::ReviewedFallback))
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn prepare(
         &self,
         source: &SourceBody,
         status: CandidateStatus,
+        check_labels_at_staging: bool,
     ) -> Result<Prepared, Vec<Reason>> {
         let body = source.body();
         let terminal = status.is_terminal();
@@ -474,10 +746,25 @@ impl TaskReview {
             .relations
             .as_ref()
             .and_then(|review| review.prepare(source, terminal));
-        let criteria = self
-            .acceptance_criteria
-            .and_then(|range| BodyEvidence::select(range, body, valid_text));
+        let criteria_range = self.acceptance_criteria.flatten();
+        let criteria =
+            criteria_range.and_then(|range| BodyEvidence::select(range, body, valid_text));
+        let todo_fallback = self
+            .todo_fallback
+            .as_ref()
+            .map(|decision| decision.0)
+            .filter(|_| {
+                status == CandidateStatus::Todo
+                    && self.acceptance_criteria.is_none()
+                    && !*source
+                        .criteria_indicators
+                        .get_or_init(|| has_criteria_indicators(body))
+            });
+        let title = self.selected_title(source);
         let mut reasons = Vec::new();
+        if title.is_none() {
+            reasons.push(Reason::MissingOrConflictingTitle);
+        }
         if dates.is_none()
             || (terminal && closure.is_none())
             || (!terminal && self.closure.is_some())
@@ -487,27 +774,35 @@ impl TaskReview {
         if relations.is_none() {
             reasons.push(status.relation_hold());
         }
+        if self.todo_fallback.is_some() && todo_fallback.is_none() {
+            reasons.push(Reason::InapplicableTodoFallback);
+        }
         if criteria.is_none()
-            && (status == CandidateStatus::Todo || self.acceptance_criteria.is_some())
+            && ((status == CandidateStatus::Todo && todo_fallback.is_none())
+                || criteria_range.is_some())
         {
             reasons.push(Reason::UnverifiedAcceptanceCriteria);
         }
-        if source.has_tags {
+        if !check_labels_at_staging && !source.labels.is_empty() {
             reasons.push(Reason::UnverifiedTaskLabels);
         }
         if !reasons.is_empty() {
             return Err(reasons);
         }
         let ((created_at, _), (updated_at, _)) = dates.expect("validated dates");
+        let (title, title_source) = title.expect("validated Task title");
         Ok(Prepared {
             relations: relations.expect("validated Task relations"),
             body_sha256: source.body_sha256.clone(),
-            title_source: source.title_source,
-            title_sha256: source.title_sha256.clone(),
+            title: title.to_owned(),
+            title_source,
+            title_sha256: format!("{:x}", Sha256::digest(title)),
+            issue_type: self.issue_type.unwrap_or_default(),
             priority: source.priority,
             created_at,
             updated_at,
             acceptance_criteria: criteria,
+            todo_fallback,
             closure,
         })
     }

@@ -1,13 +1,17 @@
 use std::collections::{BTreeMap, HashSet};
 
-use serde::{Deserialize, Deserializer, de::value::StrDeserializer};
-use serde_json::{Value, json};
+use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use super::artifact_archive::ArchiveReview;
 use super::directive_artifact_intake::{ArtifactKind, Candidate, DirectiveStatus};
-use super::json_object;
+use super::directive_history::{DirectiveHistory, Edges};
+use super::directive_scope::{DirectiveScope, ScopeReview};
+use super::prepared_records::{ArtifactFields, DirectiveFields, Fields};
 use super::scope_plan::portable_reference;
+use super::standalone_artifact::{JoinContext, LinkReview};
+use super::work_artifact::{TaskContext, WorkArtifactReview};
 use super::{Inventory, Reason};
 use crate::cli::is_slug;
 use crate::dolt::is_uuid_v7;
@@ -19,8 +23,28 @@ pub(super) struct Review {
     source_path: String,
     source_git_blob_sha: String,
     pub(super) target_id: String,
-    #[serde(deserialize_with = "json_object::deserialize")]
+    #[serde(default, deserialize_with = "deserialize_title")]
+    title: Option<TitleReview>,
+    #[serde(deserialize_with = "super::json_object::deserialize")]
     provenance: Provenance,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+enum TitleReview {
+    Fallback { value: String },
+    Override { value: String },
+}
+
+pub(super) enum TitleProblem {
+    Unavailable,
+    Conflicting,
+}
+
+fn deserialize_title<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<TitleReview>, D::Error> {
+    super::json_object::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -28,41 +52,42 @@ pub(super) struct Review {
 enum Provenance {
     ProposedDirective {
         area_id: String,
+        #[serde(default, deserialize_with = "super::json_object::deserialize")]
+        scope: ScopeReview,
         source_ref: String,
         issuer_ref: String,
         created_at: String,
         updated_at: String,
-        #[serde(deserialize_with = "string_enum")]
+        #[serde(deserialize_with = "super::json_object::string_enum")]
         supersession: AbsenceReview,
-        #[serde(deserialize_with = "string_enum")]
+        #[serde(deserialize_with = "super::json_object::string_enum")]
         approval_and_validity: AbsenceReview,
     },
+    DirectiveHistory(DirectiveHistory),
+    WorkScopedArtifact(WorkArtifactReview),
     StandaloneArtifact {
-        #[serde(deserialize_with = "string_enum")]
+        #[serde(deserialize_with = "super::json_object::string_enum")]
         artifact_kind: ArtifactKind,
         source_ref: String,
         author_ref: String,
         created_at: String,
         substantive_updated_at: String,
-        #[serde(deserialize_with = "string_enum")]
-        links: AbsenceReview,
-        #[serde(deserialize_with = "string_enum")]
-        archive: AbsenceReview,
+        links: LinkReview,
+        archive: ArchiveReview,
     },
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum AbsenceReview {
+pub(super) enum AbsenceReview {
     None,
     Unresolved,
 }
 
-fn string_enum<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+pub(super) fn deserialize_present<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<T, D::Error> {
-    let label = String::deserialize(deserializer)?;
-    T::deserialize(StrDeserializer::new(&label))
+) -> Result<Option<Vec<Review>>, D::Error> {
+    super::json_object::deserialize_vec(deserializer).map(Some)
 }
 
 pub(super) fn bind<'a>(
@@ -96,7 +121,79 @@ pub(super) fn bind<'a>(
 }
 
 impl Review {
-    pub(super) fn prepare(&self, candidate: &Candidate) -> Result<Value, Reason> {
+    pub(super) fn selected_title<'a>(
+        &'a self,
+        source: Result<&'a str, &TitleProblem>,
+    ) -> Option<&'a str> {
+        match &self.title {
+            None => source.ok(),
+            Some(TitleReview::Override { value }) if valid_title(value) => Some(value),
+            Some(TitleReview::Fallback { value })
+                if matches!(source, Err(TitleProblem::Unavailable)) && valid_title(value) =>
+            {
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn is_work_scoped(&self) -> bool {
+        matches!(self.provenance, Provenance::WorkScopedArtifact(_))
+    }
+
+    pub(super) fn needs_tasks(&self) -> bool {
+        match &self.provenance {
+            Provenance::WorkScopedArtifact(_) => true,
+            Provenance::StandaloneArtifact { links, .. } => links.needs_tasks(),
+            _ => false,
+        }
+    }
+
+    pub(super) fn artifact_kind(&self, work_scoped: bool) -> Option<ArtifactKind> {
+        match (&self.provenance, work_scoped) {
+            (Provenance::StandaloneArtifact { artifact_kind, .. }, false) => Some(*artifact_kind),
+            (Provenance::WorkScopedArtifact(review), true) => Some(review.artifact_kind),
+            _ => None,
+        }
+    }
+
+    pub(super) fn prepare_work_scoped(
+        &self,
+        candidate: &Candidate,
+        body: &str,
+        parent_bundle: &str,
+        tasks: &TaskContext<'_>,
+    ) -> Result<Fields, Reason> {
+        let (Provenance::WorkScopedArtifact(review), Candidate::Artifact { kind, .. }) =
+            (&self.provenance, candidate)
+        else {
+            return Err(Reason::UnsupportedReviewedRecord);
+        };
+        review.prepare(*kind, body, parent_bundle, tasks)
+    }
+
+    pub(super) fn directive_edges(&self) -> Option<&Edges> {
+        match &self.provenance {
+            Provenance::DirectiveHistory(history) => Some(&history.supersession),
+            _ => None,
+        }
+    }
+
+    pub(super) fn directive_scope(&self) -> Option<&ScopeReview> {
+        match &self.provenance {
+            Provenance::ProposedDirective { scope, .. } => Some(scope),
+            Provenance::DirectiveHistory(history) => Some(&history.scope),
+            _ => None,
+        }
+    }
+
+    pub(super) fn prepare(
+        &self,
+        candidate: &Candidate,
+        observed_at: Option<OffsetDateTime>,
+        ctx: &JoinContext<'_>,
+        body: Option<&str>,
+    ) -> Result<Fields, Reason> {
         match (&self.provenance, candidate) {
             (
                 Provenance::ProposedDirective {
@@ -107,10 +204,11 @@ impl Review {
                     updated_at,
                     supersession,
                     approval_and_validity,
+                    ..
                 },
                 Candidate::Directive {
                     status: DirectiveStatus::Proposed,
-                    area_id: mapped,
+                    scope: DirectiveScope::Area { area_id: mapped },
                     ..
                 },
             ) => {
@@ -123,21 +221,33 @@ impl Review {
                 if matches!(approval_and_validity, AbsenceReview::Unresolved) {
                     return Err(Reason::UnverifiedDirectiveValidity);
                 }
-                let source_hash = historical_source_digest(source_ref, created_at, updated_at)?;
+                validate_historical_source(source_ref, created_at, updated_at)?;
                 if !actor_ref(issuer_ref) {
                     return Err(Reason::IncompleteHistoricalProvenance);
                 }
-                Ok(json!({
-                    "source_ref_sha256": source_hash,
-                    "issuer_ref_sha256": sha256(issuer_ref),
-                    "created_at": created_at,
-                    "updated_at": updated_at,
-                    "supersedes_id": null,
-                    "approval_ref": null,
-                    "valid_from": null,
-                    "expires_at": null,
+                Ok(Fields::Directive(DirectiveFields {
+                    status: DirectiveStatus::Proposed,
+                    scope: DirectiveScope::Area {
+                        area_id: area_id.clone(),
+                    },
+                    source_ref: source_ref.clone(),
+                    issuer_ref: issuer_ref.clone(),
+                    created_at: created_at.clone(),
+                    updated_at: updated_at.clone(),
+                    supersedes_id: None,
+                    approval_ref: None,
+                    valid_from: None,
+                    expires_at: None,
                 }))
             }
+            (
+                Provenance::DirectiveHistory(history),
+                Candidate::Directive {
+                    status,
+                    scope: DirectiveScope::Area { area_id },
+                    ..
+                },
+            ) => history.prepare(*status, area_id, observed_at),
             (
                 Provenance::StandaloneArtifact {
                     artifact_kind,
@@ -153,25 +263,21 @@ impl Review {
                 if artifact_kind != kind {
                     return Err(Reason::UnclassifiedArtifactKind);
                 }
-                if matches!(links, AbsenceReview::Unresolved) {
-                    return Err(Reason::UnresolvedArtifactLinks);
-                }
+                let standalone_links = links.prepare(ctx)?;
                 if !actor_ref(author_ref) {
                     return Err(Reason::UnverifiedArtifactAuthor);
                 }
-                if matches!(archive, AbsenceReview::Unresolved) {
-                    return Err(Reason::UnverifiedArtifactRetention);
-                }
-                let source_hash =
-                    historical_source_digest(source_ref, created_at, substantive_updated_at)?;
-                Ok(json!({
-                    "source_ref_sha256": source_hash,
-                    "author_ref_sha256": sha256(author_ref),
-                    "created_at": created_at,
-                    "substantive_updated_at": substantive_updated_at,
-                    "scope": "standalone",
-                    "archived_at": null,
-                    "archive_reason": null,
+                let updated =
+                    validate_historical_source(source_ref, created_at, substantive_updated_at)?;
+                Ok(Fields::Artifact(ArtifactFields {
+                    kind: *kind,
+                    source_ref: source_ref.clone(),
+                    author_ref: author_ref.clone(),
+                    created_at: created_at.clone(),
+                    substantive_updated_at: substantive_updated_at.clone(),
+                    archive: archive.prepare(body, updated)?,
+                    work: None,
+                    standalone_links,
                 }))
             }
             _ => Err(Reason::UnsupportedReviewedRecord),
@@ -179,20 +285,37 @@ impl Review {
     }
 }
 
-fn historical_source_digest(
+pub(super) fn valid_title(value: &str) -> bool {
+    !value.trim().is_empty() && value.chars().count() <= 255 && !value.chars().any(char::is_control)
+}
+
+pub(super) fn validate_historical_source(
     source_ref: &str,
     created: &str,
     updated: &str,
-) -> Result<String, Reason> {
-    if !portable_reference(source_ref)
-        || !matches!(timestamp(created).zip(timestamp(updated)), Some((created, updated)) if created <= updated)
-    {
+) -> Result<OffsetDateTime, Reason> {
+    if !portable_reference(source_ref) {
         return Err(Reason::IncompleteHistoricalProvenance);
     }
-    Ok(sha256(source_ref))
+    timestamp(created)
+        .zip(timestamp(updated))
+        .filter(|(created, updated)| created <= updated)
+        .map(|(_, updated)| updated)
+        .ok_or(Reason::IncompleteHistoricalProvenance)
 }
 
-fn timestamp(value: &str) -> Option<OffsetDateTime> {
+pub(super) fn canonical_utc(value: OffsetDateTime) -> String {
+    format!(
+        "{}T{:02}:{:02}:{:02}.{:06}Z",
+        value.date(),
+        value.hour(),
+        value.minute(),
+        value.second(),
+        value.nanosecond() / 1000
+    )
+}
+
+pub(super) fn timestamp(value: &str) -> Option<OffsetDateTime> {
     let bytes = value.as_bytes();
     // DATETIME(6) stores UTC wall time to microseconds. Refuse any loss of precision.
     if !value.ends_with('Z')
@@ -208,7 +331,7 @@ fn timestamp(value: &str) -> Option<OffsetDateTime> {
         .filter(|time| time.year() >= 1000)
 }
 
-fn actor_ref(value: &str) -> bool {
+pub(super) fn actor_ref(value: &str) -> bool {
     value.len() <= 255
         && value.split_once(':').map_or_else(
             || is_slug(value),
@@ -216,7 +339,7 @@ fn actor_ref(value: &str) -> bool {
         )
 }
 
-fn sha256(value: &str) -> String {
+pub(super) fn sha256(value: &str) -> String {
     format!("{:x}", Sha256::digest(value))
 }
 

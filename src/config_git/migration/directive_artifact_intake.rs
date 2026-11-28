@@ -1,13 +1,18 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
+use std::rc::Rc;
 
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::reviewed_records::{self, Review};
+use super::directive_history::{LinkDecision, ReviewedDirective, resolve_links};
+use super::directive_scope::{DirectiveContext, DirectiveScope};
+use super::prepared_records::{Content, Fields, Intake, PreparedRecord};
+use super::reviewed_records::{self, Review, TitleProblem, valid_title};
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
+use super::standalone_artifact::JoinContext;
 use super::{AssetObjectReader, Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, parse_v2, present};
@@ -23,9 +28,9 @@ enum Surface {
     ArtifactsWorkScoped,
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(super) enum DirectiveStatus {
+pub(crate) enum DirectiveStatus {
     Proposed,
     Active,
     Superseded,
@@ -40,9 +45,9 @@ pub(super) enum ArtifactStatus {
     Closed,
 }
 
-#[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub(super) enum ArtifactKind {
+pub(crate) enum ArtifactKind {
     Report,
     Research,
     Review,
@@ -51,6 +56,15 @@ pub(super) enum ArtifactKind {
     Checkpoint,
     WorkNote,
     Manifest,
+    Design,
+    Decision,
+    Evidence,
+}
+
+impl ArtifactKind {
+    fn is_v1(self) -> bool {
+        !matches!(self, Self::Design | Self::Decision | Self::Evidence)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -84,7 +98,7 @@ enum Outcome {
         target_id: String,
         target_title_sha256: String,
         target_body_sha256: String,
-        provenance: Value,
+        provenance: Box<Fields>,
     },
 }
 
@@ -93,8 +107,8 @@ enum Outcome {
 pub(super) enum Candidate {
     Directive {
         status: DirectiveStatus,
-        scope_kind: &'static str,
-        area_id: String,
+        #[serde(flatten)]
+        scope: DirectiveScope,
         include_descendants: bool,
     },
     Artifact {
@@ -111,26 +125,56 @@ impl Outcome {
         }
     }
 
-    fn with_review(self, review: &Review, record: &InspectedRecord, single_file: bool) -> Self {
+    fn with_review(
+        self,
+        review: &Review,
+        selected: SelectedContent<'_>,
+        supported_shape: bool,
+        directive_context: &DirectiveContext<'_>,
+        parent: Option<&str>,
+        ctx: &JoinContext<'_>,
+    ) -> Self {
         let Self::Held {
-            candidate: Some(candidate),
+            candidate: Some(mut candidate),
             mut reason_codes,
         } = self
         else {
             return self;
         };
-        let provenance = if single_file {
-            review.prepare(&candidate)
+        let observed_at = directive_context.observed_at;
+        let provenance = if review.is_work_scoped() {
+            match (supported_shape, parent, selected.record.body.as_deref()) {
+                (true, Some(parent), Some(body)) => {
+                    review.prepare_work_scoped(&candidate, body, parent, &ctx.tasks)
+                }
+                _ => Err(Reason::UnsupportedReviewedRecord),
+            }
+        } else if supported_shape && parent.is_none() {
+            review.prepare(
+                &candidate,
+                observed_at,
+                ctx,
+                selected.record.body.as_deref(),
+            )
         } else {
             Err(Reason::UnsupportedReviewedRecord)
         };
+        let provenance = provenance.and_then(|mut provenance| {
+            if let (Fields::Directive(fields), Candidate::Directive { scope, .. }, Some(review)) =
+                (&mut provenance, &mut candidate, review.directive_scope())
+            {
+                fields.scope = review.resolve(scope, directive_context)?;
+                scope.clone_from(&fields.scope);
+            }
+            Ok(provenance)
+        });
         match provenance {
             Ok(provenance) => Self::Prepared {
                 candidate,
                 target_id: review.target_id.clone(),
-                target_title_sha256: record.title_sha256.clone(),
-                target_body_sha256: record.body_sha256.clone(),
-                provenance,
+                target_title_sha256: reviewed_records::sha256(selected.title),
+                target_body_sha256: selected.record.body_sha256.clone(),
+                provenance: Box::new(provenance),
             },
             Err(reason) => {
                 if !matches!(reason, Reason::UnsupportedReviewedRecord) {
@@ -143,6 +187,39 @@ impl Outcome {
                 }
             }
         }
+    }
+
+    fn with_link(mut self, decision: LinkDecision<'_>) -> Self {
+        match decision {
+            LinkDecision::ReverseTo(supersedes_id) => {
+                if let Self::Prepared { provenance, .. } = &mut self
+                    && let Fields::Directive(fields) = provenance.as_mut()
+                {
+                    fields.supersedes_id = Some(supersedes_id.to_owned());
+                }
+            }
+            LinkDecision::Hold => match self {
+                Self::Prepared { candidate, .. } => {
+                    return Self::Held {
+                        candidate: Some(candidate),
+                        reason_codes: vec![Reason::InvalidSupersessionChain],
+                    };
+                }
+                Self::Held {
+                    ref mut reason_codes,
+                    ..
+                } => {
+                    if !reason_codes
+                        .iter()
+                        .any(|reason| matches!(reason, Reason::InvalidSupersessionChain))
+                    {
+                        reason_codes.push(Reason::InvalidSupersessionChain);
+                    }
+                }
+                Self::Excluded { .. } => {}
+            },
+        }
+        self
     }
 }
 
@@ -162,16 +239,34 @@ struct Inspection {
 
 struct InspectedRecord {
     metadata: Metadata,
-    title_sha256: String,
+    title: Result<String, TitleProblem>,
     body_sha256: String,
+    body: Option<Rc<str>>,
 }
 
-pub(super) fn report(
+struct SelectedContent<'a> {
+    record: &'a InspectedRecord,
+    title: &'a str,
+}
+
+impl SelectedContent<'_> {
+    fn for_storage(&self) -> Option<Content> {
+        Some(Content {
+            title: self.title.to_owned(),
+            body: self.record.body.clone()?,
+        })
+    }
+}
+
+pub(super) fn scan(
     inventory: &Inventory,
     reader: &AssetObjectReader<'_>,
     scopes: &BTreeMap<&str, &ScopeOutcome<'_>>,
     reviews: Option<&[Review]>,
-) -> Result<Value, HiveError> {
+    directive_context: &DirectiveContext<'_>,
+    prepare_storage: bool,
+    ctx: &JoinContext<'_>,
+) -> Result<Intake, HiveError> {
     let mut reviewed = reviewed_records::bind(reviews.unwrap_or_default(), inventory)?;
     let mut counts = BTreeMap::from([
         (Surface::Directives, Counts::default()),
@@ -185,6 +280,7 @@ pub(super) fn report(
     }
     let mut inspected = HashMap::new();
     let mut records = Vec::new();
+    let mut directives = Vec::new();
     for (path, entry) in &inventory.entries {
         let Some(size) = entry.size else { continue };
         let (surface, scope, parent, tail) =
@@ -229,9 +325,18 @@ pub(super) fn report(
         };
 
         let mut raw_sha256 = None;
+        let mut content = None;
         let outcome = match (shape, scope.and_then(|scope| scopes.get(scope))) {
             (Shape::Excluded(reason), _) => Outcome::Excluded { reason },
             (_, Some(ScopeOutcome::Excluded { reason })) => Outcome::Excluded { reason: *reason },
+            (Shape::Record, Some(ScopeOutcome::Held { reason }))
+                if parent.is_some() && review.is_some_and(Review::is_work_scoped) =>
+            {
+                Outcome::Held {
+                    reason_codes: vec![*reason, Reason::ParentTaskQuarantined],
+                    candidate: None,
+                }
+            }
             (_, Some(ScopeOutcome::Held { reason })) => Outcome::held(*reason),
             (Shape::Held(reason), _) => Outcome::held(reason),
             (Shape::Record, mapped) => {
@@ -239,14 +344,20 @@ pub(super) fn report(
                     Outcome::held(Reason::RecordMarkdownTooLarge)
                 } else {
                     let directive = surface == Surface::Directives;
-                    let inspection = match inspected.entry((entry.oid.as_str(), directive)) {
+                    let direct_markdown = tail.strip_suffix(".md").is_some_and(is_slug);
+                    let reviewed_kind = review
+                        .filter(|_| !directive && direct_markdown)
+                        .and_then(|review| review.artifact_kind(parent.is_some()));
+                    let capture = review.is_some() && (prepare_storage || reviewed_kind.is_some());
+                    let key = (entry.oid.as_str(), directive, capture, reviewed_kind);
+                    let inspection = match inspected.entry(key) {
                         Entry::Occupied(cached) => cached.into_mut(),
                         Entry::Vacant(cache) => {
                             let bytes =
                                 snapshot_object(&|| reader.command(), "blob", &entry.oid, size)?;
                             cache.insert(Inspection {
                                 raw_sha256: format!("{:x}", Sha256::digest(&bytes)),
-                                record: inspect(&bytes, directive),
+                                record: inspect(&bytes, directive, capture, reviewed_kind),
                             })
                         }
                     };
@@ -254,39 +365,74 @@ pub(super) fn report(
                     match &inspection.record {
                         Err(reason) => Outcome::held(*reason),
                         Ok(record) => {
-                            let outcome = candidate(
-                                record.metadata,
-                                mapped.copied(),
-                                parent.map(|(path, _)| path),
-                                inventory,
-                            );
-                            match review {
-                                Some(review) => outcome.with_review(
-                                    review,
-                                    record,
-                                    parent.is_none()
-                                        && tail.strip_suffix(".md").is_some_and(is_slug),
-                                ),
-                                None => outcome,
+                            let source_title = record.title.as_deref();
+                            let title = match review {
+                                Some(review) => review.selected_title(source_title),
+                                None => source_title.ok(),
+                            };
+                            if let Some(title) = title {
+                                let outcome = candidate(
+                                    record.metadata,
+                                    mapped.copied(),
+                                    parent.map(|(path, _)| path),
+                                    inventory,
+                                );
+                                match review {
+                                    Some(review) => {
+                                        let selected = SelectedContent { record, title };
+                                        if prepare_storage {
+                                            content = selected.for_storage();
+                                        }
+                                        outcome.with_review(
+                                            review,
+                                            selected,
+                                            (surface == Surface::Directives
+                                                && review.directive_edges().is_some())
+                                                || direct_markdown,
+                                            directive_context,
+                                            parent.map(|(path, _)| path),
+                                            ctx,
+                                        )
+                                    }
+                                    None => outcome,
+                                }
+                            } else {
+                                Outcome::held(Reason::MissingOrConflictingTitle)
                             }
                         }
                     }
                 }
             }
         };
-        let count = counts.entry(surface).or_default();
-        count.inventoried += 1;
-        match outcome {
-            Outcome::Held { .. } => count.held += 1,
-            Outcome::Excluded { .. } => count.excluded += 1,
-            Outcome::Prepared { .. } => *count.prepared.get_or_insert(0) += 1,
+        let legacy_key = if surface == Surface::Directives {
+            path.strip_suffix("/README.md")
+                .or_else(|| path.strip_suffix(".md"))
+                .unwrap_or(path)
+        } else {
+            path
+        };
+        if surface == Surface::Directives
+            && let Some(review) = review
+        {
+            directives.push(ReviewedDirective {
+                key: legacy_key,
+                row: records.len(),
+                review,
+                scope: match &outcome {
+                    Outcome::Prepared { provenance, .. } => match provenance.as_ref() {
+                        Fields::Directive(fields) => Some(fields.scope.clone()),
+                        Fields::Artifact(_) => None,
+                    },
+                    _ => None,
+                },
+            });
         }
         let mut record = json!({
             "surface": surface,
             "source_git_blob_sha": entry.oid,
             "source_raw_sha256": raw_sha256,
             "source_size": size,
-            "outcome": outcome,
+            "legacy_key_sha256": format!("{:x}", Sha256::digest(legacy_key)),
         });
         let portable_ancestry = scope.is_none_or(is_portable_scope)
             && parent.is_none_or(|(_, work_id)| is_slug(work_id));
@@ -302,14 +448,54 @@ pub(super) fn report(
                 record["parent_task_path_sha256"] = json!(format!("{:x}", Sha256::digest(path)));
             }
         }
-        records.push(record);
+        records.push((surface, record, outcome, content));
     }
     if !reviewed.is_empty() {
         return Err(reviewed_records::invalid(
             "Reviewed records must belong to the Directive or Artifact intake surfaces.",
         ));
     }
-    Ok(json!({"coverage": "partial", "counts": counts, "records": records}))
+    let mut links: HashMap<_, _> = resolve_links(&directives).into_iter().collect();
+    let mut prepared = Vec::new();
+    let records = records
+        .into_iter()
+        .enumerate()
+        .map(|(index, (surface, mut record, outcome, content))| {
+            let outcome = match links.remove(&index) {
+                Some(decision) => outcome.with_link(decision),
+                None => outcome,
+            };
+            let count = counts.entry(surface).or_default();
+            count.inventoried += 1;
+            match outcome {
+                Outcome::Held { .. } => count.held += 1,
+                Outcome::Excluded { .. } => count.excluded += 1,
+                Outcome::Prepared { .. } => *count.prepared.get_or_insert(0) += 1,
+            }
+            record["outcome"] = json!(outcome);
+            if prepare_storage
+                && let Outcome::Prepared {
+                    target_id,
+                    provenance,
+                    ..
+                } = outcome
+            {
+                let content = content.ok_or_else(|| {
+                    reviewed_records::invalid("Prepared source content is unavailable.")
+                })?;
+                prepared.push(PreparedRecord {
+                    id: target_id,
+                    fields: *provenance,
+                    content,
+                });
+            }
+            Ok(record)
+        })
+        .collect::<Result<Vec<_>, HiveError>>()?;
+    Ok(Intake {
+        records: prepared,
+        report: json!({"coverage": "partial", "counts": counts, "records": records}),
+    })
 }
 
 fn portable_record_tail(tail: &str) -> bool {
@@ -411,13 +597,14 @@ fn candidate(
                 reasons.push(Reason::UnresolvedSupersessionGraph);
             }
             let area_id = match scope {
-                Some(ScopeOutcome::Mapped { area }) => &area.id,
+                Some(ScopeOutcome::Mapped { area, .. }) => &area.id,
                 _ => return Outcome::held(Reason::AmbiguousScopeOrCollision),
             };
             Candidate::Directive {
                 status,
-                scope_kind: "area",
-                area_id: area_id.clone(),
+                scope: DirectiveScope::Area {
+                    area_id: area_id.clone(),
+                },
                 include_descendants: false,
             }
         }
@@ -469,7 +656,12 @@ fn scalar_label<T: DeserializeOwned>(value: Value) -> Option<T> {
     }
 }
 
-fn inspect(bytes: &[u8], directive: bool) -> Result<InspectedRecord, Reason> {
+fn inspect(
+    bytes: &[u8],
+    directive: bool,
+    capture: bool,
+    reviewed_kind: Option<ArtifactKind>,
+) -> Result<InspectedRecord, Reason> {
     let invalid = if directive {
         Reason::UnsupportedDirectiveMetadata
     } else {
@@ -515,10 +707,11 @@ fn inspect(bytes: &[u8], directive: bool) -> Result<InspectedRecord, Reason> {
             .ok_or(Reason::InvalidDirectiveStatus)?;
         Metadata::Directive(status)
     } else {
-        let kind = fields
-            .kind
-            .and_then(scalar_label)
-            .ok_or(Reason::UnclassifiedArtifactKind)?;
+        let kind = match fields.kind {
+            Some(value) => scalar_label::<ArtifactKind>(value).filter(|kind| kind.is_v1()),
+            None => reviewed_kind,
+        }
+        .ok_or(Reason::UnclassifiedArtifactKind)?;
         let legacy_status = fields
             .status
             .map(|value| scalar_label(value).ok_or(Reason::InvalidArtifactStatus))
@@ -528,12 +721,12 @@ fn inspect(bytes: &[u8], directive: bool) -> Result<InspectedRecord, Reason> {
             legacy_status,
         }
     };
-    let title = select_title(fields.title.as_deref(), &fields.description, body)
-        .ok_or(Reason::MissingOrConflictingTitle)?;
     Ok(InspectedRecord {
         metadata,
-        title_sha256: format!("{:x}", Sha256::digest(title.as_bytes())),
+        title: select_title(fields.title.as_deref(), &fields.description, body)
+            .map(Cow::into_owned),
         body_sha256: format!("{:x}", Sha256::digest(body)),
+        body: capture.then(|| Rc::from(body)),
     })
 }
 
@@ -558,14 +751,9 @@ fn select_title<'a>(
     title: Option<&'a str>,
     description: &'a str,
     body: &str,
-) -> Option<Cow<'a, str>> {
-    let valid = |value: &str| {
-        !value.trim().is_empty()
-            && value.chars().count() <= 255
-            && !value.chars().any(char::is_control)
-    };
-    if let Some(title) = title.filter(|value| valid(value)) {
-        return Some(Cow::Borrowed(title));
+) -> Result<Cow<'a, str>, TitleProblem> {
+    if let Some(title) = title.filter(|value| valid_title(value)) {
+        return Ok(Cow::Borrowed(title));
     }
     let mut depth = 0;
     let mut heading = None;
@@ -594,7 +782,7 @@ fn select_title<'a>(
                     let text = text.trim();
                     match first_heading.as_deref() {
                         None => first_heading = Some(text.to_owned()),
-                        Some(first) if first != text => return None,
+                        Some(first) if first != text => return Err(TitleProblem::Conflicting),
                         Some(_) => {}
                     }
                 }
@@ -613,7 +801,12 @@ fn select_title<'a>(
         }
     }
     first_heading
-        .filter(|text| valid(text))
+        .filter(|text| valid_title(text))
         .map(Cow::Owned)
-        .or_else(|| valid(description).then_some(Cow::Borrowed(description)))
+        .or_else(|| valid_title(description).then_some(Cow::Borrowed(description)))
+        .ok_or(if title.is_some() {
+            TitleProblem::Conflicting
+        } else {
+            TitleProblem::Unavailable
+        })
 }

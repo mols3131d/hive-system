@@ -13,16 +13,30 @@ use super::*;
 use crate::cli::is_slug;
 use crate::config_file::{Coordination, ScopedDirectory};
 
+mod artifact_archive;
 mod directive_artifact_intake;
+mod directive_history;
+mod directive_scope;
+mod issue_resources;
 mod json_object;
+pub(crate) mod prepared_records;
+mod projects;
 mod queen_assets;
 mod queen_preparation;
 mod reviewed_records;
-mod scope_plan;
 mod task_graph;
 mod task_intake;
 mod task_provenance;
-pub(crate) use scope_plan::{Area, ReviewedScopes, plan, with_scope_mapping};
+mod work_artifact;
+pub(crate) use projects::PreparedProjects;
+pub(crate) use queen_preparation::PreparedQueen;
+pub(crate) use task_intake::StagingTask;
+mod scope_plan;
+mod standalone_artifact;
+pub(crate) use issue_resources::IssueResourceOutcome;
+pub(crate) use scope_plan::{
+    Area, PreparedResources, ResourceHold, ReviewedScopes, plan, with_scope_mapping,
+};
 
 const MAX_INVENTORY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
@@ -96,21 +110,21 @@ impl InventoryEntry {
 #[serde(rename_all = "snake_case")]
 enum Reason {
     AmbiguousScopeOrCollision,
+    ExternalBackendOwned,
+    UnsplitLegacyScope,
     ConflictingTaskReview,
     DuplicateLegacyWorkId,
     ExecutionNeedsReconciliation,
-    ExternalBackendOwned,
-    IncompleteHistoricalProvenance,
     InvalidLegacyState,
-    MissingOrConflictingTitle,
     MissingTaskEntrypoint,
     MissingTypedSubmissionEvidence,
     TaskReviewBindingMismatch,
     UnresolvedCompletionObligation,
     UnresolvedTaskRelations,
-    UnsplitLegacyScope,
     UnverifiedAcceptanceCriteria,
+    InapplicableTodoFallback,
     UnverifiedTaskLabels,
+    TaskLabelCollationCollision,
     UnsupportedTaskMetadata,
     NavigationOnly,
     DirectiveBundleSupport,
@@ -125,13 +139,18 @@ enum Reason {
     InvalidDirectiveStatus,
     UnclassifiedArtifactKind,
     InvalidArtifactStatus,
+    MissingOrConflictingTitle,
+    IncompleteHistoricalProvenance,
     MissingDirectiveApproval,
     UnverifiedDirectiveValidity,
     UnresolvedSupersessionGraph,
+    InvalidSupersessionChain,
+    UnresolvedDirectiveProject,
     UnverifiedArtifactAuthor,
     UnverifiedArtifactRetention,
     UnresolvedParentTask,
     MissingParentTaskEntrypoint,
+    ParentTaskQuarantined,
     UnsupportedReviewedRecord,
     UnresolvedArtifactLinks,
 }

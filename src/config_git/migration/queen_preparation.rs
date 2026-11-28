@@ -34,25 +34,17 @@ impl QueenMapping {
     }
 }
 
-pub(super) struct PreparedQueen {
-    registry: QueenRegistry,
+pub(crate) struct PreparedQueen {
+    pub(crate) registry: QueenRegistry,
     source_git_blob_sha: String,
-    source_raw_sha256: String,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the later asset staging step")
-    )]
-    soul_bytes: Vec<u8>,
+    pub(crate) source_raw_sha256: String,
+    pub(crate) soul_bytes: Vec<u8>,
 }
 
-struct QueenRegistry {
-    id: String,
-    slug: String,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the later registry staging step")
-    )]
-    display_name: String,
+pub(crate) struct QueenRegistry {
+    pub(crate) id: String,
+    pub(crate) slug: String,
+    pub(crate) display_name: String,
 }
 
 impl PreparedQueen {

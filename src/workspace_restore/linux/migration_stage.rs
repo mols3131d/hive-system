@@ -7,13 +7,32 @@ use time::OffsetDateTime;
 
 use super::*;
 use crate::cli::{MigrationStageArgs, MigrationStageMode};
-use crate::config_git::migration::{Area, ReviewedScopes, with_scope_mapping};
+use crate::config_git::migration::prepared_records::PreparedRecord;
+use crate::config_git::migration::{
+    Area, PreparedProjects, PreparedQueen, PreparedResources, ReviewedScopes, with_scope_mapping,
+};
 use crate::config_v2::{require_inactive_destination, verify_descriptor};
 use crate::dolt::{INITIAL_SCHEMA, issue_writer::new_uuid_v7};
 use crate::workspace_init::POLICY_REVISION;
 
+#[path = "migration_directive_artifact.rs"]
+mod directive_artifact;
+mod issue_resources;
+mod labels;
+mod projects;
+mod reconciliation_report;
+mod resources;
+mod tasks;
+
+use issue_resources::IssueResources;
+use projects::{IssueIds, StagedProjects};
+use resources::StagedResources;
+use tasks::{COUNTER, TaskImport};
+
 const COUNTS: &str = "SELECT (SELECT COUNT(*) FROM areas) AS areas, \
+    (SELECT COUNT(*) FROM bots) AS bots, (SELECT COUNT(*) FROM bot_memories) AS memories, \
     (SELECT COUNT(*) FROM issues) AS issues, (SELECT COUNT(*) FROM issue_claims) AS claims, \
+    (SELECT COUNT(*) FROM issue_dependencies) AS dependencies, \
     (SELECT next_value FROM workspace_counters WHERE name = 'issue_number') AS next_number";
 
 struct StagedPayload {
@@ -71,7 +90,9 @@ fn prepare(
     target: &InactiveTarget,
     reviewed: &ReviewedScopes<'_>,
 ) -> Result<(Value, Option<StagedPayload>), HiveError> {
+    reviewed.require_stage_task_selection(args.tasks)?;
     let areas = reviewed.areas_in_parent_order()?;
+    let queens = reviewed.prepared_queens();
     let dry_run = matches!(args.mode, MigrationStageMode::DryRun);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -95,12 +116,69 @@ fn prepare(
     let conversations = create_private_directory(&payload.join("conversations"))?;
     let installed = Installed::check(&scratch)?;
     let (base, _) = installed.initialize_db(&db, &args.workspace_id)?;
-    let (asset_commit, _) = installed.initialize_assets(&assets)?;
-    let expected = apply_areas(&installed, &db, &scratch, &areas, now, dry_run)?;
+    let task_plan = args
+        .tasks
+        .then(|| {
+            reviewed.prepare_tasks(Some(&|names| {
+                labels::collisions(&installed, &db, &scratch, names)
+            }))
+        })
+        .transpose()?;
+    let project_plan = reviewed.prepare_projects(task_plan.as_ref())?;
+    let tasks = task_plan.as_ref().map(|plan| plan.staging_tasks());
+    let intake =
+        reviewed.directive_artifacts_for_staging(tasks.as_deref(), project_plan.as_ref())?;
+    let issue_resource_reviews = reviewed.prepare_issue_resources(tasks.as_deref())?;
+    let task_import = tasks.map(|tasks| TaskImport::new(tasks, now)).transpose()?;
+    let issue_resources =
+        IssueResources::new(issue_resource_reviews.as_deref(), task_import.as_ref())?;
+    let issue_count = task_import.as_ref().map_or(0, TaskImport::len);
+    let issue_ids = project_plan
+        .as_ref()
+        .map(|projects| {
+            projects
+                .memberships()
+                .map(|(_, key)| {
+                    let id = task_import
+                        .as_ref()
+                        .and_then(|tasks| tasks.issue_id_by_key(key))
+                        .ok_or_else(|| {
+                            unverified(
+                                "A reviewed Project membership has no assigned Issue endpoint.",
+                            )
+                        })?;
+                    Ok((key, id))
+                })
+                .collect::<Result<IssueIds<'_>, HiveError>>()
+        })
+        .transpose()?;
+    let rows = ImportRows {
+        areas: &areas,
+        queens,
+        resources: reviewed.resources.as_ref(),
+        tasks: task_import.as_ref(),
+        issue_resources: &issue_resources,
+        projects: project_plan.as_ref().zip(issue_ids.as_ref()),
+        records: intake
+            .as_ref()
+            .map_or(&[], |intake| intake.records.as_slice()),
+    };
+    let (asset_base, _) = installed.initialize_assets(&assets)?;
+    let asset_commit = stage_souls(&installed, &assets, &assets_dir, &asset_base, queens)?;
+    let expected = apply_rows(&installed, &db, &scratch, &rows, now, dry_run)?;
 
     let confirmed = if dry_run {
         installed.verify_db(&db, &args.workspace_id, Some(&base))?;
-        verify_counts(&installed.query(&db, COUNTS)?, 0)?;
+        verify_rows(&installed.query(&db, COUNTS)?, &counts(0, 0, 0, 0))?;
+        verify_rows(&installed.query(&db, COUNTER)?, &counter(0))?;
+        labels::verify_empty(&installed, &db)?;
+        StagedResources::verify_rollback(&installed, &db)?;
+        verify_rows(
+            &installed.query(&db, issue_resources::COUNT)?,
+            &issue_resources::count(0),
+        )?;
+        StagedProjects::verify_rollback(&installed, &db)?;
+        directive_artifact::Expected::verify_empty(&installed, &db)?;
         None
     } else {
         installed.dolt(
@@ -112,7 +190,17 @@ fn prepare(
                 "--author",
                 "Hive <bootstrap@hive.invalid>",
                 "-m",
-                "Import reviewed Hive v1 scopes",
+                match (
+                    args.tasks,
+                    queens.is_empty(),
+                    rows.resources.is_some(),
+                    intake.is_some() || rows.projects.is_some(),
+                ) {
+                    (false, true, false, false) => "Import reviewed Hive v1 scopes",
+                    (true, true, false, false) => "Import reviewed Hive v1 scopes and Tasks",
+                    (false, false, false, false) => "Import reviewed Hive v1 scopes and Queens",
+                    _ => "Import reviewed Hive v1 records",
+                },
             ],
             None,
         )?;
@@ -125,14 +213,50 @@ fn prepare(
                 "The staged Dolt commit must extend the migration baseline.",
             ));
         }
-        verify_counts(&installed.query(&db, COUNTS)?, expected.len())?;
+        // verify_staged_db pins HEAD to the newly created clean snapshot.
+        verify_rows(&installed.query(&db, COUNTS)?, &expected.counts)?;
+        verify_rows(
+            &installed.query(&db, &format!(
+                "SELECT name, next_value FROM workspace_counters AS OF '{confirmed}' ORDER BY name"
+            ))?,
+            &counter(issue_count),
+        )?;
+        if let Some(import) = &task_import {
+            for (sql, rows) in import.checks(Some(&confirmed)) {
+                verify_rows(&installed.query(&db, &sql)?, rows)?;
+            }
+        }
+        expected
+            .resources
+            .verify_committed(&installed, &db, &confirmed)?;
+        for (sql, rows) in issue_resources.checks(Some(&confirmed)) {
+            verify_rows(&installed.query(&db, &sql)?, rows)?;
+        }
+        for (sql, rows) in expected.projects.checks(Some(&confirmed)) {
+            verify_rows(&installed.query(&db, &sql)?, &rows)?;
+        }
+        expected
+            .records
+            .verify_committed(&installed, &db, &confirmed)?;
         let rows = installed.query(&db, &format!(
             "SELECT id, parent_id, slug, HEX(name) AS name_hex, description, archived_at, revision \
              FROM areas AS OF '{confirmed}' ORDER BY id"
         ))?;
-        if rows != expected {
+        if rows != expected.areas {
             return Err(unverified(
                 "Committed Areas differ from the reviewed scope rows.",
+            ));
+        }
+        let rows = installed.query(
+            &db,
+            &format!(
+                "SELECT id, slug, HEX(display_name) AS name_hex, retired_at, revision \
+             FROM bots AS OF '{confirmed}' ORDER BY id"
+            ),
+        )?;
+        if rows != expected.bots {
+            return Err(unverified(
+                "Committed Bots differ from the reviewed Queen registry rows.",
             ));
         }
         validate_restored_records(&installed, &db, &confirmed, &args.workspace_id, |path| {
@@ -144,9 +268,14 @@ fn prepare(
         Some(confirmed)
     };
 
-    installed.git(&assets, &["fsck", "--full", "--no-reflogs", &asset_commit])?;
-    installed.verify_initial_assets(&assets, &asset_commit)?;
-    require_entries(&assets_dir, &[".git"])?;
+    let soul_blobs = verify_asset_commit(
+        &installed,
+        &assets,
+        &assets_dir,
+        &asset_base,
+        &asset_commit,
+        queens,
+    )?;
     require_entries(&conversations, &[])?;
     let staged = if dry_run {
         None
@@ -186,7 +315,7 @@ fn prepare(
         "base_dolt_commit": base,
         "confirmed_dolt_commit": confirmed,
         "asset_git_commit": asset_commit,
-        "issue_number_next_value": 1,
+        "issue_number_next_value": if dry_run { 1 } else { issue_count + 1 },
         "active_claims": 0,
     });
     report["checks"] = json!({
@@ -198,21 +327,216 @@ fn prepare(
         "published_inactive": !dry_run,
         "target_area_rows": if dry_run { 0 } else { areas.len() },
     });
+    if report.get("queen_preparation").is_some() {
+        report["checks"]["target_bot_rows"] = json!(if dry_run { 0 } else { queens.len() });
+        report["counts"]["prepared_queens"] = json!(queens.len());
+    }
+    if let (Some(plan), Some(import)) = (&task_plan, &task_import) {
+        report["coverage"] = json!("scopes_and_tasks");
+        reconciliation_report::add_task_ledger(&mut report, plan.staging_ledger());
+        report["id_map"]
+            .as_array_mut()
+            .expect("scope ID map")
+            .extend(import.id_map());
+        report["checks"]["task_rows_and_links"] = json!("verified");
+        report["checks"]["target_issue_rows"] = json!(if dry_run { 0 } else { issue_count });
+        report["target"]["projected_issue_number_next_value"] = json!(issue_count + 1);
+    }
+    expected
+        .resources
+        .add_report(&mut report, reviewed.resources.as_ref(), dry_run);
+    issue_resources.add_report(&mut report, dry_run);
+    if let Some((projects, ids)) = rows.projects {
+        expected
+            .projects
+            .add_report(&mut report, projects, ids, dry_run);
+    }
+    let include_reviewed_records = intake.is_some();
+    if let Some(intake) = intake {
+        report["coverage"] = json!("scopes_directives_artifacts");
+        directive_artifact::add_report(&mut report, intake, Some(&expected.records));
+        let (directives, artifacts) = expected.records.counts();
+        report["checks"]["target_directive_rows"] = json!(if dry_run { 0 } else { directives });
+        report["checks"]["target_artifact_rows"] = json!(if dry_run { 0 } else { artifacts });
+        report["checks"]["target_artifact_links"] = json!(if dry_run {
+            0
+        } else {
+            expected.records.link_count()
+        });
+        if let Some(observed) = reviewed.directive_observation() {
+            report["directive_observed_at"] = json!(observed);
+        }
+    }
+    let mut surfaces = Vec::new();
+    for (selected, label) in [
+        (args.tasks, "tasks"),
+        (reviewed.resources.is_some(), "resources"),
+        (project_plan.is_some(), "projects"),
+        (report.get("queen_preparation").is_some(), "queen_souls"),
+        (include_reviewed_records, "directives_artifacts"),
+    ] {
+        if selected {
+            surfaces.push(label);
+        }
+    }
+    if surfaces.len() > 1 {
+        report["coverage"] = json!("mixed");
+        report["included_surfaces"] = json!(surfaces);
+    }
+    reconciliation_report::complete(&mut report, reviewed, &soul_blobs, dry_run)?;
     Ok((report, staged))
 }
 
-fn apply_areas(
+fn stage_souls(
+    installed: &Installed<'_>,
+    assets: &Path,
+    assets_dir: &File,
+    base: &str,
+    queens: &[PreparedQueen],
+) -> Result<String, HiveError> {
+    if queens.is_empty() {
+        return Ok(base.to_owned());
+    }
+    let bots = create_private_directory(&fd_path(assets_dir).join("bots"))?;
+    for queen in queens {
+        let directory = create_private_directory(&fd_path(&bots).join(&queen.registry.slug))?;
+        private_file(&fd_path(&directory).join("SOUL.md"))?
+            .write_all(&queen.soul_bytes)
+            .map_err(io_error)?;
+    }
+    installed.git(assets, &["-c", "core.autocrlf=false", "add", "--", "bots"])?;
+    installed.git(
+        assets,
+        &[
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            "Import reviewed Hive v1 Queen Souls",
+        ],
+    )?;
+    let commit = installed.git(assets, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let commit = commit.trim();
+    verify_asset_commit(installed, assets, assets_dir, base, commit, queens)?;
+    Ok(commit.to_owned())
+}
+
+fn verify_asset_commit(
+    installed: &Installed<'_>,
+    assets: &Path,
+    assets_dir: &File,
+    base: &str,
+    commit: &str,
+    queens: &[PreparedQueen],
+) -> Result<BTreeMap<String, String>, HiveError> {
+    let invalid_assets =
+        || unverified("The staged Git asset commit differs from the reviewed Queen Souls.");
+    if commit.len() != 40 || !crate::config_git::is_full_lowercase_oid(commit) {
+        return Err(invalid_assets());
+    }
+    installed.git(assets, &["fsck", "--full", "--no-reflogs", commit])?;
+    if queens.is_empty() {
+        installed.verify_initial_assets(assets, base)?;
+        require_entries(assets_dir, &[".git"])?;
+        return Ok(BTreeMap::new());
+    }
+    if installed.git(assets, &["symbolic-ref", "HEAD"])?.trim() != "refs/heads/main"
+        || installed
+            .git(assets, &["rev-list", "--parents", "-n", "1", "HEAD"])?
+            .trim()
+            != format!("{commit} {base}")
+        || !installed
+            .git(assets, &["status", "--porcelain", "--untracked-files=all"])?
+            .is_empty()
+        || !installed.git(assets, &["remote"])?.is_empty()
+    {
+        return Err(invalid_assets());
+    }
+
+    require_entries(assets_dir, &[".git", "bots"])?;
+    let bots = open_target(&fd_path(assets_dir).join("bots"))?.ok_or_else(invalid_assets)?;
+    let slugs = queens
+        .iter()
+        .map(|queen| queen.registry.slug.as_str())
+        .collect::<Vec<_>>();
+    require_entries(&bots, &slugs)?;
+    let tree = installed.git(assets, &["ls-tree", "-rzt", "--full-tree", commit])?;
+    let mut expected = BTreeMap::from([("bots".to_owned(), "040000 tree ")]);
+    for slug in slugs {
+        expected.insert(format!("bots/{slug}"), "040000 tree ");
+        expected.insert(format!("bots/{slug}/SOUL.md"), "100644 blob ");
+    }
+    let mut soul_blobs = BTreeMap::new();
+    for entry in tree.split_terminator('\0') {
+        let (metadata, path) = entry.split_once('\t').ok_or_else(invalid_assets)?;
+        if !expected
+            .remove(path)
+            .is_some_and(|kind| metadata.starts_with(kind))
+        {
+            return Err(invalid_assets());
+        }
+        if let Some(oid) = metadata.strip_prefix("100644 blob ") {
+            if oid.len() != 40 || !crate::config_git::is_full_lowercase_oid(oid) {
+                return Err(invalid_assets());
+            }
+            soul_blobs.insert(path.to_owned(), oid.to_owned());
+        }
+    }
+    if !expected.is_empty() {
+        return Err(invalid_assets());
+    }
+    for queen in queens {
+        let slug = &queen.registry.slug;
+        let directory = open_target(&fd_path(&bots).join(slug))?.ok_or_else(invalid_assets)?;
+        require_entries(&directory, &["SOUL.md"])?;
+        let metadata =
+            fs::symlink_metadata(fd_path(&directory).join("SOUL.md")).map_err(io_error)?;
+        if !metadata.is_file() || metadata.mode() & 0o777 != 0o600 {
+            return Err(invalid_assets());
+        }
+        let bytes =
+            installed.read_committed_soul(assets, commit, &format!("bots/{slug}/SOUL.md"))?;
+        if bytes != queen.soul_bytes
+            || format!("{:x}", Sha256::digest(&bytes)) != queen.source_raw_sha256
+        {
+            return Err(invalid_assets());
+        }
+    }
+    Ok(soul_blobs)
+}
+
+struct ImportRows<'a> {
+    areas: &'a [&'a Area],
+    queens: &'a [PreparedQueen],
+    resources: Option<&'a PreparedResources<'a>>,
+    tasks: Option<&'a TaskImport<'a>>,
+    issue_resources: &'a IssueResources<'a>,
+    projects: Option<(&'a PreparedProjects<'a>, &'a IssueIds<'a>)>,
+    records: &'a [PreparedRecord],
+}
+
+struct Expected {
+    areas: Vec<Value>,
+    bots: Vec<Value>,
+    counts: [Value; 1],
+    resources: StagedResources,
+    projects: StagedProjects,
+    records: directive_artifact::Expected,
+}
+
+fn apply_rows(
     installed: &Installed<'_>,
     db: &Path,
     scratch: &File,
-    areas: &[&Area],
+    rows: &ImportRows<'_>,
     now: OffsetDateTime,
     dry_run: bool,
-) -> Result<Vec<Value>, HiveError> {
+) -> Result<Expected, HiveError> {
     let mut input = tempfile::tempfile_in(fd_path(scratch)).map_err(io_error)?;
     input.write_all(b"START TRANSACTION;\n").map_err(io_error)?;
-    let mut expected = BTreeMap::new();
-    for area in areas {
+    writeln!(input, "{COUNTS};\n{COUNTER};").map_err(io_error)?;
+    let mut checks = vec![counts(0, 0, 0, 0).to_vec(), counter(0).to_vec()];
+    let mut areas = BTreeMap::new();
+    for area in rows.areas {
         let revision = new_uuid_v7(now)?;
         let parent = area
             .parent_id
@@ -230,34 +554,113 @@ fn apply_areas(
         if let Some(parent) = &area.parent_id {
             row["parent_id"] = json!(parent);
         }
-        expected.insert(&area.id, row);
+        areas.insert(&area.id, row);
     }
+    let mut bots = BTreeMap::new();
+    for queen in rows.queens {
+        let registry = &queen.registry;
+        let revision = new_uuid_v7(now)?;
+        let name_hex = hex(&registry.display_name);
+        writeln!(input,
+            "INSERT INTO bots (id, slug, display_name, revision) VALUES ({}, {}, CONVERT(X'{name_hex}' USING utf8mb4), {});",
+            sql_text(&registry.id), sql_text(&registry.slug), sql_text(&revision),
+        ).map_err(io_error)?;
+        bots.insert(&registry.id, json!({
+            "id": registry.id, "slug": registry.slug, "name_hex": name_hex, "revision": revision,
+        }));
+    }
+    let resources = StagedResources::append(&mut input, rows.resources, now)?;
+    let (issues, dependencies) = if let Some(tasks) = rows.tasks {
+        tasks.append_sql(&mut input)?;
+        for (sql, expected) in tasks.checks(None) {
+            writeln!(input, "{sql};").map_err(io_error)?;
+            checks.push(expected.to_vec());
+        }
+        (tasks.len(), tasks.dependency_count())
+    } else {
+        (0, 0)
+    };
+    rows.issue_resources.append_sql(&mut input)?;
+    for (sql, expected) in rows.issue_resources.checks(None) {
+        writeln!(input, "{sql};").map_err(io_error)?;
+        checks.push(expected.to_vec());
+    }
+    let projects = StagedProjects::append(&mut input, rows.projects, now)?;
+    for (sql, expected) in projects.transaction_checks() {
+        writeln!(input, "{sql};").map_err(io_error)?;
+        checks.push(expected);
+    }
+    let records = directive_artifact::append(&mut input, rows.records, rows.tasks, &projects, now)?;
+    for (sql, expected) in records.transaction_checks() {
+        writeln!(input, "{sql};").map_err(io_error)?;
+        checks.push(expected);
+    }
+    let expected_counts = counts(areas.len(), bots.len(), issues, dependencies);
     let end = if dry_run { "ROLLBACK" } else { "COMMIT" };
-    writeln!(input, "{COUNTS};\n{end};").map_err(io_error)?;
+    writeln!(
+        input,
+        "{COUNTS};\n{COUNTER};\n{};\n{end};",
+        resources::COUNTS
+    )
+    .map_err(io_error)?;
+    checks.extend([expected_counts.to_vec(), counter(issues).to_vec()]);
     input.rewind().map_err(io_error)?;
     let output = installed.dolt(db, &["sql", "-r", "json"], Some(input))?;
-    let mut counts = None;
-    for result in serde_json::Deserializer::from_str(&output).into_iter::<Value>() {
-        let result =
-            result.map_err(|_| unverified("Could not read the migration transaction checks."))?;
-        if let Some(rows) = result.get("rows") {
-            if counts.is_some() {
-                return Err(unverified(
-                    "The migration transaction returned unexpected checks.",
-                ));
-            }
-            verify_counts(rows.as_array().map_or(&[], Vec::as_slice), areas.len())?;
-            counts = Some(());
-        }
+    // Dolt emits empty JSON objects for statements such as START TRANSACTION
+    // and ROLLBACK. Only the SELECT results belong to the expected checks.
+    let mut results = serde_json::Deserializer::from_str(&output)
+        .into_iter::<Value>()
+        .filter(|result| !matches!(result, Ok(Value::Object(fields)) if fields.is_empty()));
+    for expected in &checks {
+        verify_rows(&transaction_rows(&mut results)?, expected)?;
     }
-    counts.ok_or_else(|| unverified("The migration transaction did not return its checks."))?;
-    Ok(expected.into_values().collect())
+    resources.verify_transaction_counts(&transaction_rows(&mut results)?)?;
+    if results.next().is_some() {
+        return Err(unverified(
+            "The migration transaction returned unexpected checks.",
+        ));
+    }
+    Ok(Expected {
+        areas: areas.into_values().collect(),
+        bots: bots.into_values().collect(),
+        counts: expected_counts,
+        resources,
+        projects,
+        records,
+    })
 }
 
-fn verify_counts(rows: &[Value], areas: usize) -> Result<(), HiveError> {
-    if rows != [json!({"areas": areas, "issues": 0, "claims": 0, "next_number": 1})] {
+fn transaction_rows(
+    results: &mut impl Iterator<Item = Result<Value, serde_json::Error>>,
+) -> Result<Vec<Value>, HiveError> {
+    match results.next() {
+        Some(Ok(Value::Object(mut result))) => match result.remove("rows") {
+            Some(Value::Array(rows)) => Ok(rows),
+            _ => Err(unverified(
+                "Could not read the migration transaction check rows.",
+            )),
+        },
+        _ => Err(unverified(
+            "Could not read all migration transaction checks.",
+        )),
+    }
+}
+
+fn counts(areas: usize, bots: usize, issues: usize, dependencies: usize) -> [Value; 1] {
+    [
+        json!({"areas": areas, "bots": bots, "memories": 0, "issues": issues,
+        "dependencies": dependencies, "claims": 0, "next_number": issues + 1}),
+    ]
+}
+
+fn counter(issues: usize) -> [Value; 1] {
+    [json!({"name": "issue_number", "next_value": issues + 1})]
+}
+
+fn verify_rows(rows: &[Value], expected: &[Value]) -> Result<(), HiveError> {
+    if rows != expected {
         return Err(unverified(
-            "Migration Area, Issue, Claim or counter checks failed.",
+            "Migration row, link, Claim or Issue counter checks failed.",
         ));
     }
     Ok(())

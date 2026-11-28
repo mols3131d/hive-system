@@ -55,19 +55,13 @@ pub(super) fn exercise(
     let digest = |bytes: &str| format!("{:x}", Sha256::digest(bytes));
     let decision_path = root.join("reconcile-decision.json");
     let decision = |action: &str, issue: &str, rev: &str, request: &str, reason: &str| {
-        let kind = format!("issue.{action}");
-        let fingerprint = digest(
-            &json!([1, kind, workspace, area, issue, ACTOR, rev, digest(reason)]).to_string(),
-        );
-        json!({"decision": "allow", "evidence": {
-            "version": 1, "operation": kind, "workspace_id": workspace, "area_id": area,
-            "issue_id": issue, "actor_ref": ACTOR, "request_id": request,
-            "expected_issue_revision": rev, "fingerprint": fingerprint,
-            "authorization_ref": "fixture-decision", "evidence_id": "fixture-evidence",
-            "revision": "r1", "source_ref": "fixture-source", "issuer_ref": "fixture-issuer",
-            "valid_from": "2000-01-01T00:00:00Z", "expires_at": "2099-01-01T00:00:00Z",
-            "withdrawn": false
-        }})
+        IssueDecision {
+            workspace: &workspace,
+            area: &area,
+            actor: ACTOR,
+            request,
+        }
+        .reconcile(action, issue, rev, reason)
     };
     let command = |action: &str, issue: &str, rev: &str, request: &str, reason: &str, exit| {
         fs::write(

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::process::Command;
 
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag};
@@ -8,10 +8,11 @@ use sha2::{Digest, Sha256};
 
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
 use super::task_graph::{Node, held_nodes};
-use super::task_provenance::{Key, Prepared, Reviews, SourceBody, TaskReview};
+use super::task_provenance::{Key, Prepared, Reviews, SourceBody, StagingFields, TaskReview};
 use super::{Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
 use crate::config_file::{parse_v2, parse_v2_projection, present};
+use crate::dolt::is_canonical_label_name;
 use crate::error::HiveError;
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize)]
@@ -20,6 +21,16 @@ enum Lifecycle {
     Backlog,
     Active,
     Archive,
+}
+
+impl Lifecycle {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::Active => "active",
+            Self::Archive => "archive",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -32,6 +43,15 @@ pub(super) enum CandidateStatus {
 }
 
 impl CandidateStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::Todo => "todo",
+            Self::Done => "done",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
     pub(super) fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Cancelled)
     }
@@ -59,6 +79,7 @@ pub(super) struct Record {
 struct Classification {
     candidate: Result<CandidateStatus, Reason>,
     execution_needs_reconciliation: bool,
+    title_review_status: Option<CandidateStatus>,
 }
 
 pub(super) fn read_records(
@@ -100,6 +121,7 @@ pub(super) fn read_records(
             classification: Classification {
                 candidate: Err(Reason::MissingTaskEntrypoint),
                 execution_needs_reconciliation: false,
+                title_review_status: None,
             },
         };
         if let Some(blob) = inventory.entries.get(&readme)
@@ -149,16 +171,31 @@ enum Outcome<'a> {
     },
 }
 
-pub(super) struct TaskPlan<'a> {
+pub(crate) struct TaskPlan<'a> {
     records: Vec<Record>,
     outcomes: Vec<Outcome<'a>>,
+    source_bodies: HashMap<String, SourceBody>,
 }
+
+pub(crate) struct StagingTask<'a> {
+    pub(crate) key: (&'a str, &'a str),
+    pub(crate) area_id: &'a str,
+    pub(crate) status: &'static str,
+    pub(crate) source_path: &'a str,
+    pub(crate) source_git_blob_sha: &'a str,
+    pub(crate) locator: Value,
+    pub(crate) fields: StagingFields<'a>,
+}
+
+pub(crate) type LabelCollisionCheck<'a> =
+    dyn Fn(&BTreeSet<&str>) -> Result<HashSet<String>, HiveError> + 'a;
 
 pub(super) fn prepare<'a>(
     records: Vec<Record>,
     scopes: &BTreeMap<&str, &ScopeOutcome<'a>>,
     task_reviews: &[TaskReview],
     git: &impl Fn() -> Result<Command, HiveError>,
+    check_labels: Option<&LabelCollisionCheck<'_>>,
 ) -> Result<TaskPlan<'a>, HiveError> {
     let mut counts = HashMap::new();
     for record in &records {
@@ -176,6 +213,7 @@ pub(super) fn prepare<'a>(
             &reviews,
             &mut source_bodies,
             git,
+            check_labels.is_some(),
         )?;
         let status = match outcome {
             Outcome::Prepared {
@@ -183,8 +221,6 @@ pub(super) fn prepare<'a>(
             } => Some(candidate_status),
             _ => None,
         };
-        // A verified declaration can veto preparation of another Task even
-        // when this Task has no usable Area, metadata, or provenance.
         let source_reviews = match (scope, record.blob_oid.as_deref()) {
             (ScopeOutcome::Excluded { .. }, _) | (_, None) => &[],
             (_, Some(oid)) => reviews.source_bound(record.key(), oid),
@@ -197,7 +233,48 @@ pub(super) fn prepare<'a>(
         outcomes.push(outcome);
     }
 
-    for (outcome, held) in outcomes.iter_mut().zip(held_nodes(&nodes)) {
+    let mut graph_holds = held_nodes(&nodes);
+    if let Some(check_labels) = check_labels {
+        let labels_at = |index: usize| {
+            let oid = records[index]
+                .blob_oid
+                .as_deref()
+                .expect("prepared Task blob");
+            &source_bodies[oid].labels
+        };
+        let names = nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, node)| node.status.is_some() && !graph_holds[*index])
+            .flat_map(|(index, _)| labels_at(index).iter().map(String::as_str))
+            .collect();
+        let collisions = check_labels(&names)?;
+        if !collisions.is_empty() {
+            for (index, (node, outcome)) in nodes.iter_mut().zip(&mut outcomes).enumerate() {
+                if let Outcome::Prepared {
+                    area_id,
+                    candidate_status,
+                    ..
+                } = *outcome
+                    && !graph_holds[index]
+                    && labels_at(index)
+                        .iter()
+                        .any(|label| collisions.contains(label))
+                {
+                    *outcome = Outcome::Held {
+                        reason_codes: vec![Reason::TaskLabelCollationCollision],
+                        candidate_status: Some(candidate_status),
+                        area_id: Some(area_id),
+                    };
+                    node.status = None;
+                }
+            }
+            for (held, after_labels) in graph_holds.iter_mut().zip(held_nodes(&nodes)) {
+                *held |= after_labels;
+            }
+        }
+    }
+    for (outcome, held) in outcomes.iter_mut().zip(graph_holds) {
         if held
             && let Outcome::Prepared {
                 area_id,
@@ -212,10 +289,133 @@ pub(super) fn prepare<'a>(
             };
         }
     }
-    Ok(TaskPlan { records, outcomes })
+    Ok(TaskPlan {
+        records,
+        outcomes,
+        source_bodies,
+    })
+}
+
+pub(super) enum TaskSource<'a> {
+    Duplicate,
+    Unique {
+        oid: Option<&'a str>,
+        state: TaskState,
+    },
+}
+
+pub(super) enum TaskState {
+    Prepared,
+    Held,
+    Excluded,
 }
 
 impl TaskPlan<'_> {
+    pub(super) fn member_source(&self, key: Key<'_>) -> Option<TaskSource<'_>> {
+        // Intake sorts by qualified key, with all lifecycle copies contiguous.
+        let index = self.records.partition_point(|record| record.key() < key);
+        let record = self
+            .records
+            .get(index)
+            .filter(|record| record.key() == key)?;
+        if self
+            .records
+            .get(index + 1)
+            .is_some_and(|record| record.key() == key)
+        {
+            return Some(TaskSource::Duplicate);
+        }
+        let state = match self.outcomes[index] {
+            Outcome::Prepared { .. } => TaskState::Prepared,
+            Outcome::Held { .. } => TaskState::Held,
+            Outcome::Excluded { .. } => TaskState::Excluded,
+        };
+        Some(TaskSource::Unique {
+            oid: record.blob_oid.as_deref(),
+            state,
+        })
+    }
+
+    pub(crate) fn staging_tasks(&self) -> Vec<StagingTask<'_>> {
+        self.records
+            .iter()
+            .zip(&self.outcomes)
+            .filter_map(|(record, outcome)| {
+                let Outcome::Prepared {
+                    area_id,
+                    candidate_status,
+                    provenance,
+                } = outcome
+                else {
+                    return None;
+                };
+                let oid = record.blob_oid.as_deref().expect("prepared Task blob");
+                Some(StagingTask {
+                    key: record.key(),
+                    area_id,
+                    status: candidate_status.as_str(),
+                    source_path: &record.path,
+                    source_git_blob_sha: oid,
+                    locator: record.staging_locator(),
+                    fields: provenance.staging_fields(&self.source_bodies[oid]),
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn staging_ledger(&self) -> Value {
+        let mut counts = [0; 3];
+        let mut by_lifecycle =
+            BTreeMap::from([("backlog", [0; 3]), ("active", [0; 3]), ("archive", [0; 3])]);
+        let mut by_status =
+            BTreeMap::from([("backlog", 0), ("todo", 0), ("done", 0), ("cancelled", 0)]);
+        let mut holds = Vec::new();
+        let mut exclusions = Vec::new();
+        for (record, outcome) in self.records.iter().zip(&self.outcomes) {
+            let index = match outcome {
+                Outcome::Prepared {
+                    candidate_status, ..
+                } => {
+                    *by_status
+                        .get_mut(candidate_status.as_str())
+                        .expect("known candidate state") += 1;
+                    0
+                }
+                Outcome::Held { reason_codes, .. } => {
+                    let mut row = record.staging_locator();
+                    row["reason_codes"] = json!(reason_codes);
+                    holds.push(row);
+                    1
+                }
+                Outcome::Excluded { reason } => {
+                    let mut row = record.staging_locator();
+                    row["reason_code"] = json!(reason);
+                    exclusions.push(row);
+                    2
+                }
+            };
+            counts[index] += 1;
+            by_lifecycle
+                .get_mut(record.lifecycle.as_str())
+                .expect("known lifecycle")[index] += 1;
+        }
+        let summary = |[imported, held, excluded]: [usize; 3]| {
+            json!({
+                "inventoried": imported + held + excluded, "imported": imported,
+                "held": held, "excluded_non_record": excluded,
+            })
+        };
+        let mut counts = summary(counts);
+        counts["by_lifecycle"] = json!(
+            by_lifecycle
+                .into_iter()
+                .map(|(name, counts)| (name, summary(counts)))
+                .collect::<BTreeMap<_, _>>()
+        );
+        counts["imported_by_status"] = json!(by_status);
+        json!({"counts": counts, "holds": holds, "exclusions": exclusions})
+    }
+
     pub(super) fn report(self) -> Value {
         let mut excluded = 0;
         let mut prepared = 0;
@@ -245,7 +445,24 @@ impl TaskPlan<'_> {
     }
 }
 
+pub(super) fn task_key_digest((scope, work_id): Key<'_>) -> String {
+    let mut key = Sha256::new();
+    key.update(scope);
+    key.update(b"\0");
+    key.update(work_id);
+    format!("{:x}", key.finalize())
+}
+
 impl Record {
+    fn staging_locator(&self) -> Value {
+        json!({
+            "legacy_key_sha256": task_key_digest(self.key()),
+            "source_path_sha256": format!("{:x}", Sha256::digest(&self.path)),
+            "source_git_blob_sha": self.blob_oid, "source_raw_sha256": self.raw_sha256,
+            "lifecycle": self.lifecycle,
+        })
+    }
+
     fn key(&self) -> Key<'_> {
         (&self.scope, &self.work_id)
     }
@@ -274,45 +491,75 @@ impl Record {
         reasons
     }
 
-    fn assess<'a, 'record>(
-        &'record self,
+    fn assess<'a>(
+        &self,
         scope: &ScopeOutcome<'a>,
         unique: bool,
         reviews: &Reviews<'_>,
-        source_bodies: &mut HashMap<&'record str, SourceBody>,
+        source_bodies: &mut HashMap<String, SourceBody>,
         git: &impl Fn() -> Result<Command, HiveError>,
+        check_labels_at_staging: bool,
     ) -> Result<Outcome<'a>, HiveError> {
         if let ScopeOutcome::Excluded { reason } = scope {
             return Ok(Outcome::Excluded { reason: *reason });
         }
-        let reason_codes = self.hold_reasons(scope, !unique);
+        let mut reason_codes = self.hold_reasons(scope, !unique);
         let hold = |reason_codes| Outcome::Held {
             reason_codes,
             candidate_status: None,
             area_id: None,
         };
         let area = match scope {
-            ScopeOutcome::Mapped { area } if unique && is_slug(&self.work_id) => area,
+            ScopeOutcome::Mapped { area, .. } if unique && is_slug(&self.work_id) => area,
             _ => return Ok(hold(reason_codes)),
         };
         let binding = self.blob_oid.as_deref().map_or(Ok(None), |oid| {
             reviews.for_preparation(self.key(), oid, &area.id)
         });
-        match self.classification.candidate {
-            Ok(status) if reason_codes.is_empty() => {
-                self.candidate_outcome(status, &area.id, binding, source_bodies, git)
+        match (
+            self.classification.candidate,
+            reason_codes.as_slice(),
+            binding,
+        ) {
+            (Ok(status), [], _) => self.candidate_outcome(
+                status,
+                &area.id,
+                binding,
+                source_bodies,
+                git,
+                check_labels_at_staging,
+            ),
+            (_, [Reason::MissingOrConflictingTitle], Ok(Some(review)))
+                if review.has_title()
+                    && let Some(status) = self.classification.title_review_status =>
+            {
+                self.candidate_outcome(
+                    status,
+                    &area.id,
+                    binding,
+                    source_bodies,
+                    git,
+                    check_labels_at_staging,
+                )
+            }
+            (_, [Reason::MissingOrConflictingTitle], Err(reason))
+                if self.classification.title_review_status.is_some() =>
+            {
+                reason_codes.push(reason);
+                Ok(hold(reason_codes))
             }
             _ => Ok(hold(reason_codes)),
         }
     }
 
-    fn candidate_outcome<'a, 'record>(
-        &'record self,
+    fn candidate_outcome<'a>(
+        &self,
         status: CandidateStatus,
         area_id: &'a str,
         review: Result<Option<&TaskReview>, Reason>,
-        source_bodies: &mut HashMap<&'record str, SourceBody>,
+        source_bodies: &mut HashMap<String, SourceBody>,
         git: &impl Fn() -> Result<Command, HiveError>,
+        check_labels_at_staging: bool,
     ) -> Result<Outcome<'a>, HiveError> {
         let held = |reason_codes| Outcome::Held {
             reason_codes,
@@ -322,21 +569,23 @@ impl Record {
         match review {
             Ok(Some(review)) => {
                 let oid = self.blob_oid.as_deref().expect("classified Task blob");
-                let body = match source_bodies.entry(oid) {
+                let body = match source_bodies.entry(oid.to_owned()) {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => {
                         let bytes = snapshot_object(git, "blob", oid, self.blob_size)?;
                         entry.insert(SourceBody::from_verified_blob(bytes)?)
                     }
                 };
-                Ok(match review.prepare(body, status) {
-                    Ok(provenance) => Outcome::Prepared {
-                        area_id,
-                        candidate_status: status,
-                        provenance: Box::new(provenance),
+                Ok(
+                    match review.prepare(body, status, check_labels_at_staging) {
+                        Ok(provenance) => Outcome::Prepared {
+                            area_id,
+                            candidate_status: provenance.target_status(status),
+                            provenance: Box::new(provenance),
+                        },
+                        Err(reasons) => held(reasons),
                     },
-                    Err(reasons) => held(reasons),
-                })
+                )
             }
             Ok(None) => {
                 let mut reasons = vec![
@@ -404,6 +653,7 @@ fn classify(bytes: &[u8], lifecycle: Lifecycle, claims_supported: bool) -> Class
     let mut classification = Classification {
         candidate: Err(Reason::UnsupportedTaskMetadata),
         execution_needs_reconciliation: false,
+        title_review_status: None,
     };
     let Some((header, body)) = split_record(bytes) else {
         return classification;
@@ -441,7 +691,13 @@ fn classify(bytes: &[u8], lifecycle: Lifecycle, claims_supported: bool) -> Class
     if !metadata.description.trim().is_empty() {
         classification.candidate = if state.is_ok() || classification.execution_needs_reconciliation
         {
-            validate_metadata(&metadata, body, lifecycle).and(state)
+            validate_metadata(&metadata, lifecycle).and_then(|()| {
+                if resolve_title(metadata.title.as_deref(), &metadata.description, body).is_err() {
+                    classification.title_review_status = state.ok();
+                    return Err(Reason::MissingOrConflictingTitle);
+                }
+                state
+            })
         } else {
             state
         };
@@ -483,11 +739,7 @@ fn classify_state(
     Ok(candidate)
 }
 
-fn validate_metadata(
-    metadata: &Frontmatter,
-    body: &str,
-    lifecycle: Lifecycle,
-) -> Result<(), Reason> {
+fn validate_metadata(metadata: &Frontmatter, lifecycle: Lifecycle) -> Result<(), Reason> {
     if metadata.priority.as_ref().is_some_and(|priority| {
         lifecycle == Lifecycle::Archive
             || !matches!(priority.as_str(), Some("high" | "normal" | "low"))
@@ -499,17 +751,11 @@ fn validate_metadata(
         if tags.is_empty()
             || tags.iter().any(|tag| {
                 let tag = tag.trim();
-                tag.is_empty()
-                    || tag.chars().count() > 100
-                    || tag.chars().any(char::is_control)
-                    || !trimmed.insert(tag)
+                !is_canonical_label_name(tag) || !trimmed.insert(tag)
             })
         {
             return Err(Reason::UnsupportedTaskMetadata);
         }
-    }
-    if resolve_title(metadata.title.as_deref(), &metadata.description, body).is_none() {
-        return Err(Reason::MissingOrConflictingTitle);
     }
     Ok(())
 }
@@ -544,20 +790,28 @@ pub(super) enum TitleSource {
     FrontmatterTitle,
     Heading,
     Description,
+    ReviewedFallback,
+    ReviewedOverride,
+}
+
+pub(super) enum TitleProblem {
+    Unavailable,
+    NeedsOverride,
+}
+
+pub(super) fn valid_title(value: &str) -> bool {
+    !value.trim().is_empty() && value.chars().count() <= 255 && !value.chars().any(char::is_control)
 }
 
 pub(super) fn resolve_title<'a>(
     title: Option<&'a str>,
     description: &'a str,
     body: &'a str,
-) -> Option<(&'a str, TitleSource)> {
-    let valid = |value: &str| {
-        !value.trim().is_empty()
-            && value.chars().count() <= 255
-            && !value.chars().any(char::is_control)
-    };
-    if let Some(title) = title.filter(|title| valid(title)) {
-        return Some((title, TitleSource::FrontmatterTitle));
+) -> Result<(&'a str, TitleSource), TitleProblem> {
+    if let Some(title) = title {
+        return valid_title(title)
+            .then_some((title, TitleSource::FrontmatterTitle))
+            .ok_or(TitleProblem::NeedsOverride);
     }
     let is_h1 = |event: &Event<'_>| {
         matches!(
@@ -571,7 +825,7 @@ pub(super) fn resolve_title<'a>(
     let mut events = Parser::new(body).into_offset_iter();
     let first_heading = events.next().filter(|(event, _)| is_h1(event));
     if events.any(|(event, _)| is_h1(&event)) {
-        return None;
+        return Err(TitleProblem::NeedsOverride);
     }
     let heading = if let Some((_, range)) = first_heading {
         // Only a single leading unindented ATX H1 can supply the title.
@@ -582,11 +836,15 @@ pub(super) fn resolve_title<'a>(
                 .iter()
                 .any(|(_, definition)| definition.span.start < range.start)
         {
-            return None;
+            return Err(TitleProblem::NeedsOverride);
         }
-        let line = body[range].split(['\r', '\n']).next()?.strip_prefix('#')?;
+        let line = body[range]
+            .split(['\r', '\n'])
+            .next()
+            .and_then(|line| line.strip_prefix('#'))
+            .ok_or(TitleProblem::NeedsOverride)?;
         if !line.is_empty() && !line.starts_with([' ', '\t']) {
-            return None;
+            return Err(TitleProblem::NeedsOverride);
         }
         let value = line.trim();
         let unclosed = value.trim_end_matches('#');
@@ -599,7 +857,8 @@ pub(super) fn resolve_title<'a>(
         None
     };
     heading
-        .filter(|heading| valid(heading))
+        .filter(|heading| valid_title(heading))
         .map(|heading| (heading, TitleSource::Heading))
-        .or_else(|| valid(description).then_some((description, TitleSource::Description)))
+        .or_else(|| valid_title(description).then_some((description, TitleSource::Description)))
+        .ok_or(TitleProblem::Unavailable)
 }

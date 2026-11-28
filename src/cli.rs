@@ -998,7 +998,7 @@ pub(crate) enum WorkspaceAction {
         #[arg(long)]
         include_directives_artifacts: bool,
     },
-    /// Rehearse or stage an inactive v1 scope-only migration.
+    /// Rehearse or stage an inactive v1 migration.
     MigrationStage(MigrationStageArgs),
     #[command(flatten)]
     Runtime(WorkspaceCommand),
@@ -1026,6 +1026,9 @@ pub(crate) struct MigrationStageArgs {
     pub(crate) policy_revision: String,
     #[arg(long, value_enum)]
     pub(crate) mode: MigrationStageMode,
+    /// Include reviewed v1 Tasks and their resolved links.
+    #[arg(long)]
+    pub(crate) tasks: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
