@@ -122,6 +122,7 @@ enum Reason {
     UnresolvedCompletionObligation,
     UnresolvedTaskRelations,
     UnverifiedAcceptanceCriteria,
+    InapplicableTodoFallback,
     UnverifiedTaskLabels,
     TaskLabelCollationCollision,
     UnsupportedTaskMetadata,

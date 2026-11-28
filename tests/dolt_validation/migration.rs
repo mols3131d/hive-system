@@ -51,6 +51,10 @@ mod record_titles;
 #[path = "migration/task_labels.rs"]
 mod task_labels;
 
+#[cfg(target_os = "linux")]
+#[path = "migration/todo_fallback.rs"]
+mod todo_fallback;
+
 const POLICY_PIN: &str = "0e584830a7eff314d85b7af8c6f8cd69e735730a";
 const EARLIER_POLICY_PIN: &str = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
 const FORM_FEED_CRITERIA: &str = "A\x0cB";

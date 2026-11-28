@@ -1,7 +1,7 @@
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
-use pulldown_cmark::{Event, Parser, Tag};
+use pulldown_cmark::{Event, Options, Parser, Tag};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -37,10 +37,18 @@ pub(super) struct TaskReview {
     created_at: Option<BodyRange>,
     #[serde(default, deserialize_with = "optional_object")]
     updated_at: Option<BodyRange>,
-    #[serde(default, deserialize_with = "optional_object")]
-    acceptance_criteria: Option<BodyRange>,
+    #[serde(default, deserialize_with = "supplied_object")]
+    acceptance_criteria: Option<Option<BodyRange>>,
+    #[serde(default, deserialize_with = "present")]
+    todo_fallback: Option<Object<TodoFallback>>,
     #[serde(default, deserialize_with = "optional_object")]
     closure: Option<ClosureReview>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum TodoFallback {
+    BacklogWithoutCriteria {},
 }
 
 #[derive(Clone, Copy, Default, Serialize)]
@@ -107,7 +115,7 @@ impl LegacyKey {
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub(super) enum Relations {
-    Simple(RelationDeclaration),
+    Simple(#[serde(deserialize_with = "json_object::string_enum")] RelationDeclaration),
     Reviewed(Object<Obligations>),
 }
 
@@ -121,7 +129,7 @@ pub(super) enum RelationDeclaration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Obligations {
-    #[serde(default, deserialize_with = "declared_parent")]
+    #[serde(default, deserialize_with = "supplied_object")]
     parent: Option<Option<LegacyKey>>,
     #[serde(default, deserialize_with = "optional_objects")]
     prerequisites: Option<Vec<LegacyKey>>,
@@ -129,9 +137,9 @@ pub(super) struct Obligations {
     children: Option<Vec<ChildReview>>,
 }
 
-fn declared_parent<'de, D: Deserializer<'de>>(
+fn supplied_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
-) -> Result<Option<Option<LegacyKey>>, D::Error> {
+) -> Result<Option<Option<T>>, D::Error> {
     optional_object(deserializer).map(Some)
 }
 
@@ -272,6 +280,7 @@ pub(super) struct SourceBody {
     priority: Option<u8>,
     pub(super) labels: Vec<String>,
     scope_acceptance: OnceCell<HashSet<BodyRange>>,
+    criteria_indicators: OnceCell<bool>,
 }
 
 impl SourceBody {
@@ -304,6 +313,7 @@ impl SourceBody {
                 .map(|tag| tag.trim().to_owned())
                 .collect(),
             scope_acceptance: OnceCell::new(),
+            criteria_indicators: OnceCell::new(),
             text,
         })
     }
@@ -353,6 +363,29 @@ fn acceptance_paragraphs(body: &str) -> HashSet<BodyRange> {
     ranges
 }
 
+// The bound review attests that the Task has no applicable criteria, which
+// can be written in free prose or kept in a referenced source. Refuse known
+// criteria markers in the README even when the review omitted a body range.
+fn has_criteria_indicators(body: &str) -> bool {
+    Parser::new_ext(body, Options::ENABLE_TASKLISTS).any(|event| match event {
+        Event::TaskListMarker(_) => true,
+        Event::Text(text) | Event::Code(text) | Event::Html(text) | Event::InlineHtml(text) => {
+            let text = text.to_ascii_lowercase();
+            text.contains("acceptance criteria")
+                || text.contains("completion criteria")
+                || text.contains("definition of done")
+                || text.lines().any(|line| {
+                    let line = line.trim();
+                    line == "acceptance"
+                        || line.starts_with("acceptance:")
+                        || line == "criteria"
+                        || line.starts_with("criteria:")
+                })
+        }
+        _ => false,
+    })
+}
+
 #[derive(Serialize)]
 pub(super) struct Prepared {
     relations: PreparedRelations,
@@ -368,6 +401,8 @@ pub(super) struct Prepared {
     updated_at: Timestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
     acceptance_criteria: Option<BodyEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    todo_fallback: Option<TodoFallback>,
     #[serde(skip_serializing_if = "Option::is_none")]
     closure: Option<PreparedClosure>,
 }
@@ -455,6 +490,7 @@ pub(crate) struct StagingFields<'a> {
     pub(crate) body: &'a str,
     pub(crate) body_sha256: &'a str,
     pub(crate) criteria: Option<&'a str>,
+    pub(crate) todo_fallback: Option<TodoFallback>,
     pub(crate) priority: Option<u8>,
     pub(crate) labels: &'a [String],
     pub(crate) created_at: OffsetDateTime,
@@ -486,6 +522,14 @@ pub(crate) struct ScopeAcceptance<'a> {
 }
 
 impl Prepared {
+    pub(super) fn target_status(&self, source_status: CandidateStatus) -> CandidateStatus {
+        if self.todo_fallback.is_some() {
+            CandidateStatus::Backlog
+        } else {
+            source_status
+        }
+    }
+
     pub(super) fn staging_fields<'a>(&'a self, source: &'a SourceBody) -> StagingFields<'a> {
         let body = &source.text[source.body_start..];
         let selected = |range: BodyRange| range.select(body).expect("verified Task body range");
@@ -499,6 +543,7 @@ impl Prepared {
                 .acceptance_criteria
                 .as_ref()
                 .map(|evidence| selected(evidence.body_range)),
+            todo_fallback: self.todo_fallback,
             priority: self.priority,
             labels: &source.labels,
             created_at: self.created_at.instant,
@@ -653,9 +698,20 @@ impl TaskReview {
             .relations
             .as_ref()
             .and_then(|review| review.prepare(source, terminal));
-        let criteria = self
-            .acceptance_criteria
-            .and_then(|range| BodyEvidence::select(range, body, valid_text));
+        let criteria_range = self.acceptance_criteria.flatten();
+        let criteria =
+            criteria_range.and_then(|range| BodyEvidence::select(range, body, valid_text));
+        let todo_fallback = self
+            .todo_fallback
+            .as_ref()
+            .map(|decision| decision.0)
+            .filter(|_| {
+                status == CandidateStatus::Todo
+                    && self.acceptance_criteria.is_none()
+                    && !*source
+                        .criteria_indicators
+                        .get_or_init(|| has_criteria_indicators(body))
+            });
         let title = self.selected_title(source);
         let mut reasons = Vec::new();
         if title.is_none() {
@@ -670,8 +726,12 @@ impl TaskReview {
         if relations.is_none() {
             reasons.push(status.relation_hold());
         }
+        if self.todo_fallback.is_some() && todo_fallback.is_none() {
+            reasons.push(Reason::InapplicableTodoFallback);
+        }
         if criteria.is_none()
-            && (status == CandidateStatus::Todo || self.acceptance_criteria.is_some())
+            && ((status == CandidateStatus::Todo && todo_fallback.is_none())
+                || criteria_range.is_some())
         {
             reasons.push(Reason::UnverifiedAcceptanceCriteria);
         }
@@ -694,6 +754,7 @@ impl TaskReview {
             created_at,
             updated_at,
             acceptance_criteria: criteria,
+            todo_fallback,
             closure,
         })
     }

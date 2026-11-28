@@ -345,6 +345,9 @@ impl<'a> TaskImport<'a> {
                 row["issue_number"] = json!(task.number);
                 row["target_body_sha256"] = stored["body_sha256"].clone();
                 row["target_status"] = json!(task.task.status);
+                if let Some(fallback) = task.task.fields.todo_fallback {
+                    row["todo_fallback"] = json!(fallback);
+                }
                 row["target_issue_type"] = stored["issue_type"].clone();
                 row["target_title_sha256"] = stored["title_sha256"].clone();
                 row["area_id"] = json!(task.task.area_id);
