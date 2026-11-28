@@ -62,7 +62,7 @@ fn check_fallback(binary: &Path, pin: &str, installed: bool) {
             "a-reviewed",
             "active",
             todo,
-            "```text\nSynthetic example output\n```\n",
+            "Inspect `sample output` first.\n\n```text\nSynthetic example output\n```\n\n- Review the definition of\n- **Done** as the example label.\n",
         ),
         (
             "b-tagged",
@@ -97,6 +97,30 @@ fn check_fallback(binary: &Path, pin: &str, installed: bool) {
             "active",
             todo,
             "The **completion** criteria are listed below.\n\nThe output must be reproducible.\n",
+        ),
+        (
+            "tight-list-marker",
+            "active",
+            todo,
+            "- Definition of **Done**: The output must be reproducible.\n",
+        ),
+        (
+            "nested-list-marker",
+            "active",
+            todo,
+            "- Review the release\n  - Definition of **Done**: The output must be reproducible.\n",
+        ),
+        (
+            "loose-list-marker",
+            "active",
+            todo,
+            "- Review the release.\n\n- Definition of **Done**: The output must be reproducible.\n",
+        ),
+        (
+            "standalone-inline-marker",
+            "active",
+            todo,
+            "See `Criteria:` for these conditions.\n\nThe output must be reproducible.\n",
         ),
         (
             "inline-code-marker",
@@ -287,6 +311,10 @@ fn check_fallback(binary: &Path, pin: &str, installed: bool) {
         ("formatted-definition", "inapplicable_todo_fallback"),
         ("nbsp-acceptance", "inapplicable_todo_fallback"),
         ("formatted-paragraph", "inapplicable_todo_fallback"),
+        ("tight-list-marker", "inapplicable_todo_fallback"),
+        ("nested-list-marker", "inapplicable_todo_fallback"),
+        ("loose-list-marker", "inapplicable_todo_fallback"),
+        ("standalone-inline-marker", "inapplicable_todo_fallback"),
         ("inline-code-marker", "inapplicable_todo_fallback"),
         ("fenced-marker", "inapplicable_todo_fallback"),
         ("available-checklist", "inapplicable_todo_fallback"),
@@ -407,6 +435,12 @@ fn check_fallback(binary: &Path, pin: &str, installed: bool) {
             "formatted-definition",
             "nbsp-acceptance",
             "formatted-paragraph",
+            "tight-list-marker",
+            "nested-list-marker",
+            "loose-list-marker",
+            "standalone-inline-marker",
+            "inline-code-marker",
+            "fenced-marker",
         ] {
             let digest = sha256_hex(format!("tasks/_general/active/{name}/README.md").as_bytes());
             let hold = data["holds"]
