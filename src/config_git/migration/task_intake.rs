@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
+use super::task_provenance::{Prepared, Reviews, SourceBody, TaskReview};
 use super::{Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
 use crate::config_file::parse_v2;
@@ -34,6 +35,7 @@ pub(super) struct Record {
     lifecycle: Lifecycle,
     path: String,
     blob_oid: Option<String>,
+    blob_size: usize,
     raw_sha256: Option<String>,
     classification: Result<CandidateStatus, Reason>,
 }
@@ -72,6 +74,7 @@ pub(super) fn read_records(
             lifecycle,
             path: path.clone(),
             blob_oid: None,
+            blob_size: 0,
             raw_sha256: None,
             classification: Err(Reason::MissingTaskEntrypoint),
         };
@@ -90,6 +93,7 @@ pub(super) fn read_records(
             };
             record.path = readme;
             record.blob_oid = Some(blob.oid.clone());
+            record.blob_size = size;
             record.raw_sha256 = Some(digest.clone());
             record.classification = *classification;
         }
@@ -104,6 +108,11 @@ pub(super) fn read_records(
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Outcome<'a> {
+    Prepared {
+        area_id: &'a str,
+        candidate_status: CandidateStatus,
+        provenance: Prepared<'a>,
+    },
     Held {
         reason_codes: Vec<Reason>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,102 +125,154 @@ enum Outcome<'a> {
     },
 }
 
-pub(super) fn report(records: Vec<Record>, scopes: &BTreeMap<&str, &ScopeOutcome<'_>>) -> Value {
+pub(super) fn report(
+    records: Vec<Record>,
+    scopes: &BTreeMap<&str, &ScopeOutcome<'_>>,
+    task_reviews: &[TaskReview],
+    git: &impl Fn() -> Result<Command, HiveError>,
+) -> Result<Value, HiveError> {
     let mut counts = HashMap::new();
     for record in &records {
-        *counts.entry((&record.scope, &record.work_id)).or_insert(0) += 1;
+        *counts
+            .entry((record.scope.as_str(), record.work_id.as_str()))
+            .or_insert(0) += 1;
     }
+    let reviews = Reviews::new(task_reviews, &counts)?;
+    let mut source_bodies = HashMap::new();
     let mut excluded = 0;
-    let tasks: Vec<_> = records
-        .iter()
-        .map(|record| {
-            let scope = scopes[record.scope.as_str()];
-            let hold = |reason| {
-                let mut reason_codes = vec![reason];
-                if !matches!(reason, Reason::ExecutionNeedsReconciliation)
-                    && matches!(
-                        record.classification,
-                        Err(Reason::ExecutionNeedsReconciliation)
-                    )
-                {
-                    reason_codes.push(Reason::ExecutionNeedsReconciliation);
-                }
-                Outcome::Held {
-                    reason_codes,
-                    candidate_status: None,
-                    area_id: None,
-                }
-            };
-            let outcome = match scope {
-                ScopeOutcome::Excluded { reason } => {
-                    excluded += 1;
-                    Outcome::Excluded { reason: *reason }
-                }
-                _ if counts[&(&record.scope, &record.work_id)] > 1 => {
-                    hold(Reason::DuplicateLegacyWorkId)
-                }
-                _ if !is_slug(&record.work_id) => hold(Reason::InvalidLegacyState),
-                ScopeOutcome::Held { reason } => hold(*reason),
-                ScopeOutcome::Mapped { area } => match record.classification {
-                    Err(reason) => hold(reason),
-                    Ok(status) => {
-                        // The v1 policies keep dates, acceptance, closure and relations
-                        // in free-form records. A scope mapping cannot verify that evidence.
-                        let mut reasons = vec![Reason::IncompleteHistoricalProvenance];
-                        reasons.push(match status {
-                            CandidateStatus::Done => Reason::UnresolvedCompletionObligation,
-                            _ => Reason::UnresolvedTaskRelations,
-                        });
-                        if matches!(status, CandidateStatus::Todo) {
-                            reasons.push(Reason::UnverifiedAcceptanceCriteria);
-                        }
-                        Outcome::Held {
-                            reason_codes: reasons,
-                            candidate_status: Some(status),
-                            area_id: Some(&area.id),
-                        }
-                    }
-                },
-            };
-            let mut task = json!({
-                "lifecycle": record.lifecycle,
-                "source_git_blob_sha": record.blob_oid,
-                "source_raw_sha256": record.raw_sha256,
-                "outcome": outcome,
-            });
-            if is_portable_scope(&record.scope) && is_slug(&record.work_id) {
-                task["legacy_key"] = json!({"scope": record.scope, "work_id": record.work_id});
-                task["source_path"] = json!(record.path);
-            } else {
-                task["source_path_sha256"] = json!(format!("{:x}", Sha256::digest(&record.path)));
+    let mut prepared = 0;
+    let mut tasks = Vec::with_capacity(records.len());
+    for record in &records {
+        let scope = scopes[record.scope.as_str()];
+        let hold = |reason| {
+            let mut reason_codes = vec![reason];
+            if !matches!(reason, Reason::ExecutionNeedsReconciliation)
+                && matches!(
+                    record.classification,
+                    Err(Reason::ExecutionNeedsReconciliation)
+                )
+            {
+                reason_codes.push(Reason::ExecutionNeedsReconciliation);
             }
-            task
-        })
-        .collect();
-    json!({
+            Outcome::Held {
+                reason_codes,
+                candidate_status: None,
+                area_id: None,
+            }
+        };
+        let outcome = match scope {
+            ScopeOutcome::Excluded { reason } => Outcome::Excluded { reason: *reason },
+            _ if counts[&(record.scope.as_str(), record.work_id.as_str())] > 1 => {
+                hold(Reason::DuplicateLegacyWorkId)
+            }
+            _ if !is_slug(&record.work_id) => hold(Reason::InvalidLegacyState),
+            ScopeOutcome::Held { reason } => hold(*reason),
+            ScopeOutcome::Mapped { area } => match record.classification {
+                Err(reason) => hold(reason),
+                Ok(status) => {
+                    record.candidate_outcome(status, &area.id, &reviews, &mut source_bodies, git)?
+                }
+            },
+        };
+        match outcome {
+            Outcome::Prepared { .. } => prepared += 1,
+            Outcome::Excluded { .. } => excluded += 1,
+            Outcome::Held { .. } => {}
+        }
+        tasks.push(record.report(outcome));
+    }
+    Ok(json!({
         "coverage": "partial",
         "counts": {
             "inventoried": tasks.len(),
-            "held": tasks.len() - excluded,
+            "held": tasks.len() - excluded - prepared,
             "excluded": excluded,
+            "prepared": prepared,
         },
         "tasks": tasks,
-    })
+    }))
+}
+
+impl Record {
+    fn candidate_outcome<'a, 'record>(
+        &'record self,
+        status: CandidateStatus,
+        area_id: &'a str,
+        reviews: &Reviews<'_>,
+        source_bodies: &'a mut HashMap<&'record str, SourceBody>,
+        git: &impl Fn() -> Result<Command, HiveError>,
+    ) -> Result<Outcome<'a>, HiveError> {
+        let held = |reason_codes| Outcome::Held {
+            reason_codes,
+            candidate_status: Some(status),
+            area_id: Some(area_id),
+        };
+        let todo = matches!(status, CandidateStatus::Todo);
+        if matches!(status, CandidateStatus::Backlog | CandidateStatus::Todo) {
+            let oid = self.blob_oid.as_deref().expect("classified Task blob");
+            match reviews.get(&self.scope, &self.work_id, oid, area_id) {
+                Ok(Some(review)) => {
+                    let body = match source_bodies.entry(oid) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => {
+                            let bytes = snapshot_object(git, "blob", oid, self.blob_size)?;
+                            entry.insert(SourceBody::from_verified_blob(bytes)?)
+                        }
+                    };
+                    return Ok(match review.prepare(body, todo) {
+                        Ok(provenance) => Outcome::Prepared {
+                            area_id,
+                            candidate_status: status,
+                            provenance,
+                        },
+                        Err(reasons) => held(reasons),
+                    });
+                }
+                Ok(None) => {}
+                Err(reason) => return Ok(held(vec![reason])),
+            }
+        }
+        let mut reasons = vec![Reason::IncompleteHistoricalProvenance];
+        reasons.push(match status {
+            CandidateStatus::Done => Reason::UnresolvedCompletionObligation,
+            _ => Reason::UnresolvedTaskRelations,
+        });
+        if todo {
+            reasons.push(Reason::UnverifiedAcceptanceCriteria);
+        }
+        Ok(held(reasons))
+    }
+
+    fn report(&self, outcome: Outcome<'_>) -> Value {
+        let mut task = json!({
+            "lifecycle": self.lifecycle,
+            "source_git_blob_sha": self.blob_oid,
+            "source_raw_sha256": self.raw_sha256,
+            "outcome": outcome,
+        });
+        if is_portable_scope(&self.scope) && is_slug(&self.work_id) {
+            task["legacy_key"] = json!({"scope": self.scope, "work_id": self.work_id});
+            task["source_path"] = json!(self.path);
+        } else {
+            task["source_path_sha256"] = json!(format!("{:x}", Sha256::digest(&self.path)));
+        }
+        task
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Frontmatter {
-    description: String,
-    title: Option<String>,
+pub(super) struct Frontmatter {
+    pub(super) description: String,
+    pub(super) title: Option<String>,
     #[serde(default, deserialize_with = "present_value")]
     status: Option<Value>,
     #[serde(default, deserialize_with = "present_value")]
     claim: Option<Value>,
     #[serde(default, deserialize_with = "present_value")]
-    priority: Option<Value>,
+    pub(super) priority: Option<Value>,
     #[serde(default, deserialize_with = "present_value")]
-    tags: Option<Vec<String>>,
+    pub(super) tags: Option<Vec<String>>,
 }
 
 fn present_value<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
@@ -233,7 +294,8 @@ fn classify(
     lifecycle: Lifecycle,
     claims_supported: bool,
 ) -> Result<CandidateStatus, Reason> {
-    let (metadata, body) = parse_record(bytes).ok_or(Reason::UnsupportedTaskMetadata)?;
+    let text = std::str::from_utf8(bytes).map_err(|_| Reason::UnsupportedTaskMetadata)?;
+    let (metadata, body) = parse_record(text).ok_or(Reason::UnsupportedTaskMetadata)?;
     let claimed = metadata.claim.is_some();
     if let Some(claim) = metadata.claim {
         let claim: Claim = serde_json::from_value(claim).map_err(|_| Reason::InvalidLegacyState)?;
@@ -279,21 +341,21 @@ fn classify(
             return Err(Reason::UnsupportedTaskMetadata);
         }
     }
-    if !has_title(metadata.title.as_deref(), &metadata.description, body) {
+    if resolve_title(metadata.title.as_deref(), &metadata.description, body).is_none() {
         return Err(Reason::MissingOrConflictingTitle);
     }
     Ok(candidate)
 }
 
-fn parse_record(bytes: &[u8]) -> Option<(Frontmatter, &str)> {
-    let text = std::str::from_utf8(bytes).ok()?;
+pub(super) fn parse_record(text: &str) -> Option<(Frontmatter, &str)> {
     let mut lines = text.split_inclusive('\n');
     let delimiter = |line: &str| matches!(line, "---\n" | "---\r\n" | "---");
     let start = lines.next().filter(|line| delimiter(line))?.len();
     let mut end = start;
     for line in lines {
         if delimiter(line) {
-            let metadata: Frontmatter = parse_v2(&bytes[start..end], "v1 Task frontmatter").ok()?;
+            let metadata: Frontmatter =
+                parse_v2(&text.as_bytes()[start..end], "v1 Task frontmatter").ok()?;
             return (!metadata.description.trim().is_empty())
                 .then_some((metadata, &text[end + line.len()..]));
         }
@@ -305,14 +367,26 @@ fn parse_record(bytes: &[u8]) -> Option<(Frontmatter, &str)> {
     None
 }
 
-fn has_title(title: Option<&str>, description: &str, body: &str) -> bool {
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum TitleSource {
+    FrontmatterTitle,
+    Heading,
+    Description,
+}
+
+pub(super) fn resolve_title<'a>(
+    title: Option<&'a str>,
+    description: &'a str,
+    body: &'a str,
+) -> Option<(&'a str, TitleSource)> {
     let valid = |value: &str| {
         !value.trim().is_empty()
             && value.chars().count() <= 255
             && !value.chars().any(char::is_control)
     };
-    if title.is_some_and(valid) {
-        return true;
+    if let Some(title) = title.filter(|title| valid(title)) {
+        return Some((title, TitleSource::FrontmatterTitle));
     }
     // Recognize a leading ATX H1. Defer other plausible headings until full
     // Markdown parsing can distinguish headings from nested blocks and examples.
@@ -326,7 +400,7 @@ fn has_title(title: Option<&str>, description: &str, body: &str) -> bool {
             h1(line) || (!line.is_empty() && line.bytes().all(|byte| byte == b'='))
         })
     {
-        return false;
+        return None;
     }
     let heading = first.get(1..).filter(|_| h1(first)).map(str::trim);
     let heading = heading.map(|value| {
@@ -337,5 +411,8 @@ fn has_title(title: Option<&str>, description: &str, body: &str) -> bool {
             value
         }
     });
-    heading.is_some_and(valid) || valid(description)
+    heading
+        .filter(|heading| valid(heading))
+        .map(|heading| (heading, TitleSource::Heading))
+        .or_else(|| valid(description).then_some((description, TitleSource::Description)))
 }

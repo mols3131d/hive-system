@@ -1391,7 +1391,7 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
     assert_eq!(
         intake["counts"],
         json!({
-            "inventoried": tasks.len(), "held": tasks.len() - 2, "excluded": 2
+            "inventoried": tasks.len(), "held": tasks.len() - 2, "excluded": 2, "prepared": 0
         })
     );
     let redacted_paths = [invalid_work, &invalid_scope_work, excluded_invalid_work]
@@ -1717,6 +1717,288 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             .unwrap();
         assert_eq!(task["outcome"]["reason_codes"], json!([reason]));
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_prepares_only_exact_reviews_of_independent_tasks() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    init_git(
+        &source,
+        &home,
+        "Synthetic operator",
+        "operator@sample.invalid",
+    );
+    fs::write(
+        source.join("AGENTS.md"),
+        format!("hive-system@{POLICY_PIN}\n"),
+    )
+    .unwrap();
+    fs::write(
+        source.join("hive.yml"),
+        "version: 1\ncoordination:\n  mode: local\n",
+    )
+    .unwrap();
+
+    let created = "2026-01-02T11:20:00.123456+02:00";
+    let updated = "2026-01-02T09:25:00Z";
+    let criteria = "- [ ] Verify synthetic café output.";
+    let heading = "Synthetic fixture heading";
+    let title = "Synthetic frontmatter title";
+    let body = format!(
+        "# {heading} ###\r\n\r\nCreated: {created}\r\nUpdated: {updated}\r\n\r\n## Acceptance\r\n{criteria}\r\n"
+    );
+    let backlog = format!("---\r\ndescription: Synthetic description\r\n---\r\n{body}");
+    let task = |fields: &str, body: &str| {
+        format!("---\ndescription: Synthetic description\n{fields}---\n{body}")
+    };
+    let todo = task(
+        &format!("title: {title}\nstatus: todo\npriority: high\n"),
+        &body,
+    );
+    let archived = task("status: done\n", &body);
+    let claim = task(
+        "status: todo\nclaim: {id: synthetic-id, holder: synthetic-holder}\n",
+        &body,
+    );
+    let review = task("status: review\n", &body);
+    let relations = task(
+        "status: todo\n",
+        &format!("{body}Prerequisite: _general/absent\n"),
+    );
+    let tags = task("status: todo\ntags: [Synthetic]\n", &body);
+    let fixtures = [
+        ("_general/backlog/shared", &backlog),
+        ("_hive-userdata/backlog/shared", &backlog),
+        ("_general/active/independent", &todo),
+        ("_general/active/claimed", &claim),
+        ("_general/active/review", &review),
+        ("_general/archive/terminal", &archived),
+        ("_general/active/unresolved", &relations),
+        ("_general/active/stale", &todo),
+        ("_general/active/wrong-area", &todo),
+        ("_general/active/duplicate-review", &todo),
+        ("_general/active/missing-dates", &todo),
+        ("_general/active/invalid-dates", &todo),
+        ("_general/active/reversed-dates", &todo),
+        ("_general/active/missing-criteria", &todo),
+        ("_general/active/invalid-criteria", &todo),
+        ("_general/active/missing-relations", &todo),
+        ("_general/active/tagged", &tags),
+    ];
+    for (bundle, raw) in fixtures {
+        let path = source.join(format!("tasks/{bundle}/README.md"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, raw).unwrap();
+    }
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic reviewed Task fixtures"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let workspace = id(1);
+    let area = id(AREA_GENERAL);
+    let mapping_file = root.path().join("mapping.json");
+    let range = |value: &str| {
+        let start = body.find(value).unwrap();
+        json!({"start": start, "end": start + value.len()})
+    };
+    let mut task_reviews = Vec::new();
+    for (bundle, _) in fixtures {
+        let (scope, lifecycle_and_id) = bundle.split_once('/').unwrap();
+        let (_, work_id) = lifecycle_and_id.split_once('/').unwrap();
+        if scope != "_general" {
+            continue;
+        }
+        let oid = git_text(
+            &source,
+            &home,
+            &["rev-parse", &format!("HEAD:tasks/{bundle}/README.md")],
+        );
+        let mut decision = json!({
+            "legacy_key": {"scope": scope, "work_id": work_id},
+            "source_git_blob_sha": oid,
+            "area_id": area,
+            "relations": "no_edges",
+            "created_at": range(created),
+            "updated_at": range(updated),
+            "acceptance_criteria": range(criteria),
+        });
+        match work_id {
+            "shared" | "missing-criteria" => {
+                decision
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("acceptance_criteria");
+            }
+            "unresolved" => decision["relations"] = json!("unresolved"),
+            "missing-relations" => decision["relations"] = Value::Null,
+            "stale" => decision["source_git_blob_sha"] = json!("f".repeat(oid.len())),
+            "wrong-area" => decision["area_id"] = json!(id(AREA_USERDATA)),
+            "duplicate-review" => task_reviews.push(decision.clone()),
+            "missing-dates" => decision["created_at"] = Value::Null,
+            "invalid-dates" => decision["updated_at"] = range(heading),
+            "reversed-dates" => {
+                decision["created_at"] = range(updated);
+                decision["updated_at"] = range(created);
+            }
+            "invalid-criteria" => {
+                let start = body.find('é').unwrap() + 1;
+                decision["acceptance_criteria"] = json!({"start": start, "end": start + 2});
+            }
+            _ => {}
+        }
+        task_reviews.push(decision);
+    }
+    let mut mapping = json!({
+        "version": 1,
+        "source_commit": commit,
+        "policy_pin": POLICY_PIN,
+        "workspace_id": workspace,
+        "scopes": [
+            {"scope": "_general", "decision": {"kind": "area", "area": {
+                "id": area, "slug": "general", "name": "General"
+            }}},
+            {"scope": "_hive-userdata", "decision": {"kind": "area", "area": {
+                "id": id(AREA_USERDATA), "slug": "operations", "name": "Operations"
+            }}}
+        ],
+        "task_reviews": task_reviews,
+    });
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+        "--workspace-id",
+        &workspace,
+        "--mapping-file",
+        mapping_file.to_str().unwrap(),
+        "--tasks",
+    ];
+    fs::write(&mapping_file, serde_json::to_vec(&mapping).unwrap()).unwrap();
+    let original_mapping = fs::read(&mapping_file).unwrap();
+    let original_index = fs::read(source.join(".git/index")).unwrap();
+    let plan = |args: &[&str], code| migration_cli(&home, &config, "migration-plan", args, code);
+    let result = plan(&args, 0);
+    assert_eq!(result, plan(&args, 0));
+    assert_eq!(fs::read(&mapping_file).unwrap(), original_mapping);
+    assert_eq!(fs::read(source.join(".git/index")).unwrap(), original_index);
+    assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+    assert!(!config.exists());
+    let intake = &result["data"]["task_intake"];
+    assert_eq!(
+        intake["counts"],
+        json!({
+            "inventoried": fixtures.len(), "held": fixtures.len()-2, "excluded": 0, "prepared": 2
+        })
+    );
+    let row = |scope, work_id| {
+        intake["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["legacy_key"] == json!({"scope": scope, "work_id": work_id}))
+            .unwrap()
+    };
+    for (work_id, raw, status, title, title_source, priority, criteria_evidence) in [
+        (
+            "shared",
+            backlog.as_str(),
+            "backlog",
+            heading,
+            "heading",
+            Value::Null,
+            None,
+        ),
+        (
+            "independent",
+            todo.as_str(),
+            "todo",
+            title,
+            "frontmatter_title",
+            json!(0),
+            Some(criteria),
+        ),
+    ] {
+        let prepared = row("_general", work_id);
+        assert_eq!(prepared["source_raw_sha256"], sha256_hex(raw.as_bytes()));
+        let mut provenance = json!({
+            "relations": "no_edges",
+            "body_sha256": sha256_hex(body.as_bytes()),
+            "title_source": title_source,
+            "title_sha256": sha256_hex(title.as_bytes()),
+            "priority": priority,
+            "created_at": {"value": created, "body_range": range(created)},
+            "updated_at": {"value": updated, "body_range": range(updated)},
+        });
+        if let Some(criteria) = criteria_evidence {
+            provenance["acceptance_criteria"] = json!({
+                "body_range": range(criteria), "sha256": sha256_hex(criteria.as_bytes()),
+            });
+        }
+        assert_eq!(
+            prepared["outcome"],
+            json!({
+                "status": "prepared", "candidate_status": status, "area_id": area,
+                "provenance": provenance,
+            })
+        );
+    }
+    let qualified_hold = row("_hive-userdata", "shared");
+    assert_eq!(
+        qualified_hold["source_git_blob_sha"],
+        row("_general", "shared")["source_git_blob_sha"]
+    );
+    assert_eq!(qualified_hold["outcome"]["status"], "held");
+    for (work_id, reasons) in [
+        ("claimed", vec!["execution_needs_reconciliation"]),
+        ("review", vec!["missing_typed_submission_evidence"]),
+        (
+            "terminal",
+            vec![
+                "incomplete_historical_provenance",
+                "unresolved_completion_obligation",
+            ],
+        ),
+        ("unresolved", vec!["unresolved_task_relations"]),
+        ("missing-relations", vec!["unresolved_task_relations"]),
+        ("stale", vec!["task_review_binding_mismatch"]),
+        ("wrong-area", vec!["task_review_binding_mismatch"]),
+        ("duplicate-review", vec!["conflicting_task_review"]),
+        ("missing-dates", vec!["incomplete_historical_provenance"]),
+        ("invalid-dates", vec!["incomplete_historical_provenance"]),
+        ("reversed-dates", vec!["incomplete_historical_provenance"]),
+        ("missing-criteria", vec!["unverified_acceptance_criteria"]),
+        ("invalid-criteria", vec!["unverified_acceptance_criteria"]),
+        ("tagged", vec!["unverified_task_labels"]),
+    ] {
+        let outcome = &row("_general", work_id)["outcome"];
+        assert_eq!(outcome["status"], "held", "{work_id}");
+        assert_eq!(outcome["reason_codes"], json!(reasons), "{work_id}");
+    }
+    let output = result.to_string();
+    for private in [
+        title,
+        heading,
+        criteria,
+        "synthetic-holder",
+        "Prerequisite:",
+        "issue_number",
+    ] {
+        assert!(!output.contains(private), "report exposed {private}");
+    }
+
+    mapping["task_reviews"][0]["legacy_key"]["work_id"] = json!("nonexistent");
+    fs::write(&mapping_file, serde_json::to_vec(&mapping).unwrap()).unwrap();
+    assert_eq!(plan(&args, 2)["error"]["code"], "INVALID_CONFIG");
 }
 
 #[cfg(target_os = "linux")]

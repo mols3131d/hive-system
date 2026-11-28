@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
+use super::task_provenance::TaskReview;
 use super::{AssetObjectReader, Inventory, Reason, snapshot_object, task_intake, verified_source};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
@@ -20,6 +21,8 @@ struct Mapping {
     policy_pin: String,
     workspace_id: String,
     scopes: Vec<ScopeMapping>,
+    #[serde(default)]
+    task_reviews: Vec<TaskReview>,
 }
 
 #[derive(Deserialize)]
@@ -155,7 +158,10 @@ pub(crate) fn plan(
             let claims_supported = !source.hive_yml.is_null();
             let records =
                 task_intake::read_records(inventory, &|| reader.command(), claims_supported)?;
-            report["task_intake"] = task_intake::report(records, &outcomes);
+            report["task_intake"] =
+                task_intake::report(records, &outcomes, &mapping.task_reviews, &|| {
+                    reader.command()
+                })?;
         }
         Ok(report)
     })
