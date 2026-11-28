@@ -580,7 +580,7 @@ impl Record {
                     match review.prepare(body, status, check_labels_at_staging) {
                         Ok(provenance) => Outcome::Prepared {
                             area_id,
-                            candidate_status: status,
+                            candidate_status: provenance.target_status(status),
                             provenance: Box::new(provenance),
                         },
                         Err(reasons) => held(reasons),
