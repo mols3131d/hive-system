@@ -1337,7 +1337,6 @@ fn installed_cli_stages_only_reviewed_scopes_and_preserves_both_contracts() {
     let v1_config_bytes = format!("workspace: {}\n", source.display());
     let v2_config_bytes = format!("version: 2\nworkspace: {}\n", target.display());
     fs::write(&v1_config, &v1_config_bytes).unwrap();
-    fs::write(&v2_config, &v2_config_bytes).unwrap();
     let installed = std::env::var_os("HIVE_STAGING_INSTALLED_BIN").unwrap();
     let cli = |contract: &str| {
         let mut command = Command::new(&installed);
@@ -1379,7 +1378,7 @@ fn installed_cli_stages_only_reviewed_scopes_and_preserves_both_contracts() {
             {"scope": "external-team", "decision": {"kind": "external"}},
         ],
     });
-    let stage_command = |mode: &str, policy: &str| {
+    let stage_command = |mode: &str, policy: &str, destination: &Path| {
         let mut command = cli("2");
         command
             .args([
@@ -1401,12 +1400,103 @@ fn installed_cli_stages_only_reviewed_scopes_and_preserves_both_contracts() {
             ])
             .arg(&mapping_file)
             .arg("--target")
-            .arg(&target);
+            .arg(destination);
         command
     };
+
+    let fallback_data = root.join("fallback-data");
+    let default_workspace = fallback_data.join("hive/v2/userdata");
+    fs::create_dir_all(&default_workspace).unwrap();
+    fs::write(
+        default_workspace.join("hive-workspace.yml"),
+        format!(
+            "version: 2\nworkspace_id: {}\nschema_version: 1\npolicy_revision: {V2_POLICY}\n",
+            id(40)
+        ),
+    )
+    .unwrap();
+    let fallback = || {
+        response(
+            cli("2").env("XDG_DATA_HOME", &fallback_data).args([
+                "config",
+                "show",
+                "--scope",
+                "workspace",
+            ]),
+            0,
+        )
+    };
+    let before_fallback = fallback();
+    assert_eq!(
+        before_fallback["data"]["sources"]["workspace"],
+        "xdg-default"
+    );
+    fs::write(&mapping_file, serde_json::to_vec(&mapping).unwrap()).unwrap();
+    let refuse_reserved = |command: &mut Command, destination: &Path| {
+        let report = response(command, 2);
+        assert_eq!(report["error"]["code"], "INVALID_ARGUMENT");
+        assert!(
+            report["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reserved")
+        );
+        assert!(!report.to_string().contains(root.to_str().unwrap()));
+        assert!(
+            fs::symlink_metadata(destination)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        );
+    };
+    let spelled_config = config.join("hive//v2/./config.yml/");
+    refuse_reserved(
+        stage_command("staged-import", V2_POLICY, &spelled_config)
+            .env("XDG_DATA_HOME", &fallback_data),
+        &v2_config,
+    );
+    let alias = root.join("config-alias");
+    std::os::unix::fs::symlink(&config, &alias).unwrap();
+    refuse_reserved(
+        stage_command("staged-import", V2_POLICY, &v2_config).env("XDG_CONFIG_HOME", alias),
+        &v2_config,
+    );
+    let bindings = config.join("hive/v2/bindings.yml");
+    refuse_reserved(
+        &mut stage_command("dry-run", V2_POLICY, &bindings),
+        &bindings,
+    );
+    fs::create_dir_all(home.join(".config/hive/v2")).unwrap();
+    for relative_path in [".config/hive/config.yml", ".config/hive/v2/config.yml"] {
+        let reserved = home.join(relative_path);
+        refuse_reserved(
+            stage_command("staged-import", V2_POLICY, &reserved)
+                .env("XDG_CONFIG_HOME", "relative-config"),
+            &reserved,
+        );
+    }
+    let discovery = root.join("discovery-data");
+    let absent_default = discovery.join("hive/v2/userdata");
+    fs::create_dir_all(absent_default.parent().unwrap()).unwrap();
+    refuse_reserved(
+        stage_command("staged-import", V2_POLICY, &absent_default).env("XDG_DATA_HOME", discovery),
+        &absent_default,
+    );
+    let isolated_state = root.join("isolated-state");
+    let reserved_state = isolated_state
+        .join("hive/v2/workspaces")
+        .join(&workspace_id);
+    fs::create_dir_all(reserved_state.parent().unwrap()).unwrap();
+    refuse_reserved(
+        stage_command("staged-import", V2_POLICY, &reserved_state)
+            .env("XDG_STATE_HOME", isolated_state),
+        &reserved_state,
+    );
+    assert_eq!(fallback(), before_fallback);
+    assert_eq!(v1(), before);
+    fs::write(&v2_config, &v2_config_bytes).unwrap();
+
     let stage = |mode: &str, policy: &str, input: &Value, status| {
         fs::write(&mapping_file, serde_json::to_vec(input).unwrap()).unwrap();
-        let report = response(&mut stage_command(mode, policy), status);
+        let report = response(&mut stage_command(mode, policy, &target), status);
         assert_eq!(report["command"], "workspace migration-stage");
         assert_eq!(report["ok"], status == 0);
         for private in [
@@ -1427,6 +1517,47 @@ fn installed_cli_stages_only_reviewed_scopes_and_preserves_both_contracts() {
         assert_eq!(error["code"], code);
         error
     };
+    for (pointer, positional) in [
+        (
+            "",
+            json!([1, commit, POLICY_PIN, workspace_id, mapping["scopes"]]),
+        ),
+        (
+            "/scopes/0",
+            json!(["_hive-userdata", mapping["scopes"][0]["decision"]]),
+        ),
+        (
+            "/scopes/1/decision/area",
+            json!([app, "application", NAME, general]),
+        ),
+        (
+            "/scopes/1/decision/project_evidence/0",
+            json!([app_sources[0], REFERENCE]),
+        ),
+    ] {
+        let mut input = mapping.clone();
+        *input.pointer_mut(pointer).unwrap() = positional;
+        for mode in ["dry-run", "staged-import"] {
+            let rejected = stage(mode, V2_POLICY, &input, 2);
+            assert_eq!(rejected["error"]["code"], "INVALID_CONFIG");
+            assert_eq!(
+                rejected["error"]["message"],
+                "The scope mapping must match the versioned JSON format."
+            );
+            assert!(rejected.get("data").is_none());
+            assert!(!target.exists());
+        }
+    }
+    verify_source();
+    assert_eq!(
+        sources.map(|name| fs::read(source.join(name)).unwrap()),
+        source_bytes
+    );
+    assert_eq!(fs::read_to_string(&v1_config).unwrap(), v1_config_bytes);
+    assert_eq!(fs::read_to_string(&v2_config).unwrap(), v2_config_bytes);
+    assert!(!state.exists());
+    assert!(!data.exists());
+
     reject(POLICY_PIN, &mapping, 4, "INCOMPATIBLE_POLICY");
     for (field, wrong) in [
         ("workspace_id", id(2)),
@@ -1523,7 +1654,7 @@ fn installed_cli_stages_only_reviewed_scopes_and_preserves_both_contracts() {
         std::env::join_paths(std::iter::once(hooks).chain(std::env::split_paths(&search_path)))
             .unwrap();
     let late_drift = response(
-        stage_command("staged-import", V2_POLICY).env("PATH", injected_path),
+        stage_command("staged-import", V2_POLICY, &target).env("PATH", injected_path),
         5,
     );
     assert_eq!(late_drift["error"]["code"], "DIRTY_CONFLICT");
@@ -1619,6 +1750,124 @@ fn installed_cli_stages_only_reviewed_scopes_and_preserves_both_contracts() {
             .to_string_lossy()
             .starts_with(".hive-init-incomplete-")
     }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_requires_named_json_objects_on_both_policy_pins() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    init_git(
+        &source,
+        &home,
+        "Synthetic Fixture",
+        "synthetic@example.invalid",
+    );
+    let mapping_file = root.path().join("mapping.json");
+    let workspace = id(1);
+    let area_id = id(AREA_APP);
+    let path = "tasks/synth-app/README.md";
+    let reference = "https://forge.example/synthetic/app";
+    fs::create_dir_all(source.join(path).parent().unwrap()).unwrap();
+    fs::write(
+        source.join(path),
+        format!("# Synthetic App\n\nProject: {reference}\n"),
+    )
+    .unwrap();
+
+    for pin in ["0fd0f8dbe632d14094a93599cb1b5f653789ac9c", POLICY_PIN] {
+        fs::write(source.join("AGENTS.md"), format!("hive-system@{pin}\n")).unwrap();
+        if pin == POLICY_PIN {
+            fs::write(
+                source.join("hive.yml"),
+                "version: 1\ncoordination:\n  mode: local\n",
+            )
+            .unwrap();
+        }
+        git(&source, &home, &["add", "."]);
+        git(&source, &home, &["commit", "-qm", "Synthetic policy pin"]);
+        let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+        let args = [
+            "--source",
+            source.to_str().unwrap(),
+            "--source-commit",
+            &commit,
+            "--workspace-id",
+            &workspace,
+            "--mapping-file",
+            mapping_file.to_str().unwrap(),
+        ];
+        let plan = |input: &str, status| {
+            fs::write(&mapping_file, input).unwrap();
+            migration_cli(&home, &config, "migration-plan", &args, status)
+        };
+
+        let evidence = json!({"path": path, "canonical_ref": reference});
+        let area = json!({"id": area_id, "slug": "application", "name": "Synthetic App", "parent_id": null});
+        let decision = json!({"kind": "area", "area": area, "project_evidence": [evidence]});
+        let entry = json!({"scope": "synth-app", "decision": decision});
+        let mapping = json!({
+            "version": 1,
+            "source_commit": commit,
+            "policy_pin": pin,
+            "workspace_id": workspace,
+            "scopes": [entry],
+        });
+        let named = mapping.to_string();
+        let report = plan(&named, 0);
+        assert_eq!(report["data"]["source"]["policy_pin"], pin);
+        assert_eq!(
+            report["data"]["scopes"][0]["outcome"],
+            json!({
+                "status": "mapped",
+                "area": {"id": area_id, "slug": "application", "parent_id": null},
+            })
+        );
+
+        let reject = |input: &str| {
+            let report = plan(input, 2);
+            assert_eq!(report["error"]["code"], "INVALID_CONFIG");
+            assert_eq!(
+                report["error"]["message"],
+                "The scope mapping must match the versioned JSON format."
+            );
+            assert!(report.get("data").is_none());
+        };
+        for (pointer, positional) in [
+            ("", json!([1, commit, pin, workspace, [entry]])),
+            ("/scopes/0", json!(["synth-app", decision])),
+            ("/scopes/0/decision", json!(["area", area, [evidence]])),
+            (
+                "/scopes/0/decision/area",
+                json!([area_id, "application", "Synthetic App", null]),
+            ),
+            (
+                "/scopes/0/decision/project_evidence/0",
+                json!([path, reference]),
+            ),
+            ("/scopes", entry),
+            ("/scopes/0/decision/project_evidence", evidence),
+        ] {
+            let mut changed = mapping.clone();
+            *changed.pointer_mut(pointer).unwrap() = positional;
+            reject(&changed.to_string());
+        }
+        for member in [
+            r#""version":1"#,
+            r#""scope":"synth-app""#,
+            r#""kind":"area""#,
+            r#""parent_id":null"#,
+            r#""canonical_ref":"https://forge.example/synthetic/app""#,
+        ] {
+            reject(&named.replacen(member, &format!("{member},{member}"), 1));
+            reject(&named.replacen(member, &format!(r#"{member},"unexpected":true"#), 1));
+        }
+        reject(&format!("{named}\n{{}}"));
+    }
+    assert!(!config.exists());
 }
 
 #[cfg(target_os = "linux")]

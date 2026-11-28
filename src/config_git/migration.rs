@@ -15,6 +15,7 @@ use crate::config_file::{Coordination, ScopedDirectory};
 
 mod directive_artifact_intake;
 mod directive_history;
+mod json_object;
 pub(crate) mod prepared_records;
 mod queen_assets;
 mod queen_preparation;

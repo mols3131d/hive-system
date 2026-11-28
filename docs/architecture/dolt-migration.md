@@ -159,7 +159,7 @@ hive --contract 2 --json workspace migration-plan \
   --workspace-id "$workspace_id" --mapping-file "$mapping_file"
 ```
 
-The command repeats source preflight and plans directly from its verified inventory. The mapping is a regular UTF-8 JSON file of up to 64 KiB. Version 1 requires the fields shown below, with the exact selected Git commit, the policy pin found in the committed source, and the explicitly selected lowercase workspace UUID. Unknown fields, repeated JSON members, unsupported versions, mismatched bindings, and mapping keys absent from the verified scope inventory are errors.
+The command repeats source preflight and plans directly from its verified inventory. The mapping is a regular UTF-8 JSON file of up to 64 KiB. Version 1 requires the fields shown below, with the exact selected Git commit, the policy pin found in the committed source, and the explicitly selected lowercase workspace UUID. Use named JSON objects for the mapping, each scope and decision, each Area, and each project evidence entry. Positional arrays in place of these objects, unknown fields, repeated JSON members, unsupported versions, mismatched bindings, and mapping keys absent from the verified scope inventory are errors.
 
 ```json
 {
@@ -390,7 +390,7 @@ The private preparation result retains the exact committed Soul bytes and the re
 
 #### Disposable migration staging
 
-On Linux, use the installed CLI with the workspace initialization policy revision and the reviewed mapping. The target must be an absent absolute path under an existing local parent, separate from the source. The command refuses an occupied path or a path registered as the active root for the selected workspace ID.
+On Linux, use the installed CLI with the workspace initialization policy revision and the reviewed mapping. The target must be an absent absolute path under an existing local parent, separate from the source. The command refuses occupied paths, the active root for the selected workspace ID, the resolved v1 and v2 user configuration and v2 bindings paths, the v2 XDG default workspace path, and overlaps with the v2 runtime state directory.
 
 ```sh
 hive --contract 2 --json workspace migration-stage \

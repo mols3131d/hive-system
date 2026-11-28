@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use url::{Host, Url};
 
+use super::json_object::{self, Object};
 use super::prepared_records::Intake;
 use super::queen_assets::{self, QueenAssets, SoulReview};
 use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
@@ -33,6 +34,7 @@ struct Mapping {
     source_commit: String,
     policy_pin: String,
     workspace_id: String,
+    #[serde(deserialize_with = "json_object::deserialize_vec")]
     scopes: Vec<ScopeMapping>,
     #[serde(default)]
     task_reviews: Vec<TaskReview>,
@@ -49,6 +51,7 @@ struct Mapping {
 #[serde(deny_unknown_fields)]
 struct ScopeMapping {
     scope: String,
+    #[serde(deserialize_with = "json_object::deserialize")]
     decision: Decision,
 }
 
@@ -56,8 +59,9 @@ struct ScopeMapping {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Decision {
     Area {
+        #[serde(deserialize_with = "json_object::deserialize")]
         area: Area,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "json_object::deserialize_vec")]
         project_evidence: Vec<ProjectEvidence>,
     },
     External {},
@@ -352,7 +356,7 @@ pub(crate) fn with_scope_mapping<T>(
     let input = read_regular(mapping_file)
         .map_err(|error| HiveError::new(error.code, "Could not read the scope mapping file."))?
         .ok_or_else(|| invalid("The scope mapping file is missing."))?;
-    let mapping: Mapping = serde_json::from_slice(&input)
+    let Object(mapping) = serde_json::from_slice::<Object<Mapping>>(&input)
         .map_err(|_| invalid("The scope mapping must match the versioned JSON format."))?;
     if mapping.version != 1 {
         return Err(invalid("The scope mapping version is unsupported."));
