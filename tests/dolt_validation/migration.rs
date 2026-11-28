@@ -2751,6 +2751,11 @@ fn cli_migration_plan_checks_task_review_boundaries_under_both_policy_pins() {
             ("setext", "Setext H1\n===\n"),
             ("indented-h1", "  # Indented H1\n"),
             ("later-h1", "Prose first\n\n# Later H1\n"),
+            ("nbsp-paragraph", "\u{00a0}\n\n# Later H1\n"),
+            (
+                "reference-before-h1",
+                "[ref]: https://example.invalid\n\n# Later H1\n",
+            ),
             ("additional-nested-h1", "# Leading H1\n\n> # Nested H1\n"),
         ]
         .map(|(id, opening)| (id, "", opening, created, updated, "A", Err(titles))),
@@ -2768,6 +2773,24 @@ fn cli_migration_plan_checks_task_review_boundaries_under_both_policy_pins() {
                 "",
                 "\n# Leading H1 ###\n\n~~~\n# Fenced example\n~~~\n",
                 Ok(("heading", "Leading H1")),
+            ),
+            (
+                "leading-h1-cr",
+                "",
+                "# Exact first title\rFollowing text\r",
+                Ok(("heading", "Exact first title")),
+            ),
+            (
+                "leading-h1-blank-cr",
+                "",
+                "\r# Exact first title ###\rFollowing text\r",
+                Ok(("heading", "Exact first title")),
+            ),
+            (
+                "leading-h1-crlf",
+                "",
+                "\r\n# Exact first title ###\r\nFollowing text\r\n",
+                Ok(("heading", "Exact first title")),
             ),
             (
                 "fenced-h1",
