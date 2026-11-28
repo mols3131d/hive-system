@@ -998,8 +998,40 @@ pub(crate) enum WorkspaceAction {
         #[arg(long)]
         include_directives_artifacts: bool,
     },
+    /// Rehearse or stage an inactive v1 scope-only migration.
+    MigrationStage(MigrationStageArgs),
     #[command(flatten)]
     Runtime(WorkspaceCommand),
+}
+
+#[derive(Args)]
+pub(crate) struct MigrationStageArgs {
+    /// Absolute path to a standalone v1 Git worktree.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) source: PathBuf,
+    /// Full lowercase Git commit ID matching the source HEAD.
+    #[arg(long, value_name = "OID")]
+    pub(crate) source_commit: String,
+    /// Intended inactive v2 workspace identity.
+    #[arg(long, value_name = "UUID")]
+    pub(crate) workspace_id: String,
+    /// Reviewed versioned scope mapping JSON file.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) mapping_file: PathBuf,
+    /// Absolute, absent target under an existing local parent.
+    #[arg(long, value_name = "NEW_DIR")]
+    pub(crate) target: PathBuf,
+    /// Reviewed v2 policy commit used by workspace initialization.
+    #[arg(long, value_name = "OID")]
+    pub(crate) policy_revision: String,
+    #[arg(long, value_enum)]
+    pub(crate) mode: MigrationStageMode,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum MigrationStageMode {
+    DryRun,
+    StagedImport,
 }
 
 #[derive(Subcommand)]
@@ -3570,6 +3602,14 @@ impl Command {
                     Err(
                         "Migration plan accepts only --source, --source-commit, --workspace-id, --mapping-file, --tasks, --include-directives-artifacts, and output selection.",
                     )
+                }
+                Self::Workspace(WorkspaceAction::MigrationStage(_))
+                    if common.workspace.is_some()
+                        || common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree) =>
+                {
+                    Err("Migration staging requires explicit migration inputs and working view.")
                 }
                 Self::Backup(BackupCommand::Create { .. }) => {
                     if common.workspace.is_none()
