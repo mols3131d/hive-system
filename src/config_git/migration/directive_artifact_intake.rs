@@ -10,9 +10,9 @@ use time::OffsetDateTime;
 
 use super::directive_history::{LinkDecision, ReviewedDirective, resolve_links};
 use super::prepared_records::{Content, Fields, Intake, PreparedRecord};
-use super::reviewed_records::{self, Review};
+use super::reviewed_records::{self, Review, TitleProblem, valid_title};
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
-use super::work_artifact::TaskContext;
+use super::standalone_artifact::JoinContext;
 use super::{AssetObjectReader, Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, parse_v2, present};
@@ -45,7 +45,7 @@ pub(super) enum ArtifactStatus {
     Closed,
 }
 
-#[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ArtifactKind {
     Report,
@@ -56,6 +56,15 @@ pub(crate) enum ArtifactKind {
     Checkpoint,
     WorkNote,
     Manifest,
+    Design,
+    Decision,
+    Evidence,
+}
+
+impl ArtifactKind {
+    fn is_v1(self) -> bool {
+        !matches!(self, Self::Design | Self::Decision | Self::Evidence)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -119,11 +128,11 @@ impl Outcome {
     fn with_review(
         self,
         review: &Review,
-        record: &InspectedRecord,
+        selected: SelectedContent<'_>,
         supported_shape: bool,
         observed_at: Option<OffsetDateTime>,
         parent: Option<&str>,
-        tasks: &TaskContext<'_>,
+        ctx: &JoinContext<'_>,
     ) -> Self {
         let Self::Held {
             candidate: Some(candidate),
@@ -133,14 +142,19 @@ impl Outcome {
             return self;
         };
         let provenance = if review.is_work_scoped() {
-            match (supported_shape, parent, &record.content) {
-                (true, Some(parent), Some(content)) => {
-                    review.prepare_work_scoped(&candidate, &content.body, parent, tasks)
+            match (supported_shape, parent, selected.record.body.as_deref()) {
+                (true, Some(parent), Some(body)) => {
+                    review.prepare_work_scoped(&candidate, body, parent, &ctx.tasks)
                 }
                 _ => Err(Reason::UnsupportedReviewedRecord),
             }
         } else if supported_shape && parent.is_none() {
-            review.prepare(&candidate, observed_at)
+            review.prepare(
+                &candidate,
+                observed_at,
+                ctx,
+                selected.record.body.as_deref(),
+            )
         } else {
             Err(Reason::UnsupportedReviewedRecord)
         };
@@ -148,8 +162,8 @@ impl Outcome {
             Ok(provenance) => Self::Prepared {
                 candidate,
                 target_id: review.target_id.clone(),
-                target_title_sha256: record.title_sha256.clone(),
-                target_body_sha256: record.body_sha256.clone(),
+                target_title_sha256: reviewed_records::sha256(selected.title),
+                target_body_sha256: selected.record.body_sha256.clone(),
                 provenance: Box::new(provenance),
             },
             Err(reason) => {
@@ -215,9 +229,23 @@ struct Inspection {
 
 struct InspectedRecord {
     metadata: Metadata,
-    title_sha256: String,
+    title: Result<String, TitleProblem>,
     body_sha256: String,
-    content: Option<Rc<Content>>,
+    body: Option<Rc<str>>,
+}
+
+struct SelectedContent<'a> {
+    record: &'a InspectedRecord,
+    title: &'a str,
+}
+
+impl SelectedContent<'_> {
+    fn for_storage(&self) -> Option<Content> {
+        Some(Content {
+            title: self.title.to_owned(),
+            body: self.record.body.clone()?,
+        })
+    }
 }
 
 pub(super) fn scan(
@@ -227,7 +255,7 @@ pub(super) fn scan(
     reviews: Option<&[Review]>,
     observed_at: Option<OffsetDateTime>,
     prepare_storage: bool,
-    tasks: &TaskContext<'_>,
+    ctx: &JoinContext<'_>,
 ) -> Result<Intake, HiveError> {
     let mut reviewed = reviewed_records::bind(reviews.unwrap_or_default(), inventory)?;
     let mut counts = BTreeMap::from([
@@ -306,18 +334,20 @@ pub(super) fn scan(
                     Outcome::held(Reason::RecordMarkdownTooLarge)
                 } else {
                     let directive = surface == Surface::Directives;
-                    let capture = review.is_some_and(|review| {
-                        prepare_storage || (parent.is_some() && review.is_work_scoped())
-                    });
-                    let inspection = match inspected.entry((entry.oid.as_str(), directive, capture))
-                    {
+                    let direct_markdown = tail.strip_suffix(".md").is_some_and(is_slug);
+                    let reviewed_kind = review
+                        .filter(|_| !directive && direct_markdown)
+                        .and_then(|review| review.artifact_kind(parent.is_some()));
+                    let capture = review.is_some() && (prepare_storage || reviewed_kind.is_some());
+                    let key = (entry.oid.as_str(), directive, capture, reviewed_kind);
+                    let inspection = match inspected.entry(key) {
                         Entry::Occupied(cached) => cached.into_mut(),
                         Entry::Vacant(cache) => {
                             let bytes =
                                 snapshot_object(&|| reader.command(), "blob", &entry.oid, size)?;
                             cache.insert(Inspection {
                                 raw_sha256: format!("{:x}", Sha256::digest(&bytes)),
-                                record: inspect(&bytes, directive, capture),
+                                record: inspect(&bytes, directive, capture, reviewed_kind),
                             })
                         }
                     };
@@ -325,25 +355,39 @@ pub(super) fn scan(
                     match &inspection.record {
                         Err(reason) => Outcome::held(*reason),
                         Ok(record) => {
-                            content = record.content.clone();
-                            let outcome = candidate(
-                                record.metadata,
-                                mapped.copied(),
-                                parent.map(|(path, _)| path),
-                                inventory,
-                            );
-                            match review {
-                                Some(review) => outcome.with_review(
-                                    review,
-                                    record,
-                                    (surface == Surface::Directives
-                                        && review.directive_edges().is_some())
-                                        || tail.strip_suffix(".md").is_some_and(is_slug),
-                                    observed_at,
+                            let source_title = record.title.as_deref();
+                            let title = match review {
+                                Some(review) => review.selected_title(source_title),
+                                None => source_title.ok(),
+                            };
+                            if let Some(title) = title {
+                                let outcome = candidate(
+                                    record.metadata,
+                                    mapped.copied(),
                                     parent.map(|(path, _)| path),
-                                    tasks,
-                                ),
-                                None => outcome,
+                                    inventory,
+                                );
+                                match review {
+                                    Some(review) => {
+                                        let selected = SelectedContent { record, title };
+                                        if prepare_storage {
+                                            content = selected.for_storage();
+                                        }
+                                        outcome.with_review(
+                                            review,
+                                            selected,
+                                            (surface == Surface::Directives
+                                                && review.directive_edges().is_some())
+                                                || direct_markdown,
+                                            observed_at,
+                                            parent.map(|(path, _)| path),
+                                            ctx,
+                                        )
+                                    }
+                                    None => outcome,
+                                }
+                            } else {
+                                Outcome::held(Reason::MissingOrConflictingTitle)
                             }
                         }
                     }
@@ -595,7 +639,12 @@ fn scalar_label<T: DeserializeOwned>(value: Value) -> Option<T> {
     }
 }
 
-fn inspect(bytes: &[u8], directive: bool, capture: bool) -> Result<InspectedRecord, Reason> {
+fn inspect(
+    bytes: &[u8],
+    directive: bool,
+    capture: bool,
+    reviewed_kind: Option<ArtifactKind>,
+) -> Result<InspectedRecord, Reason> {
     let invalid = if directive {
         Reason::UnsupportedDirectiveMetadata
     } else {
@@ -641,10 +690,11 @@ fn inspect(bytes: &[u8], directive: bool, capture: bool) -> Result<InspectedReco
             .ok_or(Reason::InvalidDirectiveStatus)?;
         Metadata::Directive(status)
     } else {
-        let kind = fields
-            .kind
-            .and_then(scalar_label)
-            .ok_or(Reason::UnclassifiedArtifactKind)?;
+        let kind = match fields.kind {
+            Some(value) => scalar_label::<ArtifactKind>(value).filter(|kind| kind.is_v1()),
+            None => reviewed_kind,
+        }
+        .ok_or(Reason::UnclassifiedArtifactKind)?;
         let legacy_status = fields
             .status
             .map(|value| scalar_label(value).ok_or(Reason::InvalidArtifactStatus))
@@ -654,18 +704,12 @@ fn inspect(bytes: &[u8], directive: bool, capture: bool) -> Result<InspectedReco
             legacy_status,
         }
     };
-    let title = select_title(fields.title.as_deref(), &fields.description, body)
-        .ok_or(Reason::MissingOrConflictingTitle)?;
     Ok(InspectedRecord {
         metadata,
-        title_sha256: format!("{:x}", Sha256::digest(title.as_bytes())),
+        title: select_title(fields.title.as_deref(), &fields.description, body)
+            .map(Cow::into_owned),
         body_sha256: format!("{:x}", Sha256::digest(body)),
-        content: capture.then(|| {
-            Rc::new(Content {
-                title: title.into_owned(),
-                body: body.to_owned(),
-            })
-        }),
+        body: capture.then(|| Rc::from(body)),
     })
 }
 
@@ -690,14 +734,9 @@ fn select_title<'a>(
     title: Option<&'a str>,
     description: &'a str,
     body: &str,
-) -> Option<Cow<'a, str>> {
-    let valid = |value: &str| {
-        !value.trim().is_empty()
-            && value.chars().count() <= 255
-            && !value.chars().any(char::is_control)
-    };
-    if let Some(title) = title.filter(|value| valid(value)) {
-        return Some(Cow::Borrowed(title));
+) -> Result<Cow<'a, str>, TitleProblem> {
+    if let Some(title) = title.filter(|value| valid_title(value)) {
+        return Ok(Cow::Borrowed(title));
     }
     let mut depth = 0;
     let mut heading = None;
@@ -726,7 +765,7 @@ fn select_title<'a>(
                     let text = text.trim();
                     match first_heading.as_deref() {
                         None => first_heading = Some(text.to_owned()),
-                        Some(first) if first != text => return None,
+                        Some(first) if first != text => return Err(TitleProblem::Conflicting),
                         Some(_) => {}
                     }
                 }
@@ -745,7 +784,12 @@ fn select_title<'a>(
         }
     }
     first_heading
-        .filter(|text| valid(text))
+        .filter(|text| valid_title(text))
         .map(Cow::Owned)
-        .or_else(|| valid(description).then_some(Cow::Borrowed(description)))
+        .or_else(|| valid_title(description).then_some(Cow::Borrowed(description)))
+        .ok_or(if title.is_some() {
+            TitleProblem::Conflicting
+        } else {
+            TitleProblem::Unavailable
+        })
 }

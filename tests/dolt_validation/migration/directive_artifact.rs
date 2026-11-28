@@ -6,6 +6,9 @@ use super::{
 #[path = "directive_history.rs"]
 mod directive_history;
 
+#[path = "standalone_artifact_joins.rs"]
+mod standalone_artifact_joins;
+
 #[path = "work_artifact.rs"]
 mod work_artifact;
 
@@ -21,6 +24,8 @@ fn cli_migration_plan_prepares_only_exact_reviewed_records_under_both_pins() {
     const REFERENCE: &str = "https://forge.example/synthetic/review/123";
     const CREATED: &str = "2024-02-29T12:00:00Z";
     const UPDATED: &str = "2024-03-01T12:00:00.000001Z";
+    const ARCHIVED_AT: &str = "2024-03-02T12:00:00Z";
+    const ARCHIVE_REASON: &str = "Reviewed synthetic archive reason";
     const ISSUER: &str = "human:synthetic-issuer";
     const AUTHOR: &str = "bot:synthetic-author";
 
@@ -56,7 +61,10 @@ fn cli_migration_plan_prepares_only_exact_reviewed_records_under_both_pins() {
             "---\ndescription: Synthetic evidence\ntitle: Reviewed synthetic artifact\nkind: review\nstatus: closed\n---\n{artifact_body}"
         );
         let active = proposal.replace("status: proposed", "status: active");
-        let unclassified = artifact.replace("kind: review\n", "");
+        let unclassified_body = format!("{artifact_body}\n{ARCHIVED_AT}\n{ARCHIVE_REASON}");
+        let unclassified = artifact
+            .replace("kind: review\n", "")
+            .replace(artifact_body, &unclassified_body);
         let files = [
             (PROPOSAL, &proposal),
             (REPORT, &artifact),
@@ -301,10 +309,28 @@ fn cli_migration_plan_prepares_only_exact_reviewed_records_under_both_pins() {
         }
         changed["reviewed_records"][1]["source_path"] = json!(UNCLASSIFIED);
         changed["reviewed_records"][1]["source_git_blob_sha"] = json!(blob(UNCLASSIFIED));
+        changed["reviewed_records"][1]["provenance"]["artifact_kind"] = json!("decision");
+        let range = |literal: &str| {
+            let start = unclassified_body.find(literal).unwrap();
+            json!({"start":start,"end":start+literal.len()})
+        };
+        changed["reviewed_records"][1]["provenance"]["archive"] = json!({
+            "archived_at": range(ARCHIVED_AT),
+            "archive_reason": range(ARCHIVE_REASON),
+        });
+        let with_review = run(&changed, 0);
+        let prepared = &reviewed_row(&with_review, UNCLASSIFIED)["outcome"];
+        assert_eq!(prepared["status"], "prepared");
+        assert_eq!(prepared["candidate"]["kind"], "decision");
         assert_eq!(
-            reviewed_row(&run(&changed, 0), UNCLASSIFIED)["outcome"]["reason_codes"],
-            json!(["unclassified_artifact_kind"])
+            prepared["provenance"]["archived_at"],
+            "2024-03-02T12:00:00.000000Z"
         );
+        assert_eq!(
+            prepared["provenance"]["archive_reason_sha256"],
+            sha256_hex(ARCHIVE_REASON.as_bytes())
+        );
+        assert!(!with_review.to_string().contains(ARCHIVE_REASON));
         for (field, value) in [
             ("source_commit", json!(blob(PROPOSAL))),
             ("workspace_id", json!(id(2))),

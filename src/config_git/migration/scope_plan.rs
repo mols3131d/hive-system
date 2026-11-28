@@ -16,9 +16,9 @@ use super::projects::{self, PreparedProjects};
 use super::queen_assets::{self, QueenAssets, SoulReview};
 use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
 use super::reviewed_records::{Review, timestamp};
+use super::standalone_artifact::JoinContext;
 use super::task_intake::StagingTask;
 use super::task_provenance::TaskReview;
-use super::work_artifact::TaskContext;
 use super::{
     AssetObjectReader, Inventory, Reason, SourceSnapshot, directive_artifact_intake,
     is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
@@ -184,25 +184,25 @@ pub(crate) fn plan(
             "scopes": reviewed.scopes.iter().map(Scope::report).collect::<Vec<_>>(),
         });
         let task_plan = (include_tasks
-            || (include_directives_artifacts && reviewed.has_work_artifacts()))
+            || (include_directives_artifacts && reviewed.artifact_reviews_need_tasks()))
         .then(|| reviewed.prepare_tasks(None))
         .transpose()?;
+        let projects = reviewed.prepare_projects(if include_tasks {
+            task_plan.as_ref()
+        } else {
+            None
+        })?;
         let tasks = task_plan.as_ref().map(task_intake::TaskPlan::staging_tasks);
+        if let Some(projects) = &projects {
+            report["project_membership"] = projects.report(None);
+        }
         if include_directives_artifacts {
             report["directive_artifact_intake"] = reviewed
-                .scan_directive_artifacts(false, tasks.as_deref())?
+                .scan_directive_artifacts(false, tasks.as_deref(), projects.as_ref())?
                 .report;
             if let Some(observed_at) = reviewed.directive_observation() {
                 report["directive_observed_at"] = json!(observed_at);
             }
-        }
-        let selected_plan = if include_tasks {
-            task_plan.as_ref()
-        } else {
-            None
-        };
-        if let Some(projects) = reviewed.prepare_projects(selected_plan)? {
-            report["project_membership"] = projects.report(None);
         }
         if reviewed.mapping.issue_resource_bindings.is_some() {
             let selected_tasks = if include_tasks {
@@ -305,13 +305,13 @@ impl ReviewedScopes<'_> {
             .transpose()
     }
 
-    fn has_work_artifacts(&self) -> bool {
+    fn artifact_reviews_need_tasks(&self) -> bool {
         self.mapping
             .reviewed_records
             .as_deref()
             .unwrap_or_default()
             .iter()
-            .any(Review::is_work_scoped)
+            .any(Review::needs_tasks)
     }
 
     pub(crate) fn require_stage_task_selection(
@@ -320,7 +320,7 @@ impl ReviewedScopes<'_> {
     ) -> Result<(), HiveError> {
         if !include_tasks
             && !self.mapping.task_reviews.is_empty()
-            && !self.has_work_artifacts()
+            && !self.artifact_reviews_need_tasks()
             && self.mapping.project_membership.is_none()
         {
             return Err(invalid("Task reviews require --tasks for staging."));
@@ -331,16 +331,17 @@ impl ReviewedScopes<'_> {
     pub(crate) fn directive_artifacts_for_staging(
         &self,
         tasks: Option<&[StagingTask<'_>]>,
+        projects: Option<&PreparedProjects<'_>>,
     ) -> Result<Option<Intake>, HiveError> {
         self.mapping
             .reviewed_records
             .as_ref()
-            .map(|_| self.scan_directive_artifacts(true, tasks))
+            .map(|_| self.scan_directive_artifacts(true, tasks, projects))
             .transpose()
     }
 
     pub(crate) fn unselected_directive_artifact_inventory(&self) -> Result<Intake, HiveError> {
-        self.scan_directive_artifacts(false, None)
+        self.scan_directive_artifacts(false, None, None)
     }
 
     pub(crate) fn asset_reconciliation(&self) -> Result<Value, HiveError> {
@@ -360,6 +361,7 @@ impl ReviewedScopes<'_> {
         &self,
         prepare_storage: bool,
         tasks: Option<&[StagingTask<'_>]>,
+        projects: Option<&PreparedProjects<'_>>,
     ) -> Result<Intake, HiveError> {
         let scopes = self
             .scopes
@@ -373,7 +375,13 @@ impl ReviewedScopes<'_> {
             self.mapping.reviewed_records.as_deref(),
             self.directive_observed_at,
             prepare_storage,
-            &TaskContext::new(&self.mapping.workspace_id, tasks),
+            &JoinContext::new(
+                &self.mapping.workspace_id,
+                tasks,
+                self.scopes.iter().map(|scope| &scope.outcome),
+                projects.into_iter().flat_map(PreparedProjects::project_ids),
+                self.resources.as_ref(),
+            ),
         )
     }
 

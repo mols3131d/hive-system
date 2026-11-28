@@ -1,11 +1,12 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Write;
 
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use super::{
-    Installed, Path, Value, io_error, json, new_uuid_v7, sql_text, tasks::TaskImport, unverified,
+    Installed, Path, Value, io_error, json, new_uuid_v7, projects::StagedProjects, sql_text,
+    tasks::TaskImport, unverified,
 };
 use crate::config_git::migration::prepared_records::{
     ArtifactKind, DirectiveStatus, Fields, Intake, PreparedRecord,
@@ -16,9 +17,13 @@ use crate::error::HiveError;
 pub(super) struct Expected {
     directives: BTreeMap<String, Value>,
     artifacts: BTreeMap<String, Value>,
-    issue_links: BTreeMap<String, String>,
-    area_links: BTreeMap<String, String>,
+    issue_links: Joins,
+    area_links: Joins,
+    project_links: Joins,
+    resource_links: Joins,
 }
+
+type Joins = BTreeMap<String, BTreeSet<String>>;
 
 impl Expected {
     pub(super) fn counts(&self) -> (usize, usize) {
@@ -26,7 +31,16 @@ impl Expected {
     }
 
     pub(super) fn link_count(&self) -> usize {
-        self.issue_links.len() + self.area_links.len()
+        [
+            &self.issue_links,
+            &self.area_links,
+            &self.project_links,
+            &self.resource_links,
+        ]
+        .into_iter()
+        .flat_map(BTreeMap::values)
+        .map(BTreeSet::len)
+        .sum()
     }
 
     pub(super) fn transaction_checks(&self) -> impl Iterator<Item = (String, Vec<Value>)> + use<> {
@@ -87,22 +101,62 @@ impl Expected {
                 SHA2(author_ref, 256) AS author_ref_sha256, SHA2(source_ref, 256) AS source_ref_sha256, revision,
                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS created_at,
                 DATE_FORMAT(substantive_updated_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS substantive_updated_at,
-                archived_at, archive_reason FROM artifacts{snapshot} ORDER BY id"), self.artifacts.values().cloned().collect()),
-            (format!("SELECT artifact_id, issue_id FROM artifact_issues{snapshot} ORDER BY artifact_id, issue_id"),
-                self.issue_links.iter().map(|(artifact, issue)| json!({"artifact_id": artifact, "issue_id": issue})).collect()),
-            (format!("SELECT artifact_id, area_id FROM artifact_areas{snapshot} ORDER BY artifact_id, area_id"),
-                self.area_links.iter().map(|(artifact, area)| json!({"artifact_id": artifact, "area_id": area})).collect()),
+                DATE_FORMAT(archived_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS archived_at,
+                SHA2(archive_reason, 256) AS archive_reason_sha256
+                FROM artifacts{snapshot} ORDER BY id"), self.artifacts.values().cloned().collect()),
+            join_check(snapshot, "artifact_issues", "issue_id", &self.issue_links),
+            join_check(snapshot, "artifact_areas", "area_id", &self.area_links),
+            join_check(snapshot, "artifact_projects", "project_id", &self.project_links),
+            join_check(snapshot, "artifact_resources", "resource_id", &self.resource_links),
         ].into_iter()
     }
+}
+
+fn join_check(snapshot: &str, table: &str, column: &str, pairs: &Joins) -> (String, Vec<Value>) {
+    let query = format!(
+        "SELECT artifact_id, {column} FROM {table}{snapshot} ORDER BY artifact_id, {column}"
+    );
+    let expected = pairs
+        .iter()
+        .flat_map(|(artifact, ids)| {
+            ids.iter()
+                .map(move |id| json!({"artifact_id": artifact, (column): id}))
+        })
+        .collect();
+    (query, expected)
+}
+
+fn append_join(
+    sql: &mut impl Write,
+    table: &str,
+    column: &str,
+    pairs: &mut Joins,
+    artifact_id: &str,
+    endpoint: &str,
+) -> Result<(), HiveError> {
+    writeln!(
+        sql,
+        "INSERT INTO {table} (artifact_id, {column}) VALUES ({}, {});",
+        sql_text(artifact_id),
+        sql_text(endpoint)
+    )
+    .map_err(io_error)?;
+    pairs
+        .entry(artifact_id.to_owned())
+        .or_default()
+        .insert(endpoint.to_owned());
+    Ok(())
 }
 
 pub(super) fn append(
     sql: &mut impl Write,
     records: &[PreparedRecord],
     tasks: Option<&TaskImport<'_>>,
+    projects: &StagedProjects,
     now: OffsetDateTime,
 ) -> Result<Expected, HiveError> {
     let mut expected = Expected::default();
+    let inserted_projects: BTreeSet<_> = projects.inserted_project_ids().collect();
     for record in in_insert_order(records)? {
         let revision = new_uuid_v7(now)?;
         let mut row = json!({"id": record.id, "title_sha256": digest(&record.content.title),
@@ -151,34 +205,88 @@ pub(super) fn append(
                 row["source_ref_sha256"] = json!(digest(&fields.source_ref));
                 row["created_at"] = json!(report_time(&fields.created_at));
                 row["substantive_updated_at"] = json!(report_time(&fields.substantive_updated_at));
+                let archive = fields.archive.as_ref();
+                if let Some(archive) = archive {
+                    row["archived_at"] = json!(report_time(&archive.archived_at));
+                    row["archive_reason_sha256"] = json!(digest(&archive.reason));
+                }
                 writeln!(sql, "INSERT INTO artifacts (id, kind, title, body, author_ref, source_ref, revision,
-                    created_at, substantive_updated_at) VALUES ({id}, {}, {title}, {body}, {}, {}, {revision}, {}, {});",
+                    created_at, substantive_updated_at, archived_at, archive_reason)
+                    VALUES ({id}, {}, {title}, {body}, {}, {}, {revision}, {}, {}, {}, {});",
                     sql_text(kind), sql_text(&fields.author_ref), sql_text(&fields.source_ref),
-                    sql_time(&fields.created_at), sql_time(&fields.substantive_updated_at)).map_err(io_error)?;
+                    sql_time(&fields.created_at), sql_time(&fields.substantive_updated_at),
+                    nullable(archive.map(|entry| entry.archived_at.as_str()), sql_time),
+                    nullable(archive.map(|entry| entry.reason.as_str()), sql_text)).map_err(io_error)?;
                 if let Some(work) = &fields.work {
                     let link = &work.issue_link;
                     let issue = tasks.and_then(|tasks| tasks.issue_id(link)).ok_or_else(|| {
                         unverified("A prepared work-scoped Artifact has no eligible Issue in this transaction.")
                     })?;
-                    writeln!(
+                    append_join(
                         sql,
-                        "INSERT INTO artifact_issues (artifact_id, issue_id) VALUES ({id}, {});",
-                        sql_text(issue)
-                    )
-                    .map_err(io_error)?;
-                    expected
-                        .issue_links
-                        .insert(record.id.clone(), issue.to_owned());
+                        "artifact_issues",
+                        "issue_id",
+                        &mut expected.issue_links,
+                        &record.id,
+                        issue,
+                    )?;
                     if let Some(area_id) = &link.joined_area_id {
-                        writeln!(
+                        append_join(
                             sql,
-                            "INSERT INTO artifact_areas (artifact_id, area_id) VALUES ({id}, {});",
-                            sql_text(area_id)
-                        )
-                        .map_err(io_error)?;
-                        expected
-                            .area_links
-                            .insert(record.id.clone(), area_id.clone());
+                            "artifact_areas",
+                            "area_id",
+                            &mut expected.area_links,
+                            &record.id,
+                            area_id,
+                        )?;
+                    }
+                }
+                if let Some(links) = &fields.standalone_links {
+                    if links
+                        .project_ids
+                        .iter()
+                        .any(|id| !inserted_projects.contains(id.as_str()))
+                    {
+                        return Err(unverified(
+                            "A prepared standalone Artifact has no eligible Project in this transaction.",
+                        ));
+                    }
+                    for (table, column, pairs, ids) in [
+                        (
+                            "artifact_areas",
+                            "area_id",
+                            &mut expected.area_links,
+                            &links.area_ids,
+                        ),
+                        (
+                            "artifact_projects",
+                            "project_id",
+                            &mut expected.project_links,
+                            &links.project_ids,
+                        ),
+                        (
+                            "artifact_resources",
+                            "resource_id",
+                            &mut expected.resource_links,
+                            &links.resource_ids,
+                        ),
+                    ] {
+                        for endpoint in ids {
+                            append_join(sql, table, column, pairs, &record.id, endpoint)?;
+                        }
+                    }
+                    for issue in &links.issues {
+                        let issue_id = tasks.and_then(|tasks| tasks.standalone_issue_id(issue)).ok_or_else(|| {
+                            unverified("A prepared standalone Artifact has no eligible Issue in this transaction.")
+                        })?;
+                        append_join(
+                            sql,
+                            "artifact_issues",
+                            "issue_id",
+                            &mut expected.issue_links,
+                            &record.id,
+                            issue_id,
+                        )?;
                     }
                 }
                 expected.artifacts.insert(record.id.clone(), row);
@@ -243,21 +351,31 @@ pub(super) fn add_report(report: &mut Value, mut intake: Intake, expected: Optio
                     record.insert(digest_field.to_owned(), json!(path));
                 }
             }
-            if let Some(issue) = record["outcome"]["target_id"]
+            if let Some(issues) = record["outcome"]["target_id"]
                 .as_str()
                 .and_then(|id| expected?.issue_links.get(id))
             {
-                let link = record.get_mut("outcome").expect("prepared outcome")["provenance"]["issue_link"]
-                    .as_object_mut().expect("prepared Artifact link");
-                if let Some(key) = link.remove("legacy_key") {
-                    let scope = key["scope"].as_str().expect("prepared Task scope");
-                    let work = key["work_id"].as_str().expect("prepared Task work ID");
+                let provenance =
+                    &mut record.get_mut("outcome").expect("prepared outcome")["provenance"];
+                if let Some(link) = provenance
+                    .get_mut("issue_link")
+                    .and_then(Value::as_object_mut)
+                {
+                    if let Some(key) = link.remove("legacy_key") {
+                        let scope = key["scope"].as_str().expect("prepared Task scope");
+                        let work = key["work_id"].as_str().expect("prepared Task work ID");
+                        link.insert(
+                            "legacy_key_sha256".to_owned(),
+                            json!(digest(&format!("{scope}\0{work}"))),
+                        );
+                    }
                     link.insert(
-                        "legacy_key_sha256".to_owned(),
-                        json!(digest(&format!("{scope}\0{work}"))),
+                        "issue_id".to_owned(),
+                        json!(issues.first().expect("work-scoped Issue")),
                     );
+                } else {
+                    provenance["links"]["issue_ids"] = json!(issues);
                 }
-                link.insert("issue_id".to_owned(), json!(issue));
             }
             let section = match record["outcome"]["status"].as_str() {
                 Some("prepared") => "id_map",
@@ -309,5 +427,8 @@ fn artifact_kind(value: ArtifactKind) -> &'static str {
         ArtifactKind::Checkpoint => "checkpoint",
         ArtifactKind::WorkNote => "work-note",
         ArtifactKind::Manifest => "manifest",
+        ArtifactKind::Design => "design",
+        ArtifactKind::Decision => "decision",
+        ArtifactKind::Evidence => "evidence",
     }
 }

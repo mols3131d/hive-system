@@ -4,10 +4,12 @@ use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use super::artifact_archive::ArchiveReview;
 use super::directive_artifact_intake::{ArtifactKind, Candidate, DirectiveStatus};
 use super::directive_history::{DirectiveHistory, Edges};
 use super::prepared_records::{ArtifactFields, DirectiveFields, Fields};
 use super::scope_plan::portable_reference;
+use super::standalone_artifact::{JoinContext, LinkReview};
 use super::work_artifact::{TaskContext, WorkArtifactReview};
 use super::{Inventory, Reason};
 use crate::cli::is_slug;
@@ -20,8 +22,28 @@ pub(super) struct Review {
     source_path: String,
     source_git_blob_sha: String,
     pub(super) target_id: String,
+    #[serde(default, deserialize_with = "deserialize_title")]
+    title: Option<TitleReview>,
     #[serde(deserialize_with = "super::json_object::deserialize")]
     provenance: Provenance,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+enum TitleReview {
+    Fallback { value: String },
+    Override { value: String },
+}
+
+pub(super) enum TitleProblem {
+    Unavailable,
+    Conflicting,
+}
+
+fn deserialize_title<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<TitleReview>, D::Error> {
+    super::json_object::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -47,10 +69,8 @@ enum Provenance {
         author_ref: String,
         created_at: String,
         substantive_updated_at: String,
-        #[serde(deserialize_with = "super::json_object::string_enum")]
-        links: AbsenceReview,
-        #[serde(deserialize_with = "super::json_object::string_enum")]
-        archive: AbsenceReview,
+        links: LinkReview,
+        archive: ArchiveReview,
     },
 }
 
@@ -98,8 +118,40 @@ pub(super) fn bind<'a>(
 }
 
 impl Review {
+    pub(super) fn selected_title<'a>(
+        &'a self,
+        source: Result<&'a str, &TitleProblem>,
+    ) -> Option<&'a str> {
+        match &self.title {
+            None => source.ok(),
+            Some(TitleReview::Override { value }) if valid_title(value) => Some(value),
+            Some(TitleReview::Fallback { value })
+                if matches!(source, Err(TitleProblem::Unavailable)) && valid_title(value) =>
+            {
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn is_work_scoped(&self) -> bool {
         matches!(self.provenance, Provenance::WorkScopedArtifact(_))
+    }
+
+    pub(super) fn needs_tasks(&self) -> bool {
+        match &self.provenance {
+            Provenance::WorkScopedArtifact(_) => true,
+            Provenance::StandaloneArtifact { links, .. } => links.needs_tasks(),
+            _ => false,
+        }
+    }
+
+    pub(super) fn artifact_kind(&self, work_scoped: bool) -> Option<ArtifactKind> {
+        match (&self.provenance, work_scoped) {
+            (Provenance::StandaloneArtifact { artifact_kind, .. }, false) => Some(*artifact_kind),
+            (Provenance::WorkScopedArtifact(review), true) => Some(review.artifact_kind),
+            _ => None,
+        }
     }
 
     pub(super) fn prepare_work_scoped(
@@ -128,6 +180,8 @@ impl Review {
         &self,
         candidate: &Candidate,
         observed_at: Option<OffsetDateTime>,
+        ctx: &JoinContext<'_>,
+        body: Option<&str>,
     ) -> Result<Fields, Reason> {
         match (&self.provenance, candidate) {
             (
@@ -193,23 +247,21 @@ impl Review {
                 if artifact_kind != kind {
                     return Err(Reason::UnclassifiedArtifactKind);
                 }
-                if matches!(links, AbsenceReview::Unresolved) {
-                    return Err(Reason::UnresolvedArtifactLinks);
-                }
+                let standalone_links = links.prepare(ctx)?;
                 if !actor_ref(author_ref) {
                     return Err(Reason::UnverifiedArtifactAuthor);
                 }
-                if matches!(archive, AbsenceReview::Unresolved) {
-                    return Err(Reason::UnverifiedArtifactRetention);
-                }
-                validate_historical_source(source_ref, created_at, substantive_updated_at)?;
+                let updated =
+                    validate_historical_source(source_ref, created_at, substantive_updated_at)?;
                 Ok(Fields::Artifact(ArtifactFields {
                     kind: *kind,
                     source_ref: source_ref.clone(),
                     author_ref: author_ref.clone(),
                     created_at: created_at.clone(),
                     substantive_updated_at: substantive_updated_at.clone(),
+                    archive: archive.prepare(body, updated)?,
                     work: None,
+                    standalone_links,
                 }))
             }
             _ => Err(Reason::UnsupportedReviewedRecord),
@@ -217,17 +269,34 @@ impl Review {
     }
 }
 
+pub(super) fn valid_title(value: &str) -> bool {
+    !value.trim().is_empty() && value.chars().count() <= 255 && !value.chars().any(char::is_control)
+}
+
 pub(super) fn validate_historical_source(
     source_ref: &str,
     created: &str,
     updated: &str,
-) -> Result<(), Reason> {
-    if !portable_reference(source_ref)
-        || !matches!(timestamp(created).zip(timestamp(updated)), Some((created, updated)) if created <= updated)
-    {
+) -> Result<OffsetDateTime, Reason> {
+    if !portable_reference(source_ref) {
         return Err(Reason::IncompleteHistoricalProvenance);
     }
-    Ok(())
+    timestamp(created)
+        .zip(timestamp(updated))
+        .filter(|(created, updated)| created <= updated)
+        .map(|(_, updated)| updated)
+        .ok_or(Reason::IncompleteHistoricalProvenance)
+}
+
+pub(super) fn canonical_utc(value: OffsetDateTime) -> String {
+    format!(
+        "{}T{:02}:{:02}:{:02}.{:06}Z",
+        value.date(),
+        value.hour(),
+        value.minute(),
+        value.second(),
+        value.nanosecond() / 1000
+    )
 }
 
 pub(super) fn timestamp(value: &str) -> Option<OffsetDateTime> {

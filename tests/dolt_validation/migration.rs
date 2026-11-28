@@ -40,6 +40,10 @@ mod queen_staging;
 mod resource_staging;
 
 #[cfg(target_os = "linux")]
+#[path = "migration/record_titles.rs"]
+mod record_titles;
+
+#[cfg(target_os = "linux")]
 #[path = "migration/task_labels.rs"]
 mod task_labels;
 

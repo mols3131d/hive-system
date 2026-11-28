@@ -126,7 +126,8 @@ fn prepare(
         .transpose()?;
     let project_plan = reviewed.prepare_projects(task_plan.as_ref())?;
     let tasks = task_plan.as_ref().map(|plan| plan.staging_tasks());
-    let intake = reviewed.directive_artifacts_for_staging(tasks.as_deref())?;
+    let intake =
+        reviewed.directive_artifacts_for_staging(tasks.as_deref(), project_plan.as_ref())?;
     let issue_resource_reviews = reviewed.prepare_issue_resources(tasks.as_deref())?;
     let task_import = tasks.map(|tasks| TaskImport::new(tasks, now)).transpose()?;
     let issue_resources =
@@ -589,7 +590,7 @@ fn apply_rows(
         writeln!(input, "{sql};").map_err(io_error)?;
         checks.push(expected);
     }
-    let records = directive_artifact::append(&mut input, rows.records, rows.tasks, now)?;
+    let records = directive_artifact::append(&mut input, rows.records, rows.tasks, &projects, now)?;
     for (sql, expected) in records.transaction_checks() {
         writeln!(input, "{sql};").map_err(io_error)?;
         checks.push(expected);

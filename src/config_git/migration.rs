@@ -13,6 +13,7 @@ use super::*;
 use crate::cli::is_slug;
 use crate::config_file::{Coordination, ScopedDirectory};
 
+mod artifact_archive;
 mod directive_artifact_intake;
 mod directive_history;
 mod issue_resources;
@@ -30,6 +31,7 @@ pub(crate) use projects::PreparedProjects;
 pub(crate) use queen_preparation::PreparedQueen;
 pub(crate) use task_intake::StagingTask;
 mod scope_plan;
+mod standalone_artifact;
 pub(crate) use issue_resources::IssueResourceOutcome;
 pub(crate) use scope_plan::{
     Area, PreparedResources, ResourceHold, ReviewedScopes, plan, with_scope_mapping,
