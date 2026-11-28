@@ -991,6 +991,9 @@ pub(crate) enum WorkspaceAction {
         /// Reviewed versioned scope and optional record mapping JSON file.
         #[arg(long, value_name = "FILE")]
         mapping_file: PathBuf,
+        /// Include partial v1 Task intake and its reconciliation holds.
+        #[arg(long)]
+        tasks: bool,
         /// Include Directive and Artifact intake and any reviewed record plans.
         #[arg(long)]
         include_directives_artifacts: bool,
@@ -3565,7 +3568,7 @@ impl Command {
                         || !matches!(common.view, View::WorkingTree) =>
                 {
                     Err(
-                        "Migration plan accepts only --source, --source-commit, --workspace-id, --mapping-file, and output selection.",
+                        "Migration plan accepts only --source, --source-commit, --workspace-id, --mapping-file, --tasks, --include-directives-artifacts, and output selection.",
                     )
                 }
                 Self::Backup(BackupCommand::Create { .. }) => {

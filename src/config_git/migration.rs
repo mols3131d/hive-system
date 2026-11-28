@@ -17,6 +17,7 @@ mod directive_artifact_intake;
 mod json_object;
 mod reviewed_records;
 mod scope_plan;
+mod task_intake;
 pub(crate) use scope_plan::plan;
 
 const MAX_INVENTORY_BYTES: usize = 4 * 1024 * 1024;
@@ -87,12 +88,23 @@ impl InventoryEntry {
     }
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Reason {
     AmbiguousScopeOrCollision,
+    DuplicateLegacyWorkId,
+    ExecutionNeedsReconciliation,
     ExternalBackendOwned,
+    IncompleteHistoricalProvenance,
+    InvalidLegacyState,
+    MissingOrConflictingTitle,
+    MissingTaskEntrypoint,
+    MissingTypedSubmissionEvidence,
+    UnresolvedCompletionObligation,
+    UnresolvedTaskRelations,
     UnsplitLegacyScope,
+    UnverifiedAcceptanceCriteria,
+    UnsupportedTaskMetadata,
     NavigationOnly,
     DirectiveBundleSupport,
     UnsupportedDirectiveShape,
@@ -106,8 +118,6 @@ enum Reason {
     InvalidDirectiveStatus,
     UnclassifiedArtifactKind,
     InvalidArtifactStatus,
-    MissingOrConflictingTitle,
-    IncompleteHistoricalProvenance,
     MissingDirectiveApproval,
     UnverifiedDirectiveValidity,
     UnresolvedSupersessionGraph,

@@ -145,6 +145,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
                 source_commit: _commit,
                 workspace_id: _workspace_id,
                 mapping_file: _mapping_file,
+                tasks: _tasks,
                 include_directives_artifacts: _include_directives_artifacts,
             } => {
                 #[cfg(target_os = "linux")]
@@ -153,6 +154,7 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
                     _commit,
                     _workspace_id,
                     _mapping_file,
+                    *_tasks,
                     *_include_directives_artifacts,
                 );
                 #[cfg(not(target_os = "linux"))]
