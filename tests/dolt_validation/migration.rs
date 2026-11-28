@@ -831,6 +831,11 @@ fn row_count(admin: &mut Conn, table: &str) -> u64 {
 
 #[cfg(target_os = "linux")]
 fn migration_preflight(home: &Path, config: &Path, args: &[&str], status: i32) -> Value {
+    migration_cli(home, config, "migration-preflight", args, status)
+}
+
+#[cfg(target_os = "linux")]
+fn migration_cli(home: &Path, config: &Path, action: &str, args: &[&str], status: i32) -> Value {
     let result = Command::new(env!("CARGO_BIN_EXE_hive"))
         .current_dir(home)
         .env_clear()
@@ -839,13 +844,7 @@ fn migration_preflight(home: &Path, config: &Path, args: &[&str], status: i32) -
         .env("XDG_CONFIG_HOME", config)
         // An inherited repository selection must not replace the explicit one.
         .env("GIT_DIR", home.join("unrelated.git"))
-        .args([
-            "--contract",
-            "2",
-            "--json",
-            "workspace",
-            "migration-preflight",
-        ])
+        .args(["--contract", "2", "--json", "workspace", action])
         .args(args)
         .output()
         .unwrap();
@@ -853,7 +852,7 @@ fn migration_preflight(home: &Path, config: &Path, args: &[&str], status: i32) -
     assert!(result.stderr.is_empty(), "{result:?}");
     let report: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(report["schema_version"], 2);
-    assert_eq!(report["command"], "workspace migration-preflight");
+    assert_eq!(report["command"], format!("workspace {action}"));
     assert_eq!(report["ok"], status == 0);
     if let Some([_, path]) = args.windows(2).find(|pair| pair[0] == "--source")
         && Path::new(path).is_absolute()
@@ -861,6 +860,316 @@ fn migration_preflight(home: &Path, config: &Path, args: &[&str], status: i32) -
         assert!(!String::from_utf8_lossy(&result.stdout).contains(path));
     }
     report
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    init_source(&source, &home);
+    for (path, content) in [
+        (
+            "directives/synth-app/README.md",
+            "# Project direction\n\nProject: https://forge.example/synthetic/app\n",
+        ),
+        (
+            "bots/queen-synth/memory/synth-app/MEMORY.md",
+            "# Project memory\n\nProject: https://forge.example/synthetic/app\n",
+        ),
+        (
+            "tasks/hive-system/README.md",
+            "# Synthetic product area\n\nProject: https://forge.example/synthetic/product\n",
+        ),
+        ("tasks/unmapped/README.md", "# Unmapped\n"),
+    ] {
+        let file = source.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, content).unwrap();
+    }
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic scope entries"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let workspace = id(1);
+    let file = root.path().join("mapping.json");
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let plan_args = [
+        args.as_slice(),
+        &[
+            "--workspace-id",
+            &workspace,
+            "--mapping-file",
+            file.to_str().unwrap(),
+        ],
+    ]
+    .concat();
+    let plan = |mapping: &Value| {
+        fs::write(&file, serde_json::to_vec(mapping).unwrap()).unwrap();
+        migration_cli(&home, &config, "migration-plan", &plan_args, 0)["data"].clone()
+    };
+    let area = |scope, id_value, slug, evidence: Value| {
+        json!({
+            "scope": scope,
+            "decision": {"kind": "area", "area": {"id": id(id_value), "slug": slug, "name": "Synthetic Area"}, "project_evidence": evidence}
+        })
+    };
+    let evidence = |path, key| json!({"path": path, "project_key": key});
+    let mapping = json!({
+        "version": 1,
+        "source_commit": commit,
+        "policy_pin": POLICY_PIN,
+        "workspace_id": workspace,
+        "scopes": [
+            area("synth-app", AREA_APP, "application", json!([
+                evidence("tasks/synth-app/README.md", "reviewed-synthetic-app"),
+                evidence("directives/synth-app/README.md", "reviewed-synthetic-app"),
+                evidence("bots/queen-synth/memory/synth-app/MEMORY.md", "reviewed-synthetic-app"),
+            ])),
+            area("_general", AREA_GENERAL, "general", json!([])),
+            area("_hive-userdata", AREA_USERDATA, "workspace-operations", json!([])),
+            area("hive-system", 0x104, "product", json!([
+                evidence("tasks/hive-system/README.md", "reviewed-synthetic-product")
+            ])),
+            {"scope": "external-team", "decision": {"kind": "external"}},
+            area("_hive", 0x105, "legacy-hive", json!([])),
+        ]
+    });
+    let original_git_files = [
+        ".git/index",
+        ".git/HEAD",
+        ".git/refs/heads/main",
+        ".git/config",
+    ]
+    .map(|path| fs::read(source.join(path)).unwrap());
+    let snapshot = migration_preflight(&home, &config, &args, 0);
+    let data = plan(&mapping);
+    assert_eq!(data, plan(&mapping));
+    assert_eq!(data["mode"], "scope_plan");
+    assert_eq!(data["mapping_version"], 1);
+    assert_eq!(
+        data["mapping_sha256"],
+        sha256_hex(&fs::read(&file).unwrap())
+    );
+    assert_eq!(data["source"], snapshot["data"]["source"]);
+    assert_eq!(data["inventory"], snapshot["data"]["inventory"]);
+    assert_eq!(data["target"], json!({"workspace_id": workspace}));
+    assert_eq!(data["scopes"].as_array().unwrap().len(), 7);
+    let outcomes = |report: &Value| {
+        report["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|scope| {
+                (
+                    scope["scope"].as_str().unwrap().to_owned(),
+                    scope["outcome"].clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let mapped = outcomes(&data);
+    assert_eq!(mapped["_general"]["status"], "mapped");
+    assert_eq!(mapped["_hive-userdata"]["status"], "mapped");
+    assert_eq!(mapped["hive-system"]["status"], "mapped");
+    assert_eq!(
+        mapped["synth-app"],
+        json!({"status": "mapped", "area": {
+            "id": id(AREA_APP), "slug": "application", "name": "Synthetic Area", "parent_id": null
+        }})
+    );
+    assert_eq!(
+        mapped["external-team"],
+        json!({"status": "excluded", "reason": "external_backend_owned"})
+    );
+    assert_eq!(
+        mapped["_hive"],
+        json!({"status": "held", "reason": "unsplit_legacy_scope"})
+    );
+    let held = json!({"status": "held", "reason": "ambiguous_scope_or_collision"});
+    assert_eq!(mapped["unmapped"], held);
+    assert_eq!(data["scopes"][5]["scope"], "synth-app");
+    assert_eq!(
+        data["scopes"][5]["source_paths"],
+        json!([
+            "bots/queen-synth/memory/synth-app",
+            "directives/synth-app",
+            "tasks/synth-app"
+        ])
+    );
+    let encoded = data.to_string();
+    for private in [
+        "https://forge.example",
+        "reviewed-synthetic-app",
+        "Synthetic persona bytes.",
+    ] {
+        assert!(!encoded.contains(private));
+    }
+
+    let mut changed = mapping.clone();
+    changed["scopes"][0]["decision"]["project_evidence"][2]["project_key"] =
+        json!("different-owner");
+    changed["scopes"][2]["decision"]["area"]["id"] = json!(id(0x104));
+    let conflicts = outcomes(&plan(&changed));
+    for scope in ["synth-app", "_hive-userdata", "hive-system"] {
+        assert_eq!(conflicts[scope], held, "{scope}");
+    }
+
+    let mut changed = mapping.clone();
+    changed["scopes"][0]["decision"]["project_evidence"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    changed["scopes"][1]["decision"]["area"]["slug"] = json!("product");
+    let conflicts = outcomes(&plan(&changed));
+    for scope in ["synth-app", "_general", "hive-system"] {
+        assert_eq!(conflicts[scope], held, "{scope}");
+    }
+
+    changed["scopes"][1]["decision"]["area"]["parent_id"] = json!(id(AREA_USERDATA));
+    changed["scopes"][3]["decision"]["area"]["parent_id"] = json!(id(AREA_USERDATA));
+    assert_eq!(outcomes(&plan(&changed))["_general"], held);
+    assert_eq!(outcomes(&plan(&changed))["hive-system"], held);
+    changed["scopes"][1]["decision"]["area"]["parent_id"] = json!(id(AREA_APP));
+    let separate_parents = outcomes(&plan(&changed));
+    assert_eq!(separate_parents["_general"]["status"], "mapped");
+    assert_eq!(
+        separate_parents["hive-system"]["area"]["parent_id"],
+        id(AREA_USERDATA)
+    );
+
+    let mut changed = mapping.clone();
+    changed["scopes"]
+        .as_array_mut()
+        .unwrap()
+        .push(mapping["scopes"][4].clone());
+    assert_eq!(outcomes(&plan(&changed))["external-team"], held);
+    changed["scopes"] = json!([]);
+    let unreviewed = outcomes(&plan(&changed));
+    for scope in ["_general", "_hive-userdata", "external-team"] {
+        assert_eq!(unreviewed[scope], held, "{scope}");
+    }
+
+    assert_eq!(
+        [
+            ".git/index",
+            ".git/HEAD",
+            ".git/refs/heads/main",
+            ".git/config"
+        ]
+        .map(|path| fs::read(source.join(path)).unwrap()),
+        original_git_files,
+    );
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+    assert!(!config.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_rejects_unbound_inputs_and_unverified_source() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    let commit = init_source(&source, &home);
+    let file = root.path().join("mapping.json");
+    let workspace = id(1);
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+        "--workspace-id",
+        &workspace,
+        "--mapping-file",
+        file.to_str().unwrap(),
+    ];
+    let run = |args: &[&str], status, code: &str| {
+        let report = migration_cli(&home, &config, "migration-plan", args, status);
+        assert_eq!(report["error"]["code"], code);
+        assert!(report.get("data").is_none());
+    };
+    let mapping = json!({
+        "version": 1,
+        "source_commit": commit,
+        "policy_pin": POLICY_PIN,
+        "workspace_id": workspace,
+        "scopes": [],
+    });
+    let write = |value: &Value| fs::write(&file, serde_json::to_vec(value).unwrap()).unwrap();
+    run(&args[..6], 2, "INVALID_ARGUMENT");
+    run(&args, 2, "INVALID_CONFIG");
+    for (key, value) in [
+        ("version", json!(2)),
+        (
+            "source_commit",
+            json!("1111111111111111111111111111111111111111"),
+        ),
+        (
+            "policy_pin",
+            json!("0fd0f8dbe632d14094a93599cb1b5f653789ac9c"),
+        ),
+        ("workspace_id", json!(id(2))),
+        ("unexpected", json!(true)),
+        (
+            "scopes",
+            json!([{"scope": "external-team", "decision": {"kind": "external", "area": {}}}]),
+        ),
+        (
+            "scopes",
+            json!([{"scope": "absent", "decision": {"kind": "external"}}]),
+        ),
+    ] {
+        let mut changed = mapping.clone();
+        changed[key] = value;
+        write(&changed);
+        run(&args, 2, "INVALID_CONFIG");
+    }
+    fs::write(
+        &file,
+        format!("{{\"version\":1,{}", &mapping.to_string()[1..]),
+    )
+    .unwrap();
+    run(&args, 2, "INVALID_CONFIG");
+    write(&mapping);
+    let duplicate = [args.as_slice(), &args[6..]].concat();
+    run(&duplicate, 2, "INVALID_ARGUMENT");
+    let extra = [args.as_slice(), &["--workspace", source.to_str().unwrap()]].concat();
+    run(&extra, 2, "INVALID_ARGUMENT");
+
+    let tracked = source.join("tasks/synth-app/README.md");
+    let original = fs::read(&tracked).unwrap();
+    fs::write(&tracked, "# Uncommitted identity").unwrap();
+    run(&args, 5, "DIRTY_CONFLICT");
+    fs::write(&tracked, original).unwrap();
+
+    let object = git_text(
+        &source,
+        &home,
+        &["rev-parse", "HEAD:tasks/synth-app/README.md"],
+    );
+    let object_file = source
+        .join(".git/objects")
+        .join(&object[..2])
+        .join(&object[2..]);
+    let hidden = home.join("missing-scope-object");
+    fs::rename(&object_file, &hidden).unwrap();
+    run(&args, 7, "OBJECT_UNAVAILABLE");
+    fs::rename(hidden, object_file).unwrap();
+    migration_cli(&home, &config, "migration-plan", &args, 0);
+    assert!(!config.exists());
 }
 
 #[cfg(target_os = "linux")]

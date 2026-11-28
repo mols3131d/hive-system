@@ -147,6 +147,58 @@ A successful `source_preflight` report gives the Git tree ID, SHA-256 of the raw
 
 This slice covers source selection and inventory. Per-record raw digests, mapping, holds, target validation, rollback, and staged import remain required for A15.
 
+#### Read-only scope plan
+
+On Linux, pass a reviewed scope mapping file and the intended inactive workspace ID alongside the same explicit v1 source selection.
+
+```sh
+hive --contract 2 --json workspace migration-plan \
+  --source "$source_root" --source-commit "$source_commit" \
+  --workspace-id "$workspace_id" --mapping-file "$mapping_file"
+```
+
+The command repeats source preflight and plans directly from its verified inventory. The mapping is a regular UTF-8 JSON file of up to 64 KiB. Version 1 requires the fields shown below, with the exact selected Git commit, the policy pin found in the committed source, and the explicitly selected lowercase workspace UUID. Unknown fields, repeated JSON members, unsupported versions, mismatched bindings, and mapping keys absent from the verified scope inventory are errors.
+
+```json
+{
+  "version": 1,
+  "source_commit": "1111111111111111111111111111111111111111",
+  "policy_pin": "0e584830a7eff314d85b7af8c6f8cd69e735730a",
+  "workspace_id": "00000000-0000-7000-8000-000000000001",
+  "scopes": [
+    {
+      "scope": "example-app",
+      "decision": {
+        "kind": "area",
+        "area": {
+          "id": "00000000-0000-7000-8000-000000000002",
+          "slug": "applications",
+          "name": "Applications"
+        },
+        "project_evidence": [
+          {
+            "path": "tasks/example-app/README.md",
+            "project_key": "reviewed-example-app"
+          }
+        ]
+      }
+    },
+    {
+      "scope": "example-external",
+      "decision": {"kind": "external"}
+    }
+  ]
+}
+```
+
+- Scope keys come from committed directories under `tasks/`, `directives/`, and `bots/*/memory/`. Ordinary scopes require one reviewed `project_evidence` entry for the committed `README.md` or scoped `MEMORY.md` in every such directory. Review the project's canonical reference in each entrypoint and assign the same nonsecret lowercase kebab-case `project_key` (up to 100 bytes) only where they agree. The reviewed evidence supplies the identity from v1 prose. The command verifies entrypoint coverage and agreement without interpreting that prose. Leave unresolved evidence out to hold the scope.
+- Confirm `_general` and `_hive-userdata` with explicit Area decisions and omit `project_evidence` for them. Supply a distinct Area for `_hive-userdata` and `hive-system`. The planner always holds `_hive` as `unsplit_legacy_scope`. Use an `external` decision for an ordinary scope with an explicit external ownership designation. This excludes the scope as `external_backend_owned`.
+- Areas require a lowercase UUIDv7, a lowercase kebab-case slug of up to 100 bytes, and a nonblank name of up to 255 characters without control characters. Omit `parent_id` or use null for a root, or supply a distinct lowercase UUIDv7. Missing or repeated scope decisions, missing or conflicting project evidence, duplicate Area IDs, and duplicate root or sibling slugs hold the affected scopes as `ambiguous_scope_or_collision`.
+
+A completed plan returns `mode: scope_plan`, the verified source and inventory summary, the declared target workspace ID, the mapping version and its raw SHA-256, and scope outcomes ordered by legacy key. Each outcome lists committed scope directories and either the proposed Area or a hold or exclusion reason. Exit status zero means classification completed, including when some scopes are held. The plan contains no record bodies, reviewed project keys, or host-local file paths.
+
+The workspace ID identifies the intended target for review. Actual target identity, Area ancestry, and target constraints require validation at the later staging step. Projects, resources, record mapping, staged writes, rollback, the A15 report, and live cutover are outside this command's scope.
+
 ### 6. Issue Counters and Number Non-Reuse
 
 V1 identifies tasks by `(<project-id>, <work-id>)` with no workspace-wide numeric sequence. V2 assigns each imported Issue a fresh lowercase UUIDv7 (`issues.id`) and an immutable positive workspace-wide `issues.number` (`BIGINT UNSIGNED > 0`), backed by `workspace_counters` (`name = 'issue_number'`, `next_value`).

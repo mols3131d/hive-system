@@ -1,11 +1,15 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::config_file::{Coordination, ScopedDirectory};
+
+mod scope_plan;
+pub(crate) use scope_plan::plan;
 
 const MAX_INVENTORY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
@@ -13,6 +17,33 @@ const MAX_TREE_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 
 pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveError> {
+    let (source, inventory) = verified_source(source, revision)?;
+    Ok(json!({
+        "mode": "source_preflight",
+        "source": source,
+        "inventory": inventory.summary,
+    }))
+}
+
+#[derive(Serialize)]
+struct SourceSnapshot<'a> {
+    source_commit: &'a str,
+    source_clean: bool,
+    policy_pin: &'static str,
+    hive_yml: Value,
+    tree_oid: String,
+    root_tree_sha256: String,
+}
+
+struct Inventory {
+    entries: BTreeMap<String, (String, bool)>,
+    summary: Value,
+}
+
+fn verified_source<'a>(
+    source: &Path,
+    revision: &'a str,
+) -> Result<(SourceSnapshot<'a>, Inventory), HiveError> {
     if !source.is_absolute() || !is_full_lowercase_oid(revision) {
         return Err(HiveError::new(
             ErrorCode::InvalidArgument,
@@ -77,18 +108,17 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
     if !repository.same_worktree(&select().map_err(|_| changed())?)? {
         return Err(changed());
     }
-    Ok(json!({
-        "mode": "source_preflight",
-        "source": {
-            "source_commit": revision,
-            "source_clean": true,
-            "policy_pin": policy_pin,
-            "hive_yml": hive_yml,
-            "tree_oid": tree,
-            "root_tree_sha256": format!("{:x}", Sha256::digest(raw_tree)),
+    Ok((
+        SourceSnapshot {
+            source_commit: revision,
+            source_clean: true,
+            policy_pin,
+            hive_yml,
+            tree_oid: tree,
+            root_tree_sha256: format!("{:x}", Sha256::digest(raw_tree)),
         },
-        "inventory": inventory,
-    }))
+        inventory,
+    ))
 }
 
 fn snapshot_object(
@@ -111,7 +141,7 @@ fn inventory(
     git: &impl Fn() -> Result<Command, HiveError>,
     root_oid: &str,
     root_tree: &[u8],
-) -> Result<Value, HiveError> {
+) -> Result<Inventory, HiveError> {
     let invalid = || {
         HiveError::new(
             ErrorCode::InvalidRecord,
@@ -203,12 +233,13 @@ fn inventory(
         digest.update(b"\0");
         digest.update(fields);
     }
-    Ok(json!({
+    let summary = json!({
         "directory_count": directories,
         "file_count": entries.len() - directories,
         "blob_bytes": blob_bytes,
         "catalog_sha256": format!("{:x}", digest.finalize()),
         "rulesync_directory": entries.get(".rulesync").is_some_and(|entry| entry.1),
         "rulesync_config": entries.get("rulesync.jsonc").is_some_and(|entry| !entry.1),
-    }))
+    });
+    Ok(Inventory { entries, summary })
 }
