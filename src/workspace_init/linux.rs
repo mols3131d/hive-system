@@ -17,7 +17,7 @@ mod registration;
 mod tools;
 pub(crate) use tools::{Installed, restrict_db_modes};
 
-const POLICY_REVISION: &str = "c66b3c50150e18426485d134de92c6b311dac125";
+pub(crate) const POLICY_REVISION: &str = "c66b3c50150e18426485d134de92c6b311dac125";
 // Assets init fixes the Git object format to SHA-1.
 const EMPTY_GIT_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const PAYLOAD_ENTRIES: [&str; 3] = ["db", "assets", "conversations"];

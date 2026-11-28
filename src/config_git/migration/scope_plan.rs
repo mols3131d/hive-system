@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::Path;
 
@@ -14,7 +14,7 @@ use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
 use super::reviewed_records::Review;
 use super::task_provenance::TaskReview;
 use super::{
-    AssetObjectReader, Inventory, Reason, directive_artifact_intake,
+    AssetObjectReader, Inventory, Reason, SourceSnapshot, directive_artifact_intake,
     is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
 };
 use crate::cli::is_slug;
@@ -71,11 +71,11 @@ enum Decision {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Area {
-    pub(super) id: String,
-    slug: String,
-    name: String,
-    parent_id: Option<String>,
+pub(crate) struct Area {
+    pub(crate) id: String,
+    pub(crate) slug: String,
+    pub(crate) name: String,
+    pub(crate) parent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -164,80 +164,58 @@ fn prepare_plan(
     include_tasks: bool,
     include_directives_artifacts: bool,
 ) -> Result<MigrationPlan, HiveError> {
-    if !is_uuid(workspace_id) {
-        return Err(HiveError::new(
-            ErrorCode::InvalidArgument,
-            "Select an exact lowercase --workspace-id UUID.",
-        ));
-    }
-    let input = read_regular(mapping_file)
-        .map_err(|error| HiveError::new(error.code, "Could not read the scope mapping file."))?
-        .ok_or_else(|| invalid("The scope mapping file is missing."))?;
-    let Object(mapping) = serde_json::from_slice::<Object<Mapping>>(&input)
-        .map_err(|_| invalid("The scope mapping must match the versioned JSON format."))?;
-    if mapping.version != 1 {
-        return Err(invalid("The scope mapping version is unsupported."));
-    }
-    if mapping.reviewed_records.is_some() && !include_directives_artifacts {
-        return Err(invalid(
-            "Reviewed records require --include-directives-artifacts.",
-        ));
-    }
-
-    verified_source(source, revision, |source, inventory, reader| {
-        if mapping.source_commit != source.source_commit
-            || mapping.policy_pin != source.policy_pin
-            || mapping.workspace_id != workspace_id
-        {
+    with_scope_mapping(source, revision, workspace_id, mapping_file, |reviewed| {
+        if reviewed.reviewed_records.is_some() && !include_directives_artifacts {
             return Err(invalid(
-                "The scope mapping must match the verified source commit, policy pin, and selected workspace ID.",
+                "Reviewed records require --include-directives-artifacts.",
             ));
         }
-
-        let scopes = classify_scopes(inventory, &mapping.scopes, reader)?;
         let mut report = json!({
             "mode": "scope_plan",
-            "mapping_version": mapping.version,
-            "mapping_sha256": format!("{:x}", Sha256::digest(input)),
-            "source": source,
-            "inventory": inventory.summary,
+            "mapping_version": reviewed.mapping_version,
+            "mapping_sha256": reviewed.mapping_sha256,
+            "source": reviewed.source,
+            "inventory": reviewed.inventory.summary,
             "target": {"workspace_id": workspace_id},
-            "scopes": scopes.iter().map(Scope::report).collect::<Vec<_>>(),
+            "scopes": reviewed.scopes.iter().map(Scope::report).collect::<Vec<_>>(),
         });
         if include_tasks || include_directives_artifacts {
-            let outcomes = scopes
+            let outcomes = reviewed
+                .scopes
                 .iter()
                 .map(|scope| (scope.scope, &scope.outcome))
                 .collect();
             if include_tasks {
                 // Verified v1 coordination exists only under the pin that defines claims.
-                let claims_supported = !source.hive_yml.is_null();
-                let records =
-                    task_intake::read_records(inventory, &|| reader.command(), claims_supported)?;
+                let claims_supported = !reviewed.source.hive_yml.is_null();
+                let records = task_intake::read_records(
+                    reviewed.inventory,
+                    &|| reviewed.reader.command(),
+                    claims_supported,
+                )?;
                 report["task_intake"] =
-                    task_intake::report(records, &outcomes, &mapping.task_reviews, &|| {
-                        reader.command()
+                    task_intake::report(records, &outcomes, reviewed.task_reviews, &|| {
+                        reviewed.reader.command()
                     })?;
             }
             if include_directives_artifacts {
                 report["directive_artifact_intake"] = directive_artifact_intake::report(
-                    inventory,
-                    reader,
+                    reviewed.inventory,
+                    reviewed.reader,
                     &outcomes,
-                    mapping.reviewed_records.as_deref(),
+                    reviewed.reviewed_records,
                 )?;
             }
         }
-        let mut preparation = mapping
+        let mut preparation = reviewed
             .queen_preparation
-            .as_deref()
             .map(Preparation::new)
             .transpose()?;
-        if mapping.queen_assets.is_some() || preparation.is_some() {
+        if reviewed.queen_assets.is_some() || preparation.is_some() {
             report["queen_assets"] = json!(queen_assets::classify(
-                inventory,
-                reader,
-                mapping.queen_assets.as_deref().unwrap_or_default(),
+                reviewed.inventory,
+                reviewed.reader,
+                reviewed.queen_assets.unwrap_or_default(),
                 |slug, oid, digest, bytes| {
                     if let Some(preparation) = &mut preparation {
                         preparation.accept_candidate(slug, oid, digest, bytes);
@@ -255,6 +233,172 @@ fn prepare_plan(
         Ok(MigrationPlan {
             report,
             queen_souls,
+        })
+    })
+}
+
+pub(crate) struct ReviewedScopes<'a> {
+    source: &'a SourceSnapshot<'a>,
+    inventory: &'a Inventory,
+    reader: &'a AssetObjectReader<'a>,
+    mapping_version: u32,
+    mapping_sha256: String,
+    scopes: Vec<Scope<'a>>,
+    queen_assets: Option<&'a [SoulReview]>,
+    queen_preparation: Option<&'a [QueenMapping]>,
+    task_reviews: &'a [TaskReview],
+    reviewed_records: Option<&'a [Review]>,
+}
+
+impl ReviewedScopes<'_> {
+    pub(crate) fn areas_in_parent_order(&self) -> Result<Vec<&Area>, HiveError> {
+        if !self.task_reviews.is_empty()
+            || self
+                .reviewed_records
+                .is_some_and(|records| !records.is_empty())
+        {
+            return Err(invalid(
+                "Area staging requires a mapping without Task, Directive, or Artifact reviews.",
+            ));
+        }
+        if self
+            .queen_preparation
+            .is_some_and(|reviews| !reviews.is_empty())
+        {
+            return Err(invalid(
+                "Area staging requires a mapping without Queen preparation reviews.",
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        let mut children = BTreeMap::<Option<&str>, Vec<&Area>>::new();
+        for scope in &self.scopes {
+            if let ScopeOutcome::Mapped { area } = scope.outcome {
+                ids.insert(area.id.as_str());
+                children
+                    .entry(area.parent_id.as_deref())
+                    .or_default()
+                    .push(area);
+            }
+        }
+        for parent in children.keys().flatten() {
+            if !ids.contains(parent) {
+                return Err(HiveError::new(
+                    ErrorCode::InvalidRecord,
+                    format!(
+                        "Mapped Area parent {parent} is missing or held. Review the scope mapping."
+                    ),
+                ));
+            }
+        }
+
+        let mut pending = VecDeque::from(children.remove(&None).unwrap_or_default());
+        let mut ordered = Vec::with_capacity(ids.len());
+        while let Some(area) = pending.pop_front() {
+            ordered.push(area);
+            if let Some(descendants) = children.remove(&Some(area.id.as_str())) {
+                pending.extend(descendants);
+            }
+        }
+        if !children.is_empty() {
+            return Err(HiveError::new(
+                ErrorCode::InvalidRecord,
+                "Mapped Area ancestry contains a cycle. Review the scope mapping.",
+            ));
+        }
+        Ok(ordered)
+    }
+
+    pub(crate) fn staging_evidence(&self) -> Value {
+        let mut id_map = Vec::new();
+        let mut holds = Vec::new();
+        let mut exclusions = Vec::new();
+        let hash = |value: &str| format!("{:x}", Sha256::digest(value));
+        for scope in &self.scopes {
+            let scope_sha256 = hash(scope.scope);
+            let source_path_sha256s = scope
+                .source_paths
+                .iter()
+                .map(|path| hash(path))
+                .collect::<Vec<_>>();
+            let mut entry =
+                json!({"scope_sha256": scope_sha256, "source_path_sha256s": source_path_sha256s});
+            match scope.outcome {
+                ScopeOutcome::Mapped { area } => {
+                    entry["area_id"] = json!(area.id);
+                    entry["parent_area_id"] = json!(area.parent_id);
+                    id_map.push(entry);
+                }
+                ScopeOutcome::Held { reason } => {
+                    entry["reason_code"] = json!(reason);
+                    holds.push(entry);
+                }
+                ScopeOutcome::Excluded { reason } => {
+                    entry["reason_code"] = json!(reason);
+                    exclusions.push(entry);
+                }
+            }
+        }
+        json!({
+            "coverage": "scope_only",
+            "mapping_version": self.mapping_version,
+            "mapping_sha256": self.mapping_sha256,
+            "source": self.source,
+            "inventory": self.inventory.summary,
+            "counts": {"scopes": {
+                "inventoried": self.scopes.len(), "imported": id_map.len(), "held": holds.len(),
+                "excluded_non_record": exclusions.len(),
+            }},
+            "id_map": id_map,
+            "holds": holds,
+            "exclusions": exclusions,
+        })
+    }
+}
+
+pub(crate) fn with_scope_mapping<T>(
+    source: &Path,
+    revision: &str,
+    workspace_id: &str,
+    mapping_file: &Path,
+    inspect: impl FnOnce(ReviewedScopes<'_>) -> Result<T, HiveError>,
+) -> Result<T, HiveError> {
+    if !is_uuid(workspace_id) {
+        return Err(HiveError::new(
+            ErrorCode::InvalidArgument,
+            "Select an exact lowercase --workspace-id UUID.",
+        ));
+    }
+    let input = read_regular(mapping_file)
+        .map_err(|error| HiveError::new(error.code, "Could not read the scope mapping file."))?
+        .ok_or_else(|| invalid("The scope mapping file is missing."))?;
+    let Object(mapping) = serde_json::from_slice::<Object<Mapping>>(&input)
+        .map_err(|_| invalid("The scope mapping must match the versioned JSON format."))?;
+    if mapping.version != 1 {
+        return Err(invalid("The scope mapping version is unsupported."));
+    }
+
+    verified_source(source, revision, |source, inventory, reader| {
+        if mapping.source_commit != source.source_commit
+            || mapping.policy_pin != source.policy_pin
+            || mapping.workspace_id != workspace_id
+        {
+            return Err(invalid(
+                "The scope mapping must match the verified source commit, policy pin, and selected workspace ID.",
+            ));
+        }
+
+        let scopes = classify_scopes(inventory, &mapping.scopes, reader)?;
+        inspect(ReviewedScopes {
+            source,
+            inventory,
+            reader,
+            mapping_version: mapping.version,
+            mapping_sha256: format!("{:x}", Sha256::digest(input)),
+            scopes,
+            queen_assets: mapping.queen_assets.as_deref(),
+            queen_preparation: mapping.queen_preparation.as_deref(),
+            task_reviews: &mapping.task_reviews,
+            reviewed_records: mapping.reviewed_records.as_deref(),
         })
     })
 }

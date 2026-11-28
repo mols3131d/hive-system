@@ -211,9 +211,22 @@ impl<'a> Installed<'a> {
             &["rev-parse", "--verify", "refs/heads/main^{commit}"],
         )?;
         let commit = commit.trim();
+        self.verify_initial_assets(assets, commit)?;
+        Ok((commit.to_owned(), native))
+    }
+
+    pub(crate) fn verify_initial_assets(
+        &self,
+        assets: &Path,
+        commit: &str,
+    ) -> Result<(), HiveError> {
         if commit.len() != 40
             || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
             || self.git(assets, &["symbolic-ref", "HEAD"])?.trim() != "refs/heads/main"
+            || self
+                .git(assets, &["rev-parse", "--verify", "HEAD^{commit}"])?
+                .trim()
+                != commit
             || self.git(assets, &["rev-list", "--count", "HEAD"])?.trim() != "1"
             || self
                 .git(assets, &["rev-parse", "--verify", "HEAD^{tree}"])?
@@ -230,7 +243,7 @@ impl<'a> Installed<'a> {
                 "Could not verify the initial Git asset repository and commit.",
             ));
         }
-        Ok((commit.to_owned(), native))
+        Ok(())
     }
 
     pub(crate) fn query(&self, db: &Path, query: &str) -> Result<Vec<Value>, HiveError> {

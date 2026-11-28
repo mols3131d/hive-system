@@ -61,9 +61,7 @@ struct UserSource {
 
 impl UserSource {
     fn load(home: Option<&Path>) -> Result<Self, HiveError> {
-        let path = absolute_env("XDG_CONFIG_HOME")
-            .or_else(|| home.map(|home| home.join(".config")))
-            .map(|root| root.join("hive/config.yml"));
+        let path = user_config_path(home);
         let config = match &path {
             Some(path) => config_file::read_user(path)
                 .map_err(|error| error.diagnostic(Some("hive/config.yml")))?,
@@ -721,6 +719,14 @@ pub(crate) fn absolute_env(name: &str) -> Option<PathBuf> {
     env::var_os(name)
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
+}
+
+pub(crate) fn xdg_base(variable: &str, home: Option<&Path>, fallback: &str) -> Option<PathBuf> {
+    absolute_env(variable).or_else(|| home.map(|path| path.join(fallback)))
+}
+
+pub(crate) fn user_config_path(home: Option<&Path>) -> Option<PathBuf> {
+    xdg_base("XDG_CONFIG_HOME", home, ".config").map(|root| root.join("hive/config.yml"))
 }
 
 pub(crate) fn current_dir() -> Result<PathBuf, HiveError> {

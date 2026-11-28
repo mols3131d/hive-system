@@ -4,6 +4,9 @@ use serde_json::Value;
 
 use crate::error::HiveError;
 
+#[cfg(target_os = "linux")]
+pub(crate) use linux::migration_stage::run as stage_migration;
+
 pub(crate) fn run(
     source: &Path,
     target: &Path,
@@ -147,7 +150,7 @@ mod linux {
             &installed,
             &db,
             &manifest.workspace_id,
-            &manifest.dolt_commit,
+            Some(&manifest.dolt_commit),
         )?;
 
         let links = restore_assets(
@@ -201,7 +204,7 @@ mod linux {
         fn inspect(source: &Path, target: &Path) -> Result<(Self, String), HiveError> {
             let path = absolute_path(target)?;
             if path.starts_with(source) || source.starts_with(&path) {
-                return Err(invalid("Select a target separate from the backup source."));
+                return Err(invalid("Select a target separate from the source."));
             }
             let target_json = json_path(&path)?.to_owned();
             let parent = inspect_target_parent(&path)?;
@@ -247,35 +250,20 @@ mod linux {
             stage: &File,
             payload: &File,
         ) -> Result<(), HiveError> {
-            let current_parent = inspect_target_parent(&self.path)?;
-            self.verify_inactive(workspace_id)?;
             let name = self.path.file_name().expect("inspected target name");
             let target_entry = fd_path(&self.parent).join(name);
             let staged_payload =
                 open_target(&fd_path(stage).join("workspace"))?.ok_or_else(changed_target)?;
-            if !same_directory(&self.parent, &current_parent)?
-                || !same_directory(payload, &staged_payload)?
-            {
+            if !same_directory(payload, &staged_payload)? {
                 return Err(changed_target());
             }
-            let flags = if let Some(original) = &self.original {
-                let current = open_target(&target_entry)?.ok_or_else(changed_target)?;
-                if !same_directory(original, &current)? {
-                    return Err(changed_target());
-                }
-                verify_target_directory(&self.parent, &current)?;
-                require_entries(original, &[])?;
-                // Directory rename replaces only an empty directory.
-                RenameFlags::empty()
-            } else {
-                RenameFlags::NOREPLACE
-            };
+            let flags = self.check_destination(workspace_id)?;
             renameat_with(stage, "workspace", &self.parent, name, flags).map_err(|error| {
                 if matches!(
                     error,
                     rustix::io::Errno::EXIST | rustix::io::Errno::NOTEMPTY
                 ) {
-                    HiveError::new(ErrorCode::AlreadyExists, "The restore target is occupied.")
+                    HiveError::new(ErrorCode::AlreadyExists, "The inactive target is occupied.")
                 } else {
                     io_error(error.into())
                 }
@@ -283,7 +271,7 @@ mod linux {
             let uncertain = || {
                 HiveError::new(
                     ErrorCode::UnknownWriteOutcome,
-                    "The restored workspace was published but its destination or durability could not be confirmed.",
+                    "The inactive workspace was published but its destination or durability could not be confirmed.",
                 )
             };
             self.parent.sync_all().map_err(|_| uncertain())?;
@@ -298,18 +286,47 @@ mod linux {
             }
             Ok(())
         }
+
+        fn check_destination(&self, workspace_id: &str) -> Result<RenameFlags, HiveError> {
+            let current_parent = inspect_target_parent(&self.path)?;
+            self.verify_inactive(workspace_id)?;
+            if !same_directory(&self.parent, &current_parent)? {
+                return Err(changed_target());
+            }
+            let name = self.path.file_name().expect("inspected target name");
+            let entry = fd_path(&self.parent).join(name);
+            if let Some(original) = &self.original {
+                let current = open_target(&entry)?.ok_or_else(changed_target)?;
+                if !same_directory(original, &current)? {
+                    return Err(changed_target());
+                }
+                verify_target_directory(&self.parent, &current)?;
+                require_entries(original, &[])?;
+                // Directory rename replaces only an empty directory.
+                return Ok(RenameFlags::empty());
+            }
+            match fs::symlink_metadata(entry) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RenameFlags::NOREPLACE),
+                Ok(_) => Err(HiveError::new(
+                    ErrorCode::AlreadyExists,
+                    "The inactive target is occupied.",
+                )),
+                Err(error) => Err(io_error(error)),
+            }
+        }
     }
 
     fn verify_staged_db(
         installed: &Installed<'_>,
         db: &Path,
         workspace_id: &str,
-        revision: &str,
-    ) -> Result<(), HiveError> {
+        expected: Option<&str>,
+    ) -> Result<String, HiveError> {
         // Pinned Dolt fsck walks the commit DAG and verifies each historical
         // root and its referenced objects as well as the store's chunks.
         installed.dolt(db, &["fsck", "--quiet"], None)?;
-        if verify_db(installed, db, workspace_id)? != revision {
+        let revision = verify_db(installed, db, workspace_id)?;
+        if expected.is_some_and(|expected| revision != expected) {
             return Err(unverified(
                 "The restored Dolt revision differs from the manifest.",
             ));
@@ -319,8 +336,11 @@ mod linux {
             &["constraints", "verify", "--all", "--output-only"],
             None,
         )?;
-        restrict_db_modes(db)
+        restrict_db_modes(db)?;
+        Ok(revision)
     }
+
+    pub(crate) mod migration_stage;
 
     #[cfg(test)]
     mod migration_staging_tests;
@@ -502,7 +522,7 @@ mod linux {
     fn changed_target() -> HiveError {
         HiveError::new(
             ErrorCode::ConcurrentChange,
-            "The restore target or its parent changed.",
+            "The inactive target or its parent changed.",
         )
     }
 
