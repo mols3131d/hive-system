@@ -3,6 +3,8 @@ use std::collections::{BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::dolt::artifact::MAX_SCOPES;
+
 use super::Reason;
 use super::json_object;
 use super::reviewed_records::{AbsenceReview, sha256};
@@ -124,6 +126,13 @@ impl LinkReview {
             Self::Explicit(targets) => targets,
         };
         let hold = Reason::UnresolvedArtifactLinks;
+        let requested = targets.area_ids.len()
+            + targets.project_ids.len()
+            + targets.resource_ids.len()
+            + targets.issues.len();
+        if !(1..=MAX_SCOPES).contains(&requested) {
+            return Err(hold);
+        }
         let eligible = |ids: &[String], available: &HashSet<&str>| {
             let unique: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
             (unique.len() == ids.len() && unique.iter().all(|id| available.contains(id)))
@@ -144,13 +153,6 @@ impl LinkReview {
             {
                 return Err(hold);
             }
-        }
-        if area_ids.is_empty()
-            && project_ids.is_empty()
-            && resource_ids.is_empty()
-            && targets.issues.is_empty()
-        {
-            return Err(hold);
         }
         let mut issues = targets.issues.clone();
         issues.sort_unstable_by(|left, right| left.key().cmp(&right.key()));
