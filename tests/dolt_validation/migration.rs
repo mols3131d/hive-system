@@ -1388,6 +1388,88 @@ fn loose_object(repo: &Path, oid: &str) -> std::path::PathBuf {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cli_preflight_rejects_symlinked_repository_excludes() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    init_source(&source, &home);
+    fs::write(source.join(".gitignore"), "/ignored-by-gitignore\n").unwrap();
+    git(&source, &home, &["add", ".gitignore"]);
+    git(&source, &home, &["commit", "-qm", "Synthetic ignore"]);
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    fs::write(source.join("ignored-by-gitignore"), "Local ignored bytes").unwrap();
+    let untracked = source.join("synthetic-untracked-probe");
+    fs::write(&untracked, "Synthetic untracked bytes").unwrap();
+
+    let info = source.join(".git/info");
+    fs::create_dir_all(&info).unwrap();
+    let exclude = info.join("exclude");
+    let external_info = home.join("synthetic-private-exclude-location");
+    fs::create_dir(&external_info).unwrap();
+    let external_exclude = external_info.join("exclude");
+    let rules = b"# Synthetic private ignore contents\n/synthetic-untracked-probe\n";
+    fs::write(&external_exclude, rules).unwrap();
+    fs::write(&exclude, rules).unwrap();
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let preflight = |status| migration_preflight(&home, &home, &args, status);
+    let git_files = [
+        ".git/HEAD",
+        ".git/index",
+        ".git/config",
+        ".git/refs/heads/main",
+    ];
+    let git_before = git_files.map(|name| fs::read(source.join(name)).unwrap());
+    let original = preflight(0);
+
+    let refuse = || {
+        assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+        let report = preflight(2);
+        assert_eq!(report["error"]["code"], "INVALID_CONFIG");
+        assert!(report.get("data").is_none_or(Value::is_null));
+        let text = report.to_string();
+        for private in [
+            "synthetic-private-exclude-location",
+            "Synthetic private ignore contents",
+            "synthetic-untracked-probe",
+        ] {
+            assert!(!text.contains(private));
+        }
+        assert_eq!(fs::read(&external_exclude).unwrap(), rules);
+        assert_eq!(fs::read(&untracked).unwrap(), b"Synthetic untracked bytes");
+        assert_eq!(
+            git_files.map(|name| fs::read(source.join(name)).unwrap()),
+            git_before
+        );
+    };
+
+    fs::remove_file(&exclude).unwrap();
+    symlink(&external_exclude, &exclude).unwrap();
+    refuse();
+    assert_eq!(fs::read_link(&exclude).unwrap(), external_exclude);
+    fs::remove_file(&exclude).unwrap();
+    let saved_info = home.join("saved-info");
+    fs::rename(&info, &saved_info).unwrap();
+    symlink(&external_info, &info).unwrap();
+    refuse();
+    assert_eq!(fs::read_link(&info).unwrap(), external_info);
+    fs::remove_file(&info).unwrap();
+    fs::rename(&saved_info, &info).unwrap();
+
+    assert_eq!(preflight(5)["error"]["code"], "DIRTY_CONFLICT");
+    fs::remove_file(&untracked).unwrap();
+    assert_eq!(preflight(0), original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cli_preflight_rejects_a_truncated_task_blob_with_readable_size() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
