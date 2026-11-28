@@ -1123,6 +1123,47 @@ fn installed_cli_stages_only_reviewed_scopes_and_preserves_both_contracts() {
         assert_eq!(error["code"], code);
         error
     };
+    for (pointer, positional) in [
+        (
+            "",
+            json!([1, commit, POLICY_PIN, workspace_id, mapping["scopes"]]),
+        ),
+        (
+            "/scopes/0",
+            json!(["_hive-userdata", mapping["scopes"][0]["decision"]]),
+        ),
+        (
+            "/scopes/1/decision/area",
+            json!([app, "application", NAME, general]),
+        ),
+        (
+            "/scopes/1/decision/project_evidence/0",
+            json!([app_sources[0], REFERENCE]),
+        ),
+    ] {
+        let mut input = mapping.clone();
+        *input.pointer_mut(pointer).unwrap() = positional;
+        for mode in ["dry-run", "staged-import"] {
+            let rejected = stage(mode, V2_POLICY, &input, 2);
+            assert_eq!(rejected["error"]["code"], "INVALID_CONFIG");
+            assert_eq!(
+                rejected["error"]["message"],
+                "The scope mapping must match the versioned JSON format."
+            );
+            assert!(rejected.get("data").is_none());
+            assert!(!target.exists());
+        }
+    }
+    verify_source();
+    assert_eq!(
+        sources.map(|name| fs::read(source.join(name)).unwrap()),
+        source_bytes
+    );
+    assert_eq!(fs::read_to_string(&v1_config).unwrap(), v1_config_bytes);
+    assert_eq!(fs::read_to_string(&v2_config).unwrap(), v2_config_bytes);
+    assert!(!state.exists());
+    assert!(!data.exists());
+
     reject(POLICY_PIN, &mapping, 4, "INCOMPATIBLE_POLICY");
     for (field, wrong) in [
         ("workspace_id", id(2)),
@@ -1315,6 +1356,124 @@ fn installed_cli_stages_only_reviewed_scopes_and_preserves_both_contracts() {
             .to_string_lossy()
             .starts_with(".hive-init-incomplete-")
     }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_requires_named_json_objects_on_both_policy_pins() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    init_git(
+        &source,
+        &home,
+        "Synthetic Fixture",
+        "synthetic@example.invalid",
+    );
+    let mapping_file = root.path().join("mapping.json");
+    let workspace = id(1);
+    let area_id = id(AREA_APP);
+    let path = "tasks/synth-app/README.md";
+    let reference = "https://forge.example/synthetic/app";
+    fs::create_dir_all(source.join(path).parent().unwrap()).unwrap();
+    fs::write(
+        source.join(path),
+        format!("# Synthetic App\n\nProject: {reference}\n"),
+    )
+    .unwrap();
+
+    for pin in ["0fd0f8dbe632d14094a93599cb1b5f653789ac9c", POLICY_PIN] {
+        fs::write(source.join("AGENTS.md"), format!("hive-system@{pin}\n")).unwrap();
+        if pin == POLICY_PIN {
+            fs::write(
+                source.join("hive.yml"),
+                "version: 1\ncoordination:\n  mode: local\n",
+            )
+            .unwrap();
+        }
+        git(&source, &home, &["add", "."]);
+        git(&source, &home, &["commit", "-qm", "Synthetic policy pin"]);
+        let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+        let args = [
+            "--source",
+            source.to_str().unwrap(),
+            "--source-commit",
+            &commit,
+            "--workspace-id",
+            &workspace,
+            "--mapping-file",
+            mapping_file.to_str().unwrap(),
+        ];
+        let plan = |input: &str, status| {
+            fs::write(&mapping_file, input).unwrap();
+            migration_cli(&home, &config, "migration-plan", &args, status)
+        };
+
+        let evidence = json!({"path": path, "canonical_ref": reference});
+        let area = json!({"id": area_id, "slug": "application", "name": "Synthetic App", "parent_id": null});
+        let decision = json!({"kind": "area", "area": area, "project_evidence": [evidence]});
+        let entry = json!({"scope": "synth-app", "decision": decision});
+        let mapping = json!({
+            "version": 1,
+            "source_commit": commit,
+            "policy_pin": pin,
+            "workspace_id": workspace,
+            "scopes": [entry],
+        });
+        let named = mapping.to_string();
+        let report = plan(&named, 0);
+        assert_eq!(report["data"]["source"]["policy_pin"], pin);
+        assert_eq!(
+            report["data"]["scopes"][0]["outcome"],
+            json!({
+                "status": "mapped",
+                "area": {"id": area_id, "slug": "application", "parent_id": null},
+            })
+        );
+
+        let reject = |input: &str| {
+            let report = plan(input, 2);
+            assert_eq!(report["error"]["code"], "INVALID_CONFIG");
+            assert_eq!(
+                report["error"]["message"],
+                "The scope mapping must match the versioned JSON format."
+            );
+            assert!(report.get("data").is_none());
+        };
+        for (pointer, positional) in [
+            ("", json!([1, commit, pin, workspace, [entry]])),
+            ("/scopes/0", json!(["synth-app", decision])),
+            ("/scopes/0/decision", json!(["area", area, [evidence]])),
+            (
+                "/scopes/0/decision/area",
+                json!([area_id, "application", "Synthetic App", null]),
+            ),
+            (
+                "/scopes/0/decision/project_evidence/0",
+                json!([path, reference]),
+            ),
+            ("/scopes", entry),
+            ("/scopes/0/decision/project_evidence", evidence),
+        ] {
+            let mut changed = mapping.clone();
+            *changed.pointer_mut(pointer).unwrap() = positional;
+            reject(&changed.to_string());
+        }
+        for member in [
+            r#""version":1"#,
+            r#""scope":"synth-app""#,
+            r#""kind":"area""#,
+            r#""parent_id":null"#,
+            r#""canonical_ref":"https://forge.example/synthetic/app""#,
+        ] {
+            reject(&named.replacen(member, &format!("{member},{member}"), 1));
+            reject(&named.replacen(member, &format!(r#"{member},"unexpected":true"#), 1));
+        }
+        reject(&format!("{named}\n{{}}"));
+    }
+    assert!(!config.exists());
 }
 
 #[cfg(target_os = "linux")]

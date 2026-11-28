@@ -13,6 +13,7 @@ use super::*;
 use crate::cli::is_slug;
 use crate::config_file::{Coordination, ScopedDirectory};
 
+mod json_object;
 mod scope_plan;
 pub(crate) use scope_plan::{Area, ReviewedScopes, plan, with_scope_mapping};
 
