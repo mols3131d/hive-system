@@ -905,11 +905,11 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     for (path, content) in [
         (
             "directives/synth-app/README.md",
-            "# Project direction\n\nProject: https://forge.example/synthetic/app\n",
+            "# Project direction\n\n<!-- hidden https://forge.example/synthetic/other --> Project: https://forge.example/synthetic/app <!-- hidden https://forge.example/synthetic/other -->\n",
         ),
         (
             "bots/queen-synth/memory/synth-app/MEMORY.md",
-            "# Project memory\n\nProject: https://forge.example/synthetic/app\n",
+            "# Project memory\n\n<!--\nhttps://forge.example/synthetic/other\n~~~\n-->\n\n~~~markdown\n<!--\nhttps://forge.example/synthetic/other\n~~~~\n\nProject: https://forge.example/synthetic/app\n",
         ),
         (
             "tasks/hive-system/README.md",
@@ -936,6 +936,18 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         (
             "tasks/frontmatter-only/README.md",
             "---\ndescription: https://forge.example/synthetic/app\n---\n# Project navigation\n",
+        ),
+        (
+            "tasks/inline-comment-only/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <!-- https://forge.example/synthetic/app -->\n",
+        ),
+        (
+            "tasks/multiline-comment-only/README.md",
+            "# Project navigation\n\n<!-- example\nhttps://forge.example/synthetic/app\n--> Project: /home/synthetic/private/app\n",
+        ),
+        (
+            "tasks/fenced-example-only/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app\n\n````markdown\n```\nhttps://forge.example/synthetic/app\n````\n",
         ),
     ] {
         let file = source.join(path);
@@ -1014,6 +1026,15 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             area("frontmatter-only", 0x10a, "frontmatter", json!([
                 evidence("tasks/frontmatter-only/README.md", app_ref)
             ])),
+            area("inline-comment-only", 0x10b, "inline-comment", json!([
+                evidence("tasks/inline-comment-only/README.md", app_ref)
+            ])),
+            area("multiline-comment-only", 0x10c, "multiline-comment", json!([
+                evidence("tasks/multiline-comment-only/README.md", app_ref)
+            ])),
+            area("fenced-example-only", 0x10d, "fenced-example", json!([
+                evidence("tasks/fenced-example-only/README.md", app_ref)
+            ])),
         ]
     });
     mapping["scopes"][0]["decision"]["area"]["name"] = json!(local_path);
@@ -1036,7 +1057,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(data["source"], snapshot["data"]["source"]);
     assert_eq!(data["inventory"], snapshot["data"]["inventory"]);
     assert_eq!(data["target"], json!({"workspace_id": workspace}));
-    assert_eq!(data["scopes"].as_array().unwrap().len(), 12);
+    assert_eq!(data["scopes"].as_array().unwrap().len(), 15);
     let outcomes = |report: &Value| {
         report["scopes"]
             .as_array()
@@ -1076,6 +1097,9 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         "conflicting-refs",
         "ambiguous-refs",
         "frontmatter-only",
+        "inline-comment-only",
+        "multiline-comment-only",
+        "fenced-example-only",
     ] {
         assert_eq!(mapped[scope], held, "{scope}");
     }
