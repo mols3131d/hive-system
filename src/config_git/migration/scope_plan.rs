@@ -3,13 +3,14 @@ use std::ops::Range;
 use std::path::Path;
 
 use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag, TagEnd};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
 use super::json_object::{self, Object};
-use super::reviewed_records::{self, Review};
+use super::queen_assets::{self, SoulReview};
+use super::reviewed_records::Review;
 use super::{
     AssetObjectReader, Inventory, Reason, directive_artifact_intake,
     is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
@@ -28,8 +29,18 @@ struct Mapping {
     workspace_id: String,
     #[serde(deserialize_with = "json_object::deserialize_vec")]
     scopes: Vec<ScopeMapping>,
-    #[serde(default, deserialize_with = "reviewed_records::deserialize_present")]
+    #[serde(default, deserialize_with = "optional_object_list")]
     reviewed_records: Option<Vec<Review>>,
+    #[serde(default, deserialize_with = "optional_object_list")]
+    queen_assets: Option<Vec<SoulReview>>,
+}
+
+fn optional_object_list<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    json_object::deserialize_vec(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -182,6 +193,9 @@ pub(crate) fn plan(
                     mapping.reviewed_records.as_deref(),
                 )?;
             }
+        }
+        if let Some(reviews) = &mapping.queen_assets {
+            report["queen_assets"] = json!(queen_assets::classify(inventory, reader, reviews)?);
         }
         Ok(report)
     })

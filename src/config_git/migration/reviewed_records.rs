@@ -65,12 +65,6 @@ fn string_enum<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     T::deserialize(StrDeserializer::new(&label))
 }
 
-pub(super) fn deserialize_present<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Vec<Review>>, D::Error> {
-    json_object::deserialize_vec(deserializer).map(Some)
-}
-
 pub(super) fn bind<'a>(
     reviews: &'a [Review],
     inventory: &Inventory,

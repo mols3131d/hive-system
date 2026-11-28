@@ -1680,6 +1680,511 @@ fn cli_migration_plan_redacts_malformed_scope_and_bot_directories() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cli_migration_plan_classifies_reviewed_queen_assets_without_writes() {
+    check_queen_asset_intake(POLICY_PIN);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_preserves_queen_asset_classification_under_legacy_pin() {
+    check_queen_asset_intake("0fd0f8dbe632d14094a93599cb1b5f653789ac9c");
+}
+
+#[cfg(target_os = "linux")]
+fn check_queen_asset_intake(policy_pin: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("source");
+    let config = root.path().join("config");
+    init_source(&source, &home);
+
+    let write = |path: &str, bytes: &[u8]| {
+        let path = source.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    };
+    if policy_pin != POLICY_PIN {
+        let policy = fs::read_to_string(source.join("AGENTS.md")).unwrap();
+        write(
+            "AGENTS.md",
+            policy.replace(POLICY_PIN, policy_pin).as_bytes(),
+        );
+        fs::remove_file(source.join("hive.yml")).unwrap();
+    }
+    let soul = |slug: &str, layer: &str| {
+        format!(
+            "---\ndescription: \"Select the synthetic Queen identity.\"\n---\n# Synthetic Queen\n\n## Identity\n\n- ID: {slug}\n- Name: Synthetic Private Display\n- Layer: {layer}\n\n## Purpose\n\nSynthetic private persona sentinel.\n"
+        )
+    };
+    let exact_soul = soul("queen-synth", "1 — Manager").replace('\n', "\r\n");
+    write("bots/queen-synth/SOUL.md", exact_soul.as_bytes());
+    let compatible = [
+        (
+            "identity-steward",
+            soul("identity-steward", "1 — Manager")
+                .replace("# Synthetic Queen", "# Identity Steward")
+                .replace(
+                    "- Name: Synthetic Private Display",
+                    "- Name: Identity Steward",
+                ),
+        ),
+        (
+            "purpose-duties",
+            format!(
+                "{}\n- Role-specific review duties are described in [Agent Layout](https://example.invalid/agent-layout).\n- Role assignments follow the review policy.\n- **Role**-specific guidance belongs in the review policy.\n- Review duties follow **Role** assignments.\n",
+                soul("purpose-duties", "1 — Manager")
+            ),
+        ),
+    ];
+    for (slug, contents) in &compatible {
+        write(&format!("bots/{slug}/SOUL.md"), contents.as_bytes());
+    }
+    for (slug, layer) in [
+        ("worker", "2 — Coordinator"),
+        ("wrong-id", "1 — Manager"),
+        ("collision", "1 — Manager"),
+        ("Collision", "1 — Manager"),
+        ("repeat-review", "1 — Manager"),
+        ("stale", "1 — Manager"),
+        ("unreviewed", "1 — Manager"),
+        ("alias", "1 — Manager"),
+        ("aux", "1 — Manager"),
+    ] {
+        let id = if slug == "wrong-id" { "other" } else { slug };
+        write(&format!("bots/{slug}/SOUL.md"), soul(id, layer).as_bytes());
+    }
+    write("bots/alias/soul.md", b"Case alias.");
+    let conflicting = [
+        ("conflict-star", "* Layer: 2 — Coordinator"),
+        ("conflict-plus", "+ **Role:** Coordinator"),
+        ("conflict-ordered", "1) Bot ID: different-queen"),
+        ("conflict-nested", "- > * Layer: 2 — Coordinator"),
+        ("conflict-heading", "### Layer: 2 — Coordinator ###"),
+        ("conflict-heading-section", "### Role\n\nCoordinator"),
+        ("conflict-setext", "Role\n----\nCoordinator"),
+        ("conflict-multiword-atx", "### Bot ID different-queen"),
+        ("conflict-bold-atx", "### **Bot ID** different-queen"),
+        ("conflict-multiword-setext", "Bot ID different-queen\n---"),
+        ("conflict-empty-field", "* **Display Name**:"),
+        ("conflict-empty-heading", "### **Bot ID**"),
+        ("conflict-malformed-field", "* **Bot ID = different-queen"),
+        ("conflict-dash-field", "* Role - Coordinator"),
+        ("conflict-strong-id", "- **Bot ID** different-queen"),
+        ("conflict-strong-role", "- **Role** Coordinator"),
+        ("conflict-emphasis-id", "- *Bot ID* different-queen"),
+        ("conflict-nested-format", "- ***Role*** Coordinator"),
+        ("conflict-strong-empty", "- **Bot ID**"),
+    ];
+    for (slug, declaration) in conflicting {
+        write(
+            &format!("bots/{slug}/SOUL.md"),
+            format!("{}\n{declaration}\n", soul(slug, "1 — Manager")).as_bytes(),
+        );
+    }
+    write(
+        "bots/conflict-leading/SOUL.md",
+        soul("conflict-leading", "1 — Manager")
+            .replace("# Synthetic Queen", "# Bot ID different-queen")
+            .as_bytes(),
+    );
+    write(
+        "bots/missing/README.md",
+        b"Synthetic private routing sentinel.",
+    );
+    write("bots/binary/SOUL.md", &[0xff]);
+    write(
+        "bots/bad-metadata/SOUL.md",
+        soul("bad-metadata", "1 — Manager")
+            .replacen("\n---\n", "\nrole: Manager\n---\n", 1)
+            .as_bytes(),
+    );
+    write(
+        "bots/queen-synth/memory/_general/AGENTS.md",
+        b"Synthetic instructions.",
+    );
+    let nav = b"---\ndescription: \"Select memory navigation.\"\n---\n# Memory Navigation\n\n- [General](memory/_general/MEMORY.md)\n";
+    write("bots/queen-synth/MEMORY.md", nav);
+    write("bots/unreviewed/MEMORY.md", nav);
+    let (header, navigation_body) = std::str::from_utf8(nav)
+        .unwrap()
+        .split_once("\n---\n")
+        .unwrap();
+    write(
+        "bots/missing/MEMORY.md",
+        format!(
+            "---\ndescription: \"Synthetic learned metadata sentinel.\"\n---\n{navigation_body}"
+        )
+        .as_bytes(),
+    );
+    write("bots/missing/memory/_general/MEMORY.md", nav);
+    write(
+        "bots/alias/MEMORY.md",
+        format!(
+            "{header}\ntitle: \"Synthetic learned metadata sentinel.\"\n---\n{navigation_body}"
+        )
+        .as_bytes(),
+    );
+    write("bots/alias/memory/_general/MEMORY.md", nav);
+    write(
+        "bots/stale/MEMORY.md",
+        format!("{header}\n# Synthetic learned metadata sentinel.\n---\n{navigation_body}")
+            .as_bytes(),
+    );
+    write("bots/stale/memory/_general/MEMORY.md", nav);
+    let device_bot_scope = "bots/aux/memory/_general";
+    let device_memory_scope = "bots/clean/memory/aux";
+    let reserved_memory = [
+        ("_general", "bots/clean/memory/_general"),
+        ("_hive-userdata", "bots/clean/memory/_hive-userdata"),
+    ];
+    for (_, directory) in reserved_memory {
+        write(&format!("{directory}/MEMORY.md"), nav);
+    }
+    let mut clean_nav = nav.to_vec();
+    clean_nav.extend(b"- [Hive Userdata](memory/_hive-userdata/MEMORY.md)\n");
+    write("bots/clean/MEMORY.md", &clean_nav);
+    let nonportable_paths = [
+        (
+            "bot_memories_historical",
+            "bots/aux/memory/_general/MEMORY.md",
+        ),
+        ("bot_memories_historical", "bots/clean/memory/aux/MEMORY.md"),
+        (
+            "bot_memories_historical",
+            "bots/queen-synth/memory/Host:Path/MEMORY.md",
+        ),
+        (
+            "bot_memories_historical",
+            "bots/queen-synth/memory/_general/private topic.md",
+        ),
+        (
+            "bot_memories_historical",
+            "bots/queen-synth/memory/_general/con.md",
+        ),
+        ("bots_soul", "bots/queen-synth/Local Notes/AGENTS.md"),
+        (
+            "bots_soul",
+            "bots/queen-synth/memory/_general/nul/AGENTS.md",
+        ),
+    ];
+    for (_, path) in nonportable_paths {
+        write(path, b"Synthetic historical evidence.");
+    }
+    let mut mixed = nav.to_vec();
+    mixed.extend(b"\nSynthetic private memory sentinel.\n");
+    write("bots/worker/MEMORY.md", &mixed);
+    write("bots/worker/memory/_general/MEMORY.md", nav);
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic Queen and Memory assets"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let review = |slug: &str| {
+        let oid = git_text(
+            &source,
+            &home,
+            &["rev-parse", &format!("HEAD:bots/{slug}/SOUL.md")],
+        );
+        json!({"slug": slug, "source_git_blob_sha": oid})
+    };
+    let workspace_id = id(1);
+    let mapping_file = root.path().join("queen-mapping.json");
+    let mut mapping = json!({
+        "version": 1,
+        "source_commit": commit,
+        "policy_pin": policy_pin,
+        "workspace_id": workspace_id,
+        "scopes": [],
+    });
+    let run_json = |manifest: &str, revision: &str, status| {
+        fs::write(&mapping_file, manifest).unwrap();
+        migration_cli(
+            &home,
+            &config,
+            "migration-plan",
+            &[
+                "--source",
+                source.to_str().unwrap(),
+                "--source-commit",
+                revision,
+                "--workspace-id",
+                &workspace_id,
+                "--mapping-file",
+                mapping_file.to_str().unwrap(),
+            ],
+            status,
+        )
+    };
+    let run = |mapping: &Value, status| {
+        run_json(
+            &mapping.to_string(),
+            mapping["source_commit"].as_str().unwrap(),
+            status,
+        )
+    };
+    assert!(run(&mapping, 0)["data"].get("queen_assets").is_none());
+    let index_before = fs::read(source.join(".git/index")).unwrap();
+    let mut changed = mapping.clone();
+    changed["queen_assets"] = json!([]);
+    let empty_intake = run(&changed, 0);
+    let souls = empty_intake["data"]["queen_assets"]["bots_soul"]
+        .as_array()
+        .unwrap();
+    assert!(!souls.is_empty());
+    assert!(souls.iter().all(|record| record["status"] != "candidate"));
+
+    let review_entry = review("queen-synth");
+    let reject_shape = |label: &str, manifest: &str| {
+        let report = run_json(manifest, &commit, 2);
+        assert_eq!(
+            report["error"]["code"], "INVALID_CONFIG",
+            "{policy_pin}: {label}"
+        );
+        assert!(report.get("data").is_none(), "{policy_pin}: {label}");
+    };
+    let mut unknown_member = review_entry.clone();
+    unknown_member["unknown"] = json!(true);
+    for (label, value) in [
+        (
+            "positional row",
+            json!([[review_entry["slug"], review_entry["source_git_blob_sha"]]]),
+        ),
+        ("null list", Value::Null),
+        ("bare object", review_entry.clone()),
+        ("null row", json!([null])),
+        ("unknown member", json!([unknown_member])),
+    ] {
+        changed["queen_assets"] = value;
+        reject_shape(label, &changed.to_string());
+    }
+    changed["queen_assets"] = json!([review_entry]);
+    let row = review_entry.to_string();
+    let repeated_slug = format!("{{\"slug\":{},{}", review_entry["slug"], &row[1..]);
+    let manifest = changed.to_string();
+    reject_shape(
+        "repeated row member",
+        &manifest.replace(&row, &repeated_slug),
+    );
+    reject_shape(
+        "repeated manifest member",
+        &format!("{{\"queen_assets\":[],{}", &manifest[1..]),
+    );
+
+    mapping["queen_assets"] = json!([
+        review("queen-synth"), review("worker"), review("wrong-id"), review("collision"),
+        review("repeat-review"), review("repeat-review"), review("alias"), review("binary"),
+        review("bad-metadata"), review("aux"), review("conflict-leading"),
+        {"slug": "stale", "source_git_blob_sha": "1111111111111111111111111111111111111111"}
+    ]);
+    mapping["queen_assets"].as_array_mut().unwrap().extend(
+        conflicting
+            .iter()
+            .map(|(slug, _)| *slug)
+            .chain(compatible.iter().map(|(slug, _)| *slug))
+            .map(review),
+    );
+    let report = run(&mapping, 0);
+    let assets = &report["data"]["queen_assets"];
+    let find = |surface: &str, path: &str| {
+        assets[surface]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["source_path"] == path)
+            .unwrap_or_else(|| panic!("Missing {surface} outcome for {path}"))
+    };
+    let candidate = find("bots_soul", "bots/queen-synth/SOUL.md");
+    assert_eq!(candidate["status"], "candidate");
+    assert_eq!(candidate["slug"], "queen-synth");
+    assert_eq!(candidate["target_path"], "assets/bots/queen-synth/SOUL.md");
+    assert_eq!(
+        candidate["source_git_blob_sha"],
+        review("queen-synth")["source_git_blob_sha"]
+    );
+    assert_eq!(
+        candidate["source_raw_sha256"],
+        sha256_hex(exact_soul.as_bytes())
+    );
+    for (slug, contents) in &compatible {
+        let candidate = find("bots_soul", &format!("bots/{slug}/SOUL.md"));
+        assert_eq!(candidate["status"], "candidate", "{slug}");
+        assert_eq!(
+            candidate["source_git_blob_sha"],
+            review(slug)["source_git_blob_sha"]
+        );
+        assert_eq!(
+            candidate["source_raw_sha256"],
+            sha256_hex(contents.as_bytes())
+        );
+    }
+    for slug in [
+        "worker",
+        "wrong-id",
+        "collision",
+        "repeat-review",
+        "stale",
+        "unreviewed",
+        "missing",
+        "alias",
+        "binary",
+        "bad-metadata",
+        "conflict-leading",
+    ] {
+        let record = find("bots_soul", &format!("bots/{slug}/SOUL.md"));
+        assert_eq!(record["status"], "held", "{slug}");
+        assert_eq!(record["reason"], "invalid_soul_or_slug", "{slug}");
+    }
+    let redacted = assets["bots_soul"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["source_path_sha256"] == sha256_hex(b"bots/Collision/SOUL.md"))
+        .unwrap();
+    assert_eq!(redacted["status"], "held");
+    assert!(redacted.get("source_path").is_none());
+    let device_slug = assets["bots_soul"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["source_path_sha256"] == sha256_hex(b"bots/aux/SOUL.md"))
+        .unwrap();
+    assert_eq!(device_slug["reason"], "invalid_soul_or_slug");
+    assert!(device_slug.get("source_path").is_none());
+    let serialized = report.to_string();
+    for (surface, path) in nonportable_paths {
+        let record = assets[surface]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["source_path_sha256"] == sha256_hex(path.as_bytes()))
+            .unwrap();
+        assert!(record.get("source_path").is_none(), "{path}");
+        assert!(record["source_git_blob_sha"].is_string(), "{path}");
+        assert!(!serialized.contains(path), "{path}");
+    }
+    let scopes = report["data"]["scopes"].as_array().unwrap();
+    let malformed_scope_digest = sha256_hex(b"Host:Path");
+    for (field, key, directory) in [
+        (
+            "scope_sha256",
+            malformed_scope_digest.as_str(),
+            "bots/queen-synth/memory/Host:Path",
+        ),
+        ("scope", "aux", device_memory_scope),
+    ] {
+        let scope = scopes.iter().find(|scope| scope[field] == key).unwrap();
+        assert_eq!(scope["outcome"]["status"], "held", "{directory}");
+        assert_eq!(scope["source_paths"], json!([]), "{directory}");
+        assert_eq!(
+            scope["source_path_sha256s"],
+            json!([sha256_hex(directory.as_bytes())]),
+            "{directory}"
+        );
+    }
+    for (key, directory) in reserved_memory {
+        let scope = scopes.iter().find(|scope| scope["scope"] == key).unwrap();
+        assert!(
+            scope["source_paths"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(directory))
+        );
+        assert_eq!(
+            find("bot_memories_historical", &format!("{directory}/MEMORY.md"))["reason"],
+            "curated_memory_deferred"
+        );
+        if key == "_general" {
+            assert_eq!(
+                scope["source_path_sha256s"],
+                json!([sha256_hex(device_bot_scope.as_bytes())])
+            );
+        }
+    }
+    for (slug, _) in conflicting {
+        let outcome = find("bots_soul", &format!("bots/{slug}/SOUL.md"));
+        assert_eq!(outcome["status"], "held", "{slug}");
+        assert_eq!(outcome["reason"], "invalid_soul_or_slug", "{slug}");
+    }
+    for path in [
+        "bots/queen-synth/README.md",
+        "bots/queen-synth/memory/_general/AGENTS.md",
+    ] {
+        let record = find("bots_soul", path);
+        assert_eq!(record["status"], "excluded");
+        assert_eq!(record["reason"], "management_only");
+    }
+    assert_eq!(
+        find("navigation_only", "bots/queen-synth/MEMORY.md")["reason"],
+        "navigation_only"
+    );
+    assert_eq!(
+        find("navigation_only", "bots/clean/MEMORY.md")["reason"],
+        "navigation_only"
+    );
+    for path in [
+        "bots/queen-synth/memory/_general/MEMORY.md",
+        "bots/queen-synth/memory/synth-app/architecture.md",
+        "bots/unreviewed/MEMORY.md",
+        "bots/worker/MEMORY.md",
+        "bots/worker/memory/_general/MEMORY.md",
+        "bots/missing/MEMORY.md",
+        "bots/alias/MEMORY.md",
+        "bots/stale/MEMORY.md",
+    ] {
+        assert_eq!(
+            find("bot_memories_historical", path)["reason"],
+            "curated_memory_deferred"
+        );
+    }
+    for private in [
+        "Synthetic Private Display",
+        "Identity Steward",
+        "Role-specific review duties",
+        "Host:Path",
+        device_bot_scope,
+        device_memory_scope,
+        "sentinel",
+        "memory/_general/MEMORY.md)",
+    ] {
+        assert!(!serialized.contains(private), "{private}");
+    }
+    assert_eq!(run(&mapping, 0), report);
+    mapping["queen_assets"] = json!([{"slug": "../invalid", "source_git_blob_sha": commit}]);
+    assert_eq!(run(&mapping, 2)["error"]["code"], "INVALID_CONFIG");
+    assert_eq!(fs::read(source.join(".git/index")).unwrap(), index_before);
+    assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        fs::read(source.join("bots/queen-synth/SOUL.md")).unwrap(),
+        exact_soul.as_bytes()
+    );
+    assert!(!source.join("assets").exists());
+    assert!(!config.exists());
+
+    let external = root.path().join("outside-soul.md");
+    let outside_bytes = soul("escape", "1 — Manager");
+    fs::write(&external, &outside_bytes).unwrap();
+    fs::create_dir(source.join("bots/escape")).unwrap();
+    std::os::unix::fs::symlink(&external, source.join("bots/escape/SOUL.md")).unwrap();
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic symlink escape"],
+    );
+    mapping["source_commit"] = json!(git_text(&source, &home, &["rev-parse", "HEAD"]));
+    mapping["queen_assets"] = json!([review("escape")]);
+    let rejected = run(&mapping, 4);
+    assert_eq!(rejected["error"]["code"], "INVALID_RECORD");
+    assert!(!rejected.to_string().contains(external.to_str().unwrap()));
+    assert_eq!(fs::read_to_string(&external).unwrap(), outside_bytes);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
