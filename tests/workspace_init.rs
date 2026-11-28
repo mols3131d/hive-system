@@ -1760,6 +1760,105 @@ Two lines.
             .unwrap();
     assert_eq!(repo_state["remotes"], serde_json::json!({}));
     assert_eq!(repo_state["backups"], serde_json::json!({}));
+
+    let workspace = manifest["workspace_id"].as_str().unwrap();
+    let area = "01900000-0000-7000-8000-000000000007";
+    let request = "01900000-0000-4000-8000-000000000007";
+    let actor = "synthetic-planner";
+    let title = "Synthetic inactive-copy write";
+    let payload = serde_json::json!([
+        1,
+        "issue.create",
+        workspace,
+        area,
+        actor,
+        "task",
+        title,
+        null
+    ]);
+    let decision = fixture.0.join("create-decision.json");
+    fs::write(
+        &decision,
+        serde_json::to_vec(&serde_json::json!({
+            "decision": "allow",
+            "evidence": {
+                "version": 1, "operation": "issue.create", "workspace_id": workspace,
+                "request_id": request, "area_id": area, "actor_ref": actor,
+                "fingerprint": format!("{:x}", Sha256::digest(payload.to_string().as_bytes())),
+                "authorization_ref": "fixture-authorization", "evidence_id": "fixture-evidence",
+                "revision": "r1", "source_ref": "fixture-source", "issuer_ref": "fixture-issuer",
+                "valid_from": "2000-01-01T00:00:00Z", "expires_at": "2099-01-01T00:00:00Z",
+                "withdrawn": false,
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let create_at = |target: &Path| {
+        response(
+            fixture
+                .hive()
+                .env("XDG_STATE_HOME", &xdg)
+                .env("XDG_CONFIG_HOME", fixture.0.join("unused-restore-config"))
+                .args(["--contract", "2", "--json", "--workspace"])
+                .arg(target)
+                .args([
+                    "issue",
+                    "create",
+                    "--workspace-id",
+                    workspace,
+                    "--database",
+                    "db",
+                    "--port",
+                    "38765",
+                    "--area",
+                    area,
+                    "--type",
+                    "task",
+                    "--title",
+                    title,
+                    "--actor",
+                    actor,
+                    "--request-id",
+                    request,
+                    "--evidence-file",
+                ])
+                .arg(&decision)
+                .output()
+                .unwrap(),
+            7,
+        )
+    };
+    let snapshot = |path: &Path| {
+        execute(database(path).args([
+            "sql",
+            "-r",
+            "json",
+            "-q",
+            "SELECT DOLT_HASHOF('HEAD') AS head,
+                    DOLT_HASHOF_DB('WORKING') AS working, DOLT_HASHOF_DB('STAGED') AS staged,
+                    (SELECT COUNT(*) FROM operation_receipts) AS receipts",
+        ]))
+    };
+    let restored_db = restored.join("db");
+    let before = snapshot(&db);
+    let restored_before = snapshot(&restored_db);
+    assert_eq!(restored_before, before);
+    let active_root = state.join("active-root.json");
+    let registration = fs::read(&active_root).unwrap();
+    let source = create_at(&root);
+    assert_eq!(source["error"]["message"], "No owned server is recorded.");
+    let refused = create_at(&restored);
+    assert_eq!(refused["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert_eq!(
+        refused["error"]["message"],
+        "Local state does not match the selected workspace ID and canonical root."
+    );
+    assert_eq!(snapshot(&db), before);
+    assert_eq!(snapshot(&restored_db), restored_before);
+    assert_eq!(fs::read(active_root).unwrap(), registration);
+    assert!(!state.join("pending-request.json").exists());
+
     substitute_legacy_bundle();
     let legacy = response(run_restore(&backup, "new restored"), 0);
     assert_eq!(legacy["data"]["active_root"], "inactive");
