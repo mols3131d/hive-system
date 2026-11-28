@@ -1585,7 +1585,7 @@ fn check_queen_asset_intake(policy_pin: &str) {
         (
             "purpose-duties",
             format!(
-                "{}\n- Role-specific review duties are described in [Agent Layout](https://example.invalid/agent-layout).\n- Role assignments follow the review policy.\n",
+                "{}\n- Role-specific review duties are described in [Agent Layout](https://example.invalid/agent-layout).\n- Role assignments follow the review policy.\n- **Role**-specific guidance belongs in the review policy.\n- Review duties follow **Role** assignments.\n",
                 soul("purpose-duties", "1 — Manager")
             ),
         ),
@@ -1623,6 +1623,11 @@ fn check_queen_asset_intake(policy_pin: &str) {
         ("conflict-empty-heading", "### **Bot ID**"),
         ("conflict-malformed-field", "* **Bot ID = different-queen"),
         ("conflict-dash-field", "* Role - Coordinator"),
+        ("conflict-strong-id", "- **Bot ID** different-queen"),
+        ("conflict-strong-role", "- **Role** Coordinator"),
+        ("conflict-emphasis-id", "- *Bot ID* different-queen"),
+        ("conflict-nested-format", "- ***Role*** Coordinator"),
+        ("conflict-strong-empty", "- **Bot ID**"),
     ];
     for (slug, declaration) in conflicting {
         write(
