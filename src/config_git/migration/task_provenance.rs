@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
+use super::json_object::Object;
 use super::scope_plan::is_portable_scope;
 use super::task_intake::{
     CandidateStatus, TitleProblem, TitleSource, parse_record, resolve_title, valid_title,
@@ -26,7 +27,7 @@ pub(super) struct TaskReview {
     #[serde(default, deserialize_with = "present")]
     issue_type: Option<IssueType>,
     #[serde(default, deserialize_with = "present")]
-    title: Option<TitleReview>,
+    title: Option<Object<TitleReview>>,
     pub(super) relations: Option<Relations>,
     created_at: Option<BodyRange>,
     updated_at: Option<BodyRange>,
@@ -34,7 +35,7 @@ pub(super) struct TaskReview {
     closure: Option<ClosureReview>,
 }
 
-#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum IssueType {
     Epic,
@@ -42,6 +43,22 @@ enum IssueType {
     #[default]
     Task,
     Bug,
+}
+
+impl<'de> Deserialize<'de> for IssueType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let kind = String::deserialize(deserializer)?;
+        match kind.as_str() {
+            "epic" => Ok(Self::Epic),
+            "feature" => Ok(Self::Feature),
+            "task" => Ok(Self::Task),
+            "bug" => Ok(Self::Bug),
+            _ => Err(de::Error::unknown_variant(
+                &kind,
+                &["epic", "feature", "task", "bug"],
+            )),
+        }
+    }
 }
 
 impl IssueType {
@@ -486,7 +503,7 @@ impl TaskReview {
     }
 
     fn selected_title<'a>(&'a self, source: &'a SourceBody) -> Option<(&'a str, TitleSource)> {
-        match &self.title {
+        match self.title.as_ref().map(|title| &title.0) {
             None => source
                 .source_title
                 .as_ref()

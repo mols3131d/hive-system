@@ -887,7 +887,28 @@ fn migration_cli_with_path(
     status: i32,
     search_path: &std::ffi::OsStr,
 ) -> Value {
-    let result = Command::new(env!("CARGO_BIN_EXE_hive"))
+    migration_cli_at(
+        Path::new(env!("CARGO_BIN_EXE_hive")),
+        home,
+        config,
+        action,
+        args,
+        status,
+        search_path,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn migration_cli_at(
+    binary: &Path,
+    home: &Path,
+    config: &Path,
+    action: &str,
+    args: &[&str],
+    status: i32,
+    search_path: &std::ffi::OsStr,
+) -> Value {
+    let result = Command::new(binary)
         .current_dir(home)
         .env_clear()
         .env("PATH", search_path)
@@ -3479,6 +3500,20 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
 #[cfg(target_os = "linux")]
 #[test]
 fn cli_migration_plan_binds_reviewed_type_and_title_on_both_pins() {
+    reviewed_type_and_title_matrix(Path::new(env!("CARGO_BIN_EXE_hive")), false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires installed Hive at HIVE_STAGING_INSTALLED_BIN, pinned Dolt and native Git"]
+fn installed_cli_requires_named_task_titles_and_string_types_on_both_pins() {
+    let binary = std::env::var_os("HIVE_STAGING_INSTALLED_BIN").unwrap();
+    reviewed_type_and_title_matrix(Path::new(&binary), true);
+}
+
+#[cfg(target_os = "linux")]
+fn reviewed_type_and_title_matrix(binary: &Path, verify_staging: bool) {
+    const TARGET_POLICY: &str = "c66b3c50150e18426485d134de92c6b311dac125";
     const EARLIER_PIN: &str = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
     const REVIEWED: &str = "Reviewed synthetic résumé";
     const CREATED: &str = "2026-04-01T09:00:00Z";
@@ -3488,6 +3523,8 @@ fn cli_migration_plan_binds_reviewed_type_and_title_on_both_pins() {
     let source = root.path().join("source");
     let config = root.path().join("config");
     let manifest = root.path().join("manifest.json");
+    let target = root.path().join("inactive");
+    let search_path = std::env::var_os("PATH").unwrap();
     fs::create_dir(&home).unwrap();
     init_git(
         &source,
@@ -3677,30 +3714,40 @@ fn cli_migration_plan_binds_reviewed_type_and_title_on_both_pins() {
             }
             reviews.push(review);
         }
-        let mut mapping = json!({
+        let mapping = json!({
             "version":1, "source_commit":commit, "policy_pin":pin, "workspace_id":workspace,
             "scopes":[{"scope":scope, "decision":{"kind":"area","area":{"id":area,"slug":"general","name":"General"}}}],
             "task_reviews":reviews
         });
-        let plan = |mapping: &Value, exit| {
+        let args = [
+            "--source",
+            source.to_str().unwrap(),
+            "--source-commit",
+            &commit,
+            "--workspace-id",
+            &workspace,
+            "--mapping-file",
+            manifest.to_str().unwrap(),
+            "--tasks",
+        ];
+        let invoke = |mapping: &Value, action, args: &[&str], exit| {
             fs::write(&manifest, serde_json::to_vec(mapping).unwrap()).unwrap();
-            migration_cli(
-                &home,
-                &config,
-                "migration-plan",
-                &[
-                    "--source",
-                    source.to_str().unwrap(),
-                    "--source-commit",
-                    &commit,
-                    "--workspace-id",
-                    &workspace,
-                    "--mapping-file",
-                    manifest.to_str().unwrap(),
-                    "--tasks",
-                ],
-                exit,
-            )
+            migration_cli_at(binary, &home, &config, action, args, exit, &search_path)
+        };
+        let plan = |mapping: &Value, exit| invoke(mapping, "migration-plan", &args, exit);
+        let stage = |mapping: &Value, exit| {
+            let mut stage_args = args.to_vec();
+            stage_args.extend([
+                "--target",
+                target.to_str().unwrap(),
+                "--policy-revision",
+                TARGET_POLICY,
+                "--mode",
+                "dry-run",
+            ]);
+            let report = invoke(mapping, "migration-stage", &stage_args, exit);
+            assert!(!target.exists());
+            report
         };
         let report = plan(&mapping, 0);
         let tasks = report["data"]["task_intake"]["tasks"].as_array().unwrap();
@@ -3775,9 +3822,43 @@ fn cli_migration_plan_binds_reviewed_type_and_title_on_both_pins() {
         ] {
             assert!(!report_text.contains(private), "{pin}");
         }
+        if verify_staging {
+            let staged = stage(&mapping, 0);
+            let data = &staged["data"];
+            assert_eq!(data["counts"]["tasks"]["imported"], 5);
+            assert_eq!(data["checks"]["transaction"], "rolled_back");
+            let id_map = data["id_map"].as_array().unwrap();
+            let digest = sha256_hex(REVIEWED.as_bytes());
+            for kind in ["feature", "bug"] {
+                assert!(id_map.iter().any(|row| {
+                    row["target_issue_type"] == kind && row["target_title_sha256"] == digest
+                }));
+            }
+            assert!(!staged.to_string().contains(REVIEWED));
+        }
+        for (field, invalid) in [
+            ("issue_type", json!({"feature":null})),
+            ("title", json!(["override", REVIEWED])),
+        ] {
+            let mut malformed = mapping.clone();
+            malformed["task_reviews"][0][field] = invalid;
+            assert_eq!(
+                plan(&malformed, 2)["error"]["code"],
+                "INVALID_CONFIG",
+                "{pin} {field}"
+            );
+            if verify_staging {
+                assert_eq!(
+                    stage(&malformed, 2)["error"]["code"],
+                    "INVALID_CONFIG",
+                    "{pin} {field}"
+                );
+            }
+        }
         for invalid_type in [json!("Epic"), Value::Null] {
-            mapping["task_reviews"][0]["issue_type"] = invalid_type;
-            assert_eq!(plan(&mapping, 2)["error"]["code"], "INVALID_CONFIG");
+            let mut malformed = mapping.clone();
+            malformed["task_reviews"][0]["issue_type"] = invalid_type;
+            assert_eq!(plan(&malformed, 2)["error"]["code"], "INVALID_CONFIG");
         }
         assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
     }
