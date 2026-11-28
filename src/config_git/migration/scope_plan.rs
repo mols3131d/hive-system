@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
+use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -79,13 +80,11 @@ impl Scope<'_> {
             ScopeOutcome::Excluded { reason } => json!({"status": "excluded", "reason": reason}),
         };
         let portable_scope = is_portable_scope(self.scope);
-        let (paths, redacted): (Vec<_>, Vec<_>) =
-            self.source_paths.iter().copied().partition(|path| {
-                portable_scope
-                    && path.strip_prefix("bots/").is_none_or(|rest| {
-                        rest.split_once('/').is_some_and(|(bot, _)| is_slug(bot))
-                    })
-            });
+        let (paths, redacted): (Vec<_>, Vec<_>) = self
+            .source_paths
+            .iter()
+            .copied()
+            .partition(|path| portable_scope && has_portable_bot_id(path));
         let mut report = json!({"source_paths": paths, "outcome": outcome});
         if portable_scope {
             report["scope"] = json!(self.scope);
@@ -245,6 +244,7 @@ fn classify_scopes<'a>(
                     ),
                 ) if ids[area.id.as_str()] == 1
                     && siblings[&(area.parent_id.as_deref(), area.slug.as_str())] == 1
+                    && origins.iter().all(|(path, _)| has_portable_bot_id(path))
                     && (reserved(scope)
                         || project_agrees(
                             inventory,
@@ -316,32 +316,91 @@ fn project_agrees<'a>(
 }
 
 fn entrypoint_reference(bytes: &[u8]) -> Option<&str> {
-    let mut lines = std::str::from_utf8(bytes).ok()?.lines().peekable();
-    if lines.peek() == Some(&"---") {
-        lines.next();
-        lines.by_ref().find(|line| *line == "---")?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return None;
     }
-    // V1 uses prose for identity. Accept simple standalone URLs and hold when
-    // the text contains multiple distinct URL candidates.
-    let mut candidates = lines
-        .flat_map(str::split_whitespace)
-        .filter(|token| token.contains("://"))
-        .map(url_token);
-    let reference = candidates.next()?;
-    (portable_reference(reference) && candidates.all(|other| other == reference))
-        .then_some(reference)
+    let mut body = std::str::from_utf8(bytes).ok()?;
+    if let Some(header) = body
+        .strip_prefix("---\n")
+        .or_else(|| body.strip_prefix("---\r\n"))
+    {
+        let mut offset = 0;
+        header.split_inclusive('\n').find(|line| {
+            offset += line.len();
+            line.trim_end_matches(['\r', '\n']) == "---"
+        })?;
+        body = &header[offset..];
+    }
+
+    let mut skipped = 0;
+    let mut reference = None;
+    for (event, range) in Parser::new(body).into_offset_iter() {
+        if skipped > 0 {
+            match event {
+                Event::Start(_) => skipped += 1,
+                Event::End(_) => skipped -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        match event {
+            Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock | Tag::Image { .. }) => skipped = 1,
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            }) => {
+                skipped = 1;
+                if dest_url.contains("://") {
+                    if !matches!(link_type, LinkType::Inline | LinkType::Autolink) {
+                        return None;
+                    }
+                    let CowStr::Borrowed(destination) = dest_url else {
+                        return None;
+                    };
+                    agree(&mut reference, destination)?;
+                }
+            }
+            Event::Text(_) => {
+                let raw = &body[range.clone()];
+                for token in raw.split_whitespace().filter(|token| token.contains("://")) {
+                    // Markdown can split malformed syntax or escapes across text events.
+                    // Accept a URL only when the raw token is complete.
+                    if (raw.starts_with(token)
+                        && body[..range.start]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|ch| !ch.is_whitespace()))
+                        || (raw.ends_with(token)
+                            && body[range.end..]
+                                .chars()
+                                .next()
+                                .is_some_and(|ch| !ch.is_whitespace()))
+                    {
+                        return None;
+                    }
+                    agree(&mut reference, prose_url(token))?;
+                }
+            }
+            _ => {}
+        }
+    }
+    reference
 }
 
-fn url_token(token: &str) -> &str {
-    let wrapped = token.trim_end_matches(['.', ',', ':', ';', '!', '?']);
-    if let Some((label, target)) = wrapped.split_once("](")
-        && !label.contains("://")
-        && let Some(target) = target.strip_suffix(')')
-    {
-        return target;
+fn agree<'a>(reference: &mut Option<&'a str>, candidate: &'a str) -> Option<()> {
+    match *reference {
+        None if portable_reference(candidate) => *reference = Some(candidate),
+        Some(previous) if previous == candidate => {}
+        _ => return None,
     }
-    for (open, close) in [('<', '>'), ('(', ')'), ('`', '`'), ('"', '"'), ('\'', '\'')] {
-        if let Some(target) = wrapped
+    Some(())
+}
+
+fn prose_url(token: &str) -> &str {
+    let token = token.strip_suffix('.').unwrap_or(token);
+    for (open, close) in [('(', ')'), ('"', '"'), ('\'', '\'')] {
+        if let Some(target) = token
             .strip_prefix(open)
             .and_then(|target| target.strip_suffix(close))
         {
@@ -358,6 +417,15 @@ fn portable_reference(reference: &str) -> bool {
         || reference.contains('@')
         || reference.matches("://").count() != 1
     {
+        return false;
+    }
+    let bytes = reference.as_bytes();
+    if bytes.iter().enumerate().any(|(index, byte)| {
+        *byte == b'%'
+            && !bytes
+                .get(index + 1..index + 3)
+                .is_some_and(|escape| escape.iter().all(u8::is_ascii_hexdigit))
+    }) {
         return false;
     }
     let Ok(url) = Url::parse(reference) else {
@@ -389,6 +457,11 @@ fn reserved(scope: &str) -> bool {
 
 pub(super) fn is_portable_scope(scope: &str) -> bool {
     reserved(scope) || scope == "_hive" || is_slug(scope)
+}
+
+fn has_portable_bot_id(path: &str) -> bool {
+    path.strip_prefix("bots/")
+        .is_none_or(|rest| rest.split_once('/').is_some_and(|(bot, _)| is_slug(bot)))
 }
 
 fn invalid(message: &'static str) -> HiveError {

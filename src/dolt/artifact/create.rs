@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use mysql::{Transaction, prelude::Queryable};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -5,7 +7,9 @@ use time::OffsetDateTime;
 
 use crate::cli::{ArtifactCreateArgs, CommonOptions};
 use crate::dolt::{
-    DoltSuccess, DoltTarget, Snapshot, context_workflow as workflow, is_uuid, is_uuid_v7,
+    DoltSuccess, DoltTarget, Snapshot,
+    context_resolve::observe_time,
+    context_workflow as workflow, is_uuid, is_uuid_v7,
     issue_writer::{
         self, Decision, Kind, Mutation, StagedMutation, WriteIdentity, digest, invalid,
         new_uuid_v7, valid_revision, valid_title,
@@ -24,6 +28,9 @@ use super::{
 
 pub(in crate::dolt) const KIND: &str = "artifact.create";
 const ARCHIVED: &str = "Artifact linking requires active Area ancestry.";
+// Existing request-bound evidence uses version 1. Version 2 is reserved for a
+// historical snapshot of a resolved delegation and is never accepted as input.
+const DELEGATED_SNAPSHOT: u8 = 2;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -55,6 +62,46 @@ struct CreateEvidence {
     valid_from: String,
     expires_at: String,
     withdrawn: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegationReference {
+    version: u8,
+    authorization_ref: String,
+    evidence_id: String,
+    revision: String,
+    source_ref: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentDelegation {
+    version: u8,
+    operation: String,
+    workspace_id: String,
+    actor_ref: String,
+    area_id: String,
+    authorization_ref: String,
+    evidence_id: String,
+    revision: String,
+    source_ref: String,
+    issuer_ref: String,
+    valid_from: String,
+    expires_at: String,
+    withdrawn: bool,
+}
+
+fn read_delegation<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, HiveError> {
+    issue_writer::read_workflow_object(path).map_err(|_| workflow::unverified())
+}
+
+enum Authorization<'a> {
+    Reviewed(Box<Decision<CreateEvidence>>),
+    Delegated {
+        reference: DelegationReference,
+        source: &'a Path,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -91,8 +138,7 @@ impl Scope<'_> {
         fingerprint: &str,
         now: OffsetDateTime,
     ) -> bool {
-        evidence.version == 1
-            && evidence.operation == KIND
+        evidence.operation == KIND
             && evidence.workspace_id == self.workspace
             && evidence.request_id == request
             && evidence.fingerprint == fingerprint
@@ -120,7 +166,53 @@ struct Create<'a> {
     scope: Scope<'a>,
     body: String,
     fingerprint: String,
-    decision: Decision<CreateEvidence>,
+    authorization: Authorization<'a>,
+}
+
+impl Create<'_> {
+    fn resolve_delegation(
+        &self,
+        reference: &DelegationReference,
+        source: &Path,
+        now: OffsetDateTime,
+    ) -> Result<CreateEvidence, HiveError> {
+        let current: CurrentDelegation = read_delegation(source)?;
+        if reference.version != 1
+            || current.version != 1
+            || current.authorization_ref != reference.authorization_ref
+            || current.evidence_id != reference.evidence_id
+            || current.revision != reference.revision
+            || current.source_ref != reference.source_ref
+        {
+            return Err(workflow::unverified());
+        }
+        let evidence = CreateEvidence {
+            version: DELEGATED_SNAPSHOT,
+            operation: current.operation,
+            workspace_id: current.workspace_id,
+            request_id: self.args.request_id.clone(),
+            fingerprint: self.fingerprint.clone(),
+            actor_ref: current.actor_ref,
+            bot_id: None,
+            area_id: Some(current.area_id),
+            expected_area_revision: self.scope.expected.map(str::to_owned),
+            authorization_ref: current.authorization_ref,
+            evidence_id: current.evidence_id,
+            revision: current.revision,
+            source_ref: current.source_ref,
+            issuer_ref: current.issuer_ref,
+            valid_from: current.valid_from,
+            expires_at: current.expires_at,
+            withdrawn: current.withdrawn,
+        };
+        if !self
+            .scope
+            .verifies(&evidence, &self.args.request_id, &self.fingerprint, now)
+        {
+            return Err(workflow::unverified());
+        }
+        Ok(evidence)
+    }
 }
 
 pub(super) fn write(
@@ -167,7 +259,15 @@ pub(super) fn write(
         scope,
         fingerprint: scope.fingerprint(&args.kind, &args.title, &digest(body.as_bytes())),
         body,
-        decision: issue_writer::read_decision(&args.evidence_file)?,
+        authorization: match args.delegation_source.as_deref() {
+            Some(source) => Authorization::Delegated {
+                reference: read_delegation(&args.evidence_file)?,
+                source,
+            },
+            None => {
+                Authorization::Reviewed(Box::new(issue_writer::read_decision(&args.evidence_file)?))
+            }
+        },
     };
     issue_writer::execute(&workspace, target, &create)
 }
@@ -183,14 +283,22 @@ impl Mutation for Create<'_> {
             record_id: None,
             actor: self.scope.actor,
             fingerprint: &self.fingerprint,
-            authorization_ref: &self.decision.evidence.authorization_ref,
+            authorization_ref: match &self.authorization {
+                Authorization::Reviewed(decision) => &decision.evidence.authorization_ref,
+                Authorization::Delegated { reference, .. } => &reference.authorization_ref,
+            },
         }
     }
 
     fn verify_decision(&self, now: OffsetDateTime) -> Result<(), HiveError> {
-        if self.decision.decision == "allow"
+        // Delegated requests are checked only at the locked write or replay boundary.
+        let Authorization::Reviewed(decision) = &self.authorization else {
+            return Ok(());
+        };
+        if decision.decision == "allow"
+            && decision.evidence.version == 1
             && self.scope.verifies(
-                &self.decision.evidence,
+                &decision.evidence,
                 &self.args.request_id,
                 &self.fingerprint,
                 now,
@@ -203,7 +311,44 @@ impl Mutation for Create<'_> {
     }
 
     fn evidence(&self) -> Result<String, HiveError> {
-        issue_writer::encode(&self.decision.evidence, Kind::ArtifactCreate)
+        let Authorization::Reviewed(decision) = &self.authorization else {
+            return Err(workflow::unverified());
+        };
+        issue_writer::encode(&decision.evidence, Kind::ArtifactCreate)
+    }
+
+    fn write_evidence(&self, now: OffsetDateTime) -> Result<String, HiveError> {
+        match &self.authorization {
+            Authorization::Reviewed(_) => {
+                self.verify_decision(now)?;
+                self.evidence()
+            }
+            Authorization::Delegated { reference, source } => {
+                let evidence = self.resolve_delegation(reference, source, now)?;
+                issue_writer::encode(&evidence, Kind::ArtifactCreate)
+            }
+        }
+    }
+
+    fn verify_locked_authorization(&self, now: OffsetDateTime) -> Result<(), HiveError> {
+        match &self.authorization {
+            Authorization::Reviewed(_) => self.verify_decision(now),
+            Authorization::Delegated { reference, source } => {
+                self.resolve_delegation(reference, source, now).map(|_| ())
+            }
+        }
+    }
+
+    fn verify_commit_delegation(&self, staged_evidence: &str) -> Result<(), HiveError> {
+        let Authorization::Delegated { reference, source } = &self.authorization else {
+            return Ok(());
+        };
+        let now = observe_time()?;
+        let current = self.resolve_delegation(reference, source, now)?;
+        if issue_writer::encode(&current, Kind::ArtifactCreate)? != staged_evidence {
+            return Err(workflow::unverified());
+        }
+        Ok(())
     }
 
     fn check_scope(&self, snapshot: &mut Snapshot) -> Result<(), HiveError> {
@@ -318,7 +463,10 @@ pub(in crate::dolt) fn check_scope(
         }
         _ => false,
     };
-    if receipt.kind != KIND
+    let valid_evidence_version =
+        evidence.version == 1 || (evidence.version == DELEGATED_SNAPSHOT && area.is_some());
+    if !valid_evidence_version
+        || receipt.kind != KIND
         || receipt.actor_ref != actor
         || result.version != 1
         || result.area_id.as_deref() != area
@@ -457,4 +605,75 @@ fn verify_area_revision(
         return Err(workflow::unverified());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_delegation_requires_the_same_current_evidence_as_staging() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = scratch.path().join("current.json");
+        let scope = Scope {
+            workspace: "01900000-0000-7000-8000-000000000001",
+            actor: "fixture-actor",
+            area: Some("01900000-0000-7000-8000-000000000002"),
+            expected: Some("area-r1"),
+        };
+        let args = ArtifactCreateArgs {
+            area: scope.area.map(str::to_owned),
+            if_match: Some(format!("{}=area-r1", scope.area.unwrap())),
+            kind: "report".into(),
+            title: "Fixture".into(),
+            file: scratch.path().join("artifact.md"),
+            actor: scope.actor.into(),
+            request_id: "01900000-0000-7000-8000-000000000003".into(),
+            evidence_file: scratch.path().join("reference.json"),
+            delegation_source: Some(source.clone()),
+            target: Default::default(),
+        };
+        let reference = DelegationReference {
+            version: 1,
+            authorization_ref: "fixture-auth".into(),
+            evidence_id: "fixture-evidence".into(),
+            revision: "grant-r1".into(),
+            source_ref: "fixture-source".into(),
+        };
+        let mut current = json!({
+            "version": 1, "operation": KIND, "workspace_id": scope.workspace,
+            "actor_ref": scope.actor, "area_id": scope.area,
+            "authorization_ref": reference.authorization_ref, "evidence_id": reference.evidence_id,
+            "revision": reference.revision, "source_ref": reference.source_ref,
+            "issuer_ref": "fixture-issuer", "valid_from": "2000-01-01T00:00:00Z",
+            "expires_at": "2099-01-01T00:00:00Z", "withdrawn": false,
+        });
+        let publish = |value: &Value| std::fs::write(&source, value.to_string()).unwrap();
+        publish(&current);
+        let create = Create {
+            args: &args,
+            scope,
+            body: String::new(),
+            fingerprint: scope.fingerprint(&args.kind, &args.title, &digest(b"")),
+            authorization: Authorization::Delegated {
+                reference,
+                source: &source,
+            },
+        };
+        let now = observe_time().unwrap();
+        let staged = create.write_evidence(now).unwrap();
+        create.verify_commit_delegation(&staged).unwrap();
+
+        current["issuer_ref"] = json!("fixture-replacement-issuer");
+        publish(&current);
+        assert!(create.verify_locked_authorization(now).is_ok());
+        assert!(matches!(create.verify_commit_delegation(&staged),
+            Err(error) if matches!(error.code, ErrorCode::AuthorityUnverified)));
+
+        current["issuer_ref"] = json!("fixture-issuer");
+        current["withdrawn"] = json!(true);
+        publish(&current);
+        assert!(matches!(create.verify_commit_delegation(&staged),
+            Err(error) if matches!(error.code, ErrorCode::AuthorityUnverified)));
+    }
 }

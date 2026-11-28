@@ -6,7 +6,7 @@ const TITLE: &str = "Fixture résumé";
 const BODY: &[u8] = "# Synthetic artifact body\r\nλ\n".as_bytes();
 
 #[test]
-#[ignore = "requires pinned Dolt at HIVE_DOLT_BIN, local TCP and Linux pidfds"]
+#[ignore = "requires pinned Dolt at HIVE_DOLT_BIN, native Git, local TCP and Linux pidfds"]
 fn artifact_create_confirms_replays_and_recovers() {
     let listener = TcpListener::bind((HOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port().to_string();
@@ -24,19 +24,75 @@ fn artifact_create_confirms_replays_and_recovers() {
     let state_home = fixture.root.join("state");
     let state = state_home.join("hive/v2/workspaces").join(&workspace_id);
     register_fixture(&fixture, &workspace, &state);
-    drop(listener);
-    let invoke = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_hive"))
+    let registration_path = state.join("active-root.json");
+    fs::set_permissions(&registration_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(
+        workspace.join("db/.dolt/noms/LOCK"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let registration = fs::read(&registration_path).unwrap();
+    let bin = fixture.root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("git"))
+        .find(|exe| exe.is_file())
+        .unwrap();
+    std::os::unix::fs::symlink(&fixture.dolt, bin.join("dolt")).unwrap();
+    std::os::unix::fs::symlink(git, bin.join("git")).unwrap();
+    let assets = workspace.join("assets");
+    fs::DirBuilder::new().mode(0o700).create(&assets).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new(bin.join("git"))
             .env_clear()
             .env("HOME", fixture.root.join("home"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .current_dir(&assets)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    git(&["init", "--initial-branch=main", "--template="]);
+    git(&[
+        "commit",
+        "--allow-empty",
+        "-m",
+        "Initialize synthetic assets",
+    ]);
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(workspace.join("conversations"))
+        .unwrap();
+    drop(listener);
+    let cli = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hive"));
+        command
+            .env_clear()
+            .env("HOME", fixture.root.join("home"))
+            .env("PATH", &bin)
             .env("XDG_STATE_HOME", &state_home)
             .current_dir(&fixture.root)
-            .args(["--contract", "2", "--json", "--workspace"])
-            .arg(&workspace)
+            .args(["--contract", "2", "--json"]);
+        command
+    };
+    let invoke_at = |root: &Path, args: &[&str]| {
+        cli()
+            .arg("--workspace")
+            .arg(root)
             .args(args)
             .output()
             .unwrap()
     };
+    let invoke = |args: &[&str]| invoke_at(&workspace, args);
     let run = |args: &[&str], exit| {
         let output = invoke(args);
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -315,6 +371,241 @@ fn artifact_create_confirms_replays_and_recovers() {
         assert_eq!(fs::read_to_string(&marker).unwrap(), intent.to_string());
         drop(prior);
         stopped("rolled_back");
+
+        let mut reader = connect_owned(&state, &port, "reader");
+        let before_revision = later["data"]["result"]["area_revision"].as_str().unwrap();
+        let delegation_ref = fixture.root.join("delegation-reference.json");
+        let current_source = fixture.root.join("current-delegation.json");
+        let locator = json!({
+            "version": 1, "authorization_ref": "fixture-artifact-authorization",
+            "evidence_id": "fixture-delegation", "revision": "grant-r1", "source_ref": "fixture-source",
+        });
+        let saved_bytes = locator.to_string();
+        fs::write(&delegation_ref, &saved_bytes).unwrap();
+        let mut current = locator;
+        let now = fixture_now();
+        current.as_object_mut().unwrap().extend([
+            ("operation".into(), json!("artifact.create")),
+            ("workspace_id".into(), json!(workspace_id)),
+            ("actor_ref".into(), json!(ACTOR)),
+            ("area_id".into(), json!(area)),
+            ("issuer_ref".into(), json!("fixture-issuer")),
+            (
+                "valid_from".into(),
+                json!(fixture_timestamp(now - time::Duration::hours(1))),
+            ),
+            (
+                "expires_at".into(),
+                json!(fixture_timestamp(now + time::Duration::hours(1))),
+            ),
+            ("withdrawn".into(), json!(false)),
+        ]);
+        let publish = |value: &Value| {
+            let replacement = current_source.with_extension("tmp");
+            fs::write(&replacement, value.to_string()).unwrap();
+            fs::rename(replacement, &current_source).unwrap();
+        };
+        let delegated_request = id(56);
+        let fresh_request = id(57);
+        let original_match = format!("{area}={before_revision}");
+        let delegated_args = |request, expected| {
+            [
+                "artifact",
+                "create",
+                "--workspace-id",
+                &workspace_id,
+                "--database",
+                "db",
+                "--port",
+                &port,
+                "--kind",
+                "report",
+                "--title",
+                TITLE,
+                "--actor",
+                ACTOR,
+                "--request-id",
+                request,
+                "--file",
+                body_path.to_str().unwrap(),
+                "--evidence-file",
+                delegation_ref.to_str().unwrap(),
+                "--delegation-source",
+                current_source.to_str().unwrap(),
+                "--area",
+                &area,
+                "--if-match",
+                expected,
+            ]
+        };
+        fs::write(&body_path, BODY).unwrap();
+        publish(&current);
+        let original = delegated_args(&delegated_request, &original_match);
+        let confirmed = run(&original, 0);
+        assert_eq!(confirmed["data"]["outcome"], "confirmed");
+        assert_eq!(confirmed["data"]["base_commit"], head.0);
+        let committed = storage_state(&mut reader);
+        assert_replay(run(&original, 0), &confirmed, &committed.0);
+        fs::write(&body_path, b"Changed body").unwrap();
+        assert_eq!(run(&original, 5)["error"]["code"], "REQUEST_CONFLICT");
+        fs::write(&body_path, BODY).unwrap();
+        let retained: String = reader.exec_first(
+            "SELECT CAST(workflow_evidence_json AS CHAR) FROM operation_receipts WHERE request_id = ?",
+            (&delegated_request,),
+        ).unwrap().unwrap();
+        assert!(!retained.contains(current_source.to_str().unwrap()));
+        let evidence: Value = serde_json::from_str(&retained).unwrap();
+        assert_eq!(evidence["version"], 2);
+        assert_eq!(evidence["revision"], "grant-r1");
+        assert_eq!(evidence["request_id"], delegated_request);
+
+        let withdrawn = {
+            let mut value = current.clone();
+            value["withdrawn"] = json!(true);
+            value
+        };
+        publish(&withdrawn);
+        assert_eq!(run(&original, 7)["error"]["code"], "AUTHORITY_UNVERIFIED");
+
+        let current_match = format!(
+            "{area}={}",
+            confirmed["data"]["result"]["area_revision"]
+                .as_str()
+                .unwrap()
+        );
+        // The payload has a fresh request ID and the current Area revision. The
+        // saved grant locator remains byte-for-byte identical to the successful write.
+        let delegated = delegated_args(&fresh_request, &current_match);
+        let unchanged = |reader: &mut Conn| {
+            assert_eq!(fs::read_to_string(&delegation_ref).unwrap(), saved_bytes);
+            assert_eq!(storage_state(reader), committed);
+            assert_eq!(
+                reader
+                    .exec_first::<u64, _, _>(
+                        "SELECT COUNT(*) FROM operation_receipts WHERE request_id = ?",
+                        (&fresh_request,),
+                    )
+                    .unwrap(),
+                Some(0)
+            );
+            assert!(!marker.exists());
+        };
+        let deny = |reader: &mut Conn| {
+            let response = run(&delegated, 7);
+            assert_eq!(response["error"]["code"], "AUTHORITY_UNVERIFIED");
+            assert!(response.get("data").is_none());
+            assert!(
+                !response
+                    .to_string()
+                    .contains(current_source.to_str().unwrap())
+            );
+            unchanged(reader);
+        };
+        deny(&mut reader);
+        for (field, value) in [
+            ("revision", json!("grant-r2")),
+            (
+                "expires_at",
+                json!(fixture_timestamp(now - time::Duration::minutes(1))),
+            ),
+            ("area_id", json!(archived)),
+            ("workspace_id", json!(id(58))),
+            ("actor_ref", json!("fixture-other-actor")),
+            ("operation", json!("artifact.update")),
+        ] {
+            let mut wrong = current.clone();
+            wrong[field] = value;
+            publish(&wrong);
+            deny(&mut reader);
+        }
+        fs::remove_file(&current_source).unwrap();
+        deny(&mut reader);
+        let without_source: Vec<_> = delegated
+            .into_iter()
+            .filter(|arg| !["--delegation-source", current_source.to_str().unwrap()].contains(arg))
+            .collect();
+        assert_eq!(
+            run(&without_source, 7)["error"]["code"],
+            "AUTHORITY_UNVERIFIED"
+        );
+        unchanged(&mut reader);
+
+        // A separate current reviewed decision can inspect the retained outcome.
+        assert_replay(
+            create(
+                &delegated_request,
+                Some((&area, before_revision)),
+                BODY,
+                false,
+                0,
+            ),
+            &confirmed,
+            &committed.0,
+        );
+        unchanged(&mut reader);
+
+        drop(reader);
+        run(&["workspace", "stop"], 0);
+        let snapshot = |root: &Path| {
+            let projection = format!(
+                "SELECT DOLT_HASHOF('HEAD') AS head, DOLT_HASHOF_DB('WORKING') AS working,
+                   DOLT_HASHOF_DB('STAGED') AS staged,
+                   (SELECT workflow_evidence_json FROM operation_receipts
+                    WHERE request_id = '{delegated_request}') AS evidence"
+            );
+            let rows: Value = serde_json::from_str(&fixture.local_at(
+                &root.join("db"),
+                &["sql", "-r", "json", "-q", &projection],
+                None,
+            ))
+            .unwrap();
+            rows["rows"][0].clone()
+        };
+        let saved = snapshot(&workspace);
+        assert_eq!(saved["head"], committed.0);
+        let backup = run(&["backup", "create", "--destination", "paired"], 0);
+        let inactive = fixture.root.join("restored");
+        let restored = cli()
+            .args(["backup", "restore", "--source", "paired", "--target"])
+            .arg(&inactive)
+            .output()
+            .unwrap();
+        let restored_report: Value = serde_json::from_slice(&restored.stdout).unwrap();
+        assert!(restored.status.success(), "{restored_report}");
+        assert_eq!(restored_report["data"]["active_root"], "inactive");
+        assert_eq!(restored_report["data"]["db_commit"], committed.0);
+        assert_eq!(
+            restored_report["data"]["asset_commit"],
+            backup["data"]["manifest"]["asset_git_commit"]
+        );
+        assert_eq!(snapshot(&inactive), saved);
+        let restored_evidence = match &saved["evidence"] {
+            Value::String(bytes) => serde_json::from_str(bytes).unwrap(),
+            value => value.clone(),
+        };
+        assert_eq!(restored_evidence, evidence);
+        assert!(!inactive.join(current_source.file_name().unwrap()).exists());
+        assert!(!inactive.join(delegation_ref.file_name().unwrap()).exists());
+        assert!(!inactive.join("db/config.yaml").exists());
+        assert!(!inactive.join("db/.doltcfg").exists());
+
+        publish(&current);
+        let output = invoke_at(&inactive, &delegated);
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(7), "{response}");
+        assert_eq!(response["error"]["code"], "AUTHORITY_UNVERIFIED");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("canonical root"),
+            "{response}"
+        );
+        assert_eq!(snapshot(&inactive), saved);
+        assert_eq!(snapshot(&workspace), saved);
+        assert_eq!(fs::read(&registration_path).unwrap(), registration);
+        assert!(!state.join("server.json").exists());
+        assert!(!marker.exists());
     }));
     if state.join("server.json").exists() {
         let stop = invoke(&["workspace", "stop"]);
