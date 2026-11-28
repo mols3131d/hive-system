@@ -7,7 +7,9 @@ use time::OffsetDateTime;
 
 use crate::cli::{ArtifactCreateArgs, CommonOptions};
 use crate::dolt::{
-    DoltSuccess, DoltTarget, Snapshot, context_workflow as workflow, is_uuid, is_uuid_v7,
+    DoltSuccess, DoltTarget, Snapshot,
+    context_resolve::observe_time,
+    context_workflow as workflow, is_uuid, is_uuid_v7,
     issue_writer::{
         self, Decision, Kind, Mutation, StagedMutation, WriteIdentity, digest, invalid,
         new_uuid_v7, valid_revision, valid_title,
@@ -337,6 +339,18 @@ impl Mutation for Create<'_> {
         }
     }
 
+    fn verify_commit_delegation(&self, staged_evidence: &str) -> Result<(), HiveError> {
+        let Authorization::Delegated { reference, source } = &self.authorization else {
+            return Ok(());
+        };
+        let now = observe_time()?;
+        let current = self.resolve_delegation(reference, source, now)?;
+        if issue_writer::encode(&current, Kind::ArtifactCreate)? != staged_evidence {
+            return Err(workflow::unverified());
+        }
+        Ok(())
+    }
+
     fn check_scope(&self, snapshot: &mut Snapshot) -> Result<(), HiveError> {
         if let Some(area) = self.scope.area {
             super::Scope {
@@ -591,4 +605,75 @@ fn verify_area_revision(
         return Err(workflow::unverified());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_delegation_requires_the_same_current_evidence_as_staging() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = scratch.path().join("current.json");
+        let scope = Scope {
+            workspace: "01900000-0000-7000-8000-000000000001",
+            actor: "fixture-actor",
+            area: Some("01900000-0000-7000-8000-000000000002"),
+            expected: Some("area-r1"),
+        };
+        let args = ArtifactCreateArgs {
+            area: scope.area.map(str::to_owned),
+            if_match: Some(format!("{}=area-r1", scope.area.unwrap())),
+            kind: "report".into(),
+            title: "Fixture".into(),
+            file: scratch.path().join("artifact.md"),
+            actor: scope.actor.into(),
+            request_id: "01900000-0000-7000-8000-000000000003".into(),
+            evidence_file: scratch.path().join("reference.json"),
+            delegation_source: Some(source.clone()),
+            target: Default::default(),
+        };
+        let reference = DelegationReference {
+            version: 1,
+            authorization_ref: "fixture-auth".into(),
+            evidence_id: "fixture-evidence".into(),
+            revision: "grant-r1".into(),
+            source_ref: "fixture-source".into(),
+        };
+        let mut current = json!({
+            "version": 1, "operation": KIND, "workspace_id": scope.workspace,
+            "actor_ref": scope.actor, "area_id": scope.area,
+            "authorization_ref": reference.authorization_ref, "evidence_id": reference.evidence_id,
+            "revision": reference.revision, "source_ref": reference.source_ref,
+            "issuer_ref": "fixture-issuer", "valid_from": "2000-01-01T00:00:00Z",
+            "expires_at": "2099-01-01T00:00:00Z", "withdrawn": false,
+        });
+        let publish = |value: &Value| std::fs::write(&source, value.to_string()).unwrap();
+        publish(&current);
+        let create = Create {
+            args: &args,
+            scope,
+            body: String::new(),
+            fingerprint: scope.fingerprint(&args.kind, &args.title, &digest(b"")),
+            authorization: Authorization::Delegated {
+                reference,
+                source: &source,
+            },
+        };
+        let now = observe_time().unwrap();
+        let staged = create.write_evidence(now).unwrap();
+        create.verify_commit_delegation(&staged).unwrap();
+
+        current["issuer_ref"] = json!("fixture-replacement-issuer");
+        publish(&current);
+        assert!(create.verify_locked_authorization(now).is_ok());
+        assert!(matches!(create.verify_commit_delegation(&staged),
+            Err(error) if matches!(error.code, ErrorCode::AuthorityUnverified)));
+
+        current["issuer_ref"] = json!("fixture-issuer");
+        current["withdrawn"] = json!(true);
+        publish(&current);
+        assert!(matches!(create.verify_commit_delegation(&staged),
+            Err(error) if matches!(error.code, ErrorCode::AuthorityUnverified)));
+    }
 }

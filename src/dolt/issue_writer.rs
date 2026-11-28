@@ -215,6 +215,10 @@ pub(super) trait Mutation {
     fn verify_locked_authorization(&self, now: OffsetDateTime) -> Result<(), HiveError> {
         self.verify_decision(now)
     }
+    // Revocable delegations must still match the staged receipt at commit time.
+    fn verify_commit_delegation(&self, _staged_evidence: &str) -> Result<(), HiveError> {
+        Ok(())
+    }
     fn check_scope(&self, snapshot: &mut Snapshot) -> Result<(), HiveError>;
     fn verify_replay_decision(
         &self,
@@ -350,8 +354,8 @@ impl Pending {
         Ok(marker)
     }
 
-    /// The caller must establish prior-session termination and open a fresh,
-    /// verified snapshot before resolving the marker.
+    /// The caller must establish that the prior transaction cannot still
+    /// publish and open a fresh, verified snapshot before resolving the marker.
     pub(crate) fn resolve(&self, snapshot: &mut Snapshot) -> Result<&'static str, HiveError> {
         if confirm(snapshot, self)?.is_some() {
             return Ok("confirmed");
@@ -690,6 +694,18 @@ fn apply(
         .map_err(|_| uncertain())?;
     mutation.verify_decision(observe_time()?)?;
     runtime.check().map_err(|_| uncertain())?;
+    if let Err(error) = mutation.verify_commit_delegation(&receipt.workflow_evidence) {
+        // An acknowledged ROLLBACK ends this transaction. Keep its marker
+        // unless committed history and the authoritative working set agree.
+        tx.rollback().map_err(|_| uncertain())?;
+        drop(writer);
+        let mut rolled_back = runtime.open(false).map_err(|_| uncertain())?;
+        if marker.resolve(&mut rolled_back).map_err(|_| uncertain())? != "rolled_back" {
+            return Err(uncertain());
+        }
+        runtime.clear_pending(entry).map_err(|_| uncertain())?;
+        return Err(error);
+    }
     tx.commit().map_err(|_| uncertain())?;
     drop(writer);
 

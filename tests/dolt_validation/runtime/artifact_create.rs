@@ -6,7 +6,7 @@ const TITLE: &str = "Fixture résumé";
 const BODY: &[u8] = "# Synthetic artifact body\r\nλ\n".as_bytes();
 
 #[test]
-#[ignore = "requires pinned Dolt at HIVE_DOLT_BIN, local TCP and Linux pidfds"]
+#[ignore = "requires pinned Dolt at HIVE_DOLT_BIN, native Git, local TCP and Linux pidfds"]
 fn artifact_create_confirms_replays_and_recovers() {
     let listener = TcpListener::bind((HOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port().to_string();
@@ -24,14 +24,69 @@ fn artifact_create_confirms_replays_and_recovers() {
     let state_home = fixture.root.join("state");
     let state = state_home.join("hive/v2/workspaces").join(&workspace_id);
     register_fixture(&fixture, &workspace, &state);
-    drop(listener);
-    let invoke_at = |root: &Path, args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_hive"))
+    let registration_path = state.join("active-root.json");
+    fs::set_permissions(&registration_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(
+        workspace.join("db/.dolt/noms/LOCK"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let registration = fs::read(&registration_path).unwrap();
+    let bin = fixture.root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("git"))
+        .find(|exe| exe.is_file())
+        .unwrap();
+    std::os::unix::fs::symlink(&fixture.dolt, bin.join("dolt")).unwrap();
+    std::os::unix::fs::symlink(git, bin.join("git")).unwrap();
+    let assets = workspace.join("assets");
+    fs::DirBuilder::new().mode(0o700).create(&assets).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new(bin.join("git"))
             .env_clear()
             .env("HOME", fixture.root.join("home"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .current_dir(&assets)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    git(&["init", "--initial-branch=main", "--template="]);
+    git(&[
+        "commit",
+        "--allow-empty",
+        "-m",
+        "Initialize synthetic assets",
+    ]);
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(workspace.join("conversations"))
+        .unwrap();
+    drop(listener);
+    let cli = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hive"));
+        command
+            .env_clear()
+            .env("HOME", fixture.root.join("home"))
+            .env("PATH", &bin)
             .env("XDG_STATE_HOME", &state_home)
             .current_dir(&fixture.root)
-            .args(["--contract", "2", "--json", "--workspace"])
+            .args(["--contract", "2", "--json"]);
+        command
+    };
+    let invoke_at = |root: &Path, args: &[&str]| {
+        cli()
+            .arg("--workspace")
             .arg(root)
             .args(args)
             .output()
@@ -489,14 +544,52 @@ fn artifact_create_confirms_replays_and_recovers() {
         );
         unchanged(&mut reader);
 
+        drop(reader);
+        run(&["workspace", "stop"], 0);
+        let snapshot = |root: &Path| {
+            let projection = format!(
+                "SELECT DOLT_HASHOF('HEAD') AS head, DOLT_HASHOF_DB('WORKING') AS working,
+                   DOLT_HASHOF_DB('STAGED') AS staged,
+                   (SELECT workflow_evidence_json FROM operation_receipts
+                    WHERE request_id = '{delegated_request}') AS evidence"
+            );
+            let rows: Value = serde_json::from_str(&fixture.local_at(
+                &root.join("db"),
+                &["sql", "-r", "json", "-q", &projection],
+                None,
+            ))
+            .unwrap();
+            rows["rows"][0].clone()
+        };
+        let saved = snapshot(&workspace);
+        assert_eq!(saved["head"], committed.0);
+        let backup = run(&["backup", "create", "--destination", "paired"], 0);
+        let inactive = fixture.root.join("restored");
+        let restored = cli()
+            .args(["backup", "restore", "--source", "paired", "--target"])
+            .arg(&inactive)
+            .output()
+            .unwrap();
+        let restored_report: Value = serde_json::from_slice(&restored.stdout).unwrap();
+        assert!(restored.status.success(), "{restored_report}");
+        assert_eq!(restored_report["data"]["active_root"], "inactive");
+        assert_eq!(restored_report["data"]["db_commit"], committed.0);
+        assert_eq!(
+            restored_report["data"]["asset_commit"],
+            backup["data"]["manifest"]["asset_git_commit"]
+        );
+        assert_eq!(snapshot(&inactive), saved);
+        let restored_evidence = match &saved["evidence"] {
+            Value::String(bytes) => serde_json::from_str(bytes).unwrap(),
+            value => value.clone(),
+        };
+        assert_eq!(restored_evidence, evidence);
+        assert!(!inactive.join(current_source.file_name().unwrap()).exists());
+        assert!(!inactive.join(delegation_ref.file_name().unwrap()).exists());
+        assert!(!inactive.join("db/config.yaml").exists());
+        assert!(!inactive.join("db/.doltcfg").exists());
+
         publish(&current);
-        let inactive = fixture.root.join("inactive-copy");
-        fs::create_dir(&inactive).unwrap();
-        fs::copy(
-            workspace.join("hive-workspace.yml"),
-            inactive.join("hive-workspace.yml"),
-        )
-        .unwrap();
         let output = invoke_at(&inactive, &delegated);
         let response: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(output.status.code(), Some(7), "{response}");
@@ -508,8 +601,11 @@ fn artifact_create_confirms_replays_and_recovers() {
                 .contains("canonical root"),
             "{response}"
         );
-        assert_eq!(fs::read_dir(&inactive).unwrap().count(), 1);
-        unchanged(&mut reader);
+        assert_eq!(snapshot(&inactive), saved);
+        assert_eq!(snapshot(&workspace), saved);
+        assert_eq!(fs::read(&registration_path).unwrap(), registration);
+        assert!(!state.join("server.json").exists());
+        assert!(!marker.exists());
     }));
     if state.join("server.json").exists() {
         let stop = invoke(&["workspace", "stop"]);
