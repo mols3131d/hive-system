@@ -8,7 +8,7 @@ use super::{
     Installed, Path, Value, io_error, json, new_uuid_v7, sql_text, tasks::TaskImport, unverified,
 };
 use crate::config_git::migration::prepared_records::{
-    ArtifactKind, DirectiveStatus, Fields, Intake, PreparedRecord,
+    ArtifactKind, DirectiveScope, DirectiveStatus, Fields, Intake, PreparedRecord,
 };
 use crate::error::HiveError;
 
@@ -114,9 +114,21 @@ pub(super) fn append(
         match &record.fields {
             Fields::Directive(fields) => {
                 let status = directive_status(fields.status);
+                let (scope_kind, area_id, project_id) = match &fields.scope {
+                    DirectiveScope::Area { area_id } => ("area", Some(area_id.as_str()), None),
+                    DirectiveScope::Workspace => ("workspace", None, None),
+                    DirectiveScope::Project { project_id } => {
+                        ("project", None, Some(project_id.as_str()))
+                    }
+                };
                 row["status"] = json!(status);
-                row["scope_kind"] = json!("area");
-                row["area_id"] = json!(fields.area_id);
+                row["scope_kind"] = json!(scope_kind);
+                if let Some(area_id) = area_id {
+                    row["area_id"] = json!(area_id);
+                }
+                if let Some(project_id) = project_id {
+                    row["project_id"] = json!(project_id);
+                }
                 row["include_descendants"] = json!(0);
                 row["issuer_ref_sha256"] = json!(digest(&fields.issuer_ref));
                 row["source_ref_sha256"] = json!(digest(&fields.source_ref));
@@ -134,11 +146,12 @@ pub(super) fn append(
                 if let Some(value) = &fields.supersedes_id {
                     row["supersedes_id"] = json!(value);
                 }
-                writeln!(sql, "INSERT INTO directives (id, scope_kind, area_id, include_descendants, title, body,
+                writeln!(sql, "INSERT INTO directives (id, scope_kind, area_id, project_id, include_descendants, title, body,
                     status, issuer_ref, source_ref, approval_ref, valid_from, expires_at, supersedes_id,
-                    revision, created_at, updated_at) VALUES ({id}, 'area', {}, FALSE, {title}, {body},
+                    revision, created_at, updated_at) VALUES ({id}, {}, {}, {}, FALSE, {title}, {body},
                     {}, {}, {}, {}, {}, {}, {}, {revision}, {}, {});",
-                    sql_text(&fields.area_id), sql_text(status), sql_text(&fields.issuer_ref), sql_text(&fields.source_ref),
+                    sql_text(scope_kind), nullable(area_id, sql_text), nullable(project_id, sql_text),
+                    sql_text(status), sql_text(&fields.issuer_ref), sql_text(&fields.source_ref),
                     nullable(fields.approval_ref.as_deref(), sql_text), nullable(fields.valid_from.as_deref(), sql_time),
                     nullable(fields.expires_at.as_deref(), sql_time), nullable(fields.supersedes_id.as_deref(), sql_text),
                     sql_time(&fields.created_at), sql_time(&fields.updated_at)).map_err(io_error)?;

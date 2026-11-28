@@ -20,6 +20,10 @@ mod directive_artifact;
 mod directive_artifact_staging;
 
 #[cfg(target_os = "linux")]
+#[path = "migration/directive_scopes.rs"]
+mod directive_scopes;
+
+#[cfg(target_os = "linux")]
 #[path = "migration/issue_resource_staging.rs"]
 mod issue_resource_staging;
 

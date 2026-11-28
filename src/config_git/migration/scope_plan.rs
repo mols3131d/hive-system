@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use url::{Host, Url};
 
+use super::directive_scope::DirectiveContext;
 use super::issue_resources::{self, IssueResourceOutcome};
 use super::json_object::{self, Object};
 use super::prepared_records::Intake;
@@ -188,20 +189,21 @@ pub(crate) fn plan(
         .then(|| reviewed.prepare_tasks(None))
         .transpose()?;
         let tasks = task_plan.as_ref().map(task_intake::TaskPlan::staging_tasks);
-        if include_directives_artifacts {
-            report["directive_artifact_intake"] = reviewed
-                .scan_directive_artifacts(false, tasks.as_deref())?
-                .report;
-            if let Some(observed_at) = reviewed.directive_observation() {
-                report["directive_observed_at"] = json!(observed_at);
-            }
-        }
         let selected_plan = if include_tasks {
             task_plan.as_ref()
         } else {
             None
         };
-        if let Some(projects) = reviewed.prepare_projects(selected_plan)? {
+        let projects = reviewed.prepare_projects(selected_plan)?;
+        if include_directives_artifacts {
+            report["directive_artifact_intake"] = reviewed
+                .scan_directive_artifacts(false, tasks.as_deref(), projects.as_ref())?
+                .report;
+            if let Some(observed_at) = reviewed.directive_observation() {
+                report["directive_observed_at"] = json!(observed_at);
+            }
+        }
+        if let Some(projects) = projects {
             report["project_membership"] = projects.report(None);
         }
         if reviewed.mapping.issue_resource_bindings.is_some() {
@@ -331,16 +333,17 @@ impl ReviewedScopes<'_> {
     pub(crate) fn directive_artifacts_for_staging(
         &self,
         tasks: Option<&[StagingTask<'_>]>,
+        projects: Option<&PreparedProjects<'_>>,
     ) -> Result<Option<Intake>, HiveError> {
         self.mapping
             .reviewed_records
             .as_ref()
-            .map(|_| self.scan_directive_artifacts(true, tasks))
+            .map(|_| self.scan_directive_artifacts(true, tasks, projects))
             .transpose()
     }
 
     pub(crate) fn unselected_directive_artifact_inventory(&self) -> Result<Intake, HiveError> {
-        self.scan_directive_artifacts(false, None)
+        self.scan_directive_artifacts(false, None, None)
     }
 
     pub(crate) fn asset_reconciliation(&self) -> Result<Value, HiveError> {
@@ -360,6 +363,7 @@ impl ReviewedScopes<'_> {
         &self,
         prepare_storage: bool,
         tasks: Option<&[StagingTask<'_>]>,
+        projects: Option<&PreparedProjects<'_>>,
     ) -> Result<Intake, HiveError> {
         let scopes = self
             .scopes
@@ -371,7 +375,13 @@ impl ReviewedScopes<'_> {
             self.reader,
             &scopes,
             self.mapping.reviewed_records.as_deref(),
-            self.directive_observed_at,
+            &DirectiveContext {
+                observed_at: self.directive_observed_at,
+                project_ids: projects
+                    .into_iter()
+                    .flat_map(PreparedProjects::project_ids)
+                    .collect(),
+            },
             prepare_storage,
             &TaskContext::new(&self.mapping.workspace_id, tasks),
         )

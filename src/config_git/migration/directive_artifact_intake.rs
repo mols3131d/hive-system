@@ -6,9 +6,9 @@ use pulldown_cmark::{Event, HeadingLevel, Parser, Tag};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use time::OffsetDateTime;
 
 use super::directive_history::{LinkDecision, ReviewedDirective, resolve_links};
+use super::directive_scope::{DirectiveContext, DirectiveScope};
 use super::prepared_records::{Content, Fields, Intake, PreparedRecord};
 use super::reviewed_records::{self, Review};
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
@@ -98,8 +98,8 @@ enum Outcome {
 pub(super) enum Candidate {
     Directive {
         status: DirectiveStatus,
-        scope_kind: &'static str,
-        area_id: String,
+        #[serde(flatten)]
+        scope: DirectiveScope,
         include_descendants: bool,
     },
     Artifact {
@@ -121,17 +121,18 @@ impl Outcome {
         review: &Review,
         record: &InspectedRecord,
         supported_shape: bool,
-        observed_at: Option<OffsetDateTime>,
+        directive_context: &DirectiveContext<'_>,
         parent: Option<&str>,
         tasks: &TaskContext<'_>,
     ) -> Self {
         let Self::Held {
-            candidate: Some(candidate),
+            candidate: Some(mut candidate),
             mut reason_codes,
         } = self
         else {
             return self;
         };
+        let observed_at = directive_context.observed_at;
         let provenance = if review.is_work_scoped() {
             match (supported_shape, parent, &record.content) {
                 (true, Some(parent), Some(content)) => {
@@ -144,6 +145,15 @@ impl Outcome {
         } else {
             Err(Reason::UnsupportedReviewedRecord)
         };
+        let provenance = provenance.and_then(|mut provenance| {
+            if let (Fields::Directive(fields), Candidate::Directive { scope, .. }, Some(review)) =
+                (&mut provenance, &mut candidate, review.directive_scope())
+            {
+                fields.scope = review.resolve(scope, directive_context)?;
+                scope.clone_from(&fields.scope);
+            }
+            Ok(provenance)
+        });
         match provenance {
             Ok(provenance) => Self::Prepared {
                 candidate,
@@ -225,7 +235,7 @@ pub(super) fn scan(
     reader: &AssetObjectReader<'_>,
     scopes: &BTreeMap<&str, &ScopeOutcome<'_>>,
     reviews: Option<&[Review]>,
-    observed_at: Option<OffsetDateTime>,
+    directive_context: &DirectiveContext<'_>,
     prepare_storage: bool,
     tasks: &TaskContext<'_>,
 ) -> Result<Intake, HiveError> {
@@ -339,7 +349,7 @@ pub(super) fn scan(
                                     (surface == Surface::Directives
                                         && review.directive_edges().is_some())
                                         || tail.strip_suffix(".md").is_some_and(is_slug),
-                                    observed_at,
+                                    directive_context,
                                     parent.map(|(path, _)| path),
                                     tasks,
                                 ),
@@ -364,7 +374,13 @@ pub(super) fn scan(
                 key: legacy_key,
                 row: records.len(),
                 review,
-                prepared: matches!(outcome, Outcome::Prepared { .. }),
+                scope: match &outcome {
+                    Outcome::Prepared { provenance, .. } => match provenance.as_ref() {
+                        Fields::Directive(fields) => Some(fields.scope.clone()),
+                        Fields::Artifact(_) => None,
+                    },
+                    _ => None,
+                },
             });
         }
         let mut record = json!({
@@ -542,8 +558,9 @@ fn candidate(
             };
             Candidate::Directive {
                 status,
-                scope_kind: "area",
-                area_id: area_id.clone(),
+                scope: DirectiveScope::Area {
+                    area_id: area_id.clone(),
+                },
                 include_descendants: false,
             }
         }
