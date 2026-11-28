@@ -13,6 +13,7 @@ use super::*;
 use crate::cli::is_slug;
 use crate::config_file::{Coordination, ScopedDirectory};
 
+mod directive_artifact_intake;
 mod json_object;
 mod scope_plan;
 mod task_intake;
@@ -107,6 +108,26 @@ enum Reason {
     UnverifiedAcceptanceCriteria,
     UnverifiedTaskLabels,
     UnsupportedTaskMetadata,
+    NavigationOnly,
+    DirectiveBundleSupport,
+    UnsupportedDirectiveShape,
+    DuplicateLegacyDirective,
+    UnsupportedArtifactShape,
+    UnresolvedArtifactBundleMember,
+    UnresolvedBinaryOrExternalOwner,
+    RecordMarkdownTooLarge,
+    UnsupportedDirectiveMetadata,
+    UnsupportedArtifactMetadata,
+    InvalidDirectiveStatus,
+    UnclassifiedArtifactKind,
+    InvalidArtifactStatus,
+    MissingDirectiveApproval,
+    UnverifiedDirectiveValidity,
+    UnresolvedSupersessionGraph,
+    UnverifiedArtifactAuthor,
+    UnverifiedArtifactRetention,
+    UnresolvedParentTask,
+    MissingParentTaskEntrypoint,
 }
 
 fn verified_source<T>(

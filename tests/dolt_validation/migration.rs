@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 
 use super::{ADMIN, Fixture, id, storage_state};
 
+#[cfg(target_os = "linux")]
+#[path = "migration/directive_artifact.rs"]
+mod directive_artifact;
+
 const POLICY_PIN: &str = "0e584830a7eff314d85b7af8c6f8cd69e735730a";
 const FORM_FEED_CRITERIA: &str = "A\x0cB";
 const REVISION: u32 = 4;
@@ -897,6 +901,124 @@ fn migration_cli_with_path(
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cli_migration_plan_requires_named_json_objects_on_both_policy_pins() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    init_git(
+        &source,
+        &home,
+        "Synthetic Fixture",
+        "synthetic@example.invalid",
+    );
+    let mapping_file = root.path().join("mapping.json");
+    let workspace = id(1);
+    let area_id = id(AREA_APP);
+    let path = "tasks/synth-app/README.md";
+    let reference = "https://forge.example/synthetic/app";
+    fs::create_dir_all(source.join(path).parent().unwrap()).unwrap();
+    fs::write(
+        source.join(path),
+        format!("# Synthetic App\n\nProject: {reference}\n"),
+    )
+    .unwrap();
+
+    for pin in ["0fd0f8dbe632d14094a93599cb1b5f653789ac9c", POLICY_PIN] {
+        fs::write(source.join("AGENTS.md"), format!("hive-system@{pin}\n")).unwrap();
+        if pin == POLICY_PIN {
+            fs::write(
+                source.join("hive.yml"),
+                "version: 1\ncoordination:\n  mode: local\n",
+            )
+            .unwrap();
+        }
+        git(&source, &home, &["add", "."]);
+        git(&source, &home, &["commit", "-qm", "Synthetic policy pin"]);
+        let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+        let args = [
+            "--source",
+            source.to_str().unwrap(),
+            "--source-commit",
+            &commit,
+            "--workspace-id",
+            &workspace,
+            "--mapping-file",
+            mapping_file.to_str().unwrap(),
+        ];
+        let plan = |input: &str, status| {
+            fs::write(&mapping_file, input).unwrap();
+            migration_cli(&home, &config, "migration-plan", &args, status)
+        };
+
+        let evidence = json!({"path": path, "canonical_ref": reference});
+        let area = json!({"id": area_id, "slug": "application", "name": "Synthetic App", "parent_id": null});
+        let decision = json!({"kind": "area", "area": area, "project_evidence": [evidence]});
+        let entry = json!({"scope": "synth-app", "decision": decision});
+        let mapping = json!({
+            "version": 1,
+            "source_commit": commit,
+            "policy_pin": pin,
+            "workspace_id": workspace,
+            "scopes": [entry],
+        });
+        let named = mapping.to_string();
+        let report = plan(&named, 0);
+        assert_eq!(report["data"]["source"]["policy_pin"], pin);
+        assert_eq!(
+            report["data"]["scopes"][0]["outcome"],
+            json!({
+                "status": "mapped",
+                "area": {"id": area_id, "slug": "application", "parent_id": null},
+            })
+        );
+
+        let reject = |input: &str| {
+            let report = plan(input, 2);
+            assert_eq!(report["error"]["code"], "INVALID_CONFIG");
+            assert_eq!(
+                report["error"]["message"],
+                "The scope mapping must match the versioned JSON format."
+            );
+            assert!(report.get("data").is_none());
+        };
+        for (pointer, positional) in [
+            ("", json!([1, commit, pin, workspace, [entry]])),
+            ("/scopes/0", json!(["synth-app", decision])),
+            ("/scopes/0/decision", json!(["area", area, [evidence]])),
+            (
+                "/scopes/0/decision/area",
+                json!([area_id, "application", "Synthetic App", null]),
+            ),
+            (
+                "/scopes/0/decision/project_evidence/0",
+                json!([path, reference]),
+            ),
+            ("/scopes", entry),
+            ("/scopes/0/decision/project_evidence", evidence),
+        ] {
+            let mut changed = mapping.clone();
+            *changed.pointer_mut(pointer).unwrap() = positional;
+            reject(&changed.to_string());
+        }
+        for member in [
+            r#""version":1"#,
+            r#""scope":"synth-app""#,
+            r#""kind":"area""#,
+            r#""parent_id":null"#,
+            r#""canonical_ref":"https://forge.example/synthetic/app""#,
+        ] {
+            reject(&named.replacen(member, &format!("{member},{member}"), 1));
+            reject(&named.replacen(member, &format!(r#"{member},"unexpected":true"#), 1));
+        }
+        reject(&format!("{named}\n{{}}"));
+    }
+    assert!(!config.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
@@ -993,7 +1115,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         ),
         (
             "tasks/valid-spaced-link/README.md",
-            "# Project navigation\n\nAn example <span hidden> https://forge.example/synthetic/other </span>\n\nProject: [Owner]( https://forge.example/synthetic/app )\n",
+            "# Project navigation\n\nExamples <span hidden> https://forge.example/synthetic/other </span> and <code> https://forge.example/synthetic/other </code>\n\nProject: [Owner]( https://forge.example/synthetic/app )\n",
         ),
         (
             "tasks/valid-angle-link/README.md",
@@ -1014,6 +1136,18 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         (
             "tasks/apparent-html-close/README.md",
             "<div title=\"</div>\">\n\nProject: https://forge.example/synthetic/app\n\n</div>\n",
+        ),
+        (
+            "tasks/inline-wrapper-across-blocks/README.md",
+            "Intro <div hidden>\n\nProject: https://forge.example/synthetic/app\n\nEnd </div>\n",
+        ),
+        (
+            "tasks/unclosed-inline-span/README.md",
+            "Intro <span hidden>\n\nProject: https://forge.example/synthetic/app\n",
+        ),
+        (
+            "tasks/nested-inline-tags/README.md",
+            "Example <span hidden> <code> hidden </code> </span>\n\nProject: https://forge.example/synthetic/app\n",
         ),
     ] {
         let file = source.join(path);
@@ -1149,6 +1283,15 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             area("valid-angle-link", 0x11d, "valid-angle", json!([
                 evidence("tasks/valid-angle-link/README.md", app_ref)
             ])),
+            area("inline-wrapper-across-blocks", 0x11e, "inline-wrapper", json!([
+                evidence("tasks/inline-wrapper-across-blocks/README.md", app_ref)
+            ])),
+            area("unclosed-inline-span", 0x11f, "unclosed-span", json!([
+                evidence("tasks/unclosed-inline-span/README.md", app_ref)
+            ])),
+            area("nested-inline-tags", 0x120, "nested-inline", json!([
+                evidence("tasks/nested-inline-tags/README.md", app_ref)
+            ])),
         ]
     });
     mapping["scopes"][0]["decision"]["area"]["name"] = json!(local_path);
@@ -1171,7 +1314,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(data["source"], snapshot["data"]["source"]);
     assert_eq!(data["inventory"], snapshot["data"]["inventory"]);
     assert_eq!(data["target"], json!({"workspace_id": workspace}));
-    assert_eq!(data["scopes"].as_array().unwrap().len(), 31);
+    assert_eq!(data["scopes"].as_array().unwrap().len(), 34);
     let outcomes = |report: &Value| {
         report["scopes"]
             .as_array()
@@ -1230,6 +1373,9 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         "broken-angle-link",
         "hidden-across-blocks",
         "apparent-html-close",
+        "inline-wrapper-across-blocks",
+        "unclosed-inline-span",
+        "nested-inline-tags",
     ] {
         assert_eq!(mapped[scope], held, "{scope}");
     }
@@ -2452,6 +2598,15 @@ fn cli_migration_plan_prepares_only_exact_reviews_of_independent_tasks() {
     let plan = |args: &[&str], code| migration_cli(&home, &config, "migration-plan", args, code);
     let result = plan(&args, 0);
     assert_eq!(result, plan(&args, 0));
+    let combined = plan(
+        &[args.as_slice(), &["--include-directives-artifacts"]].concat(),
+        0,
+    );
+    assert_eq!(
+        combined["data"]["task_intake"],
+        result["data"]["task_intake"]
+    );
+    assert!(combined["data"]["directive_artifact_intake"].is_object());
     assert_eq!(fs::read(&mapping_file).unwrap(), original_mapping);
     assert_eq!(fs::read(source.join(".git/index")).unwrap(), original_index);
     assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
