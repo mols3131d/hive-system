@@ -28,7 +28,7 @@ mod issue_update;
 #[path = "runtime/project_planning.rs"]
 mod project_planning;
 
-type Receipt = (
+pub(super) type Receipt = (
     String,
     String,
     String,
@@ -39,7 +39,7 @@ type Receipt = (
     String,
 );
 
-fn stored_receipt(connection: &mut Conn, request: &str) -> Receipt {
+pub(super) fn stored_receipt(connection: &mut Conn, request: &str) -> Receipt {
     connection.exec_first(
         "SELECT kind, actor_ref, fingerprint, authorization_ref, base_commit,
                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'), workflow_evidence_json, result_json
@@ -402,6 +402,11 @@ fn register_fixture(fixture: &Fixture, workspace: &Path, state: &Path) -> Value 
         ),
     )
     .unwrap();
+    register_fixture_root(workspace, state, &workspace_id)
+}
+
+// Only records authority inside the disposable fixture's own XDG state.
+pub(super) fn register_fixture_root(workspace: &Path, state: &Path, workspace_id: &str) -> Value {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -1960,10 +1965,15 @@ fn launch_nonce(state: &Path) -> String {
     server["nonce"].as_str().unwrap().to_owned()
 }
 
-fn connect_owned(state: &Path, port: &str, role: &str) -> Conn {
+pub(super) fn fixture_credentials(state: &Path, role: &str) -> (String, String) {
     let nonce = launch_nonce(state);
     let password = fs::read_to_string(state.join(format!("run-{nonce}/{role}-password"))).unwrap();
     let user = format!("{role}_{}", &nonce.replace('-', "")[..24]);
+    (user, password)
+}
+
+pub(super) fn connect_owned(state: &Path, port: &str, role: &str) -> Conn {
+    let (user, password) = fixture_credentials(state, role);
     Conn::new(
         OptsBuilder::new()
             .ip_or_hostname(Some(HOST))
@@ -1974,6 +1984,69 @@ fn connect_owned(state: &Path, port: &str, role: &str) -> Conn {
             .db_name(Some("db")),
     )
     .unwrap_or_else(|_| panic!("Could not connect the synthetic independent client."))
+}
+
+pub(super) struct IssueDecision<'a> {
+    pub(super) workspace: &'a str,
+    pub(super) area: &'a str,
+    pub(super) actor: &'a str,
+    pub(super) request: &'a str,
+}
+
+impl IssueDecision<'_> {
+    pub(super) fn create(&self, title: &str, body: Option<&str>, expiry_hours: i64) -> Value {
+        let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let payload = serde_json::json!([
+            1,
+            "issue.create",
+            self.workspace,
+            self.area,
+            self.actor,
+            "task",
+            title,
+            body.map(|value| digest(value.as_bytes())),
+        ]);
+        let now = fixture_now();
+        serde_json::json!({
+            "decision": "allow",
+            "evidence": {
+                "version": 1, "operation": "issue.create", "workspace_id": self.workspace,
+                "request_id": self.request, "fingerprint": digest(payload.to_string().as_bytes()),
+                "actor_ref": self.actor, "area_id": self.area,
+                "authorization_ref": "fixture-create-authorization",
+                "evidence_id": "fixture-create-evidence", "revision": "r1",
+                "source_ref": "fixture-create-source", "issuer_ref": "fixture-create-issuer",
+                "valid_from": fixture_timestamp(now - time::Duration::hours(2)),
+                "expires_at": fixture_timestamp(now + time::Duration::hours(expiry_hours)),
+                "withdrawn": false,
+            }
+        })
+    }
+
+    pub(super) fn reconcile(&self, action: &str, issue: &str, rev: &str, reason: &str) -> Value {
+        let kind = format!("issue.{action}");
+        let reason_hash = format!("{:x}", Sha256::digest(reason));
+        let payload = serde_json::json!([
+            1,
+            kind,
+            self.workspace,
+            self.area,
+            issue,
+            self.actor,
+            rev,
+            reason_hash
+        ]);
+        let fingerprint = format!("{:x}", Sha256::digest(payload.to_string()));
+        serde_json::json!({"decision": "allow", "evidence": {
+            "version": 1, "operation": kind, "workspace_id": self.workspace,
+            "area_id": self.area, "issue_id": issue, "actor_ref": self.actor,
+            "request_id": self.request, "expected_issue_revision": rev, "fingerprint": fingerprint,
+            "authorization_ref": "fixture-decision", "evidence_id": "fixture-evidence",
+            "revision": "r1", "source_ref": "fixture-source", "issuer_ref": "fixture-issuer",
+            "valid_from": "2000-01-01T00:00:00Z", "expires_at": "2099-01-01T00:00:00Z",
+            "withdrawn": false
+        }})
+    }
 }
 
 fn issue_create_writer_fixture(
@@ -2025,31 +2098,13 @@ fn issue_create_writer_fixture(
     };
     let create =
         |request: &str, area: &str, title: &str, body: Option<&str>, expiry_hours: i64, exit| {
-            let payload = serde_json::json!([
-                1,
-                "issue.create",
-                workspace,
+            let evidence = IssueDecision {
+                workspace: &workspace,
                 area,
                 actor,
-                "task",
-                title,
-                body.map(|value| digest(value.as_bytes())),
-            ]);
-            let now = fixture_now();
-            let evidence = serde_json::json!({
-                "decision": "allow",
-                "evidence": {
-                    "version": 1, "operation": "issue.create", "workspace_id": workspace,
-                    "request_id": request, "fingerprint": digest(payload.to_string().as_bytes()),
-                    "actor_ref": actor, "area_id": area,
-                    "authorization_ref": "fixture-create-authorization",
-                    "evidence_id": "fixture-create-evidence", "revision": "r1",
-                    "source_ref": "fixture-create-source", "issuer_ref": "fixture-create-issuer",
-                    "valid_from": fixture_timestamp(now - time::Duration::hours(2)),
-                    "expires_at": fixture_timestamp(now + time::Duration::hours(expiry_hours)),
-                    "withdrawn": false,
-                }
-            });
+                request,
+            }
+            .create(title, body, expiry_hours);
             fs::write(&decision_path, evidence.to_string()).unwrap();
             invoke_create(request, area, title, body, exit)
         };

@@ -562,6 +562,18 @@ Every dry-run and staged import must emit a machine-readable JSON report (plus o
 
 Never delete the v1 source snapshot, rewrite Git history, or auto-promote an inactive restored or migrated target.
 
+The installed Linux mixed migration fixture checks the public `validate --all` result at the exact migrated Dolt commit. It backs up that stopped synthetic target, then starts a runtime scoped to the disposable fixture and exercises Issue create, cancel and create. The cancelled Issue retains number `N+1`, the next Issue receives `N+2`, and the counter advances to `N+3`. The fixture checks all three receipts and an unchanged v1 snapshot. It stops the runtime and verifies that staged import and backup restore each refuse the occupied post-write target while preserving the written Dolt and asset state and the pre-write backup manifest. For the rollback boundary, the fixture exercises destination refusal. Live cutover and reverse transitions are outside its scope.
+
+With Git and Dolt 2.7.6 on absolute `PATH` entries, use a fresh install root and disposable local scratch to run the fixture on Linux with procfs, pidfds and loopback TCP.
+
+```sh
+cargo install --locked --path . --root "$install_root"
+HIVE_STAGING_INSTALLED_BIN="$install_root/bin/hive" HIVE_DOLT_BIN="$dolt_bin" \
+  TMPDIR="$scratch_tmp" cargo test --locked --test dolt_validation \
+  migration::mixed_staging::installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target \
+  -- --exact --ignored
+```
+
 ## Remaining Synthetic Coverage Matrix
 
 Tier 1 (`tests/spikes/dolt_migration.py` at `025b80fc749d06b6cc624bb85cee3c5b7c88f923`) covers only the 8 synthetic task records under `tasks/synthetic/`. The remaining coverage required before closing `A15` is:
