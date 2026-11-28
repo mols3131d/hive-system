@@ -67,7 +67,7 @@ impl<'a> Installed<'a> {
         Ok((git.to_owned(), dolt))
     }
 
-    pub(super) fn initialize_db(
+    pub(crate) fn initialize_db(
         &self,
         db: &Path,
         workspace_id: &str,
@@ -118,7 +118,7 @@ impl<'a> Installed<'a> {
         Ok((commit, native))
     }
 
-    pub(super) fn verify_db(
+    pub(crate) fn verify_db(
         &self,
         db: &Path,
         workspace_id: &str,
@@ -193,7 +193,7 @@ impl<'a> Installed<'a> {
         Ok(())
     }
 
-    pub(super) fn initialize_assets(&self, assets: &Path) -> Result<(String, File), HiveError> {
+    pub(crate) fn initialize_assets(&self, assets: &Path) -> Result<(String, File), HiveError> {
         self.git(assets, &["init", "--initial-branch=main", "--template="])?;
         let native = super::open_directory(&assets.join(".git"))?;
         self.git(

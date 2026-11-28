@@ -353,13 +353,33 @@ fn valid_soul(bytes: &[u8], slug: &str) -> bool {
 fn has_identity_declaration(markdown: &str) -> bool {
     let mut text = String::new();
     let mut heading = false;
+    let mut items = 0;
+    let mut leading_format_depth = 0;
+    let mut formatted_label = false;
     for event in Parser::new(markdown) {
         match event {
             Event::Text(value) | Event::Code(value) => {
+                if formatted_label && value.starts_with(char::is_whitespace) {
+                    return true;
+                }
+                formatted_label = false;
                 text.push_str(&value);
                 continue;
             }
-            Event::SoftBreak | Event::HardBreak if heading => {
+            Event::Start(Tag::Strong | Tag::Emphasis)
+                if items > 0 && (text.trim().is_empty() || leading_format_depth > 0) =>
+            {
+                leading_format_depth += 1;
+                continue;
+            }
+            Event::End(TagEnd::Strong | TagEnd::Emphasis) if leading_format_depth > 0 => {
+                leading_format_depth -= 1;
+                if leading_format_depth == 0 {
+                    formatted_label = identity_declaration(&text, false);
+                }
+                continue;
+            }
+            Event::SoftBreak | Event::HardBreak if heading || leading_format_depth > 0 => {
                 text.push(' ');
                 continue;
             }
@@ -373,9 +393,12 @@ fn has_identity_declaration(markdown: &str) -> bool {
             return true;
         }
         text.clear();
+        formatted_label = false;
         match event {
             Event::Start(Tag::Heading { .. }) => heading = true,
             Event::End(TagEnd::Heading(_)) => heading = false,
+            Event::Start(Tag::Item) => items += 1,
+            Event::End(TagEnd::Item) => items -= 1,
             _ => {}
         }
     }

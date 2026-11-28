@@ -8,12 +8,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
-use super::json_object::{Object, deserialize_vec};
+use super::json_object::{self, Object};
 use super::queen_assets::{self, SoulReview};
 use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
 use super::{
-    AssetObjectReader, Inventory, Reason, is_portable_bot_memory_locator, snapshot_object,
-    verified_source,
+    AssetObjectReader, Inventory, Reason, directive_artifact_intake,
+    is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
 };
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
@@ -27,6 +27,7 @@ struct Mapping {
     source_commit: String,
     policy_pin: String,
     workspace_id: String,
+    #[serde(deserialize_with = "json_object::deserialize_vec")]
     scopes: Vec<ScopeMapping>,
     #[serde(default, deserialize_with = "optional_object_list")]
     queen_assets: Option<Vec<SoulReview>>,
@@ -39,13 +40,14 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    deserialize_vec(deserializer).map(Some)
+    json_object::deserialize_vec(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScopeMapping {
     scope: String,
+    #[serde(deserialize_with = "json_object::deserialize")]
     decision: Decision,
 }
 
@@ -53,8 +55,9 @@ struct ScopeMapping {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Decision {
     Area {
+        #[serde(deserialize_with = "json_object::deserialize")]
         area: Area,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "json_object::deserialize_vec")]
         project_evidence: Vec<ProjectEvidence>,
     },
     External {},
@@ -127,8 +130,18 @@ pub(crate) fn plan(
     revision: &str,
     workspace_id: &str,
     mapping_file: &Path,
+    include_tasks: bool,
+    include_directives_artifacts: bool,
 ) -> Result<Value, HiveError> {
-    Ok(prepare_plan(source, revision, workspace_id, mapping_file)?.report)
+    Ok(prepare_plan(
+        source,
+        revision,
+        workspace_id,
+        mapping_file,
+        include_tasks,
+        include_directives_artifacts,
+    )?
+    .report)
 }
 
 struct MigrationPlan {
@@ -142,6 +155,8 @@ fn prepare_plan(
     revision: &str,
     workspace_id: &str,
     mapping_file: &Path,
+    include_tasks: bool,
+    include_directives_artifacts: bool,
 ) -> Result<MigrationPlan, HiveError> {
     if !is_uuid(workspace_id) {
         return Err(HiveError::new(
@@ -178,6 +193,23 @@ fn prepare_plan(
             "target": {"workspace_id": workspace_id},
             "scopes": scopes.iter().map(Scope::report).collect::<Vec<_>>(),
         });
+        if include_tasks || include_directives_artifacts {
+            let outcomes = scopes
+                .iter()
+                .map(|scope| (scope.scope, &scope.outcome))
+                .collect();
+            if include_tasks {
+                // Verified v1 coordination exists only under the pin that defines claims.
+                let claims_supported = !source.hive_yml.is_null();
+                let records =
+                    task_intake::read_records(inventory, &|| reader.command(), claims_supported)?;
+                report["task_intake"] = task_intake::report(records, &outcomes);
+            }
+            if include_directives_artifacts {
+                report["directive_artifact_intake"] =
+                    directive_artifact_intake::report(inventory, reader, &outcomes)?;
+            }
+        }
         let mut preparation = mapping
             .queen_preparation
             .as_deref()
@@ -384,7 +416,7 @@ fn entrypoint_reference(bytes: &[u8]) -> Option<&str> {
     }
 
     let events: Vec<_> = Parser::new(body).into_offset_iter().collect();
-    let html_blocks = prose_blocks_with_html(&events);
+    let html_blocks = closed_inline_html_blocks(&events)?;
     let mut skipped = 0;
     let mut reference = None;
     for (event, range) in events {
@@ -493,11 +525,18 @@ fn closed_raw_html_block(raw: &str) -> bool {
         .is_some_and(|contents| !contents.contains('<'))
 }
 
-fn prose_blocks_with_html(events: &[(Event<'_>, Range<usize>)]) -> HashSet<Range<usize>> {
+fn closed_inline_html_blocks(
+    events: &[(Event<'_>, Range<usize>)],
+) -> Option<HashSet<Range<usize>>> {
     let mut prose = Vec::new();
     let mut html_blocks = HashSet::new();
     let mut image_depth = 0;
+    let mut expected_close = None;
     for (event, range) in events {
+        // A raw pair must close before crossing any Markdown element boundary.
+        if expected_close.is_some() && matches!(event, Event::Start(_) | Event::End(_)) {
+            return None;
+        }
         match event {
             Event::Start(Tag::Image { .. }) => image_depth += 1,
             Event::End(TagEnd::Image) => image_depth -= 1,
@@ -505,15 +544,29 @@ fn prose_blocks_with_html(events: &[(Event<'_>, Range<usize>)]) -> HashSet<Range
             Event::End(TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item) => {
                 prose.pop();
             }
-            Event::InlineHtml(html) if image_depth == 0 && !html.starts_with("<!--") => {
-                if let Some(&block) = prose.last() {
+            Event::InlineHtml(html) if image_depth == 0 => {
+                if html.starts_with("<!--") {
+                    if !closed_raw_html_block(html) {
+                        return None;
+                    }
+                } else if let Some(close) = expected_close.take() {
+                    if html.as_ref() != close {
+                        return None;
+                    }
+                } else {
+                    let &block = prose.last()?;
+                    expected_close = Some(match html.as_ref() {
+                        "<code>" => "</code>",
+                        "<span hidden>" => "</span>",
+                        _ => return None,
+                    });
                     html_blocks.insert(block.clone());
                 }
             }
             _ => {}
         }
     }
-    html_blocks
+    expected_close.is_none().then_some(html_blocks)
 }
 
 fn agree<'a>(reference: &mut Option<&'a str>, candidate: &'a str) -> Option<()> {
