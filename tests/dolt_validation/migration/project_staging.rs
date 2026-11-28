@@ -400,3 +400,144 @@ fn installed_cli_stages_explicit_cross_area_project_memberships() {
         assert!(!dir.exists());
     }
 }
+
+#[test]
+#[ignore = "requires HIVE_STAGING_INSTALLED_BIN and pinned Git"]
+fn installed_cli_requires_project_status_and_membership_decision_strings_at_both_pins() {
+    const EARLIER_PIN: &str = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
+    const TARGET_POLICY: &str = "c66b3c50150e18426485d134de92c6b311dac125";
+    const TASK: &str = "tasks/_general/backlog/example/README.md";
+    const DATE: &str = "2024-02-01T12:00:00Z";
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let home = root.join("home");
+    let source = root.join("source");
+    let target = root.join("inactive");
+    let mapping_file = root.join("mapping.json");
+    let hive = std::env::var_os("HIVE_STAGING_INSTALLED_BIN").unwrap();
+    let path = std::env::var_os("PATH").unwrap();
+
+    fs::create_dir(&home).unwrap();
+    init_git(
+        &source,
+        &home,
+        "Synthetic Operator",
+        "operator@example.invalid",
+    );
+    let task = source.join(TASK);
+    fs::create_dir_all(task.parent().unwrap()).unwrap();
+    fs::write(
+        &task,
+        format!("---\ndescription: Synthetic Task\n---\n{DATE}\n"),
+    )
+    .unwrap();
+    let workspace = id(1);
+    let area = id(2);
+    let project = id(3);
+
+    for pin in [EARLIER_PIN, POLICY_PIN] {
+        fs::write(source.join("AGENTS.md"), format!("hive-system@{pin}\n")).unwrap();
+        if pin == POLICY_PIN {
+            fs::write(
+                source.join("hive.yml"),
+                "version: 1\ncoordination:\n  mode: local\n",
+            )
+            .unwrap();
+        }
+        git(&source, &home, &["add", "."]);
+        git(
+            &source,
+            &home,
+            &["commit", "-qm", "Synthetic Project enum policy"],
+        );
+        let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+        let blob = git_text(&source, &home, &["rev-parse", &format!("{commit}:{TASK}")]);
+        let legacy_key = json!({"scope":"_general","work_id":"example"});
+        let dates = json!({"start":0,"end":DATE.len()});
+        let manifest = json!({
+            "version":1, "source_commit":commit, "policy_pin":pin, "workspace_id":workspace,
+            "scopes":[{"scope":"_general","decision":{"kind":"area","area":{"id":area,"slug":"general","name":"General"}}}],
+            "task_reviews":[{
+                "legacy_key":legacy_key, "source_git_blob_sha":blob, "area_id":area, "relations":"no_edges",
+                "created_at":dates, "updated_at":dates
+            }],
+            "project_membership":{
+                "projects":[{"id":project,"name":"Synthetic Project","status":"active"}],
+                "memberships":[{"project_id":project,"legacy_key":legacy_key,"source_git_blob_sha":blob,"decision":"link"}]
+            }
+        });
+        let run = |action: &str, mapping: &Value| {
+            fs::write(&mapping_file, mapping.to_string()).unwrap();
+            let mut command = Command::new(&hive);
+            command
+                .current_dir(&home)
+                .env_clear()
+                .env("HOME", &home)
+                .env("PATH", &path)
+                .env("TMPDIR", root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_STATE_HOME", root.join("state"))
+                .args(["--contract", "2", "--json", "workspace", action, "--source"])
+                .arg(&source)
+                .args([
+                    "--source-commit",
+                    &commit,
+                    "--workspace-id",
+                    &workspace,
+                    "--tasks",
+                    "--mapping-file",
+                ])
+                .arg(&mapping_file);
+            if action == "migration-stage" {
+                command
+                    .args([
+                        "--mode",
+                        "staged-import",
+                        "--policy-revision",
+                        TARGET_POLICY,
+                        "--target",
+                    ])
+                    .arg(&target);
+            }
+            let output = command.output().unwrap();
+            assert!(output.stderr.is_empty(), "{pin} {action}: {output:?}");
+            let response = serde_json::from_slice::<Value>(&output.stdout).unwrap();
+            (output.status.code(), response)
+        };
+
+        let (status, positive) = run("migration-plan", &manifest);
+        assert_eq!(status, Some(0), "{pin}: {positive}");
+        assert_eq!(positive["data"]["source"]["policy_pin"], pin);
+        let prepared = &positive["data"]["project_membership"];
+        assert_eq!(prepared["projects"][0]["status"], "prepared", "{pin}");
+        assert_eq!(prepared["projects"][0]["project_status"], "active", "{pin}");
+        assert_eq!(prepared["memberships"][0]["status"], "prepared", "{pin}");
+
+        for (field, tagged) in [
+            (
+                "/project_membership/projects/0/status",
+                json!({"active":null}),
+            ),
+            (
+                "/project_membership/memberships/0/decision",
+                json!({"link":null}),
+            ),
+        ] {
+            let mut malformed = manifest.clone();
+            *malformed.pointer_mut(field).unwrap() = tagged;
+            for action in ["migration-plan", "migration-stage"] {
+                let (status, rejected) = run(action, &malformed);
+                assert_eq!(status, Some(2), "{pin} {action} {field}: {rejected}");
+                assert_eq!(
+                    rejected["error"]["code"], "INVALID_CONFIG",
+                    "{pin} {action} {field}"
+                );
+                assert!(rejected.get("data").is_none(), "{pin} {action} {field}");
+                assert!(!target.exists(), "{pin} {action} {field}");
+            }
+        }
+        assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+    }
+}

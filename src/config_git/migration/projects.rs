@@ -35,6 +35,7 @@ pub(crate) struct Project {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) description: Option<String>,
+    #[serde(deserialize_with = "json_object::string_enum")]
     status: ProjectStatus,
 }
 
@@ -63,6 +64,7 @@ struct Membership {
     #[serde(deserialize_with = "json_object::deserialize")]
     legacy_key: LegacyKey,
     source_git_blob_sha: String,
+    #[serde(deserialize_with = "json_object::string_enum")]
     decision: Decision,
 }
 
