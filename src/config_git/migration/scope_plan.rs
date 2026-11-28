@@ -10,6 +10,7 @@ use url::{Host, Url};
 
 use super::json_object::{self, Object};
 use super::queen_assets::{self, SoulReview};
+use super::reviewed_records::Review;
 use super::{
     AssetObjectReader, Inventory, Reason, directive_artifact_intake,
     is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
@@ -28,6 +29,8 @@ struct Mapping {
     workspace_id: String,
     #[serde(deserialize_with = "json_object::deserialize_vec")]
     scopes: Vec<ScopeMapping>,
+    #[serde(default, deserialize_with = "optional_object_list")]
+    reviewed_records: Option<Vec<Review>>,
     #[serde(default, deserialize_with = "optional_object_list")]
     queen_assets: Option<Vec<SoulReview>>,
 }
@@ -144,6 +147,11 @@ pub(crate) fn plan(
     if mapping.version != 1 {
         return Err(invalid("The scope mapping version is unsupported."));
     }
+    if mapping.reviewed_records.is_some() && !include_directives_artifacts {
+        return Err(invalid(
+            "Reviewed records require --include-directives-artifacts.",
+        ));
+    }
 
     verified_source(source, revision, |source, inventory, reader| {
         if mapping.source_commit != source.source_commit
@@ -178,8 +186,12 @@ pub(crate) fn plan(
                 report["task_intake"] = task_intake::report(records, &outcomes);
             }
             if include_directives_artifacts {
-                report["directive_artifact_intake"] =
-                    directive_artifact_intake::report(inventory, reader, &outcomes)?;
+                report["directive_artifact_intake"] = directive_artifact_intake::report(
+                    inventory,
+                    reader,
+                    &outcomes,
+                    mapping.reviewed_records.as_deref(),
+                )?;
             }
         }
         if let Some(reviews) = &mapping.queen_assets {
@@ -539,7 +551,7 @@ fn prose_url(token: &str) -> &str {
     token
 }
 
-fn portable_reference(reference: &str) -> bool {
+pub(super) fn portable_reference(reference: &str) -> bool {
     if reference.len() > MAX_FILE_BYTES
         || !reference.starts_with("https://")
         || !reference.is_ascii()
