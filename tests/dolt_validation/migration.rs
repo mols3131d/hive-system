@@ -973,6 +973,26 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             "tasks/good-percent/README.md",
             "# Project navigation\n\n[Project](https://forge.example/synthetic/app%20one)\n",
         ),
+        (
+            "tasks/inline-code-tag/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <code> https://forge.example/synthetic/app </code>\n",
+        ),
+        (
+            "tasks/hidden-span/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <span hidden> https://forge.example/synthetic/app </span>\n",
+        ),
+        (
+            "tasks/hidden-image-alt/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app ![ https://forge.example/synthetic/app ](example.png)\n",
+        ),
+        (
+            "tasks/broken-spaced-link/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app Owner]( https://forge.example/synthetic/app )\n",
+        ),
+        (
+            "tasks/valid-spaced-link/README.md",
+            "# Project navigation\n\nAn example <span hidden> https://forge.example/synthetic/other </span>\n\nProject: [Owner]( https://forge.example/synthetic/app )\n",
+        ),
     ] {
         let file = source.join(path);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -1077,6 +1097,21 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             area("good-percent", 0x113, "good-percent", json!([
                 evidence("tasks/good-percent/README.md", "https://forge.example/synthetic/app%20one")
             ])),
+            area("inline-code-tag", 0x114, "inline-code", json!([
+                evidence("tasks/inline-code-tag/README.md", app_ref)
+            ])),
+            area("hidden-span", 0x115, "hidden-span", json!([
+                evidence("tasks/hidden-span/README.md", app_ref)
+            ])),
+            area("hidden-image-alt", 0x116, "hidden-image", json!([
+                evidence("tasks/hidden-image-alt/README.md", app_ref)
+            ])),
+            area("broken-spaced-link", 0x117, "broken-spaced", json!([
+                evidence("tasks/broken-spaced-link/README.md", app_ref)
+            ])),
+            area("valid-spaced-link", 0x118, "valid-spaced", json!([
+                evidence("tasks/valid-spaced-link/README.md", app_ref)
+            ])),
         ]
     });
     mapping["scopes"][0]["decision"]["area"]["name"] = json!(local_path);
@@ -1099,7 +1134,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(data["source"], snapshot["data"]["source"]);
     assert_eq!(data["inventory"], snapshot["data"]["inventory"]);
     assert_eq!(data["target"], json!({"workspace_id": workspace}));
-    assert_eq!(data["scopes"].as_array().unwrap().len(), 21);
+    assert_eq!(data["scopes"].as_array().unwrap().len(), 26);
     let outcomes = |report: &Value| {
         report["scopes"]
             .as_array()
@@ -1118,6 +1153,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(mapped["_hive-userdata"]["status"], "mapped");
     assert_eq!(mapped["hive-system"]["status"], "mapped");
     assert_eq!(mapped["good-percent"]["status"], "mapped");
+    assert_eq!(mapped["valid-spaced-link"]["status"], "mapped");
     assert_eq!(
         mapped["synth-app"],
         json!({"status": "mapped", "area": {
@@ -1148,6 +1184,10 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         "quoted-fence-only",
         "broken-link-only",
         "bad-percent",
+        "inline-code-tag",
+        "hidden-span",
+        "hidden-image-alt",
+        "broken-spaced-link",
     ] {
         assert_eq!(mapped[scope], held, "{scope}");
     }
