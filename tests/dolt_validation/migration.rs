@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 
 use super::{ADMIN, Fixture, id, storage_state};
 
+#[cfg(target_os = "linux")]
+#[path = "migration/directive_artifact.rs"]
+mod directive_artifact;
+
 const POLICY_PIN: &str = "0e584830a7eff314d85b7af8c6f8cd69e735730a";
 const REVISION: u32 = 4;
 const AREA_GENERAL: u32 = 0x101;
@@ -871,6 +875,7 @@ fn migration_cli_with_path(
         .current_dir(home)
         .env_clear()
         .env("PATH", search_path)
+        .env("TMPDIR", std::env::temp_dir())
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", config)
         // An inherited repository selection must not replace the explicit one.
@@ -2005,6 +2010,756 @@ fn check_queen_asset_intake(policy_pin: &str) {
     assert_eq!(rejected["error"]["code"], "INVALID_RECORD");
     assert!(!rejected.to_string().contains(external.to_str().unwrap()));
     assert_eq!(fs::read_to_string(&external).unwrap(), outside_bytes);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    init_source(&source, &home);
+    let app_ref = "https://forge.example/synthetic/app";
+    let app_entrypoints = [
+        "tasks/synth-app/README.md",
+        "directives/synth-app/README.md",
+        "bots/queen-synth/memory/synth-app/MEMORY.md",
+    ];
+    // The Task scope entrypoint comes from init_source. Add the same literal
+    // reference to the other two scope entrypoints before committing the source.
+    for path in &app_entrypoints[1..] {
+        let entrypoint = source.join(path);
+        fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        fs::write(
+            entrypoint,
+            format!("# Synthetic App\n\nProject: {app_ref}\n"),
+        )
+        .unwrap();
+    }
+    let malformed_bot_origin = "bots/Synthetic-Bot@sample.invalid/memory/unmapped";
+    fs::create_dir_all(source.join(malformed_bot_origin)).unwrap();
+    fs::write(
+        source.join(malformed_bot_origin).join("MEMORY.md"),
+        "# Synthetic memory\n",
+    )
+    .unwrap();
+    let claim = "claim: {id: private-claim-id, holder: private-claim-holder}\n";
+    let repeated_title = "title: Private first title\ntitle: Private second title\n";
+    // Expected execution hold on the adopted pin and the earlier pin.
+    let projection_cases = [
+        (
+            "repeat-title-claimed",
+            format!("status: in-progress\n{claim}{repeated_title}"),
+            [true, false],
+        ),
+        (
+            "repeat-title-unclaimed",
+            format!("status: in-progress\n{repeated_title}"),
+            [false, true],
+        ),
+        (
+            "repeat-title-todo",
+            format!("status: todo\n{repeated_title}"),
+            [false, false],
+        ),
+        (
+            "repeat-status-claimed",
+            format!("status: in-progress\nstatus: in-progress\n{claim}"),
+            [false, false],
+        ),
+        (
+            "repeat-status-unclaimed",
+            "status: in-progress\nstatus: in-progress\n".to_owned(),
+            [false, false],
+        ),
+        (
+            "repeat-claim",
+            format!("status: in-progress\n{claim}{claim}"),
+            [false, false],
+        ),
+        (
+            "repeat-claim-holder",
+            "status: in-progress\nclaim: {id: private-claim-id, holder: private-first, holder: private-second}\n".to_owned(),
+            [false, false],
+        ),
+        (
+            "repeat-claim-id",
+            "status: in-progress\nclaim: {id: private-first, id: private-second, holder: private-claim-holder}\n".to_owned(),
+            [false, false],
+        ),
+        (
+            "invalid-yaml",
+            format!("status: in-progress\n{claim}tags: [unterminated\n"),
+            [false, false],
+        ),
+        (
+            "invalid-yaml-unclaimed",
+            "status: in-progress\ntags: [unterminated\n".to_owned(),
+            [false, false],
+        ),
+    ];
+    let invalid_work = "_general/backlog/Synthetic-Work@sample.invalid";
+    let invalid_scope = "Synthetic-Scope@sample.invalid";
+    let invalid_scope_work = format!("{invalid_scope}/backlog/item");
+    let excluded_invalid_work = "external-team/active/Synthetic-External@sample.invalid";
+    let fixtures = [
+        ("_general/backlog/shared", "", "# Private H1 title\n"),
+        (
+            "_hive-userdata/backlog/shared",
+            "tags: [private-synthetic-tag]\n",
+            "Description fallback.\n",
+        ),
+        (
+            "_general/active/shared",
+            &format!("status: todo\n{claim}"),
+            "Duplicated across areas.\n",
+        ),
+        ("_general/backlog/shared-malformed", "", ""),
+        (
+            "_general/active/shared-malformed",
+            &format!("status: in-progress\n{claim}tags: null\n"),
+            "",
+        ),
+        (
+            "_general/active/waiting",
+            "status: todo\n",
+            "## Acceptance\n\n- [ ] Private acceptance criterion\n",
+        ),
+        (
+            "_general/active/claimed",
+            &format!("status: todo\n{claim}"),
+            "",
+        ),
+        (
+            "_general/active/running",
+            &format!("status: in-progress\n{claim}"),
+            "",
+        ),
+        (
+            "_general/active/running-no-claim",
+            "status: in-progress\n",
+            "",
+        ),
+        (
+            "_general/active/reviewing",
+            &format!("status: review\n{claim}"),
+            "",
+        ),
+        (
+            "_general/active/unclaimed-review",
+            "status: review\n",
+            "Submitted by: private-prose-holder\n",
+        ),
+        (
+            "_general/active/claimed-done",
+            &format!("status: done\n{claim}"),
+            "",
+        ),
+        (
+            "_general/archive/claimed-closed",
+            &format!("status: cancelled\n{claim}"),
+            "",
+        ),
+        (
+            "_general/archive/cancelled",
+            "status: cancelled\n",
+            "Cancelled by: private-reviewer\n",
+        ),
+        ("_general/backlog/claimed-backlog", "claim: null\n", ""),
+        ("_general/backlog/null-status", "status: null\n", ""),
+        ("_general/backlog/null-tags", "tags: null\n", ""),
+        ("synth-app/backlog/null-title", "title: null\n", ""),
+        ("synth-app/backlog/description-fallback", "", ""),
+        (
+            "synth-app/active/malformed-claim",
+            "status: in-progress\nclaim: null\ntags: null\n",
+            "",
+        ),
+        (
+            "synth-app/active/malformed-tags",
+            &format!("status: in-progress\n{claim}tags: null\n"),
+            "",
+        ),
+        (
+            "_general/backlog/conflict",
+            "",
+            "# Private H1 one\n\n# Private H1 two\n",
+        ),
+        (
+            "_general/backlog/title-override",
+            "title: Private chosen title\n",
+            "# First\n\n# Second\n",
+        ),
+        (
+            "_general/backlog/duplicate-field",
+            "title: First\ntitle: Second\n",
+            "",
+        ),
+        (
+            "_general/backlog/unknown-field",
+            "depends_on: [synth-app/example]\n",
+            "",
+        ),
+        ("_general/backlog/broken-blob", "", ""),
+        (invalid_work, "", ""),
+        (&invalid_scope_work, "", ""),
+        (
+            "_general/archive/with-child",
+            "status: done\n",
+            "Closed: 2026-04-01 00:00:00\nAccepted by: private-reviewer\nOutcome: private result\n\nChild: _general/cancelled\n",
+        ),
+        (
+            "_general/archive/with-prerequisite",
+            "status: done\n",
+            "Prerequisite: _general/waiting\n",
+        ),
+        ("external-team/backlog/native", "", ""),
+        (
+            excluded_invalid_work,
+            &format!("status: in-progress\n{claim}"),
+            "",
+        ),
+        ("_hive/backlog/legacy", "", ""),
+        (
+            "_hive/active/legacy",
+            &format!("status: in-progress\n{claim}"),
+            "",
+        ),
+        (
+            "unmapped/active/uncertain",
+            &format!("status: in-progress\n{claim}"),
+            "",
+        ),
+        (
+            "unmapped/active/uncertain-malformed",
+            &format!("status: in-progress\n{claim}tags: null\n"),
+            "",
+        ),
+        (
+            "unmapped/active/unclaimed-malformed",
+            "status: in-progress\ntags: null\n",
+            "",
+        ),
+        (
+            "unmapped/active/ambiguous-status",
+            &format!("status: in-progress\nstatus: done\n{claim}tags: null\n"),
+            "",
+        ),
+    ];
+    for (bundle, fields, body) in fixtures {
+        let file = source.join(format!("tasks/{bundle}/README.md"));
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let record = format!("---\ndescription: \"Private task description\"\n{fields}---\n{body}");
+        if bundle.ends_with("/broken-blob") {
+            fs::write(file, [0xff]).unwrap();
+        } else {
+            fs::write(file, record).unwrap();
+        }
+    }
+    for (work_id, fields, _) in &projection_cases {
+        let bundle = source.join(format!("tasks/unmapped/active/{work_id}"));
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(
+            bundle.join("README.md"),
+            format!("---\ndescription: Private task description\n{fields}---\n"),
+        )
+        .unwrap();
+    }
+    let missing = source.join("tasks/_general/backlog/no-readme");
+    fs::create_dir_all(&missing).unwrap();
+    fs::write(missing.join("notes.md"), "Private supporting note").unwrap();
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic task intake entries"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let workspace = id(1);
+    let file = root.path().join("mapping.json");
+    let mapping = json!({
+        "version": 1,
+        "source_commit": commit,
+        "policy_pin": POLICY_PIN,
+        "workspace_id": workspace,
+        "scopes": [
+            {"scope": "_general", "decision": {"kind": "area", "area": {
+                "id": id(AREA_GENERAL), "slug": "general", "name": "General"
+            }}},
+            {"scope": "_hive-userdata", "decision": {"kind": "area", "area": {
+                "id": id(AREA_USERDATA), "slug": "operations", "name": "Operations"
+            }}},
+            {"scope": "external-team", "decision": {"kind": "external"}},
+            {"scope": "synth-app", "decision": {
+                "kind": "area",
+                "area": {"id": id(AREA_APP), "slug": "app", "name": "Private Area name"},
+                "project_evidence": app_entrypoints.map(|path| json!({
+                    "path": path,
+                    "canonical_ref": app_ref,
+                })),
+            }},
+        ]
+    });
+    fs::write(&file, serde_json::to_vec(&mapping).unwrap()).unwrap();
+    let mut args = vec![
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+        "--workspace-id",
+        &workspace,
+        "--mapping-file",
+        file.to_str().unwrap(),
+    ];
+    let scope_plan = migration_cli(&home, &config, "migration-plan", &args, 0)["data"].clone();
+    assert!(scope_plan.get("task_intake").is_none());
+    args.push("--tasks");
+
+    let source_files = [
+        ".git/index",
+        ".git/HEAD",
+        ".git/refs/heads/main",
+        ".git/config",
+        "AGENTS.md",
+        "hive.yml",
+    ];
+    let original = source_files.map(|path| fs::read(source.join(path)).unwrap());
+    let plan = migration_cli(&home, &config, "migration-plan", &args, 0)["data"].clone();
+    assert_eq!(
+        plan,
+        migration_cli(&home, &config, "migration-plan", &args, 0)["data"]
+    );
+    for (key, value) in scope_plan.as_object().unwrap() {
+        assert_eq!(&plan[key], value, "{key}");
+    }
+    assert_eq!(plan["source"]["source_commit"], commit);
+    let intake = &plan["task_intake"];
+    assert_eq!(intake["coverage"], "partial");
+    let tasks = intake["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), fixtures.len() + projection_cases.len() + 4);
+    assert_eq!(
+        intake["counts"],
+        json!({
+            "inventoried": tasks.len(), "held": tasks.len() - 2, "excluded": 2
+        })
+    );
+    let redacted_paths = [invalid_work, &invalid_scope_work, excluded_invalid_work]
+        .map(|bundle| format!("tasks/{bundle}/README.md"));
+    let redacted_locators = redacted_paths
+        .each_ref()
+        .map(|path| sha256_hex(path.as_bytes()));
+    let path_for = |task: &Value| {
+        if let Some(path) = task["source_path"].as_str() {
+            assert!(task.get("source_path_sha256").is_none());
+            path.to_owned()
+        } else {
+            assert!(task.get("legacy_key").is_none());
+            assert!(task.get("source_path").is_none());
+            let index = redacted_locators
+                .iter()
+                .position(|digest| task["source_path_sha256"] == *digest)
+                .expect("known redacted path digest");
+            redacted_paths[index].clone()
+        }
+    };
+    let ordered: Vec<_> = tasks
+        .iter()
+        .map(|task| {
+            let path = path_for(task);
+            let mut parts = path.split('/');
+            let scope = parts.nth(1).unwrap();
+            let work_id = parts.nth(1).unwrap();
+            if task.get("legacy_key").is_some() {
+                assert_eq!(
+                    task["legacy_key"],
+                    json!({"scope": scope, "work_id": work_id})
+                );
+            }
+            (scope.to_owned(), work_id.to_owned(), path)
+        })
+        .collect();
+    assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
+    for (task, (_, _, path)) in tasks.iter().zip(&ordered) {
+        if path.ends_with("/no-readme") {
+            assert!(task["source_git_blob_sha"].is_null());
+            assert!(task["source_raw_sha256"].is_null());
+        } else {
+            let object = format!("{commit}:{path}");
+            assert_eq!(
+                task["source_git_blob_sha"],
+                git_text(&source, &home, &["rev-parse", &object])
+            );
+            assert_eq!(
+                task["source_raw_sha256"],
+                sha256_hex(&git(&source, &home, &["show", &object]))
+            );
+        }
+    }
+    let outcome = |path| {
+        &tasks
+            .iter()
+            .zip(&ordered)
+            .find(|(_, (_, _, source_path))| source_path == &path)
+            .map(|(task, _)| task)
+            .unwrap()["outcome"]
+    };
+    for (path, reason) in [
+        (
+            "_general/backlog/shared/README.md",
+            "duplicate_legacy_work_id",
+        ),
+        (
+            "_general/active/claimed/README.md",
+            "execution_needs_reconciliation",
+        ),
+        (
+            "_general/active/running/README.md",
+            "execution_needs_reconciliation",
+        ),
+        (
+            "_general/active/running-no-claim/README.md",
+            "invalid_legacy_state",
+        ),
+        (
+            "_general/active/reviewing/README.md",
+            "execution_needs_reconciliation",
+        ),
+        (
+            "_general/active/unclaimed-review/README.md",
+            "missing_typed_submission_evidence",
+        ),
+        (
+            "_general/active/claimed-done/README.md",
+            "invalid_legacy_state",
+        ),
+        (
+            "_general/archive/claimed-closed/README.md",
+            "invalid_legacy_state",
+        ),
+        (
+            "_general/backlog/claimed-backlog/README.md",
+            "invalid_legacy_state",
+        ),
+        (
+            "_general/backlog/null-status/README.md",
+            "invalid_legacy_state",
+        ),
+        (
+            "_general/backlog/conflict/README.md",
+            "missing_or_conflicting_title",
+        ),
+        (
+            "_general/backlog/duplicate-field/README.md",
+            "unsupported_task_metadata",
+        ),
+        (
+            "_general/backlog/unknown-field/README.md",
+            "unsupported_task_metadata",
+        ),
+        (
+            "_general/backlog/broken-blob/README.md",
+            "unsupported_task_metadata",
+        ),
+        (
+            "_general/backlog/null-tags/README.md",
+            "unsupported_task_metadata",
+        ),
+        (
+            "synth-app/backlog/null-title/README.md",
+            "unsupported_task_metadata",
+        ),
+        (
+            "synth-app/active/malformed-claim/README.md",
+            "unsupported_task_metadata",
+        ),
+        ("_general/backlog/no-readme", "missing_task_entrypoint"),
+    ] {
+        assert_eq!(
+            outcome(format!("tasks/{path}")),
+            &json!({
+                "status": "held",
+                "reason_codes": [reason],
+            }),
+            "{path}"
+        );
+    }
+    for (path, expected) in [
+        (
+            "tasks/_general/active/shared/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/_general/active/shared-malformed/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "unsupported_task_metadata", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/synth-app/active/malformed-tags/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["unsupported_task_metadata", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/_hive/backlog/legacy/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "unsplit_legacy_scope"]}),
+        ),
+        (
+            "tasks/_hive/active/legacy/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "unsplit_legacy_scope", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/unmapped/active/uncertain/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/unmapped/active/uncertain-malformed/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "unsupported_task_metadata", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/unmapped/active/unclaimed-malformed/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "unsupported_task_metadata"]}),
+        ),
+        (
+            "tasks/unmapped/active/ambiguous-status/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "unsupported_task_metadata"]}),
+        ),
+        (
+            redacted_paths[0].clone(),
+            json!({"status": "held", "reason_codes": ["invalid_legacy_state"]}),
+        ),
+        (
+            redacted_paths[1].clone(),
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision"]}),
+        ),
+        (
+            redacted_paths[2].clone(),
+            json!({"status": "excluded", "reason": "external_backend_owned"}),
+        ),
+    ] {
+        assert_eq!(outcome(path), &expected);
+    }
+    let scopes = plan["scopes"].as_array().unwrap();
+    let malformed_scope = scopes
+        .iter()
+        .find(|scope| scope["scope_sha256"] == sha256_hex(invalid_scope.as_bytes()))
+        .unwrap();
+    assert!(malformed_scope.get("scope").is_none());
+    assert_eq!(malformed_scope["source_paths"], json!([]));
+    assert_eq!(
+        malformed_scope["source_path_sha256s"],
+        json!([sha256_hex(format!("tasks/{invalid_scope}").as_bytes())])
+    );
+    let unmapped = scopes
+        .iter()
+        .find(|scope| scope["scope"] == "unmapped")
+        .unwrap();
+    assert_eq!(unmapped["source_paths"], json!(["tasks/unmapped"]));
+    assert_eq!(
+        unmapped["source_path_sha256s"],
+        json!([sha256_hex(malformed_bot_origin.as_bytes())])
+    );
+    for (path, status, area, reasons) in [
+        (
+            "synth-app/backlog/description-fallback",
+            "backlog",
+            AREA_APP,
+            vec!["unresolved_task_relations"],
+        ),
+        (
+            "synth-app/backlog/implement-widget",
+            "backlog",
+            AREA_APP,
+            vec!["unresolved_task_relations"],
+        ),
+        (
+            "_hive-userdata/backlog/shared",
+            "backlog",
+            AREA_USERDATA,
+            vec!["unresolved_task_relations"],
+        ),
+        (
+            "_general/backlog/title-override",
+            "backlog",
+            AREA_GENERAL,
+            vec!["unresolved_task_relations"],
+        ),
+        (
+            "_general/active/waiting",
+            "todo",
+            AREA_GENERAL,
+            vec![
+                "unresolved_task_relations",
+                "unverified_acceptance_criteria",
+            ],
+        ),
+        (
+            "_hive-userdata/active/unproven-done",
+            "done",
+            AREA_USERDATA,
+            vec!["unresolved_completion_obligation"],
+        ),
+        (
+            "_general/archive/with-child",
+            "done",
+            AREA_GENERAL,
+            vec!["unresolved_completion_obligation"],
+        ),
+        (
+            "_general/archive/with-prerequisite",
+            "done",
+            AREA_GENERAL,
+            vec!["unresolved_completion_obligation"],
+        ),
+        (
+            "_general/archive/close-checklist",
+            "done",
+            AREA_GENERAL,
+            vec!["unresolved_completion_obligation"],
+        ),
+        (
+            "_general/archive/cancelled",
+            "cancelled",
+            AREA_GENERAL,
+            vec!["unresolved_task_relations"],
+        ),
+    ] {
+        let mut reason_codes = vec!["incomplete_historical_provenance"];
+        reason_codes.extend(reasons);
+        assert_eq!(
+            outcome(format!("tasks/{path}/README.md")),
+            &json!({
+                "status": "held", "candidate_status": status, "area_id": id(area), "reason_codes": reason_codes,
+            }),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        outcome("tasks/external-team/backlog/native/README.md".to_owned()),
+        &json!({
+            "status": "excluded", "reason": "external_backend_owned"
+        })
+    );
+    let output = plan.to_string().to_lowercase();
+    for private in [
+        "private",
+        app_ref,
+        "synthetic-reviewer",
+        "synthetic checklist verified",
+        "2026-04-01",
+        "@sample.invalid",
+        file.to_str().unwrap(),
+    ] {
+        assert!(!output.contains(private), "report exposed fixture data");
+    }
+    let mut conflicting = mapping.clone();
+    conflicting["scopes"][3]["decision"]["project_evidence"][2]["canonical_ref"] =
+        json!("https://forge.example/synthetic/other");
+    fs::write(&file, serde_json::to_vec(&conflicting).unwrap()).unwrap();
+    let conflicted = migration_cli(&home, &config, "migration-plan", &args, 0);
+    let task = conflicted["data"]["task_intake"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["legacy_key"]["work_id"] == "implement-widget")
+        .unwrap();
+    assert_eq!(
+        task["outcome"],
+        json!({
+            "status": "held",
+            "reason_codes": ["ambiguous_scope_or_collision"],
+        })
+    );
+    assert_eq!(
+        original,
+        source_files.map(|path| fs::read(source.join(path)).unwrap())
+    );
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+    assert!(!config.exists());
+
+    // The earlier pin has no Git-backed claims. An unclaimed in-progress task
+    // remains an execution hold, and a claim on it is unsupported by that pin.
+    fs::remove_file(source.join("hive.yml")).unwrap();
+    let older_pin = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
+    fs::write(
+        source.join("AGENTS.md"),
+        format!("hive-system@{older_pin}\n"),
+    )
+    .unwrap();
+    git(&source, &home, &["add", "-A"]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Earlier synthetic policy pin"],
+    );
+    let older_commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let mut mapping = mapping;
+    mapping["policy_pin"] = json!(older_pin);
+    mapping["source_commit"] = json!(older_commit);
+    fs::write(&file, serde_json::to_vec(&mapping).unwrap()).unwrap();
+    args[3] = &older_commit;
+    let earlier = migration_cli(&home, &config, "migration-plan", &args, 0);
+    for (id, reason) in [
+        ("running", "invalid_legacy_state"),
+        ("running-no-claim", "execution_needs_reconciliation"),
+    ] {
+        let task = earlier["data"]["task_intake"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["legacy_key"]["work_id"] == id)
+            .unwrap();
+        assert_eq!(task["outcome"]["reason_codes"], json!([reason]));
+    }
+    let early_tasks = earlier["data"]["task_intake"]["tasks"].as_array().unwrap();
+    for (pin_index, rows) in [tasks, early_tasks].into_iter().enumerate() {
+        for (work_id, _, expected_execution) in &projection_cases {
+            let path = format!("tasks/unmapped/active/{work_id}/README.md");
+            let row = rows.iter().find(|row| row["source_path"] == path).unwrap();
+            let mut reasons = vec!["ambiguous_scope_or_collision", "unsupported_task_metadata"];
+            if expected_execution[pin_index] {
+                reasons.push("execution_needs_reconciliation");
+            }
+            assert_eq!(
+                row["outcome"],
+                json!({"status": "held", "reason_codes": reasons}),
+                "{path} under pin {pin_index}"
+            );
+        }
+    }
+    for (path, expected) in [
+        (
+            "tasks/synth-app/backlog/null-title/README.md",
+            json!({"status": "held", "reason_codes": ["unsupported_task_metadata"]}),
+        ),
+        (
+            "tasks/_general/active/shared-malformed/README.md",
+            json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "unsupported_task_metadata"]}),
+        ),
+        (
+            "tasks/_hive/active/legacy/README.md",
+            json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "unsplit_legacy_scope", "invalid_legacy_state"]}),
+        ),
+        (
+            "tasks/unmapped/active/uncertain-malformed/README.md",
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "unsupported_task_metadata"]}),
+        ),
+        (
+            "tasks/unmapped/active/unclaimed-malformed/README.md",
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "unsupported_task_metadata", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/synth-app/backlog/description-fallback/README.md",
+            json!({
+                "status": "held", "candidate_status": "backlog", "area_id": id(AREA_APP),
+                "reason_codes": ["incomplete_historical_provenance", "unresolved_task_relations"],
+            }),
+        ),
+    ] {
+        let task = early_tasks
+            .iter()
+            .find(|task| task["source_path"] == path)
+            .unwrap();
+        assert_eq!(task["outcome"], expected, "{path}");
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -13,8 +13,10 @@ use super::*;
 use crate::cli::is_slug;
 use crate::config_file::{Coordination, ScopedDirectory};
 
+mod directive_artifact_intake;
 mod queen_assets;
 mod scope_plan;
+mod task_intake;
 pub(crate) use scope_plan::plan;
 
 const MAX_INVENTORY_BYTES: usize = 4 * 1024 * 1024;
@@ -85,12 +87,43 @@ impl InventoryEntry {
     }
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Reason {
     AmbiguousScopeOrCollision,
+    DuplicateLegacyWorkId,
+    ExecutionNeedsReconciliation,
     ExternalBackendOwned,
+    IncompleteHistoricalProvenance,
+    InvalidLegacyState,
+    MissingOrConflictingTitle,
+    MissingTaskEntrypoint,
+    MissingTypedSubmissionEvidence,
+    UnresolvedCompletionObligation,
+    UnresolvedTaskRelations,
     UnsplitLegacyScope,
+    UnverifiedAcceptanceCriteria,
+    UnsupportedTaskMetadata,
+    NavigationOnly,
+    DirectiveBundleSupport,
+    UnsupportedDirectiveShape,
+    DuplicateLegacyDirective,
+    UnsupportedArtifactShape,
+    UnresolvedArtifactBundleMember,
+    UnresolvedBinaryOrExternalOwner,
+    RecordMarkdownTooLarge,
+    UnsupportedDirectiveMetadata,
+    UnsupportedArtifactMetadata,
+    InvalidDirectiveStatus,
+    UnclassifiedArtifactKind,
+    InvalidArtifactStatus,
+    MissingDirectiveApproval,
+    UnverifiedDirectiveValidity,
+    UnresolvedSupersessionGraph,
+    UnverifiedArtifactAuthor,
+    UnverifiedArtifactRetention,
+    UnresolvedParentTask,
+    MissingParentTaskEntrypoint,
 }
 
 fn verified_source<T>(
