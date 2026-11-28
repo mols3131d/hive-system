@@ -44,6 +44,7 @@ mod resource_staging;
 mod task_labels;
 
 const POLICY_PIN: &str = "0e584830a7eff314d85b7af8c6f8cd69e735730a";
+const EARLIER_POLICY_PIN: &str = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
 const FORM_FEED_CRITERIA: &str = "A\x0cB";
 const REVISION: u32 = 4;
 const AREA_GENERAL: u32 = 0x101;
