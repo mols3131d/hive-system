@@ -835,11 +835,42 @@ fn migration_preflight(home: &Path, config: &Path, args: &[&str], status: i32) -
 }
 
 #[cfg(target_os = "linux")]
+fn migration_preflight_with_path(
+    home: &Path,
+    config: &Path,
+    args: &[&str],
+    status: i32,
+    search_path: &std::ffi::OsStr,
+) -> Value {
+    migration_cli_with_path(
+        home,
+        config,
+        "migration-preflight",
+        args,
+        status,
+        search_path,
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn migration_cli(home: &Path, config: &Path, action: &str, args: &[&str], status: i32) -> Value {
+    let search_path = std::env::var_os("PATH").unwrap();
+    migration_cli_with_path(home, config, action, args, status, &search_path)
+}
+
+#[cfg(target_os = "linux")]
+fn migration_cli_with_path(
+    home: &Path,
+    config: &Path,
+    action: &str,
+    args: &[&str],
+    status: i32,
+    search_path: &std::ffi::OsStr,
+) -> Value {
     let result = Command::new(env!("CARGO_BIN_EXE_hive"))
         .current_dir(home)
         .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("PATH", search_path)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", config)
         // An inherited repository selection must not replace the explicit one.
@@ -885,6 +916,27 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             "# Synthetic product area\n\nProject: https://forge.example/synthetic/product\n",
         ),
         ("tasks/unmapped/README.md", "# Unmapped\n"),
+        ("tasks/empty-ref/README.md", ""),
+        (
+            "tasks/local-ref/README.md",
+            "# Local project\n\nThe canonical checkout is /home/synthetic/private/app.\n",
+        ),
+        (
+            "tasks/conflicting-refs/README.md",
+            "# Project navigation\n\nSee <https://forge.example/synthetic/app> for this project.\n",
+        ),
+        (
+            "directives/conflicting-refs/README.md",
+            "# Directive scope\n\n[Project](https://forge.example/synthetic/app(other)) owns these directives.\n",
+        ),
+        (
+            "tasks/ambiguous-refs/README.md",
+            "# Project navigation\n\nProject: <https://forge.example/synthetic/app> or <https://forge.example/synthetic/app-other>.\n",
+        ),
+        (
+            "tasks/frontmatter-only/README.md",
+            "---\ndescription: https://forge.example/synthetic/app\n---\n# Project navigation\n",
+        ),
     ] {
         let file = source.join(path);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -925,27 +977,46 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             "decision": {"kind": "area", "area": {"id": id(id_value), "slug": slug, "name": "Synthetic Area"}, "project_evidence": evidence}
         })
     };
-    let evidence = |path, key| json!({"path": path, "project_key": key});
-    let mapping = json!({
+    let evidence = |path, reference| json!({"path": path, "canonical_ref": reference});
+    let app_ref = "https://forge.example/synthetic/app";
+    let local_path = "/home/synthetic/private/app";
+    let mut mapping = json!({
         "version": 1,
         "source_commit": commit,
         "policy_pin": POLICY_PIN,
         "workspace_id": workspace,
         "scopes": [
             area("synth-app", AREA_APP, "application", json!([
-                evidence("tasks/synth-app/README.md", "reviewed-synthetic-app"),
-                evidence("directives/synth-app/README.md", "reviewed-synthetic-app"),
-                evidence("bots/queen-synth/memory/synth-app/MEMORY.md", "reviewed-synthetic-app"),
+                evidence("tasks/synth-app/README.md", app_ref),
+                evidence("directives/synth-app/README.md", app_ref),
+                evidence("bots/queen-synth/memory/synth-app/MEMORY.md", app_ref),
             ])),
             area("_general", AREA_GENERAL, "general", json!([])),
             area("_hive-userdata", AREA_USERDATA, "workspace-operations", json!([])),
             area("hive-system", 0x104, "product", json!([
-                evidence("tasks/hive-system/README.md", "reviewed-synthetic-product")
+                evidence("tasks/hive-system/README.md", "https://forge.example/synthetic/product")
             ])),
             {"scope": "external-team", "decision": {"kind": "external"}},
             area("_hive", 0x105, "legacy-hive", json!([])),
+            area("empty-ref", 0x106, "empty", json!([
+                evidence("tasks/empty-ref/README.md", app_ref)
+            ])),
+            area("local-ref", 0x107, "local", json!([
+                evidence("tasks/local-ref/README.md", local_path)
+            ])),
+            area("conflicting-refs", 0x108, "conflicting", json!([
+                evidence("tasks/conflicting-refs/README.md", app_ref),
+                evidence("directives/conflicting-refs/README.md", app_ref),
+            ])),
+            area("ambiguous-refs", 0x109, "ambiguous", json!([
+                evidence("tasks/ambiguous-refs/README.md", app_ref)
+            ])),
+            area("frontmatter-only", 0x10a, "frontmatter", json!([
+                evidence("tasks/frontmatter-only/README.md", app_ref)
+            ])),
         ]
     });
+    mapping["scopes"][0]["decision"]["area"]["name"] = json!(local_path);
     let original_git_files = [
         ".git/index",
         ".git/HEAD",
@@ -965,7 +1036,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(data["source"], snapshot["data"]["source"]);
     assert_eq!(data["inventory"], snapshot["data"]["inventory"]);
     assert_eq!(data["target"], json!({"workspace_id": workspace}));
-    assert_eq!(data["scopes"].as_array().unwrap().len(), 7);
+    assert_eq!(data["scopes"].as_array().unwrap().len(), 12);
     let outcomes = |report: &Value| {
         report["scopes"]
             .as_array()
@@ -986,7 +1057,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(
         mapped["synth-app"],
         json!({"status": "mapped", "area": {
-            "id": id(AREA_APP), "slug": "application", "name": "Synthetic Area", "parent_id": null
+            "id": id(AREA_APP), "slug": "application", "parent_id": null
         }})
     );
     assert_eq!(
@@ -998,10 +1069,24 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         json!({"status": "held", "reason": "unsplit_legacy_scope"})
     );
     let held = json!({"status": "held", "reason": "ambiguous_scope_or_collision"});
-    assert_eq!(mapped["unmapped"], held);
-    assert_eq!(data["scopes"][5]["scope"], "synth-app");
+    for scope in [
+        "unmapped",
+        "empty-ref",
+        "local-ref",
+        "conflicting-refs",
+        "ambiguous-refs",
+        "frontmatter-only",
+    ] {
+        assert_eq!(mapped[scope], held, "{scope}");
+    }
+    let app = data["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|scope| scope["scope"] == "synth-app")
+        .unwrap();
     assert_eq!(
-        data["scopes"][5]["source_paths"],
+        app["source_paths"],
         json!([
             "bots/queen-synth/memory/synth-app",
             "directives/synth-app",
@@ -1011,15 +1096,16 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     let encoded = data.to_string();
     for private in [
         "https://forge.example",
-        "reviewed-synthetic-app",
+        local_path,
+        "Synthetic Area",
         "Synthetic persona bytes.",
     ] {
         assert!(!encoded.contains(private));
     }
 
     let mut changed = mapping.clone();
-    changed["scopes"][0]["decision"]["project_evidence"][2]["project_key"] =
-        json!("different-owner");
+    changed["scopes"][0]["decision"]["project_evidence"][2]["canonical_ref"] =
+        json!("https://forge.example/synthetic/other-owner");
     changed["scopes"][2]["decision"]["area"]["id"] = json!(id(0x104));
     let conflicts = outcomes(&plan(&changed));
     for scope in ["synth-app", "_hive-userdata", "hive-system"] {
@@ -1084,6 +1170,23 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
     let config = root.path().join("config");
     let source = root.path().join("source");
     init_source(&source, &home);
+    let app_ref = "https://forge.example/synthetic/app";
+    let app_entrypoints = [
+        "tasks/synth-app/README.md",
+        "directives/synth-app/README.md",
+        "bots/queen-synth/memory/synth-app/MEMORY.md",
+    ];
+    // The Task scope entrypoint comes from init_source. Add the same literal
+    // reference to the other two scope entrypoints before committing the source.
+    for path in &app_entrypoints[1..] {
+        let entrypoint = source.join(path);
+        fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        fs::write(
+            entrypoint,
+            format!("# Synthetic App\n\nProject: {app_ref}\n"),
+        )
+        .unwrap();
+    }
     let claim = "claim: {id: private-claim-id, holder: private-claim-holder}\n";
     let fixtures = [
         ("_general/backlog/shared", "", "# Private H1 title\n"),
@@ -1214,7 +1317,15 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             {"scope": "_hive-userdata", "decision": {"kind": "area", "area": {
                 "id": id(AREA_USERDATA), "slug": "operations", "name": "Operations"
             }}},
-            {"scope": "external-team", "decision": {"kind": "external"}}
+            {"scope": "external-team", "decision": {"kind": "external"}},
+            {"scope": "synth-app", "decision": {
+                "kind": "area",
+                "area": {"id": id(AREA_APP), "slug": "app", "name": "Private Area name"},
+                "project_evidence": app_entrypoints.map(|path| json!({
+                    "path": path,
+                    "canonical_ref": app_ref,
+                })),
+            }},
         ]
     });
     fs::write(&file, serde_json::to_vec(&mapping).unwrap()).unwrap();
@@ -1375,6 +1486,12 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
     }
     for (path, status, area, reasons) in [
         (
+            "synth-app/backlog/implement-widget",
+            "backlog",
+            AREA_APP,
+            vec!["unresolved_task_relations"],
+        ),
+        (
             "_hive-userdata/backlog/shared",
             "backlog",
             AREA_USERDATA,
@@ -1445,6 +1562,7 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
     let output = plan.to_string().to_lowercase();
     for private in [
         "private",
+        app_ref,
         "synthetic-reviewer",
         "synthetic checklist verified",
         "2026-04-01",
@@ -1452,6 +1570,24 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
     ] {
         assert!(!output.contains(private), "report exposed fixture data");
     }
+    let mut conflicting = mapping.clone();
+    conflicting["scopes"][3]["decision"]["project_evidence"][2]["canonical_ref"] =
+        json!("https://forge.example/synthetic/other");
+    fs::write(&file, serde_json::to_vec(&conflicting).unwrap()).unwrap();
+    let conflicted = migration_cli(&home, &config, "migration-plan", &args, 0);
+    let task = conflicted["data"]["task_intake"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["legacy_key"]["work_id"] == "implement-widget")
+        .unwrap();
+    assert_eq!(
+        task["outcome"],
+        json!({
+            "status": "held",
+            "reason_codes": ["ambiguous_scope_or_collision"],
+        })
+    );
     assert_eq!(
         original,
         source_files.map(|path| fs::read(source.join(path)).unwrap())
@@ -1816,7 +1952,11 @@ fn cli_preflight_rejects_symlinked_repository_excludes() {
     fs::create_dir(&home).unwrap();
     let source = root.path().join("legacy-v1");
     init_source(&source, &home);
-    fs::write(source.join(".gitignore"), "/ignored-by-gitignore\n").unwrap();
+    fs::write(
+        source.join(".gitignore"),
+        "/ignored-by-gitignore\n!/visible-by-gitignore\n",
+    )
+    .unwrap();
     git(&source, &home, &["add", ".gitignore"]);
     git(&source, &home, &["commit", "-qm", "Synthetic ignore"]);
     let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
@@ -1830,7 +1970,8 @@ fn cli_preflight_rejects_symlinked_repository_excludes() {
     let external_info = home.join("synthetic-private-exclude-location");
     fs::create_dir(&external_info).unwrap();
     let external_exclude = external_info.join("exclude");
-    let rules = b"# Synthetic private ignore contents\n/synthetic-untracked-probe\n";
+    let rules =
+        b"# Synthetic private ignore contents\n/synthetic-untracked-probe\n/visible-by-gitignore\n";
     fs::write(&external_exclude, rules).unwrap();
     fs::write(&exclude, rules).unwrap();
     let args = [
@@ -1848,6 +1989,10 @@ fn cli_preflight_rejects_symlinked_repository_excludes() {
     ];
     let git_before = git_files.map(|name| fs::read(source.join(name)).unwrap());
     let original = preflight(0);
+    let visible = source.join("visible-by-gitignore");
+    fs::write(&visible, "Negated by .gitignore").unwrap();
+    assert_eq!(preflight(5)["error"]["code"], "DIRTY_CONFLICT");
+    fs::remove_file(visible).unwrap();
 
     let refuse = || {
         assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
@@ -1886,6 +2031,138 @@ fn cli_preflight_rejects_symlinked_repository_excludes() {
     assert_eq!(preflight(5)["error"]["code"], "DIRTY_CONFLICT");
     fs::remove_file(&untracked).unwrap();
     assert_eq!(preflight(0), original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_uses_the_copied_exclude_during_untracked_enumeration() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    let commit = init_source(&source, &home);
+    let info = source.join(".git/info");
+    fs::create_dir_all(&info).unwrap();
+    let exclude = info.join("exclude");
+    fs::write(&exclude, "/safe-scratch\n").unwrap();
+    fs::write(source.join("safe-scratch"), "Ignored local bytes").unwrap();
+    let untracked = source.join("synthetic-visible-file");
+    fs::write(&untracked, "Untracked bytes").unwrap();
+    let external = home.join("external-exclude");
+    fs::write(&external, "/synthetic-visible-file\n/safe-scratch\n").unwrap();
+
+    let bin = home.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let path = std::env::var_os("PATH").unwrap();
+    let git_path = std::env::split_paths(&path)
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    symlink(git_path, home.join("real-git")).unwrap();
+    let wrapper = bin.join("git");
+    fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+set -eu
+for arg in "$@"; do
+    case "$arg" in
+        status|--others)
+            exclude="$HOME/../legacy-v1/.git/info/exclude"
+            mv "$exclude" "$exclude.saved"
+            trap 'rm -f "$exclude"; mv "$exclude.saved" "$exclude"' EXIT
+            ln -s "$HOME/external-exclude" "$exclude"
+            echo "$arg" >> "$HOME/swaps"
+            "$HOME/real-git" "$@"
+            exit
+            ;;
+    esac
+done
+exec "$HOME/real-git" "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let search_path =
+        std::env::join_paths([bin].into_iter().chain(std::env::split_paths(&path))).unwrap();
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let report = migration_preflight_with_path(&home, &home, &args, 5, &search_path);
+    assert_eq!(report["error"]["code"], "DIRTY_CONFLICT");
+    let text = report.to_string();
+    assert!(!text.contains("synthetic-visible-file"));
+    assert!(!text.contains("external-exclude"));
+    let swaps = fs::read_to_string(home.join("swaps")).unwrap();
+    assert_eq!(swaps, "status\n--others\n");
+    assert_eq!(fs::read(&exclude).unwrap(), b"/safe-scratch\n");
+    assert!(fs::symlink_metadata(exclude).unwrap().is_file());
+    assert_eq!(fs::read(&untracked).unwrap(), b"Untracked bytes");
+    assert_eq!(
+        fs::read(&external).unwrap(),
+        b"/synthetic-visible-file\n/safe-scratch\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_refuses_a_split_index_without_refreshing_source_metadata() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    let commit = init_source(&source, &home);
+    git(&source, &home, &["update-index", "--split-index"]);
+    let git_dir = source.join(".git");
+    let shared = fs::read_dir(&git_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .as_encoded_bytes()
+                .starts_with(b"sharedindex.")
+        })
+        .unwrap();
+    let paths = [git_dir.join("index"), shared];
+    for path in &paths {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+            .unwrap();
+    }
+    let snapshot = || {
+        paths.each_ref().map(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                fs::read(path).unwrap(),
+                metadata.modified().unwrap(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        })
+    };
+    let before = snapshot();
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let report = migration_preflight(&home, &home, &args, 7);
+    assert_eq!(report["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert!(report.get("data").is_none_or(Value::is_null));
+    assert!(!report.to_string().contains("sharedindex."));
+    assert_eq!(snapshot(), before);
 }
 
 #[cfg(target_os = "linux")]
