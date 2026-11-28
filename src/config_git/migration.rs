@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::io::Read;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -11,6 +13,7 @@ const MAX_INVENTORY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;
 const MAX_TREE_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EXCLUDE_BYTES: usize = 64 * 1024;
 
 pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveError> {
     if !source.is_absolute() || !is_full_lowercase_oid(revision) {
@@ -30,26 +33,8 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
         })
     };
     verify_layout()?;
-    let verify_local_exclude = || -> Result<(), HiveError> {
-        let invalid_exclude = |error: HiveError| {
-            HiveError::new(
-                error.code,
-                "The v1 source Git info directory and exclude file must be local when present.",
-            )
-        };
-        if let Some(info) = repository
-            .git_dir
-            .open_child_directory(OsStr::new("info"))
-            .map_err(invalid_exclude)?
-        {
-            info.open_regular(OsStr::new("exclude"))
-                .map_err(invalid_exclude)?;
-        }
-        Ok(())
-    };
-    let check_clean = || {
-        // Git status follows links in the repository's info/exclude path.
-        verify_local_exclude()?;
+    let exclude = read_local_exclude(&repository.git_dir)?;
+    let check_tracked = || {
         repository
             .check_clean(revision, CleanWorktree::MigrationSource)
             .map_err(|error| {
@@ -63,10 +48,9 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
                     _ => "Could not establish a clean v1 source worktree.",
                 };
                 HiveError::new(error.code, message)
-            })?;
-        verify_local_exclude()
+            })
     };
-    check_clean()?;
+    let index = check_tracked()?;
 
     let config = repository
         .git_dir
@@ -74,9 +58,12 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
         .unwrap_or_default();
     let reader = AssetObjectReader::new(&repository.objects, &config, revision.len())?;
     let git = || reader.command();
+    let check_untracked =
+        prepare_untracked_check(&repository, &reader, &index, exclude.as_deref())?;
+    check_untracked()?;
     let tree = committed_asset_tree(&git, revision)?;
     let raw_tree = snapshot_object(&git, "tree", &tree, MAX_TREE_BYTES)?;
-    let inventory = inventory(&git, &tree, &raw_tree)?;
+    let inventory = inventory(&git, &tree, &raw_tree, &index)?;
     let (policy_pin, coordination) = crate::config::parse_workspace_sources(|path| {
         read_committed_asset_blob(&git, revision, path)
     })?;
@@ -86,14 +73,20 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
         None => Value::Null,
     };
 
-    check_clean()?;
-    verify_layout()?;
     let changed = || {
         HiveError::new(
             ErrorCode::ConcurrentChange,
             "The v1 source repository changed during inspection.",
         )
     };
+    if check_tracked()? != index {
+        return Err(changed());
+    }
+    check_untracked()?;
+    if read_local_exclude(&repository.git_dir)? != exclude {
+        return Err(changed());
+    }
+    verify_layout()?;
     if !repository.same_worktree(&select().map_err(|_| changed())?)? {
         return Err(changed());
     }
@@ -109,6 +102,121 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
         },
         "inventory": inventory,
     }))
+}
+
+fn read_local_exclude(git_dir: &ScopedDirectory) -> Result<Option<Vec<u8>>, HiveError> {
+    let invalid_exclude = |error: HiveError| {
+        HiveError::new(
+            error.code,
+            "Could not open the v1 source Git info directory and exclude file as local paths.",
+        )
+    };
+    let Some(info) = git_dir
+        .open_child_directory(OsStr::new("info"))
+        .map_err(invalid_exclude)?
+    else {
+        return Ok(None);
+    };
+    let Some(file) = info
+        .open_regular(OsStr::new("exclude"))
+        .map_err(invalid_exclude)?
+    else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_EXCLUDE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            HiveError::new(
+                ErrorCode::IoError,
+                "Could not read the v1 source Git exclude file.",
+            )
+        })?;
+    if bytes.len() > MAX_EXCLUDE_BYTES {
+        return Err(HiveError::new(
+            ErrorCode::InvalidConfig,
+            "The v1 source Git exclude file exceeds 64 KiB.",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn prepare_untracked_check<'a>(
+    repository: &'a AssetRepository,
+    reader: &'a AssetObjectReader<'_>,
+    index: &[u8],
+    exclude: Option<&[u8]>,
+) -> Result<impl Fn() -> Result<(), HiveError> + 'a, HiveError> {
+    let unverified = || {
+        HiveError::new(
+            ErrorCode::AuthorityUnverified,
+            "Could not verify untracked entries in the v1 source worktree.",
+        )
+    };
+    if let Some(exclude) = exclude {
+        // Keep Git's standard exclude precedence under worktree .gitignore.
+        let info = reader.repository.path().join("info");
+        fs::create_dir(&info)
+            .and_then(|()| fs::write(info.join("exclude"), exclude))
+            .map_err(|_| unverified())?;
+    }
+    let mut index_info = Vec::new();
+    for entry in index.split_inclusive(|byte| *byte == 0) {
+        index_info.extend_from_slice(entry.strip_prefix(b"H ").ok_or_else(unverified)?);
+    }
+    let index_setup = execute_asset(
+        reader
+            .command()?
+            .args(["update-index", "-z", "--index-info"]),
+        0,
+        Some(&index_info),
+    )?;
+    if !index_setup.status.success() {
+        return Err(unverified());
+    }
+    let setting = execute_asset(
+        repository
+            .status_command()?
+            .args(["config", "--bool", "--get", "core.ignoreCase"]),
+        6,
+        None,
+    )?;
+    let ignore_case = match (setting.status.code(), setting.stdout.as_slice()) {
+        (Some(0), b"true\n") => "core.ignoreCase=true",
+        (Some(0), b"false\n") | (Some(1), b"") => "core.ignoreCase=false",
+        _ => return Err(unverified()),
+    };
+    Ok(move || {
+        let mut command = reader.command()?;
+        // SAFETY: The selected worktree descriptor stays open until the child is reaped.
+        let worktree = unsafe { repository.assets.inherit_directory(&mut command)? };
+        let result = execute_asset(
+            command.env("GIT_WORK_TREE", worktree).args([
+                "-c",
+                "core.excludesFile=/dev/null",
+                "-c",
+                ignore_case,
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "--directory",
+                "--no-empty-directory",
+                "-z",
+            ]),
+            4 * 1024 * 1024,
+            None,
+        )?;
+        if !result.status.success() {
+            return Err(unverified());
+        }
+        if !result.stdout.is_empty() {
+            return Err(HiveError::new(
+                ErrorCode::DirtyConflict,
+                "The v1 source has untracked entries.",
+            ));
+        }
+        Ok(())
+    })
 }
 
 fn snapshot_object(
@@ -131,6 +239,7 @@ fn inventory(
     git: &impl Fn() -> Result<Command, HiveError>,
     root_oid: &str,
     root_tree: &[u8],
+    index: &[u8],
 ) -> Result<Value, HiveError> {
     let invalid = || {
         HiveError::new(
@@ -204,31 +313,44 @@ fn inventory(
                 _ => return Err(invalid()),
             };
             let size_field = size.map_or_else(|| "-".into(), |size| size.to_string());
-            let fields = format!("{mode}\0{oid}\0{size_field}\0");
-            catalog_bytes += path.len() + 1 + fields.len();
+            catalog_bytes += path.len() + mode.len() + oid.len() + size_field.len() + 4;
             if catalog_bytes > MAX_INVENTORY_BYTES {
                 return Err(HiveError::new(
                     ErrorCode::InvalidConfig,
                     "The v1 source inventory exceeds 4 MiB.",
                 ));
             }
-            if entries.insert(path, (fields, size.is_none())).is_some() {
+            if entries.insert(path, (mode, oid, size_field)).is_some() {
                 return Err(invalid());
             }
         }
     }
     let mut digest = Sha256::new();
-    for (path, (fields, _)) in &entries {
-        digest.update(path);
-        digest.update(b"\0");
-        digest.update(fields);
+    let inconsistent_index = || {
+        HiveError::new(
+            ErrorCode::AuthorityUnverified,
+            "The v1 source index does not match the verified commit.",
+        )
+    };
+    let mut index = index.split_inclusive(|byte| *byte == 0);
+    for (path, (mode, oid, size)) in &entries {
+        digest.update(format!("{path}\0{mode}\0{oid}\0{size}\0"));
+        if *mode != "040000" {
+            let expected = format!("H {mode} {oid} 0\t{path}\0");
+            if index.next() != Some(expected.as_bytes()) {
+                return Err(inconsistent_index());
+            }
+        }
+    }
+    if index.next().is_some() {
+        return Err(inconsistent_index());
     }
     Ok(json!({
         "directory_count": directories,
         "file_count": entries.len() - directories,
         "blob_bytes": blob_bytes,
         "catalog_sha256": format!("{:x}", digest.finalize()),
-        "rulesync_directory": entries.get(".rulesync").is_some_and(|entry| entry.1),
-        "rulesync_config": entries.get("rulesync.jsonc").is_some_and(|entry| !entry.1),
+        "rulesync_directory": entries.get(".rulesync").is_some_and(|entry| entry.0 == "040000"),
+        "rulesync_config": entries.get("rulesync.jsonc").is_some_and(|entry| entry.0 != "040000"),
     }))
 }

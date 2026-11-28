@@ -831,10 +831,22 @@ fn row_count(admin: &mut Conn, table: &str) -> u64 {
 
 #[cfg(target_os = "linux")]
 fn migration_preflight(home: &Path, config: &Path, args: &[&str], status: i32) -> Value {
+    let path = std::env::var_os("PATH").unwrap();
+    migration_preflight_with_path(home, config, args, status, &path)
+}
+
+#[cfg(target_os = "linux")]
+fn migration_preflight_with_path(
+    home: &Path,
+    config: &Path,
+    args: &[&str],
+    status: i32,
+    search_path: &std::ffi::OsStr,
+) -> Value {
     let result = Command::new(env!("CARGO_BIN_EXE_hive"))
         .current_dir(home)
         .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("PATH", search_path)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", config)
         // An inherited repository selection must not replace the explicit one.
@@ -1087,7 +1099,11 @@ fn cli_preflight_rejects_symlinked_repository_excludes() {
     fs::create_dir(&home).unwrap();
     let source = root.path().join("legacy-v1");
     init_source(&source, &home);
-    fs::write(source.join(".gitignore"), "/ignored-by-gitignore\n").unwrap();
+    fs::write(
+        source.join(".gitignore"),
+        "/ignored-by-gitignore\n!/visible-by-gitignore\n",
+    )
+    .unwrap();
     git(&source, &home, &["add", ".gitignore"]);
     git(&source, &home, &["commit", "-qm", "Synthetic ignore"]);
     let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
@@ -1101,7 +1117,8 @@ fn cli_preflight_rejects_symlinked_repository_excludes() {
     let external_info = home.join("synthetic-private-exclude-location");
     fs::create_dir(&external_info).unwrap();
     let external_exclude = external_info.join("exclude");
-    let rules = b"# Synthetic private ignore contents\n/synthetic-untracked-probe\n";
+    let rules =
+        b"# Synthetic private ignore contents\n/synthetic-untracked-probe\n/visible-by-gitignore\n";
     fs::write(&external_exclude, rules).unwrap();
     fs::write(&exclude, rules).unwrap();
     let args = [
@@ -1119,6 +1136,10 @@ fn cli_preflight_rejects_symlinked_repository_excludes() {
     ];
     let git_before = git_files.map(|name| fs::read(source.join(name)).unwrap());
     let original = preflight(0);
+    let visible = source.join("visible-by-gitignore");
+    fs::write(&visible, "Negated by .gitignore").unwrap();
+    assert_eq!(preflight(5)["error"]["code"], "DIRTY_CONFLICT");
+    fs::remove_file(visible).unwrap();
 
     let refuse = || {
         assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
@@ -1157,6 +1178,83 @@ fn cli_preflight_rejects_symlinked_repository_excludes() {
     assert_eq!(preflight(5)["error"]["code"], "DIRTY_CONFLICT");
     fs::remove_file(&untracked).unwrap();
     assert_eq!(preflight(0), original);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_preflight_uses_the_copied_exclude_during_untracked_enumeration() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let source = root.path().join("legacy-v1");
+    let commit = init_source(&source, &home);
+    let info = source.join(".git/info");
+    fs::create_dir_all(&info).unwrap();
+    let exclude = info.join("exclude");
+    fs::write(&exclude, "/safe-scratch\n").unwrap();
+    fs::write(source.join("safe-scratch"), "Ignored local bytes").unwrap();
+    let untracked = source.join("synthetic-visible-file");
+    fs::write(&untracked, "Untracked bytes").unwrap();
+    let external = home.join("external-exclude");
+    fs::write(&external, "/synthetic-visible-file\n/safe-scratch\n").unwrap();
+
+    let bin = home.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let path = std::env::var_os("PATH").unwrap();
+    let git_path = std::env::split_paths(&path)
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    symlink(git_path, home.join("real-git")).unwrap();
+    let wrapper = bin.join("git");
+    fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+set -eu
+for arg in "$@"; do
+    case "$arg" in
+        status|--others)
+            exclude="$HOME/../legacy-v1/.git/info/exclude"
+            mv "$exclude" "$exclude.saved"
+            trap 'rm -f "$exclude"; mv "$exclude.saved" "$exclude"' EXIT
+            ln -s "$HOME/external-exclude" "$exclude"
+            echo "$arg" >> "$HOME/swaps"
+            "$HOME/real-git" "$@"
+            exit
+            ;;
+    esac
+done
+exec "$HOME/real-git" "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let search_path =
+        std::env::join_paths([bin].into_iter().chain(std::env::split_paths(&path))).unwrap();
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let report = migration_preflight_with_path(&home, &home, &args, 5, &search_path);
+    assert_eq!(report["error"]["code"], "DIRTY_CONFLICT");
+    let text = report.to_string();
+    assert!(!text.contains("synthetic-visible-file"));
+    assert!(!text.contains("external-exclude"));
+    let swaps = fs::read_to_string(home.join("swaps")).unwrap();
+    assert_eq!(swaps, "status\n--others\n");
+    assert_eq!(fs::read(&exclude).unwrap(), b"/safe-scratch\n");
+    assert!(fs::symlink_metadata(exclude).unwrap().is_file());
+    assert_eq!(fs::read(&untracked).unwrap(), b"Untracked bytes");
+    assert_eq!(
+        fs::read(&external).unwrap(),
+        b"/synthetic-visible-file\n/safe-scratch\n"
+    );
 }
 
 #[cfg(target_os = "linux")]

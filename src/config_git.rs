@@ -385,7 +385,7 @@ enum CleanWorktree {
 
 #[cfg(target_os = "linux")]
 impl AssetRepository {
-    fn check_clean(&self, revision: &str, worktree: CleanWorktree) -> Result<(), HiveError> {
+    fn check_clean(&self, revision: &str, worktree: CleanWorktree) -> Result<Vec<u8>, HiveError> {
         let migration = matches!(worktree, CleanWorktree::MigrationSource);
         let command = || self.status_command();
         let check_head = || {
@@ -424,10 +424,6 @@ impl AssetRepository {
 
         let mut status = command()?;
         disable_status_filters(command()?, &mut status)?;
-        if migration {
-            // Permit .gitignore and .git/info/exclude independently of host settings.
-            status.args(["-c", "core.excludesFile=/dev/null"]);
-        }
         status.arg("status");
         if matches!(
             worktree,
@@ -441,7 +437,11 @@ impl AssetRepository {
             status.args([
                 "--porcelain=v1",
                 "-z",
-                "--untracked-files=normal",
+                if migration {
+                    "--untracked-files=no"
+                } else {
+                    "--untracked-files=normal"
+                },
                 if migration {
                     "--ignore-submodules=all"
                 } else {
@@ -463,7 +463,8 @@ impl AssetRepository {
                 "The selected asset worktree has staged, modified, or untracked entries.",
             ));
         }
-        check_head()
+        check_head()?;
+        Ok(index.stdout)
     }
 }
 
