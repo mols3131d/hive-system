@@ -140,6 +140,22 @@ fn dispatch_dolt(invocation: Invocation) -> ExitCode {
                 ));
                 (format, result)
             }
+            WorkspaceAction::MigrationPlan {
+                source: _source,
+                source_commit: _commit,
+                workspace_id: _workspace_id,
+                mapping_file: _mapping_file,
+            } => {
+                #[cfg(target_os = "linux")]
+                let result =
+                    config_git::migration::plan(_source, _commit, _workspace_id, _mapping_file);
+                #[cfg(not(target_os = "linux"))]
+                let result = Err(HiveError::new(
+                    ErrorCode::NotImplemented,
+                    "Migration planning requires Linux.",
+                ));
+                (format, result)
+            }
             WorkspaceAction::Runtime(command) => workspace_status::run(&invocation.common, command),
         };
         return match result {

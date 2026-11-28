@@ -831,14 +831,38 @@ fn row_count(admin: &mut Conn, table: &str) -> u64 {
 
 #[cfg(target_os = "linux")]
 fn migration_preflight(home: &Path, config: &Path, args: &[&str], status: i32) -> Value {
-    let path = std::env::var_os("PATH").unwrap();
-    migration_preflight_with_path(home, config, args, status, &path)
+    migration_cli(home, config, "migration-preflight", args, status)
 }
 
 #[cfg(target_os = "linux")]
 fn migration_preflight_with_path(
     home: &Path,
     config: &Path,
+    args: &[&str],
+    status: i32,
+    search_path: &std::ffi::OsStr,
+) -> Value {
+    migration_cli_with_path(
+        home,
+        config,
+        "migration-preflight",
+        args,
+        status,
+        search_path,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn migration_cli(home: &Path, config: &Path, action: &str, args: &[&str], status: i32) -> Value {
+    let search_path = std::env::var_os("PATH").unwrap();
+    migration_cli_with_path(home, config, action, args, status, &search_path)
+}
+
+#[cfg(target_os = "linux")]
+fn migration_cli_with_path(
+    home: &Path,
+    config: &Path,
+    action: &str,
     args: &[&str],
     status: i32,
     search_path: &std::ffi::OsStr,
@@ -851,13 +875,7 @@ fn migration_preflight_with_path(
         .env("XDG_CONFIG_HOME", config)
         // An inherited repository selection must not replace the explicit one.
         .env("GIT_DIR", home.join("unrelated.git"))
-        .args([
-            "--contract",
-            "2",
-            "--json",
-            "workspace",
-            "migration-preflight",
-        ])
+        .args(["--contract", "2", "--json", "workspace", action])
         .args(args)
         .output()
         .unwrap();
@@ -865,7 +883,7 @@ fn migration_preflight_with_path(
     assert!(result.stderr.is_empty(), "{result:?}");
     let report: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(report["schema_version"], 2);
-    assert_eq!(report["command"], "workspace migration-preflight");
+    assert_eq!(report["command"], format!("workspace {action}"));
     assert_eq!(report["ok"], status == 0);
     if let Some([_, path]) = args.windows(2).find(|pair| pair[0] == "--source")
         && Path::new(path).is_absolute()
@@ -873,6 +891,765 @@ fn migration_preflight_with_path(
         assert!(!String::from_utf8_lossy(&result.stdout).contains(path));
     }
     report
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    init_source(&source, &home);
+    for (path, content) in [
+        (
+            "directives/synth-app/README.md",
+            "# Project direction\n\nProject: <!-- hidden https://forge.example/synthetic/other --> https://forge.example/synthetic/app. <!-- hidden https://forge.example/synthetic/other -->\n",
+        ),
+        (
+            "bots/queen-synth/memory/synth-app/MEMORY.md",
+            "# Project memory\n\n<!--\nhttps://forge.example/synthetic/other\n~~~\n-->\n\n~~~markdown\n<!--\nhttps://forge.example/synthetic/other\n~~~~\n\nProject: https://forge.example/synthetic/app\n",
+        ),
+        (
+            "tasks/hive-system/README.md",
+            "# Synthetic product area\n\nProject: https://forge.example/synthetic/product\n",
+        ),
+        ("tasks/unmapped/README.md", "# Unmapped\n"),
+        ("tasks/empty-ref/README.md", ""),
+        (
+            "tasks/local-ref/README.md",
+            "# Local project\n\nThe canonical checkout is /home/synthetic/private/app.\n",
+        ),
+        (
+            "tasks/conflicting-refs/README.md",
+            "# Project navigation\n\nSee <https://forge.example/synthetic/app> for this project.\n",
+        ),
+        (
+            "directives/conflicting-refs/README.md",
+            "# Directive scope\n\n[Project](https://forge.example/synthetic/app(other)) owns these directives.\n",
+        ),
+        (
+            "tasks/ambiguous-refs/README.md",
+            "# Project navigation\n\nProject: <https://forge.example/synthetic/app> or <https://forge.example/synthetic/app-other>.\n",
+        ),
+        (
+            "tasks/frontmatter-only/README.md",
+            "---\ndescription: https://forge.example/synthetic/app\n---\n# Project navigation\n",
+        ),
+        (
+            "tasks/inline-comment-only/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <!-- https://forge.example/synthetic/app -->\n",
+        ),
+        (
+            "tasks/multiline-comment-only/README.md",
+            "# Project navigation\n\n<!-- example\nhttps://forge.example/synthetic/app\n--> Project: /home/synthetic/private/app\n",
+        ),
+        (
+            "tasks/fenced-example-only/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app\n\n````markdown\n```\nhttps://forge.example/synthetic/app\n````\n",
+        ),
+        (
+            "tasks/inline-html-only/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <span data-project=\" https://forge.example/synthetic/app \">example</span>\n",
+        ),
+        (
+            "tasks/multiline-html-only/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <span data-project=\"\nhttps://forge.example/synthetic/app\n\">example</span>\n",
+        ),
+        (
+            "tasks/quoted-fence-only/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app\n\n> ```markdown\n> https://forge.example/synthetic/app\n> ```\n",
+        ),
+        (
+            "tasks/broken-link-only/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app Owner](https://forge.example/synthetic/app)\n",
+        ),
+        (
+            "tasks/bad-percent/README.md",
+            "# Project navigation\n\n[Project](https://forge.example/synthetic/app%zz)\n",
+        ),
+        (
+            "tasks/good-percent/README.md",
+            "# Project navigation\n\n[Project](https://forge.example/synthetic/app%20one)\n",
+        ),
+        (
+            "tasks/inline-code-tag/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <code> https://forge.example/synthetic/app </code>\n",
+        ),
+        (
+            "tasks/hidden-span/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <span hidden> https://forge.example/synthetic/app </span>\n",
+        ),
+        (
+            "tasks/hidden-image-alt/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app ![ https://forge.example/synthetic/app ](example.png)\n",
+        ),
+        (
+            "tasks/broken-spaced-link/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app Owner]( https://forge.example/synthetic/app )\n",
+        ),
+        (
+            "tasks/valid-spaced-link/README.md",
+            "# Project navigation\n\nExamples <span hidden> https://forge.example/synthetic/other </span> and <code> https://forge.example/synthetic/other </code>\n\nProject: [Owner]( https://forge.example/synthetic/app )\n",
+        ),
+        (
+            "tasks/valid-angle-link/README.md",
+            "[Owner]( <https://forge.example/synthetic/app> )\n\n<https://forge.example/synthetic/app>\n",
+        ),
+        (
+            "tasks/broken-angle-link/README.md",
+            "Owner]( <https://forge.example/synthetic/app> )\n",
+        ),
+        (
+            "tasks/hidden-across-blocks/README.md",
+            "<div hidden>\n\nProject: https://forge.example/synthetic/app\n\n</div>\n",
+        ),
+        (
+            "tasks/visible-after-html-block/README.md",
+            "<div hidden>\nhttps://forge.example/synthetic/other\n</div>\n\nProject: https://forge.example/synthetic/app\n",
+        ),
+        (
+            "tasks/apparent-html-close/README.md",
+            "<div title=\"</div>\">\n\nProject: https://forge.example/synthetic/app\n\n</div>\n",
+        ),
+        (
+            "tasks/inline-wrapper-across-blocks/README.md",
+            "Intro <div hidden>\n\nProject: https://forge.example/synthetic/app\n\nEnd </div>\n",
+        ),
+        (
+            "tasks/unclosed-inline-span/README.md",
+            "Intro <span hidden>\n\nProject: https://forge.example/synthetic/app\n",
+        ),
+        (
+            "tasks/nested-inline-tags/README.md",
+            "Example <span hidden> <code> hidden </code> </span>\n\nProject: https://forge.example/synthetic/app\n",
+        ),
+    ] {
+        let file = source.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, content).unwrap();
+    }
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic scope entries"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let workspace = id(1);
+    let file = root.path().join("mapping.json");
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+    ];
+    let plan_args = [
+        args.as_slice(),
+        &[
+            "--workspace-id",
+            &workspace,
+            "--mapping-file",
+            file.to_str().unwrap(),
+        ],
+    ]
+    .concat();
+    let plan = |mapping: &Value| {
+        fs::write(&file, serde_json::to_vec(mapping).unwrap()).unwrap();
+        migration_cli(&home, &config, "migration-plan", &plan_args, 0)["data"].clone()
+    };
+    let area = |scope, id_value, slug, evidence: Value| {
+        json!({
+            "scope": scope,
+            "decision": {"kind": "area", "area": {"id": id(id_value), "slug": slug, "name": "Synthetic Area"}, "project_evidence": evidence}
+        })
+    };
+    let evidence = |path, reference| json!({"path": path, "canonical_ref": reference});
+    let app_ref = "https://forge.example/synthetic/app";
+    let local_path = "/home/synthetic/private/app";
+    let mut mapping = json!({
+        "version": 1,
+        "source_commit": commit,
+        "policy_pin": POLICY_PIN,
+        "workspace_id": workspace,
+        "scopes": [
+            area("synth-app", AREA_APP, "application", json!([
+                evidence("tasks/synth-app/README.md", app_ref),
+                evidence("directives/synth-app/README.md", app_ref),
+                evidence("bots/queen-synth/memory/synth-app/MEMORY.md", app_ref),
+            ])),
+            area("_general", AREA_GENERAL, "general", json!([])),
+            area("_hive-userdata", AREA_USERDATA, "workspace-operations", json!([])),
+            area("hive-system", 0x104, "product", json!([
+                evidence("tasks/hive-system/README.md", "https://forge.example/synthetic/product")
+            ])),
+            {"scope": "external-team", "decision": {"kind": "external"}},
+            area("_hive", 0x105, "legacy-hive", json!([])),
+            area("empty-ref", 0x106, "empty", json!([
+                evidence("tasks/empty-ref/README.md", app_ref)
+            ])),
+            area("local-ref", 0x107, "local", json!([
+                evidence("tasks/local-ref/README.md", local_path)
+            ])),
+            area("conflicting-refs", 0x108, "conflicting", json!([
+                evidence("tasks/conflicting-refs/README.md", app_ref),
+                evidence("directives/conflicting-refs/README.md", app_ref),
+            ])),
+            area("ambiguous-refs", 0x109, "ambiguous", json!([
+                evidence("tasks/ambiguous-refs/README.md", app_ref)
+            ])),
+            area("frontmatter-only", 0x10a, "frontmatter", json!([
+                evidence("tasks/frontmatter-only/README.md", app_ref)
+            ])),
+            area("inline-comment-only", 0x10b, "inline-comment", json!([
+                evidence("tasks/inline-comment-only/README.md", app_ref)
+            ])),
+            area("multiline-comment-only", 0x10c, "multiline-comment", json!([
+                evidence("tasks/multiline-comment-only/README.md", app_ref)
+            ])),
+            area("fenced-example-only", 0x10d, "fenced-example", json!([
+                evidence("tasks/fenced-example-only/README.md", app_ref)
+            ])),
+            area("inline-html-only", 0x10e, "inline-html", json!([
+                evidence("tasks/inline-html-only/README.md", app_ref)
+            ])),
+            area("multiline-html-only", 0x10f, "multiline-html", json!([
+                evidence("tasks/multiline-html-only/README.md", app_ref)
+            ])),
+            area("quoted-fence-only", 0x110, "quoted-fence", json!([
+                evidence("tasks/quoted-fence-only/README.md", app_ref)
+            ])),
+            area("broken-link-only", 0x111, "broken-link", json!([
+                evidence("tasks/broken-link-only/README.md", app_ref)
+            ])),
+            area("bad-percent", 0x112, "bad-percent", json!([
+                evidence("tasks/bad-percent/README.md", "https://forge.example/synthetic/app%zz")
+            ])),
+            area("good-percent", 0x113, "good-percent", json!([
+                evidence("tasks/good-percent/README.md", "https://forge.example/synthetic/app%20one")
+            ])),
+            area("inline-code-tag", 0x114, "inline-code", json!([
+                evidence("tasks/inline-code-tag/README.md", app_ref)
+            ])),
+            area("hidden-span", 0x115, "hidden-span", json!([
+                evidence("tasks/hidden-span/README.md", app_ref)
+            ])),
+            area("hidden-image-alt", 0x116, "hidden-image", json!([
+                evidence("tasks/hidden-image-alt/README.md", app_ref)
+            ])),
+            area("broken-spaced-link", 0x117, "broken-spaced", json!([
+                evidence("tasks/broken-spaced-link/README.md", app_ref)
+            ])),
+            area("valid-spaced-link", 0x118, "valid-spaced", json!([
+                evidence("tasks/valid-spaced-link/README.md", app_ref)
+            ])),
+            area("broken-angle-link", 0x119, "broken-angle", json!([
+                evidence("tasks/broken-angle-link/README.md", app_ref)
+            ])),
+            area("hidden-across-blocks", 0x11a, "hidden-blocks", json!([
+                evidence("tasks/hidden-across-blocks/README.md", app_ref)
+            ])),
+            area("visible-after-html-block", 0x11b, "visible-after-html", json!([
+                evidence("tasks/visible-after-html-block/README.md", app_ref)
+            ])),
+            area("apparent-html-close", 0x11c, "apparent-close", json!([
+                evidence("tasks/apparent-html-close/README.md", app_ref)
+            ])),
+            area("valid-angle-link", 0x11d, "valid-angle", json!([
+                evidence("tasks/valid-angle-link/README.md", app_ref)
+            ])),
+            area("inline-wrapper-across-blocks", 0x11e, "inline-wrapper", json!([
+                evidence("tasks/inline-wrapper-across-blocks/README.md", app_ref)
+            ])),
+            area("unclosed-inline-span", 0x11f, "unclosed-span", json!([
+                evidence("tasks/unclosed-inline-span/README.md", app_ref)
+            ])),
+            area("nested-inline-tags", 0x120, "nested-inline", json!([
+                evidence("tasks/nested-inline-tags/README.md", app_ref)
+            ])),
+        ]
+    });
+    mapping["scopes"][0]["decision"]["area"]["name"] = json!(local_path);
+    let original_git_files = [
+        ".git/index",
+        ".git/HEAD",
+        ".git/refs/heads/main",
+        ".git/config",
+    ]
+    .map(|path| fs::read(source.join(path)).unwrap());
+    let snapshot = migration_preflight(&home, &config, &args, 0);
+    let data = plan(&mapping);
+    assert_eq!(data, plan(&mapping));
+    assert_eq!(data["mode"], "scope_plan");
+    assert_eq!(data["mapping_version"], 1);
+    assert_eq!(
+        data["mapping_sha256"],
+        sha256_hex(&fs::read(&file).unwrap())
+    );
+    assert_eq!(data["source"], snapshot["data"]["source"]);
+    assert_eq!(data["inventory"], snapshot["data"]["inventory"]);
+    assert_eq!(data["target"], json!({"workspace_id": workspace}));
+    assert_eq!(data["scopes"].as_array().unwrap().len(), 34);
+    let outcomes = |report: &Value| {
+        report["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|scope| {
+                (
+                    scope["scope"].as_str().unwrap().to_owned(),
+                    scope["outcome"].clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let mapped = outcomes(&data);
+    assert_eq!(mapped["_general"]["status"], "mapped");
+    assert_eq!(mapped["_hive-userdata"]["status"], "mapped");
+    assert_eq!(mapped["hive-system"]["status"], "mapped");
+    assert_eq!(mapped["good-percent"]["status"], "mapped");
+    assert_eq!(mapped["valid-spaced-link"]["status"], "mapped");
+    assert_eq!(mapped["visible-after-html-block"]["status"], "mapped");
+    assert_eq!(mapped["valid-angle-link"]["status"], "mapped");
+    assert_eq!(
+        mapped["synth-app"],
+        json!({"status": "mapped", "area": {
+            "id": id(AREA_APP), "slug": "application", "parent_id": null
+        }})
+    );
+    assert_eq!(
+        mapped["external-team"],
+        json!({"status": "excluded", "reason": "external_backend_owned"})
+    );
+    assert_eq!(
+        mapped["_hive"],
+        json!({"status": "held", "reason": "unsplit_legacy_scope"})
+    );
+    let held = json!({"status": "held", "reason": "ambiguous_scope_or_collision"});
+    for scope in [
+        "unmapped",
+        "empty-ref",
+        "local-ref",
+        "conflicting-refs",
+        "ambiguous-refs",
+        "frontmatter-only",
+        "inline-comment-only",
+        "multiline-comment-only",
+        "fenced-example-only",
+        "inline-html-only",
+        "multiline-html-only",
+        "quoted-fence-only",
+        "broken-link-only",
+        "bad-percent",
+        "inline-code-tag",
+        "hidden-span",
+        "hidden-image-alt",
+        "broken-spaced-link",
+        "broken-angle-link",
+        "hidden-across-blocks",
+        "apparent-html-close",
+        "inline-wrapper-across-blocks",
+        "unclosed-inline-span",
+        "nested-inline-tags",
+    ] {
+        assert_eq!(mapped[scope], held, "{scope}");
+    }
+    let app = data["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|scope| scope["scope"] == "synth-app")
+        .unwrap();
+    assert_eq!(
+        app["source_paths"],
+        json!([
+            "bots/queen-synth/memory/synth-app",
+            "directives/synth-app",
+            "tasks/synth-app"
+        ])
+    );
+    let encoded = data.to_string();
+    for private in [
+        "https://forge.example",
+        local_path,
+        "Synthetic Area",
+        "Synthetic persona bytes.",
+    ] {
+        assert!(!encoded.contains(private));
+    }
+
+    let mut changed = mapping.clone();
+    changed["scopes"][0]["decision"]["project_evidence"][2]["canonical_ref"] =
+        json!("https://forge.example/synthetic/other-owner");
+    changed["scopes"][2]["decision"]["area"]["id"] = json!(id(0x104));
+    let conflicts = outcomes(&plan(&changed));
+    for scope in ["synth-app", "_hive-userdata", "hive-system"] {
+        assert_eq!(conflicts[scope], held, "{scope}");
+    }
+
+    let mut changed = mapping.clone();
+    changed["scopes"][0]["decision"]["project_evidence"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    changed["scopes"][1]["decision"]["area"]["slug"] = json!("product");
+    let conflicts = outcomes(&plan(&changed));
+    for scope in ["synth-app", "_general", "hive-system"] {
+        assert_eq!(conflicts[scope], held, "{scope}");
+    }
+
+    changed["scopes"][1]["decision"]["area"]["parent_id"] = json!(id(AREA_USERDATA));
+    changed["scopes"][3]["decision"]["area"]["parent_id"] = json!(id(AREA_USERDATA));
+    assert_eq!(outcomes(&plan(&changed))["_general"], held);
+    assert_eq!(outcomes(&plan(&changed))["hive-system"], held);
+    changed["scopes"][1]["decision"]["area"]["parent_id"] = json!(id(AREA_APP));
+    let separate_parents = outcomes(&plan(&changed));
+    assert_eq!(separate_parents["_general"]["status"], "mapped");
+    assert_eq!(
+        separate_parents["hive-system"]["area"]["parent_id"],
+        id(AREA_USERDATA)
+    );
+
+    let mut changed = mapping.clone();
+    changed["scopes"]
+        .as_array_mut()
+        .unwrap()
+        .push(mapping["scopes"][4].clone());
+    assert_eq!(outcomes(&plan(&changed))["external-team"], held);
+    changed["scopes"] = json!([]);
+    let unreviewed = outcomes(&plan(&changed));
+    for scope in ["_general", "_hive-userdata", "external-team"] {
+        assert_eq!(unreviewed[scope], held, "{scope}");
+    }
+
+    assert_eq!(
+        [
+            ".git/index",
+            ".git/HEAD",
+            ".git/refs/heads/main",
+            ".git/config"
+        ]
+        .map(|path| fs::read(source.join(path)).unwrap()),
+        original_git_files,
+    );
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+    assert!(!config.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_redacts_malformed_scope_and_bot_directories() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    init_source(&source, &home);
+
+    let malformed_scope = "Synthetic Private Scope";
+    let malformed_scope_paths = [
+        "bots/queen-synth/memory/Synthetic Private Scope",
+        "directives/Synthetic Private Scope",
+        "tasks/Synthetic Private Scope",
+    ];
+    let portable_paths = [
+        "bots/queen-synth/memory/portable-scope",
+        "directives/portable-scope",
+        "tasks/portable-scope",
+    ];
+    let malformed_bot_paths = [
+        "bots/Synthetic Private Bot/memory/portable-scope",
+        "bots/synthetic.private.bot/memory/portable-scope",
+    ];
+    let device_bot_path = "bots/aux/memory/_general";
+    let device_scope_path = "bots/clean/memory/aux";
+    let general_memory = "bots/clean/memory/_general";
+    let userdata_memory = "bots/clean/memory/_hive-userdata";
+    let unsplit_memory = "bots/clean/memory/_hive";
+    let reference = "https://forge.example/synthetic/portable";
+    let mut evidence = Vec::new();
+    for path in malformed_bot_paths
+        .into_iter()
+        .chain(portable_paths)
+        .chain(malformed_scope_paths)
+        .chain([
+            device_bot_path,
+            device_scope_path,
+            general_memory,
+            userdata_memory,
+            unsplit_memory,
+        ])
+        .rev()
+    {
+        let entrypoint = if path.starts_with("bots/") {
+            "MEMORY.md"
+        } else {
+            "README.md"
+        };
+        let path = format!("{path}/{entrypoint}");
+        let file = source.join(&path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            file,
+            format!("# Synthetic project\n\nProject: {reference}\n"),
+        )
+        .unwrap();
+        if path.contains("/portable-scope/") {
+            evidence.push(json!({"path": path, "canonical_ref": reference}));
+        }
+    }
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic scope locator inputs"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let workspace = id(1);
+    let map = root.path().join("mapping.json");
+    let mut input = json!({
+        "version": 1,
+        "source_commit": commit,
+        "policy_pin": POLICY_PIN,
+        "workspace_id": workspace,
+        "scopes": [
+            {
+                "scope": "portable-scope",
+                "decision": {
+                    "kind": "area",
+                    "area": {"id": id(AREA_APP), "slug": "portable", "name": "Portable project"},
+                    "project_evidence": evidence,
+                }
+            },
+            {
+                "scope": "aux",
+                "decision": {
+                    "kind": "area",
+                    "area": {"id": id(0x104), "slug": "synthetic-device", "name": "Synthetic project"},
+                    "project_evidence": [{
+                        "path": format!("{device_scope_path}/MEMORY.md"),
+                        "canonical_ref": reference
+                    }]
+                }
+            },
+            {"scope": "_general", "decision": {"kind": "area", "area": {
+                "id": id(AREA_GENERAL), "slug": "general", "name": "General"
+            }}},
+            {"scope": "_hive-userdata", "decision": {"kind": "area", "area": {
+                "id": id(AREA_USERDATA), "slug": "operations", "name": "Workspace operations"
+            }}},
+        ],
+    });
+    fs::write(&map, serde_json::to_vec(&input).unwrap()).unwrap();
+    let plan = |revision| {
+        let args = [
+            "--source",
+            source.to_str().unwrap(),
+            "--source-commit",
+            revision,
+            "--workspace-id",
+            &workspace,
+            "--mapping-file",
+            map.to_str().unwrap(),
+        ];
+        migration_cli(&home, &config, "migration-plan", &args, 0)
+    };
+    let report = plan(&commit);
+    assert_eq!(report, plan(&commit));
+    let encoded = report.to_string();
+    for private in [
+        malformed_scope,
+        "Synthetic Private Bot",
+        "synthetic.private.bot",
+    ] {
+        assert!(!encoded.contains(private), "leaked {private}");
+    }
+    for path in [device_bot_path, device_scope_path, unsplit_memory] {
+        assert!(!encoded.contains(&json!(path).to_string()), "leaked {path}");
+    }
+    let scopes = report["data"]["scopes"].as_array().unwrap();
+    let scope_digest = sha256_hex(malformed_scope.as_bytes());
+    let digest_path = |path: &str| sha256_hex(path.as_bytes());
+    let held = json!({"status": "held", "reason": "ambiguous_scope_or_collision"});
+    assert_eq!(
+        scopes
+            .iter()
+            .find(|scope| scope["scope_sha256"] == scope_digest),
+        Some(&json!({
+            "scope_sha256": scope_digest,
+            "source_paths": [],
+            "source_path_sha256s": malformed_scope_paths.map(digest_path),
+            "outcome": held,
+        })),
+    );
+    assert_eq!(
+        scopes
+            .iter()
+            .find(|scope| scope["scope"] == "portable-scope"),
+        Some(&json!({
+            "scope": "portable-scope",
+            "source_paths": portable_paths,
+            "source_path_sha256s": malformed_bot_paths.map(digest_path),
+            "outcome": held,
+        })),
+    );
+    let scope = |key| scopes.iter().find(|scope| scope["scope"] == key).unwrap();
+    assert_eq!(
+        scope("_general"),
+        &json!({
+            "scope": "_general",
+            "source_paths": [general_memory, "bots/queen-synth/memory/_general", "tasks/_general"],
+            "source_path_sha256s": [digest_path(device_bot_path)],
+            "outcome": held,
+        }),
+    );
+    assert_eq!(
+        scope("aux"),
+        &json!({
+            "scope": "aux",
+            "source_paths": [],
+            "source_path_sha256s": [digest_path(device_scope_path)],
+            "outcome": held,
+        }),
+    );
+    assert_eq!(
+        scope("_hive-userdata")["source_paths"],
+        json!([
+            userdata_memory,
+            "directives/_hive-userdata",
+            "tasks/_hive-userdata"
+        ]),
+    );
+    assert_eq!(scope("_hive-userdata")["outcome"]["status"], "mapped");
+    assert_eq!(scope("_hive")["source_paths"], json!(["tasks/_hive"]));
+    assert_eq!(
+        scope("_hive")["source_path_sha256s"],
+        json!([digest_path(unsplit_memory)]),
+    );
+    assert_eq!(scope("_hive")["outcome"]["reason"], "unsplit_legacy_scope");
+    assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+
+    let older_pin = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
+    fs::write(
+        source.join("AGENTS.md"),
+        format!("hive-system@{older_pin}\n"),
+    )
+    .unwrap();
+    fs::remove_file(source.join("hive.yml")).unwrap();
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Use the older synthetic policy pin"],
+    );
+    let older_commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    input["source_commit"] = json!(older_commit);
+    input["policy_pin"] = json!(older_pin);
+    fs::write(&map, serde_json::to_vec(&input).unwrap()).unwrap();
+    assert_eq!(
+        plan(&older_commit)["data"]["scopes"],
+        report["data"]["scopes"]
+    );
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_rejects_unbound_inputs_and_unverified_source() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    let commit = init_source(&source, &home);
+    let file = root.path().join("mapping.json");
+    let workspace = id(1);
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+        "--workspace-id",
+        &workspace,
+        "--mapping-file",
+        file.to_str().unwrap(),
+    ];
+    let run = |args: &[&str], status, code: &str| {
+        let report = migration_cli(&home, &config, "migration-plan", args, status);
+        assert_eq!(report["error"]["code"], code);
+        assert!(report.get("data").is_none());
+    };
+    let mapping = json!({
+        "version": 1,
+        "source_commit": commit,
+        "policy_pin": POLICY_PIN,
+        "workspace_id": workspace,
+        "scopes": [],
+    });
+    let write = |value: &Value| fs::write(&file, serde_json::to_vec(value).unwrap()).unwrap();
+    run(&args[..6], 2, "INVALID_ARGUMENT");
+    run(&args, 2, "INVALID_CONFIG");
+    for (key, value) in [
+        ("version", json!(2)),
+        (
+            "source_commit",
+            json!("1111111111111111111111111111111111111111"),
+        ),
+        (
+            "policy_pin",
+            json!("0fd0f8dbe632d14094a93599cb1b5f653789ac9c"),
+        ),
+        ("workspace_id", json!(id(2))),
+        ("unexpected", json!(true)),
+        (
+            "scopes",
+            json!([{"scope": "external-team", "decision": {"kind": "external", "area": {}}}]),
+        ),
+        (
+            "scopes",
+            json!([{"scope": "absent", "decision": {"kind": "external"}}]),
+        ),
+    ] {
+        let mut changed = mapping.clone();
+        changed[key] = value;
+        write(&changed);
+        run(&args, 2, "INVALID_CONFIG");
+    }
+    fs::write(
+        &file,
+        format!("{{\"version\":1,{}", &mapping.to_string()[1..]),
+    )
+    .unwrap();
+    run(&args, 2, "INVALID_CONFIG");
+    write(&mapping);
+    let duplicate = [args.as_slice(), &args[6..]].concat();
+    run(&duplicate, 2, "INVALID_ARGUMENT");
+    let extra = [args.as_slice(), &["--workspace", source.to_str().unwrap()]].concat();
+    run(&extra, 2, "INVALID_ARGUMENT");
+
+    let tracked = source.join("tasks/synth-app/README.md");
+    let original = fs::read(&tracked).unwrap();
+    fs::write(&tracked, "# Uncommitted identity").unwrap();
+    run(&args, 5, "DIRTY_CONFLICT");
+    fs::write(&tracked, original).unwrap();
+
+    let object = git_text(
+        &source,
+        &home,
+        &["rev-parse", "HEAD:tasks/synth-app/README.md"],
+    );
+    let object_file = source
+        .join(".git/objects")
+        .join(&object[..2])
+        .join(&object[2..]);
+    let hidden = home.join("missing-scope-object");
+    fs::rename(&object_file, &hidden).unwrap();
+    run(&args, 7, "OBJECT_UNAVAILABLE");
+    fs::rename(hidden, object_file).unwrap();
+    migration_cli(&home, &config, "migration-plan", &args, 0);
+    assert!(!config.exists());
 }
 
 #[cfg(target_os = "linux")]
