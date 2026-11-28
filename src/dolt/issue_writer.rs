@@ -206,6 +206,15 @@ pub(super) trait Mutation {
     fn identity(&self) -> WriteIdentity<'_>;
     fn verify_decision(&self, now: OffsetDateTime) -> Result<(), HiveError>;
     fn evidence(&self) -> Result<String, HiveError>;
+    // Runs under the writer lock at the new-write boundary.
+    fn write_evidence(&self, now: OffsetDateTime) -> Result<String, HiveError> {
+        self.verify_decision(now)?;
+        self.evidence()
+    }
+    // Runs under the writer lock before reading history and before returning a replay.
+    fn verify_locked_authorization(&self, now: OffsetDateTime) -> Result<(), HiveError> {
+        self.verify_decision(now)
+    }
     fn check_scope(&self, snapshot: &mut Snapshot) -> Result<(), HiveError>;
     fn verify_replay_decision(
         &self,
@@ -248,6 +257,12 @@ fn deserialize_object<'de, D: serde::Deserializer<'de>, E: Deserialize<'de>>(
 pub(super) fn read_decision<E: serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<Decision<E>, HiveError> {
+    read_workflow_object(path)
+}
+
+pub(super) fn read_workflow_object<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<T, HiveError> {
     let bytes = read_evidence_bytes(path, workflow::MAX_DECLARATION_BYTES)?;
     workflow::parse_json_object::<_, serde_json::Error>(
         serde_json::from_slice(&bytes).map_err(|_| workflow::unverified())?,
@@ -466,7 +481,7 @@ pub(super) fn execute(
     let request = mutation.identity();
     mutation.verify_decision(observe_time()?)?;
     with_writer_runtime(workspace, target, |runtime, snapshot| {
-        mutation.verify_decision(observe_time()?)?;
+        mutation.verify_locked_authorization(observe_time()?)?;
         mutation.check_scope(snapshot)?;
         if let Some(recovered) = reconcile(runtime, workspace.workspace_id())? {
             *snapshot = recovered;
@@ -514,7 +529,7 @@ pub(super) fn execute(
             mutation.verify_replay_decision(snapshot, &receipt.base_commit)?;
             require_clean(&mut snapshot.connection, &commit)?;
             runtime.check()?;
-            mutation.verify_decision(observe_time()?)?;
+            mutation.verify_locked_authorization(observe_time()?)?;
             ("replayed", receipt.base_commit, introduced, result)
         } else {
             if has_receipt_history(snapshot, request.request_id).map_err(|_| uncertain())? {
@@ -592,7 +607,7 @@ fn apply(
     let now = observed
         .replace_nanosecond(observed.nanosecond() / 1000 * 1000)
         .expect("valid microsecond adjustment");
-    mutation.verify_decision(now)?;
+    let workflow_evidence = mutation.write_evidence(now)?;
     let timestamp = workflow::format_observed_at(now);
     let sql_time = timestamp[..26].replace('T', " ");
     let staged = mutation.stage(&mut tx, guard, now, &sql_time)?;
@@ -603,7 +618,7 @@ fn apply(
         kind: request.kind.name().to_owned(),
         authorization_ref: request.authorization_ref.to_owned(),
         actor_ref: request.actor.to_owned(),
-        workflow_evidence: mutation.evidence()?,
+        workflow_evidence,
         result: staged.result,
     };
     tx.exec_drop(

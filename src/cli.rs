@@ -714,9 +714,12 @@ pub(crate) struct ArtifactCreateArgs {
     pub(crate) actor: String,
     #[arg(long)]
     pub(crate) request_id: String,
-    /// Current request-bound operator decision.
+    /// Request-bound operator decision, or a saved reference with --delegation-source.
     #[arg(long)]
     pub(crate) evidence_file: PathBuf,
+    /// Operator-selected local file holding the current direct-Area delegation.
+    #[arg(long, requires = "area")]
+    pub(crate) delegation_source: Option<PathBuf>,
     #[command(flatten)]
     pub(crate) target: DoltTargetArgs,
 }
