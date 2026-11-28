@@ -367,31 +367,56 @@ fn acceptance_paragraphs(body: &str) -> HashSet<BodyRange> {
 // can be written in free prose or kept in a referenced source. Refuse known
 // criteria markers in the README even when the review omitted a body range.
 fn has_criteria_indicators(body: &str) -> bool {
-    let mut inline = None;
+    let mut blocks = Vec::new();
+    let mut rendered = String::new();
     for event in Parser::new_ext(body, Options::ENABLE_TASKLISTS) {
         match event {
             Event::TaskListMarker(_) => return true,
-            Event::Start(Tag::Heading { .. } | Tag::Paragraph) => inline = Some(String::new()),
-            Event::End(TagEnd::Heading(_) | TagEnd::Paragraph) => {
-                if inline.take().is_some_and(|text| criteria_marker(&text)) {
+            Event::Text(text) | Event::Code(text) => {
+                if criteria_marker(&text) {
                     return true;
                 }
-            }
-            Event::Text(text) | Event::Code(text) => match &mut inline {
-                Some(inline) => inline.push_str(&text),
-                None if criteria_marker(&text) => return true,
-                None => {}
-            },
-            Event::SoftBreak | Event::HardBreak => {
-                if let Some(inline) = &mut inline {
-                    inline.push('\n');
+                if blocks.last() == Some(&true) {
+                    rendered.push_str(&text);
                 }
+                continue;
             }
             Event::Html(text) | Event::InlineHtml(text) if criteria_marker(&text) => return true,
-            _ => {}
+            Event::SoftBreak | Event::HardBreak if blocks.last() == Some(&true) => {
+                rendered.push('\n');
+                continue;
+            }
+            Event::Start(tag) => {
+                let Some(render_text) = criteria_block(tag.to_end()) else {
+                    continue;
+                };
+                blocks.push(render_text);
+            }
+            Event::End(tag) if criteria_block(tag).is_some() => {
+                blocks.pop();
+            }
+            Event::Rule => {}
+            _ => continue,
         }
+
+        // Containers separate prose runs. Tight list items can supply their
+        // own inline text without a paragraph, including in nested lists.
+        if !rendered.is_empty() && criteria_marker(&rendered) {
+            return true;
+        }
+        rendered.clear();
     }
     false
+}
+
+fn criteria_block(tag: TagEnd) -> Option<bool> {
+    match tag {
+        TagEnd::Heading(_) | TagEnd::Paragraph | TagEnd::Item => Some(true),
+        TagEnd::BlockQuote(_) | TagEnd::CodeBlock | TagEnd::HtmlBlock | TagEnd::List(_) => {
+            Some(false)
+        }
+        _ => None,
+    }
 }
 
 fn criteria_marker(text: &str) -> bool {
