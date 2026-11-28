@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
-use super::{AssetObjectReader, Inventory, Reason, snapshot_object, verified_source};
+use super::{
+    AssetObjectReader, Inventory, Reason, is_portable_bot_memory_locator, snapshot_object,
+    verified_source,
+};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, read_regular};
 use crate::dolt::{is_uuid, is_uuid_v7};
@@ -85,7 +88,7 @@ impl Scope<'_> {
             .source_paths
             .iter()
             .copied()
-            .partition(|path| portable_scope && has_portable_bot_id(path));
+            .partition(|path| portable_scope && has_portable_memory_locator(path));
         let mut report = json!({"source_paths": paths, "outcome": outcome});
         if portable_scope {
             report["scope"] = json!(self.scope);
@@ -232,7 +235,9 @@ fn classify_scopes<'a>(
                     ),
                 ) if ids[area.id.as_str()] == 1
                     && siblings[&(area.parent_id.as_deref(), area.slug.as_str())] == 1
-                    && origins.iter().all(|(path, _)| has_portable_bot_id(path))
+                    && origins
+                        .iter()
+                        .all(|(path, _)| has_portable_memory_locator(path))
                     && (reserved(scope)
                         || project_agrees(
                             inventory,
@@ -487,9 +492,12 @@ pub(super) fn is_portable_scope(scope: &str) -> bool {
     reserved(scope) || scope == "_hive" || is_slug(scope)
 }
 
-fn has_portable_bot_id(path: &str) -> bool {
-    path.strip_prefix("bots/")
-        .is_none_or(|rest| rest.split_once('/').is_some_and(|(bot, _)| is_slug(bot)))
+fn has_portable_memory_locator(path: &str) -> bool {
+    path.strip_prefix("bots/").is_none_or(|relative| {
+        relative
+            .split_once("/memory/")
+            .is_some_and(|(bot, scope)| is_portable_bot_memory_locator(bot, Some(scope)))
+    })
 }
 
 fn invalid(message: &'static str) -> HiveError {
