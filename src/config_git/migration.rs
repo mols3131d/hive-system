@@ -30,7 +30,26 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
         })
     };
     verify_layout()?;
+    let verify_local_exclude = || -> Result<(), HiveError> {
+        let invalid_exclude = |error: HiveError| {
+            HiveError::new(
+                error.code,
+                "The v1 source Git info directory and exclude file must be local when present.",
+            )
+        };
+        if let Some(info) = repository
+            .git_dir
+            .open_child_directory(OsStr::new("info"))
+            .map_err(invalid_exclude)?
+        {
+            info.open_regular(OsStr::new("exclude"))
+                .map_err(invalid_exclude)?;
+        }
+        Ok(())
+    };
     let check_clean = || {
+        // Git status follows links in the repository's info/exclude path.
+        verify_local_exclude()?;
         repository
             .check_clean(revision, CleanWorktree::MigrationSource)
             .map_err(|error| {
@@ -44,7 +63,8 @@ pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveErro
                     _ => "Could not establish a clean v1 source worktree.",
                 };
                 HiveError::new(error.code, message)
-            })
+            })?;
+        verify_local_exclude()
     };
     check_clean()?;
 
