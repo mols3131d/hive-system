@@ -7,6 +7,7 @@ use super::{Command, POLICY_PIN, Value, fs, git, git_text, id, init_git, json, s
 #[ignore = "requires installed Hive and pinned Dolt and Git"]
 fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     const POLICY: &str = "c66b3c50150e18426485d134de92c6b311dac125";
+    const PROJECT_NAME: &str = "Synthetic reviewed delivery";
     const LABEL: &str = "synthetic-ready-label";
     const REPO_URL: &str = "https://forge.example/synthetic/mixed";
     const RECORD_REF: &str = "https://forge.example/synthetic/history";
@@ -116,6 +117,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     let directive = id(5);
     let artifact = id(6);
     let work_artifact = id(8);
+    let project = id(10);
     let record_review = |path: &str, id: &str, provenance| json!({"source_path":path, "source_git_blob_sha":oid(path), "target_id":id, "provenance":provenance});
     let work_range = |value: &str| {
         let start = work_body.find(value).unwrap();
@@ -148,6 +150,13 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
             {"legacy_key":{"scope":"synthetic-app","work_id":"ready"},"source_git_blob_sha":oid(TASK),"resource_id":resource},
             {"legacy_key":{"scope":"synthetic-app","work_id":"claimed"},"source_git_blob_sha":oid(CLAIMED),"resource_id":resource}
         ],
+        "project_membership":{
+            "projects":[{"id":project,"name":PROJECT_NAME,"status":"active"}],
+            "memberships":[
+                {"project_id":project,"legacy_key":{"scope":"synthetic-app","work_id":"ready"},"source_git_blob_sha":oid(TASK),"decision":"link"},
+                {"project_id":project,"legacy_key":{"scope":"synthetic-app","work_id":"claimed"},"source_git_blob_sha":oid(CLAIMED),"decision":"link"}
+            ]
+        },
         "queen_assets":[
             {"slug":"synthetic-queen","source_git_blob_sha":oid(SOUL)},
             {"slug":"invalid-queen","source_git_blob_sha":oid(INVALID_SOUL)}
@@ -228,6 +237,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         "queen_preparation",
         "resource_bindings",
         "issue_resource_bindings",
+        "project_membership",
         "directive_artifact_intake",
     ] {
         assert!(plan["data"].get(key).is_some(), "{key}");
@@ -238,6 +248,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         "task_reviews",
         "resource_bindings",
         "issue_resource_bindings",
+        "project_membership",
         "queen_assets",
         "queen_preparation",
         "reviewed_records",
@@ -286,6 +297,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     assert_eq!(dry["checks"]["transaction"], "rolled_back");
     assert_eq!(dry["checks"]["task_rows_and_links"], "verified");
     assert!(!dry.to_string().contains(LABEL));
+    assert!(!dry.to_string().contains(PROJECT_NAME));
     for surface in [
         "area",
         "issue",
@@ -293,6 +305,8 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         "resource",
         "area_resource",
         "issue_resource",
+        "project",
+        "project_issue",
         "directive",
         "artifact",
     ] {
@@ -411,6 +425,21 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         assert_eq!(links[1]["reason_code"], "task_unprepared");
     }
     assert_eq!(staged["checks"]["target_issue_resource_rows"], 1);
+    assert_eq!(staged["checks"]["target_project_rows"], 1);
+    assert_eq!(staged["checks"]["target_project_issue_rows"], 1);
+    for report in [&dry, &staged] {
+        let memberships = report["project_membership"]["memberships"]
+            .as_array()
+            .unwrap();
+        assert_eq!(memberships.len(), 2);
+        assert_eq!(memberships[0]["status"], "imported");
+        assert_eq!(memberships[0]["project_id"], project);
+        assert_eq!(memberships[1]["status"], "held");
+        assert_eq!(
+            memberships[1]["reason_code"],
+            "unresolved_project_membership"
+        );
+    }
     assert_eq!(
         staged["counts"]["bots_soul"],
         json!({"inventoried":2,"imported":1,"held":1,"excluded_non_record":0})
@@ -540,6 +569,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         "Reviewed Synthetic Queen",
         "sample-holder",
         LABEL,
+        PROJECT_NAME,
         root.to_str().unwrap(),
     ] {
         assert!(!report.contains(redacted), "{redacted}");
@@ -673,6 +703,18 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
             "SELECT issue_id, resource_id FROM issue_resources AS OF '{db}'"
         )),
         json!([{"issue_id":issue["issue_id"],"resource_id":resource}])
+    );
+    assert_eq!(
+        sql(&format!(
+            "SELECT id, name, status FROM projects AS OF '{db}'"
+        )),
+        json!([{"id":project,"name":PROJECT_NAME,"status":"active"}])
+    );
+    assert_eq!(
+        sql(&format!(
+            "SELECT project_id, issue_id FROM project_issues AS OF '{db}'"
+        )),
+        json!([{"project_id":project,"issue_id":issue["issue_id"]}])
     );
     assert_eq!(
         sql(&format!("SELECT id, uri FROM resources AS OF '{db}'")),

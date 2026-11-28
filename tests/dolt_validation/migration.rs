@@ -28,6 +28,10 @@ mod issue_resource_staging;
 mod mixed_staging;
 
 #[cfg(target_os = "linux")]
+#[path = "migration/project_staging.rs"]
+mod project_staging;
+
+#[cfg(target_os = "linux")]
 #[path = "migration/queen_staging.rs"]
 mod queen_staging;
 
@@ -40,6 +44,7 @@ mod resource_staging;
 mod task_labels;
 
 const POLICY_PIN: &str = "0e584830a7eff314d85b7af8c6f8cd69e735730a";
+const FORM_FEED_CRITERIA: &str = "A\x0cB";
 const REVISION: u32 = 4;
 const AREA_GENERAL: u32 = 0x101;
 const AREA_USERDATA: u32 = 0x102;

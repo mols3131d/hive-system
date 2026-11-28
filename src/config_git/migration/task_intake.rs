@@ -291,7 +291,46 @@ pub(super) fn prepare<'a>(
     })
 }
 
+pub(super) enum TaskSource<'a> {
+    Duplicate,
+    Unique {
+        oid: Option<&'a str>,
+        state: TaskState,
+    },
+}
+
+pub(super) enum TaskState {
+    Prepared,
+    Held,
+    Excluded,
+}
+
 impl TaskPlan<'_> {
+    pub(super) fn member_source(&self, key: Key<'_>) -> Option<TaskSource<'_>> {
+        // Intake sorts by qualified key, with all lifecycle copies contiguous.
+        let index = self.records.partition_point(|record| record.key() < key);
+        let record = self
+            .records
+            .get(index)
+            .filter(|record| record.key() == key)?;
+        if self
+            .records
+            .get(index + 1)
+            .is_some_and(|record| record.key() == key)
+        {
+            return Some(TaskSource::Duplicate);
+        }
+        let state = match self.outcomes[index] {
+            Outcome::Prepared { .. } => TaskState::Prepared,
+            Outcome::Held { .. } => TaskState::Held,
+            Outcome::Excluded { .. } => TaskState::Excluded,
+        };
+        Some(TaskSource::Unique {
+            oid: record.blob_oid.as_deref(),
+            state,
+        })
+    }
+
     pub(crate) fn staging_tasks(&self) -> Vec<StagingTask<'_>> {
         self.records
             .iter()

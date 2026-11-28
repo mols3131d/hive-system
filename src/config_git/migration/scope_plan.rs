@@ -3,7 +3,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag, TagEnd};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -12,6 +12,7 @@ use url::{Host, Url};
 use super::issue_resources::{self, IssueResourceOutcome};
 use super::json_object::{self, Object};
 use super::prepared_records::Intake;
+use super::projects::{self, PreparedProjects};
 use super::queen_assets::{self, QueenAssets, SoulReview};
 use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
 use super::reviewed_records::{Review, timestamp};
@@ -47,6 +48,8 @@ struct Mapping {
     queen_preparation: Option<Vec<QueenMapping>>,
     #[serde(default, deserialize_with = "resources::deserialize_section")]
     resource_bindings: Option<resources::Bindings>,
+    #[serde(default, deserialize_with = "projects::deserialize_section")]
+    project_membership: Option<projects::Mapping>,
     #[serde(default, deserialize_with = "issue_resources::optional_list")]
     issue_resource_bindings: Option<Vec<issue_resources::Binding>>,
     #[serde(
@@ -193,6 +196,14 @@ pub(crate) fn plan(
                 report["directive_observed_at"] = json!(observed_at);
             }
         }
+        let selected_plan = if include_tasks {
+            task_plan.as_ref()
+        } else {
+            None
+        };
+        if let Some(projects) = reviewed.prepare_projects(selected_plan)? {
+            report["project_membership"] = projects.report(None);
+        }
         if reviewed.mapping.issue_resource_bindings.is_some() {
             let selected_tasks = if include_tasks {
                 tasks.as_deref()
@@ -272,6 +283,17 @@ impl ReviewedScopes<'_> {
         task_intake::prepare(records, &outcomes, reviews, &git, check_labels)
     }
 
+    pub(crate) fn prepare_projects(
+        &self,
+        tasks: Option<&task_intake::TaskPlan<'_>>,
+    ) -> Result<Option<PreparedProjects<'_>>, HiveError> {
+        self.mapping
+            .project_membership
+            .as_ref()
+            .map(|mapping| mapping.prepare(tasks))
+            .transpose()
+    }
+
     pub(crate) fn prepare_issue_resources(
         &self,
         tasks: Option<&[task_intake::StagingTask<'_>]>,
@@ -296,7 +318,11 @@ impl ReviewedScopes<'_> {
         &self,
         include_tasks: bool,
     ) -> Result<(), HiveError> {
-        if !include_tasks && !self.mapping.task_reviews.is_empty() && !self.has_work_artifacts() {
+        if !include_tasks
+            && !self.mapping.task_reviews.is_empty()
+            && !self.has_work_artifacts()
+            && self.mapping.project_membership.is_none()
+        {
             return Err(invalid("Task reviews require --tasks for staging."));
         }
         Ok(())

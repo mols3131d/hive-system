@@ -393,7 +393,7 @@ impl BodyEvidence {
     }
 }
 
-fn fits_text_column(text: &str) -> bool {
+pub(super) fn fits_text_column(text: &str) -> bool {
     text.len() <= 65_535
         && !text
             .chars()
