@@ -2,7 +2,7 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use serde::de::{MapAccess, Visitor, value::MapAccessDeserializer};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de::value::StrDeserializer};
 
 pub(super) struct Object<T>(pub(super) T);
 
@@ -43,4 +43,25 @@ where
 {
     let objects = Vec::<Object<T>>::deserialize(deserializer)?;
     Ok(objects.into_iter().map(|object| object.0).collect())
+}
+
+pub(super) fn string_enum<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<T, D::Error> {
+    let label = String::deserialize(deserializer)?;
+    T::deserialize(StrDeserializer::new(&label))
+}
+
+pub(super) fn optional_string_enum<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    Option::<String>::deserialize(deserializer)?
+        .map(|label| T::deserialize(StrDeserializer::new(&label)))
+        .transpose()
+}
+
+pub(super) fn optional_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    Option::<Object<T>>::deserialize(deserializer).map(|value| value.map(|object| object.0))
 }

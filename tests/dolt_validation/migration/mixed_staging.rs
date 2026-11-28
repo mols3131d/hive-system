@@ -11,6 +11,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     const RECORD_REF: &str = "https://forge.example/synthetic/history";
     const TASK: &str = "tasks/synthetic-app/backlog/ready/README.md";
     const CLAIMED: &str = "tasks/synthetic-app/active/claimed/README.md";
+    const READY_WORK_ARTIFACT: &str = "tasks/synthetic-app/backlog/ready/artifacts/report.md";
     const HELD_WORK_ARTIFACT: &str = "tasks/synthetic-app/active/claimed/artifacts/report.md";
     const README: &str = "tasks/synthetic-app/README.md";
     const DIRECTIVE: &str = "directives/synthetic-app/proposal.md";
@@ -46,6 +47,10 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     let record = |fields| {
         format!("---\r\ndescription: Synthetic record\r\n{fields}\r\n---\r\n{RECORD_BODY}")
     };
+    let work_body = format!("{RECORD_BODY}Created: {CREATED}\r\nUpdated: {UPDATED}\r\n");
+    let work_record = format!(
+        "---\r\ndescription: Synthetic work evidence\r\nkind: report\r\n---\r\n{work_body}"
+    );
     let reference_doc = format!("# Synthetic Project\n\n{REPO_URL}\n");
     let fixtures = [
         ("AGENTS.md", format!("hive-system@{POLICY_PIN}\n")),
@@ -67,7 +72,8 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
                 "---\ndescription: Synthetic claim\nstatus: todo\nclaim: {{id: sample-claim, holder: sample-holder}}\n---\n{task_body}"
             ),
         ),
-        (HELD_WORK_ARTIFACT, record("kind: report")),
+        (READY_WORK_ARTIFACT, work_record.clone()),
+        (HELD_WORK_ARTIFACT, work_record),
         (SOUL, SOUL_TEXT.into()),
         (INVALID_SOUL, "# Missing Queen identity\n".into()),
         (DIRECTIVE, record("status: proposed")),
@@ -99,7 +105,19 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     let queen = id(4);
     let directive = id(5);
     let artifact = id(6);
+    let work_artifact = id(8);
     let record_review = |path: &str, id: &str, provenance| json!({"source_path":path, "source_git_blob_sha":oid(path), "target_id":id, "provenance":provenance});
+    let work_range = |value: &str| {
+        let start = work_body.find(value).unwrap();
+        json!({"start":start,"end":start + value.len()})
+    };
+    let work_provenance = |work_id, parent_path| {
+        json!({"kind":"work_scoped_artifact","artifact_kind":"report","author_ref":"bot:synthetic-author",
+            "source_ref":RECORD_REF,"created_at":work_range(CREATED),"substantive_updated_at":work_range(UPDATED),
+            "parent_task":{"legacy_key":{"scope":"synthetic-app","work_id":work_id},
+                "source_path":parent_path,"source_git_blob_sha":oid(parent_path),"area_id":area,"workspace_id":workspace},
+            "issue_link":"retain","area_link":area,"archive":"none"})
+    };
     let project_evidence = [README, "directives/synthetic-app/README.md", MEMORY]
         .map(|path| json!({"path":path, "canonical_ref": REPO_URL}));
     let mapping = json!({
@@ -116,6 +134,10 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
             {"scope":"synthetic-app","area_id":area,"resource":{"id":id(7),"kind":"git-repo","name":"Stale Repo"},
              "evidence_path":README,"evidence_blob_oid":"0".repeat(commit.len())}
         ]},
+        "issue_resource_bindings":[
+            {"legacy_key":{"scope":"synthetic-app","work_id":"ready"},"source_git_blob_sha":oid(TASK),"resource_id":resource},
+            {"legacy_key":{"scope":"synthetic-app","work_id":"claimed"},"source_git_blob_sha":oid(CLAIMED),"resource_id":resource}
+        ],
         "queen_assets":[
             {"slug":"synthetic-queen","source_git_blob_sha":oid(SOUL)},
             {"slug":"invalid-queen","source_git_blob_sha":oid(INVALID_SOUL)}
@@ -126,7 +148,9 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
             record_review(DIRECTIVE, &directive, json!({"kind":"proposed_directive","area_id":area,"issuer_ref":"human:synthetic-operator",
                 "source_ref":RECORD_REF,"created_at":CREATED,"updated_at":UPDATED,"supersession":"none","approval_and_validity":"none"})),
             record_review(ARTIFACT, &artifact, json!({"kind":"standalone_artifact","artifact_kind":"report","author_ref":"bot:synthetic-author",
-                "source_ref":RECORD_REF,"created_at":CREATED,"substantive_updated_at":UPDATED,"links":"none","archive":"none"}))
+                "source_ref":RECORD_REF,"created_at":CREATED,"substantive_updated_at":UPDATED,"links":"none","archive":"none"})),
+            record_review(READY_WORK_ARTIFACT, &work_artifact, work_provenance("ready", TASK)),
+            record_review(HELD_WORK_ARTIFACT, &id(9), work_provenance("claimed", CLAIMED))
         ]
     });
     let mapping_bytes = serde_json::to_vec(&mapping).unwrap();
@@ -188,6 +212,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         "task_intake",
         "queen_preparation",
         "resource_bindings",
+        "issue_resource_bindings",
         "directive_artifact_intake",
     ] {
         assert!(plan["data"].get(key).is_some(), "{key}");
@@ -202,11 +227,13 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         "bot",
         "resource",
         "area_resource",
+        "issue_resource",
         "directive",
         "artifact",
     ] {
         assert_eq!(dry["checks"][format!("target_{surface}_rows")], 0);
     }
+    assert_eq!(dry["checks"]["target_artifact_links"], 0);
     assert_eq!(dry["target"]["issue_number_next_value"], 1);
     assert!(dry["target"]["confirmed_dolt_commit"].is_null());
     assert!(!target.exists());
@@ -254,13 +281,29 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         assert_eq!(staged["counts"][key]["imported"], 1);
         assert_eq!(staged["counts"][key]["held"], held);
     }
-    assert_eq!(staged["counts"]["artifacts_work_scoped"]["held"], 1);
+    assert_eq!(
+        staged["counts"]["artifacts_work_scoped"],
+        json!({"inventoried":2,"imported":1,"held":1,"excluded_non_record":0})
+    );
+    assert_eq!(staged["checks"]["target_artifact_links"], 2);
+    assert_eq!(
+        staged["counts"]["issue_resources"],
+        json!({"inventoried":2,"imported":1,"held":1})
+    );
+    for report in [&dry, &staged] {
+        let links = report["issue_resource_bindings"].as_array().unwrap();
+        assert_eq!(links[0]["status"], "imported");
+        assert_eq!(links[0]["resource_id"], resource);
+        assert_eq!(links[1]["status"], "held");
+        assert_eq!(links[1]["reason_code"], "task_unprepared");
+    }
+    assert_eq!(staged["checks"]["target_issue_resource_rows"], 1);
     let holds = staged["holds"].as_array().unwrap();
     for (path, reason) in [
         (CLAIMED, "execution_needs_reconciliation"),
         (UNAPPROVED, "missing_directive_approval"),
         (UNCLASSIFIED, "unclassified_artifact_kind"),
-        (HELD_WORK_ARTIFACT, "unresolved_parent_task"),
+        (HELD_WORK_ARTIFACT, "parent_task_quarantined"),
     ] {
         let locator = sha256_hex(path.as_bytes());
         assert!(holds.iter().any(|row| row["source_path_sha256"] == locator && row.to_string().contains(reason)), "{path}: {holds:?}");
@@ -286,6 +329,8 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         MEMORY,
         DIRECTIVE,
         ARTIFACT,
+        READY_WORK_ARTIFACT,
+        HELD_WORK_ARTIFACT,
         REPO_URL,
         RECORD_REF,
         "Exact café bytes",
@@ -332,6 +377,12 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         json!([{"resource_id":resource,"area_id":area}])
     );
     assert_eq!(
+        sql(&format!(
+            "SELECT issue_id, resource_id FROM issue_resources AS OF '{db}'"
+        )),
+        json!([{"issue_id":issue["issue_id"],"resource_id":resource}])
+    );
+    assert_eq!(
         sql(&format!("SELECT id, uri FROM resources AS OF '{db}'")),
         json!([{"id":resource,"uri":REPO_URL}])
     );
@@ -344,8 +395,22 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         json!([{"id":directive,"body":RECORD_BODY}])
     );
     assert_eq!(
-        sql(&format!("SELECT id, body FROM artifacts AS OF '{db}'")),
-        json!([{"id":artifact,"body":RECORD_BODY}])
+        sql(&format!(
+            "SELECT id, body FROM artifacts AS OF '{db}' ORDER BY id"
+        )),
+        json!([{"id":artifact,"body":RECORD_BODY},{"id":work_artifact,"body":work_body}])
+    );
+    assert_eq!(
+        sql(&format!(
+            "SELECT artifact_id, issue_id FROM artifact_issues AS OF '{db}'"
+        )),
+        json!([{"artifact_id":work_artifact,"issue_id":issue["issue_id"]}])
+    );
+    assert_eq!(
+        sql(&format!(
+            "SELECT artifact_id, area_id FROM artifact_areas AS OF '{db}'"
+        )),
+        json!([{"artifact_id":work_artifact,"area_id":area}])
     );
     assert_eq!(
         sql(&format!(

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::io::Write;
 
 use serde_json::{Value, json};
@@ -24,16 +24,18 @@ impl<'a> IssueResources<'a> {
         let mut pairs = BTreeSet::new();
         let outcomes = outcomes
             .map(|outcomes| {
-                let ids: HashMap<_, _> =
-                    tasks.into_iter().flat_map(TaskImport::issue_ids).collect();
                 outcomes
                     .iter()
                     .map(|outcome| {
                         let mut report = outcome.report();
                         if outcome.hold.is_none() {
-                            let issue_id = ids.get(&outcome.key).copied().ok_or_else(|| {
-                                unverified("A prepared Issue Resource link has no staged Issue.")
-                            })?;
+                            let issue_id = tasks
+                                .and_then(|tasks| tasks.issue_id_by_key(outcome.key))
+                                .ok_or_else(|| {
+                                    unverified(
+                                        "A prepared Issue Resource link has no staged Issue.",
+                                    )
+                                })?;
                             pairs.insert((issue_id, outcome.resource_id));
                             report["status"] = json!("imported");
                             report["issue_id"] = json!(issue_id);

@@ -7,6 +7,7 @@ use time::OffsetDateTime;
 
 use super::{io_error, sql_text, unverified};
 use crate::config_git::migration::StagingTask;
+use crate::config_git::migration::prepared_records::IssueLink;
 use crate::dolt::issue_writer::new_uuid_v7;
 use crate::error::{ErrorCode, HiveError};
 
@@ -24,6 +25,7 @@ struct AssignedTask<'a> {
 
 pub(super) struct TaskImport<'a> {
     tasks: Vec<AssignedTask<'a>>,
+    indices: HashMap<(&'a str, &'a str), usize>,
     placement: Vec<usize>,
     rows: Vec<Value>,
     dependencies: Vec<Value>,
@@ -123,11 +125,20 @@ impl<'a> TaskImport<'a> {
         let dependency_count = [json!({"dependencies": dependencies.len()})];
         Ok(Self {
             tasks: assigned,
+            indices,
             placement,
             rows,
             dependencies,
             dependency_count,
         })
+    }
+
+    pub(super) fn issue_id(&self, link: &IssueLink) -> Option<&str> {
+        let task = self.assigned(link.key())?;
+        (task.task.area_id == link.area_id
+            && task.task.source_path == link.source_path
+            && task.task.source_git_blob_sha == link.source_git_blob_sha)
+            .then_some(task.id.as_str())
     }
 
     pub(super) fn dependency_count(&self) -> usize {
@@ -211,10 +222,12 @@ impl<'a> TaskImport<'a> {
         checks
     }
 
-    pub(super) fn issue_ids(&self) -> impl Iterator<Item = ((&str, &str), &str)> {
-        self.tasks
-            .iter()
-            .map(|task| (task.task.key, task.id.as_str()))
+    pub(super) fn issue_id_by_key(&self, key: (&str, &str)) -> Option<&str> {
+        self.assigned(key).map(|task| task.id.as_str())
+    }
+
+    fn assigned(&self, key: (&str, &str)) -> Option<&AssignedTask<'a>> {
+        self.indices.get(&key).map(|&index| &self.tasks[index])
     }
 
     pub(super) fn id_map(&self) -> Vec<Value> {

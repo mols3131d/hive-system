@@ -88,7 +88,6 @@ fn prepare(
 ) -> Result<(Value, Option<StagedPayload>), HiveError> {
     let areas = reviewed.areas_in_parent_order()?;
     let queens = reviewed.prepared_queens();
-    let intake = reviewed.directive_artifacts_for_staging()?;
     let dry_run = matches!(args.mode, MigrationStageMode::DryRun);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -100,6 +99,7 @@ fn prepare(
 
     let task_plan = args.tasks.then(|| reviewed.prepare_tasks()).transpose()?;
     let tasks = task_plan.as_ref().map(|plan| plan.staging_tasks());
+    let intake = reviewed.directive_artifacts_for_staging(tasks.as_deref())?;
     let issue_resource_reviews = reviewed.prepare_issue_resources(tasks.as_deref())?;
     let task_import = tasks.map(|tasks| TaskImport::new(tasks, now)).transpose()?;
     let issue_resources =
@@ -322,11 +322,15 @@ fn prepare(
     issue_resources.add_report(&mut report, dry_run);
     let include_reviewed_records = intake.is_some();
     if let Some(intake) = intake {
-        directive_artifact::add_report(&mut report, intake);
+        directive_artifact::add_report(&mut report, intake, &expected.records);
         let (directives, artifacts) = expected.records.counts();
         report["checks"]["target_directive_rows"] = json!(if dry_run { 0 } else { directives });
         report["checks"]["target_artifact_rows"] = json!(if dry_run { 0 } else { artifacts });
-        report["checks"]["target_artifact_links"] = json!(0);
+        report["checks"]["target_artifact_links"] = json!(if dry_run {
+            0
+        } else {
+            expected.records.link_count()
+        });
         if let Some(observed) = reviewed.directive_observation() {
             report["directive_observed_at"] = json!(observed);
         }
@@ -537,7 +541,7 @@ fn apply_rows(
         writeln!(input, "{sql};").map_err(io_error)?;
         checks.push(expected.to_vec());
     }
-    let records = directive_artifact::append(&mut input, rows.records, now)?;
+    let records = directive_artifact::append(&mut input, rows.records, rows.tasks, now)?;
     for (sql, expected) in records.transaction_checks() {
         writeln!(input, "{sql};").map_err(io_error)?;
         checks.push(expected);

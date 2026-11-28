@@ -86,7 +86,7 @@ pub(super) fn prepare<'a>(
             }
             let hold = match task_by_key.get(&key) {
                 None => Some(Hold::TaskUnprepared),
-                Some(task) if task.blob_oid != binding.source_git_blob_sha => {
+                Some(task) if task.source_git_blob_sha != binding.source_git_blob_sha => {
                     Some(Hold::TaskBlobMismatch)
                 }
                 Some(task) => match area_by_resource.get(resource_id) {

@@ -247,7 +247,7 @@ struct PreparedClosure {
 }
 
 #[derive(Serialize)]
-struct Timestamp {
+pub(super) struct Timestamp {
     value: String,
     body_range: BodyRange,
     #[serde(skip)]
@@ -255,13 +255,17 @@ struct Timestamp {
 }
 
 impl Timestamp {
-    fn select(range: Option<BodyRange>, body: &str) -> Option<(Self, OffsetDateTime)> {
+    pub(super) fn select(range: Option<BodyRange>, body: &str) -> Option<(Self, OffsetDateTime)> {
         let body_range = range?;
         let value = body_range.select(body)?;
         // Require an explicit offset and precision representable by DATETIME(6).
         // RFC 3339 permits an unknown offset and leap seconds, which aren't
         // usable as exact timestamps in the target.
-        if value.len() > 32 || value.ends_with("-00:00") || value.get(17..19) == Some("60") {
+        if !matches!(value.as_bytes().get(10), Some(b'T' | b't'))
+            || value.len() > 32
+            || value.ends_with("-00:00")
+            || value.get(17..19) == Some("60")
+        {
             return None;
         }
         if let Some((_, fraction)) = value.split_once('.')

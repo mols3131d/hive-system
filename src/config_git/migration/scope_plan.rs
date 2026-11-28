@@ -15,7 +15,9 @@ use super::prepared_records::Intake;
 use super::queen_assets::{self, QueenAssets, SoulReview};
 use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
 use super::reviewed_records::{Review, timestamp};
+use super::task_intake::StagingTask;
 use super::task_provenance::TaskReview;
+use super::work_artifact::TaskContext;
 use super::{
     AssetObjectReader, Inventory, Reason, SourceSnapshot, directive_artifact_intake,
     is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
@@ -46,6 +48,10 @@ struct Mapping {
     resource_bindings: Option<resources::Bindings>,
     #[serde(default, deserialize_with = "issue_resources::optional_list")]
     issue_resource_bindings: Option<Vec<issue_resources::Binding>>,
+    #[serde(
+        default,
+        deserialize_with = "super::reviewed_records::deserialize_present"
+    )]
     reviewed_records: Option<Vec<Review>>,
     directive_observed_at: Option<String>,
 }
@@ -165,18 +171,26 @@ pub(crate) fn plan(
             "target": {"workspace_id": workspace_id},
             "scopes": reviewed.scopes.iter().map(Scope::report).collect::<Vec<_>>(),
         });
+        let task_plan = (include_tasks
+            || (include_directives_artifacts && reviewed.has_work_artifacts()))
+        .then(|| reviewed.prepare_tasks())
+        .transpose()?;
+        let tasks = task_plan.as_ref().map(task_intake::TaskPlan::staging_tasks);
         if include_directives_artifacts {
-            report["directive_artifact_intake"] = reviewed.scan_directive_artifacts(false)?.report;
+            report["directive_artifact_intake"] = reviewed
+                .scan_directive_artifacts(false, tasks.as_deref())?
+                .report;
             if let Some(observed_at) = reviewed.directive_observation() {
                 report["directive_observed_at"] = json!(observed_at);
             }
         }
-        let task_plan = include_tasks
-            .then(|| reviewed.prepare_tasks())
-            .transpose()?;
         if reviewed.mapping.issue_resource_bindings.is_some() {
-            let tasks = task_plan.as_ref().map(task_intake::TaskPlan::staging_tasks);
-            if let Some(outcomes) = reviewed.prepare_issue_resources(tasks.as_deref())? {
+            let selected_tasks = if include_tasks {
+                tasks.as_deref()
+            } else {
+                None
+            };
+            if let Some(outcomes) = reviewed.prepare_issue_resources(selected_tasks)? {
                 report["issue_resource_bindings"] = json!(
                     outcomes
                         .iter()
@@ -185,7 +199,7 @@ pub(crate) fn plan(
                 );
             }
         }
-        if let Some(plan) = task_plan {
+        if include_tasks && let Some(plan) = task_plan {
             report["task_intake"] = plan.report();
         }
         if let Some(assets) = &reviewed.queen_assets {
@@ -245,11 +259,23 @@ impl ReviewedScopes<'_> {
             .transpose()
     }
 
-    pub(crate) fn directive_artifacts_for_staging(&self) -> Result<Option<Intake>, HiveError> {
+    fn has_work_artifacts(&self) -> bool {
+        self.mapping
+            .reviewed_records
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(Review::is_work_scoped)
+    }
+
+    pub(crate) fn directive_artifacts_for_staging(
+        &self,
+        tasks: Option<&[StagingTask<'_>]>,
+    ) -> Result<Option<Intake>, HiveError> {
         self.mapping
             .reviewed_records
             .as_ref()
-            .map(|_| self.scan_directive_artifacts(true))
+            .map(|_| self.scan_directive_artifacts(true, tasks))
             .transpose()
     }
 
@@ -257,7 +283,11 @@ impl ReviewedScopes<'_> {
         self.mapping.directive_observed_at.as_deref()
     }
 
-    fn scan_directive_artifacts(&self, prepare_storage: bool) -> Result<Intake, HiveError> {
+    fn scan_directive_artifacts(
+        &self,
+        prepare_storage: bool,
+        tasks: Option<&[StagingTask<'_>]>,
+    ) -> Result<Intake, HiveError> {
         let scopes = self
             .scopes
             .iter()
@@ -270,6 +300,7 @@ impl ReviewedScopes<'_> {
             self.mapping.reviewed_records.as_deref(),
             self.directive_observed_at,
             prepare_storage,
+            &TaskContext::new(&self.mapping.workspace_id, tasks),
         )
     }
 

@@ -12,6 +12,7 @@ use super::directive_history::{LinkDecision, ReviewedDirective, resolve_links};
 use super::prepared_records::{Content, Fields, Intake, PreparedRecord};
 use super::reviewed_records::{self, Review};
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
+use super::work_artifact::TaskContext;
 use super::{AssetObjectReader, Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, parse_v2, present};
@@ -121,6 +122,8 @@ impl Outcome {
         record: &InspectedRecord,
         supported_shape: bool,
         observed_at: Option<OffsetDateTime>,
+        parent: Option<&str>,
+        tasks: &TaskContext<'_>,
     ) -> Self {
         let Self::Held {
             candidate: Some(candidate),
@@ -129,7 +132,14 @@ impl Outcome {
         else {
             return self;
         };
-        let provenance = if supported_shape {
+        let provenance = if review.is_work_scoped() {
+            match (supported_shape, parent, &record.content) {
+                (true, Some(parent), Some(content)) => {
+                    review.prepare_work_scoped(&candidate, &content.body, parent, tasks)
+                }
+                _ => Err(Reason::UnsupportedReviewedRecord),
+            }
+        } else if supported_shape && parent.is_none() {
             review.prepare(&candidate, observed_at)
         } else {
             Err(Reason::UnsupportedReviewedRecord)
@@ -217,6 +227,7 @@ pub(super) fn scan(
     reviews: Option<&[Review]>,
     observed_at: Option<OffsetDateTime>,
     prepare_storage: bool,
+    tasks: &TaskContext<'_>,
 ) -> Result<Intake, HiveError> {
     let mut reviewed = reviewed_records::bind(reviews.unwrap_or_default(), inventory)?;
     let mut counts = BTreeMap::from([
@@ -280,6 +291,14 @@ pub(super) fn scan(
         let outcome = match (shape, scope.and_then(|scope| scopes.get(scope))) {
             (Shape::Excluded(reason), _) => Outcome::Excluded { reason },
             (_, Some(ScopeOutcome::Excluded { reason })) => Outcome::Excluded { reason: *reason },
+            (Shape::Record, Some(ScopeOutcome::Held { reason }))
+                if parent.is_some() && review.is_some_and(Review::is_work_scoped) =>
+            {
+                Outcome::Held {
+                    reason_codes: vec![*reason, Reason::ParentTaskQuarantined],
+                    candidate: None,
+                }
+            }
             (_, Some(ScopeOutcome::Held { reason })) => Outcome::held(*reason),
             (Shape::Held(reason), _) => Outcome::held(reason),
             (Shape::Record, mapped) => {
@@ -287,7 +306,9 @@ pub(super) fn scan(
                     Outcome::held(Reason::RecordMarkdownTooLarge)
                 } else {
                     let directive = surface == Surface::Directives;
-                    let capture = prepare_storage && review.is_some();
+                    let capture = review.is_some_and(|review| {
+                        prepare_storage || (parent.is_some() && review.is_work_scoped())
+                    });
                     let inspection = match inspected.entry((entry.oid.as_str(), directive, capture))
                     {
                         Entry::Occupied(cached) => cached.into_mut(),
@@ -317,9 +338,10 @@ pub(super) fn scan(
                                     record,
                                     (surface == Surface::Directives
                                         && review.directive_edges().is_some())
-                                        || (parent.is_none()
-                                            && tail.strip_suffix(".md").is_some_and(is_slug)),
+                                        || tail.strip_suffix(".md").is_some_and(is_slug),
                                     observed_at,
+                                    parent.map(|(path, _)| path),
+                                    tasks,
                                 ),
                                 None => outcome,
                             }
