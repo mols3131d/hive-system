@@ -3,12 +3,13 @@ use std::ops::Range;
 use std::path::Path;
 
 use pulldown_cmark::{CowStr, Event, LinkType, Parser, Tag, TagEnd};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
 use super::json_object::{self, Object};
+use super::queen_assets::{self, SoulReview};
 use super::{
     AssetObjectReader, Inventory, Reason, SourceSnapshot, directive_artifact_intake,
     is_portable_bot_memory_locator, snapshot_object, task_intake, verified_source,
@@ -27,6 +28,16 @@ struct Mapping {
     workspace_id: String,
     #[serde(deserialize_with = "json_object::deserialize_vec")]
     scopes: Vec<ScopeMapping>,
+    #[serde(default, deserialize_with = "optional_object_list")]
+    queen_assets: Option<Vec<SoulReview>>,
+}
+
+fn optional_object_list<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    json_object::deserialize_vec(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -153,6 +164,13 @@ pub(crate) fn plan(
                 )?;
             }
         }
+        if let Some(reviews) = reviewed.queen_assets {
+            report["queen_assets"] = json!(queen_assets::classify(
+                reviewed.inventory,
+                reviewed.reader,
+                reviews
+            )?);
+        }
         Ok(report)
     })
 }
@@ -164,6 +182,7 @@ pub(crate) struct ReviewedScopes<'a> {
     mapping_version: u32,
     mapping_sha256: String,
     scopes: Vec<Scope<'a>>,
+    queen_assets: Option<&'a [SoulReview]>,
 }
 
 impl ReviewedScopes<'_> {
@@ -294,6 +313,7 @@ pub(crate) fn with_scope_mapping<T>(
             mapping_version: mapping.version,
             mapping_sha256: format!("{:x}", Sha256::digest(input)),
             scopes,
+            queen_assets: mapping.queen_assets.as_deref(),
         })
     })
 }
