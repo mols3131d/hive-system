@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::scope_plan::ScopeOutcome;
+use super::scope_plan::{ScopeOutcome, is_portable_scope};
 use super::{AssetObjectReader, Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, parse_v2};
@@ -147,7 +147,7 @@ pub(super) fn report(
                     "tasks",
                     scope,
                     "backlog" | "active" | "archive",
-                    _,
+                    work_id,
                     "artifacts",
                     tail,
                 ] => {
@@ -155,7 +155,7 @@ pub(super) fn report(
                     (
                         Surface::ArtifactsWorkScoped,
                         Some(*scope),
-                        Some(&path[..root_len]),
+                        Some((&path[..root_len], *work_id)),
                         *tail,
                     )
                 }
@@ -193,7 +193,12 @@ pub(super) fn report(
                     raw_sha256 = Some(inspection.raw_sha256.as_str());
                     match inspection.metadata {
                         Err(reason) => Outcome::held(reason),
-                        Ok(metadata) => candidate(metadata, mapped.copied(), parent, inventory),
+                        Ok(metadata) => candidate(
+                            metadata,
+                            mapped.copied(),
+                            parent.map(|(path, _)| path),
+                            inventory,
+                        ),
                     }
                 }
             }
@@ -204,17 +209,55 @@ pub(super) fn report(
             Outcome::Held { .. } => count.held += 1,
             Outcome::Excluded { .. } => count.excluded += 1,
         }
-        records.push(json!({
+        let mut record = json!({
             "surface": surface,
-            "source_path": path,
             "source_git_blob_sha": entry.oid,
             "source_raw_sha256": raw_sha256,
             "source_size": size,
-            "parent_task_path": parent,
             "outcome": outcome,
-        }));
+        });
+        let portable_ancestry = scope.is_none_or(is_portable_scope)
+            && parent.is_none_or(|(_, work_id)| is_slug(work_id));
+        if portable_ancestry && portable_record_tail(tail) {
+            record["source_path"] = json!(path);
+        } else {
+            record["source_path_sha256"] = json!(format!("{:x}", Sha256::digest(path)));
+        }
+        match parent {
+            None => record["parent_task_path"] = Value::Null,
+            Some((path, _)) if portable_ancestry => record["parent_task_path"] = json!(path),
+            Some((path, _)) => {
+                record["parent_task_path_sha256"] = json!(format!("{:x}", Sha256::digest(path)));
+            }
+        }
+        records.push(record);
     }
     Ok(json!({"coverage": "partial", "counts": counts, "records": records}))
+}
+
+fn portable_record_tail(tail: &str) -> bool {
+    let filename = match tail.rsplit_once('/') {
+        Some((directories, filename)) if directories.split('/').all(is_slug) => filename,
+        Some(_) => return false,
+        None => tail,
+    };
+    if matches!(
+        filename,
+        "README.md" | "AGENTS.md" | "SOUL.md" | "MEMORY.md"
+    ) {
+        return true;
+    }
+    if let Some(stem) = filename.strip_suffix(".md") {
+        return is_slug(stem);
+    }
+    let mut parts = filename.split('.');
+    parts.next().is_some_and(is_slug)
+        && parts.all(|extension| {
+            !extension.is_empty()
+                && extension
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
 }
 
 fn directive_shape(inventory: &Inventory, root: &str, tail: &str, scoped: bool) -> Shape {

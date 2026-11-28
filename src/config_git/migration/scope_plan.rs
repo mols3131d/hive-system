@@ -81,7 +81,29 @@ impl Scope<'_> {
             ScopeOutcome::Held { reason } => json!({"status": "held", "reason": reason}),
             ScopeOutcome::Excluded { reason } => json!({"status": "excluded", "reason": reason}),
         };
-        json!({"scope": self.scope, "source_paths": self.source_paths, "outcome": outcome})
+        let portable_scope = is_portable_scope(self.scope);
+        let (paths, redacted): (Vec<_>, Vec<_>) =
+            self.source_paths.iter().copied().partition(|path| {
+                portable_scope
+                    && path.strip_prefix("bots/").is_none_or(|rest| {
+                        rest.split_once('/').is_some_and(|(bot, _)| is_slug(bot))
+                    })
+            });
+        let mut report = json!({"source_paths": paths, "outcome": outcome});
+        if portable_scope {
+            report["scope"] = json!(self.scope);
+        } else {
+            report["scope_sha256"] = json!(format!("{:x}", Sha256::digest(self.scope)));
+        }
+        if !redacted.is_empty() {
+            report["source_path_sha256s"] = json!(
+                redacted
+                    .into_iter()
+                    .map(|path| format!("{:x}", Sha256::digest(path)))
+                    .collect::<Vec<_>>()
+            );
+        }
+        report
     }
 }
 
@@ -163,7 +185,7 @@ fn classify_scopes<'a>(
     let mut siblings = HashMap::new();
     for mapping in mappings {
         let scope = mapping.scope.as_str();
-        if !(reserved(scope) || scope == "_hive" || is_slug(scope)) || !scopes.contains_key(scope) {
+        if !is_portable_scope(scope) || !scopes.contains_key(scope) {
             return Err(invalid(
                 "A scope mapping key does not name a supported scope in the verified source.",
             ));
@@ -363,6 +385,10 @@ fn portable_reference(reference: &str) -> bool {
 
 fn reserved(scope: &str) -> bool {
     matches!(scope, "_general" | "_hive-userdata")
+}
+
+pub(super) fn is_portable_scope(scope: &str) -> bool {
+    reserved(scope) || scope == "_hive" || is_slug(scope)
 }
 
 fn invalid(message: &'static str) -> HiveError {

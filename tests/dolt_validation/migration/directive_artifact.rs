@@ -405,3 +405,231 @@ fn cli_migration_plan_inventories_directives_and_artifacts_read_only() {
     assert_eq!(error["error"]["code"], "DIRTY_CONFLICT");
     assert!(error.get("data").is_none());
 }
+
+#[test]
+fn cli_migration_plan_redacts_nonportable_directive_and_artifact_locators() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = root.path().join("config");
+    let source = root.path().join("source");
+    init_source(&source, &home);
+
+    let cases = [
+        (
+            "directives/Synthetic Scope/README.md",
+            "excluded",
+            "navigation_only",
+        ),
+        (
+            "directives/Synthetic Scope/record.md",
+            "held",
+            "ambiguous_scope_or_collision",
+        ),
+        (
+            "directives/_general/Synthetic Bundle/README.md",
+            "held",
+            "unsupported_directive_shape",
+        ),
+        (
+            "directives/_general/record.private.md",
+            "held",
+            "unsupported_directive_shape",
+        ),
+        (
+            "directives/_general/bundle/approval@synthetic.invalid.md",
+            "excluded",
+            "directive_bundle_support",
+        ),
+        (
+            "directives/_general/bundle/Synthetic Nested/context.md",
+            "excluded",
+            "directive_bundle_support",
+        ),
+        (
+            "artifacts/Synthetic Artifact/README.md",
+            "held",
+            "unclassified_artifact_kind",
+        ),
+        (
+            "artifacts/Synthetic.File.bin",
+            "held",
+            "unresolved_binary_or_external_owner",
+        ),
+        (
+            "tasks/Synthetic Scope/backlog/work/artifacts/report.md",
+            "held",
+            "ambiguous_scope_or_collision",
+        ),
+        (
+            "tasks/external-team/backlog/Synthetic Work/artifacts/report.md",
+            "excluded",
+            "external_backend_owned",
+        ),
+        (
+            "tasks/external-team/backlog/Synthetic Work/artifacts/other.md",
+            "excluded",
+            "external_backend_owned",
+        ),
+        (
+            "tasks/external-team/backlog/normal-work/artifacts/Synthetic Name.md",
+            "excluded",
+            "external_backend_owned",
+        ),
+    ];
+    let body = b"---\ndescription: Synthetic fixture\nstatus: proposed\n---\n";
+    for path in cases.iter().map(|(path, _, _)| *path).chain([
+        "directives/_general/bundle/README.md",
+        "artifacts/bundle/output.tar.gz",
+        "bots/Synthetic Bot/memory/_general/MEMORY.md",
+    ]) {
+        let file = source.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, body).unwrap();
+    }
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic nonportable locators"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let workspace = id(1);
+    let mapping = root.path().join("scope.json");
+    fs::write(&mapping, json!({
+        "version": 1,
+        "source_commit": commit,
+        "policy_pin": POLICY_PIN,
+        "workspace_id": workspace,
+        "scopes": [
+            {"scope": "_general", "decision": {
+                "kind": "area", "area": {"id": id(AREA_GENERAL), "slug": "general", "name": "General"}
+            }},
+            {"scope": "external-team", "decision": {"kind": "external"}}
+        ]
+    }).to_string()).unwrap();
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+        "--workspace-id",
+        &workspace,
+        "--mapping-file",
+        mapping.to_str().unwrap(),
+        "--include-directives-artifacts",
+    ];
+    let run = |args| migration_cli(&home, &config, "migration-plan", args, 0);
+    let report = run(&args);
+    assert_eq!(report, run(&args));
+    let scopes = report["data"]["scopes"].as_array().unwrap();
+    assert_eq!(
+        report["data"]["scopes"],
+        run(&args[..args.len() - 1])["data"]["scopes"]
+    );
+    let scope_digest = sha256_hex(b"Synthetic Scope");
+    let scope = scopes
+        .iter()
+        .find(|row| row["scope_sha256"] == scope_digest)
+        .unwrap();
+    assert_eq!(
+        *scope,
+        json!({
+            "scope_sha256": scope_digest,
+            "source_paths": [],
+            "source_path_sha256s": [
+                sha256_hex(b"directives/Synthetic Scope"), sha256_hex(b"tasks/Synthetic Scope"),
+            ],
+            "outcome": {"status": "held", "reason": "ambiguous_scope_or_collision"}
+        })
+    );
+    let general = scopes
+        .iter()
+        .find(|row| row["scope"] == "_general")
+        .unwrap();
+    assert_eq!(
+        general["source_paths"],
+        json!([
+            "bots/queen-synth/memory/_general",
+            "directives/_general",
+            "tasks/_general"
+        ])
+    );
+    assert_eq!(
+        general["source_path_sha256s"],
+        json!([sha256_hex(b"bots/Synthetic Bot/memory/_general")])
+    );
+
+    let records = report["data"]["directive_artifact_intake"]["records"]
+        .as_array()
+        .unwrap();
+    let by_digest = |path: &str| {
+        let digest = sha256_hex(path.as_bytes());
+        records
+            .iter()
+            .find(|row| row["source_path_sha256"] == digest)
+            .unwrap()
+    };
+    for (path, status, reason) in cases {
+        let row = by_digest(path);
+        assert!(row.get("source_path").is_none());
+        assert_eq!(row["outcome"]["status"], status);
+        if status == "held" {
+            assert_eq!(row["outcome"]["reason_codes"], json!([reason]));
+        } else {
+            assert_eq!(row["outcome"]["reason"], reason);
+        }
+    }
+    for (parent, filenames) in [
+        ("tasks/Synthetic Scope/backlog/work", &["report.md"][..]),
+        (
+            "tasks/external-team/backlog/Synthetic Work",
+            &["report.md", "other.md"][..],
+        ),
+    ] {
+        for filename in filenames {
+            let row = by_digest(&format!("{parent}/artifacts/{filename}"));
+            assert!(row.get("parent_task_path").is_none());
+            assert_eq!(
+                row["parent_task_path_sha256"],
+                sha256_hex(parent.as_bytes())
+            );
+        }
+    }
+    let normal_parent =
+        by_digest("tasks/external-team/backlog/normal-work/artifacts/Synthetic Name.md");
+    assert_eq!(
+        normal_parent["parent_task_path"],
+        "tasks/external-team/backlog/normal-work"
+    );
+    assert!(normal_parent.get("parent_task_path_sha256").is_none());
+
+    for path in [
+        "directives/_general/bundle/README.md",
+        "artifacts/bundle/output.tar.gz",
+    ] {
+        let row = records
+            .iter()
+            .find(|row| row["source_path"] == path)
+            .unwrap();
+        assert!(row.get("source_path_sha256").is_none());
+        assert_eq!(row["parent_task_path"], Value::Null);
+    }
+    let output = report.to_string();
+    for private in [
+        "Synthetic Scope",
+        "Synthetic Bundle",
+        "record.private.md",
+        "approval@synthetic.invalid",
+        "Synthetic Nested",
+        "Synthetic Artifact",
+        "Synthetic.File",
+        "Synthetic Work",
+        "Synthetic Name",
+        "Synthetic Bot",
+    ] {
+        assert!(!output.contains(private), "{private}");
+    }
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+    assert!(!config.exists());
+}
