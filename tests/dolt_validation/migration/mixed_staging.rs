@@ -367,7 +367,9 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         )["error"]["code"],
         "INVALID_CONFIG"
     );
-    let mut changed = mapping.clone();
+    let mut without_joins = mapping.clone();
+    without_joins["reviewed_records"][archived_review]["provenance"]["links"] = json!("none");
+    let mut changed = without_joins.clone();
     for bad_evidence in [
         json!("unresolved"),
         json!({"archived_at":work_range(CREATED),"archive_reason":work_range(ARCHIVE_REASON)}),
@@ -397,23 +399,34 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     }
     assert_eq!(oid(ARCHIVED), oid(UNCLASSIFIED));
     assert_eq!(outcome(&plan, UNCLASSIFIED), outcome(&unreviewed, ARCHIVED));
-    for (path, kind) in [(ARCHIVED, "design"), (READY_WORK_ARTIFACT, "evidence")] {
-        let prepared = outcome(&plan, path);
-        assert_eq!(prepared["status"], "prepared");
-        assert_eq!(prepared["candidate"]["kind"], kind);
-        assert_eq!(prepared["provenance"]["archived_at"], CANONICAL_ARCHIVED_AT);
-        assert_eq!(
-            prepared["provenance"]["archive_reason_sha256"],
-            sha256_hex(ARCHIVE_REASON.as_bytes())
-        );
+    for (path, reason) in [
+        (ARCHIVED, "unresolved_artifact_links"),
+        (READY_WORK_ARTIFACT, "parent_task_quarantined"),
+    ] {
+        let held = outcome(&plan, path);
+        assert_eq!(held["status"], "held", "{path}");
+        assert_eq!(held["reason_codes"], json!([reason]), "{path}");
     }
-    assert!(outcome(&plan, ARTIFACT)["provenance"]["archived_at"].is_null());
-    assert!(!plan.to_string().contains("Synthetic archival rationale"));
-    assert!(!plan.to_string().contains(ARCHIVED_TITLE));
+    let standalone_plan = plan_for(&without_joins, 0);
+    let prepared = outcome(&standalone_plan, ARCHIVED);
+    assert_eq!(prepared["status"], "prepared");
+    assert_eq!(prepared["candidate"]["kind"], "design");
+    assert_eq!(prepared["provenance"]["archived_at"], CANONICAL_ARCHIVED_AT);
     assert_eq!(
-        outcome(&plan, ARCHIVED)["target_title_sha256"],
+        prepared["provenance"]["archive_reason_sha256"],
+        sha256_hex(ARCHIVE_REASON.as_bytes())
+    );
+    assert_eq!(
+        prepared["target_title_sha256"],
         sha256_hex(ARCHIVED_TITLE.as_bytes())
     );
+    assert!(outcome(&standalone_plan, ARTIFACT)["provenance"]["archived_at"].is_null());
+    assert!(
+        !standalone_plan
+            .to_string()
+            .contains("Synthetic archival rationale")
+    );
+    assert!(!standalone_plan.to_string().contains(ARCHIVED_TITLE));
     for key in [
         "task_intake",
         "queen_preparation",
@@ -862,22 +875,31 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     let dry_issue = issue_for(&dry);
     let issue = issue_for(&staged);
     for (report, issue) in [(&dry, &dry_issue), (&staged, &issue)] {
-        let archived = report["id_map"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["source_path_sha256"] == sha256_hex(ARCHIVED.as_bytes()))
-            .unwrap();
-        let outcome = &archived["outcome"];
+        let artifact_outcome = |path: &str| {
+            report["id_map"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["source_path_sha256"] == sha256_hex(path.as_bytes()))
+                .unwrap()
+                .get("outcome")
+                .unwrap()
+        };
+        for (path, kind) in [(ARCHIVED, "design"), (READY_WORK_ARTIFACT, "evidence")] {
+            let outcome = artifact_outcome(path);
+            assert_eq!(outcome["candidate"]["kind"], kind);
+            assert_eq!(outcome["provenance"]["archived_at"], CANONICAL_ARCHIVED_AT);
+            assert_eq!(
+                outcome["provenance"]["archive_reason_sha256"],
+                sha256_hex(ARCHIVE_REASON.as_bytes())
+            );
+        }
+        let outcome = artifact_outcome(ARCHIVED);
         assert_eq!(
             outcome["target_title_sha256"],
             sha256_hex(ARCHIVED_TITLE.as_bytes())
         );
         let provenance = &outcome["provenance"];
-        assert_eq!(
-            provenance["archive_reason_sha256"],
-            sha256_hex(ARCHIVE_REASON.as_bytes())
-        );
         let links = &provenance["links"];
         assert_eq!(links["area_ids"], json!([area]));
         assert_eq!(links["project_ids"], json!([project]));
