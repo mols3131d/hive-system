@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::scope_plan::ScopeOutcome;
+use super::scope_plan::{ScopeOutcome, is_portable_scope};
 use super::{Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
 use crate::config_file::parse_v2;
@@ -126,10 +126,21 @@ pub(super) fn report(records: Vec<Record>, scopes: &BTreeMap<&str, &ScopeOutcome
         .iter()
         .map(|record| {
             let scope = scopes[record.scope.as_str()];
-            let hold = |reason| Outcome::Held {
-                reason_codes: vec![reason],
-                candidate_status: None,
-                area_id: None,
+            let hold = |reason| {
+                let mut reason_codes = vec![reason];
+                if !matches!(reason, Reason::ExecutionNeedsReconciliation)
+                    && matches!(
+                        record.classification,
+                        Err(Reason::ExecutionNeedsReconciliation)
+                    )
+                {
+                    reason_codes.push(Reason::ExecutionNeedsReconciliation);
+                }
+                Outcome::Held {
+                    reason_codes,
+                    candidate_status: None,
+                    area_id: None,
+                }
             };
             let outcome = match scope {
                 ScopeOutcome::Excluded { reason } => {
@@ -162,14 +173,19 @@ pub(super) fn report(records: Vec<Record>, scopes: &BTreeMap<&str, &ScopeOutcome
                     }
                 },
             };
-            json!({
-                "legacy_key": {"scope": record.scope, "work_id": record.work_id},
+            let mut task = json!({
                 "lifecycle": record.lifecycle,
-                "source_path": record.path,
                 "source_git_blob_sha": record.blob_oid,
                 "source_raw_sha256": record.raw_sha256,
                 "outcome": outcome,
-            })
+            });
+            if is_portable_scope(&record.scope) && is_slug(&record.work_id) {
+                task["legacy_key"] = json!({"scope": record.scope, "work_id": record.work_id});
+                task["source_path"] = json!(record.path);
+            } else {
+                task["source_path_sha256"] = json!(format!("{:x}", Sha256::digest(&record.path)));
+            }
+            task
         })
         .collect();
     json!({
@@ -194,14 +210,15 @@ struct Frontmatter {
     claim: Option<Value>,
     #[serde(default, deserialize_with = "present_value")]
     priority: Option<Value>,
+    #[serde(default, deserialize_with = "present_value")]
     tags: Option<Vec<String>>,
 }
 
-fn present_value<'de, D: serde::Deserializer<'de>>(
+fn present_value<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
-) -> Result<Option<Value>, D::Error> {
-    // Explicit null still counts as a present field in the lifecycle rules.
-    Value::deserialize(deserializer).map(Some)
+) -> Result<Option<T>, D::Error> {
+    // Present fields are decoded as their declared type, including explicit null.
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]

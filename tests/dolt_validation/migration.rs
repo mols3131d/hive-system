@@ -871,6 +871,7 @@ fn migration_cli_with_path(
         .current_dir(home)
         .env_clear()
         .env("PATH", search_path)
+        .env("TMPDIR", std::env::temp_dir())
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", config)
         // An inherited repository selection must not replace the explicit one.
@@ -1187,17 +1188,28 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
         )
         .unwrap();
     }
+    let malformed_bot_origin = "bots/Synthetic-Bot@sample.invalid/memory/unmapped";
+    fs::create_dir_all(source.join(malformed_bot_origin)).unwrap();
+    fs::write(
+        source.join(malformed_bot_origin).join("MEMORY.md"),
+        "# Synthetic memory\n",
+    )
+    .unwrap();
     let claim = "claim: {id: private-claim-id, holder: private-claim-holder}\n";
+    let invalid_work = "_general/backlog/Synthetic-Work@sample.invalid";
+    let invalid_scope = "Synthetic-Scope@sample.invalid";
+    let invalid_scope_work = format!("{invalid_scope}/backlog/item");
+    let excluded_invalid_work = "external-team/active/Synthetic-External@sample.invalid";
     let fixtures = [
         ("_general/backlog/shared", "", "# Private H1 title\n"),
         (
             "_hive-userdata/backlog/shared",
-            "",
+            "tags: [private-synthetic-tag]\n",
             "Description fallback.\n",
         ),
         (
             "_general/active/shared",
-            "status: todo\n",
+            &format!("status: todo\n{claim}"),
             "Duplicated across areas.\n",
         ),
         (
@@ -1247,6 +1259,7 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
         ),
         ("_general/backlog/claimed-backlog", "claim: null\n", ""),
         ("_general/backlog/null-status", "status: null\n", ""),
+        ("_general/backlog/null-tags", "tags: null\n", ""),
         (
             "_general/backlog/conflict",
             "",
@@ -1268,7 +1281,8 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             "",
         ),
         ("_general/backlog/broken-blob", "", ""),
-        ("_general/backlog/Bad-Key", "", ""),
+        (invalid_work, "", ""),
+        (&invalid_scope_work, "", ""),
         (
             "_general/archive/with-child",
             "status: done\n",
@@ -1280,8 +1294,17 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             "Prerequisite: _general/waiting\n",
         ),
         ("external-team/backlog/native", "", ""),
+        (
+            excluded_invalid_work,
+            &format!("status: in-progress\n{claim}"),
+            "",
+        ),
         ("_hive/backlog/legacy", "", ""),
-        ("unmapped/backlog/uncertain", "", ""),
+        (
+            "unmapped/active/uncertain",
+            &format!("status: in-progress\n{claim}"),
+            "",
+        ),
     ];
     for (bundle, fields, body) in fixtures {
         let file = source.join(format!("tasks/{bundle}/README.md"));
@@ -1368,23 +1391,46 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
     assert_eq!(
         intake["counts"],
         json!({
-            "inventoried": tasks.len(), "held": tasks.len() - 1, "excluded": 1
+            "inventoried": tasks.len(), "held": tasks.len() - 2, "excluded": 2
         })
     );
-    let string = |index: usize, name: &str| tasks[index][name].as_str().unwrap();
+    let redacted_paths = [invalid_work, &invalid_scope_work, excluded_invalid_work]
+        .map(|bundle| format!("tasks/{bundle}/README.md"));
+    let redacted_locators = redacted_paths
+        .each_ref()
+        .map(|path| sha256_hex(path.as_bytes()));
+    let path_for = |task: &Value| {
+        if let Some(path) = task["source_path"].as_str() {
+            assert!(task.get("source_path_sha256").is_none());
+            path.to_owned()
+        } else {
+            assert!(task.get("legacy_key").is_none());
+            assert!(task.get("source_path").is_none());
+            let index = redacted_locators
+                .iter()
+                .position(|digest| task["source_path_sha256"] == *digest)
+                .expect("known redacted path digest");
+            redacted_paths[index].clone()
+        }
+    };
     let ordered: Vec<_> = tasks
         .iter()
         .map(|task| {
-            (
-                task["legacy_key"]["scope"].as_str().unwrap(),
-                task["legacy_key"]["work_id"].as_str().unwrap(),
-                task["source_path"].as_str().unwrap(),
-            )
+            let path = path_for(task);
+            let mut parts = path.split('/');
+            let scope = parts.nth(1).unwrap();
+            let work_id = parts.nth(1).unwrap();
+            if task.get("legacy_key").is_some() {
+                assert_eq!(
+                    task["legacy_key"],
+                    json!({"scope": scope, "work_id": work_id})
+                );
+            }
+            (scope.to_owned(), work_id.to_owned(), path)
         })
         .collect();
     assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
-    for (i, task) in tasks.iter().enumerate() {
-        let path = string(i, "source_path");
+    for (task, (_, _, path)) in tasks.iter().zip(&ordered) {
         if path.ends_with("/no-readme") {
             assert!(task["source_git_blob_sha"].is_null());
             assert!(task["source_raw_sha256"].is_null());
@@ -1403,16 +1449,14 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
     let outcome = |path| {
         &tasks
             .iter()
-            .find(|task| task["source_path"] == path)
+            .zip(&ordered)
+            .find(|(_, (_, _, source_path))| source_path == &path)
+            .map(|(task, _)| task)
             .unwrap()["outcome"]
     };
     for (path, reason) in [
         (
             "_general/backlog/shared/README.md",
-            "duplicate_legacy_work_id",
-        ),
-        (
-            "_general/active/shared/README.md",
             "duplicate_legacy_work_id",
         ),
         (
@@ -1467,13 +1511,12 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             "_general/backlog/broken-blob/README.md",
             "unsupported_task_metadata",
         ),
-        ("_general/backlog/Bad-Key/README.md", "invalid_legacy_state"),
+        (
+            "_general/backlog/null-tags/README.md",
+            "unsupported_task_metadata",
+        ),
         ("_general/backlog/no-readme", "missing_task_entrypoint"),
         ("_hive/backlog/legacy/README.md", "unsplit_legacy_scope"),
-        (
-            "unmapped/backlog/uncertain/README.md",
-            "ambiguous_scope_or_collision",
-        ),
     ] {
         assert_eq!(
             outcome(format!("tasks/{path}")),
@@ -1484,6 +1527,50 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             "{path}"
         );
     }
+    for (path, expected) in [
+        (
+            "tasks/_general/active/shared/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["duplicate_legacy_work_id", "execution_needs_reconciliation"]}),
+        ),
+        (
+            "tasks/unmapped/active/uncertain/README.md".to_owned(),
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision", "execution_needs_reconciliation"]}),
+        ),
+        (
+            redacted_paths[0].clone(),
+            json!({"status": "held", "reason_codes": ["invalid_legacy_state"]}),
+        ),
+        (
+            redacted_paths[1].clone(),
+            json!({"status": "held", "reason_codes": ["ambiguous_scope_or_collision"]}),
+        ),
+        (
+            redacted_paths[2].clone(),
+            json!({"status": "excluded", "reason": "external_backend_owned"}),
+        ),
+    ] {
+        assert_eq!(outcome(path), &expected);
+    }
+    let scopes = plan["scopes"].as_array().unwrap();
+    let malformed_scope = scopes
+        .iter()
+        .find(|scope| scope["scope_sha256"] == sha256_hex(invalid_scope.as_bytes()))
+        .unwrap();
+    assert!(malformed_scope.get("scope").is_none());
+    assert_eq!(malformed_scope["source_paths"], json!([]));
+    assert_eq!(
+        malformed_scope["source_path_sha256s"],
+        json!([sha256_hex(format!("tasks/{invalid_scope}").as_bytes())])
+    );
+    let unmapped = scopes
+        .iter()
+        .find(|scope| scope["scope"] == "unmapped")
+        .unwrap();
+    assert_eq!(unmapped["source_paths"], json!(["tasks/unmapped"]));
+    assert_eq!(
+        unmapped["source_path_sha256s"],
+        json!([sha256_hex(malformed_bot_origin.as_bytes())])
+    );
     for (path, status, area, reasons) in [
         (
             "synth-app/backlog/implement-widget",
@@ -1566,6 +1653,7 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
         "synthetic-reviewer",
         "synthetic checklist verified",
         "2026-04-01",
+        "@sample.invalid",
         file.to_str().unwrap(),
     ] {
         assert!(!output.contains(private), "report exposed fixture data");
