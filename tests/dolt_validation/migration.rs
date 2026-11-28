@@ -3943,10 +3943,21 @@ fn reviewed_type_and_title_matrix(binary: &Path, verify_staging: bool) {
         if verify_staging {
             let staged = stage(&mapping, 0);
             let data = &staged["data"];
-            assert_eq!(data["counts"]["tasks"]["imported"], 5);
+            assert_eq!(data["counts"]["tasks"]["imported"], 6);
             assert_eq!(data["checks"]["transaction"], "rolled_back");
             let id_map = data["id_map"].as_array().unwrap();
             let digest = sha256_hex(REVIEWED.as_bytes());
+            let tagged_path = sha256_hex(b"tasks/_general/backlog/tagged/README.md");
+            let tagged = id_map
+                .iter()
+                .find(|row| row["kind"] == "task" && row["source_path_sha256"] == tagged_path)
+                .expect("the verified staging collation admits the reviewed tagged Task");
+            assert_eq!(tagged["target_status"], "backlog");
+            assert_eq!(tagged["target_issue_type"], "feature");
+            assert_eq!(tagged["target_title_sha256"], digest);
+            let labels = tagged["label_ids"].as_array().unwrap();
+            assert_eq!(labels.len(), 1);
+            assert!(labels[0].as_str().is_some_and(|id| !id.is_empty()));
             for kind in ["feature", "bug"] {
                 assert!(id_map.iter().any(|row| {
                     row["target_issue_type"] == kind && row["target_title_sha256"] == digest
