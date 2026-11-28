@@ -5,7 +5,8 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use super::{
-    Installed, Path, Value, io_error, json, new_uuid_v7, sql_text, tasks::TaskImport, unverified,
+    Installed, Path, Value, io_error, json, new_uuid_v7, projects::StagedProjects, sql_text,
+    tasks::TaskImport, unverified,
 };
 use crate::config_git::migration::prepared_records::{
     ArtifactKind, DirectiveStatus, Fields, Intake, PreparedRecord,
@@ -149,9 +150,11 @@ pub(super) fn append(
     sql: &mut impl Write,
     records: &[PreparedRecord],
     tasks: Option<&TaskImport<'_>>,
+    projects: &StagedProjects,
     now: OffsetDateTime,
 ) -> Result<Expected, HiveError> {
     let mut expected = Expected::default();
+    let inserted_projects: BTreeSet<_> = projects.inserted_project_ids().collect();
     for record in in_insert_order(records)? {
         let revision = new_uuid_v7(now)?;
         let mut row = json!({"id": record.id, "title_sha256": digest(&record.content.title),
@@ -229,6 +232,15 @@ pub(super) fn append(
                     }
                 }
                 if let Some(links) = &fields.standalone_links {
+                    if links
+                        .project_ids
+                        .iter()
+                        .any(|id| !inserted_projects.contains(id.as_str()))
+                    {
+                        return Err(unverified(
+                            "A prepared standalone Artifact has no eligible Project in this transaction.",
+                        ));
+                    }
                     for (table, column, pairs, ids) in [
                         (
                             "artifact_areas",
@@ -336,7 +348,10 @@ pub(super) fn add_report(report: &mut Value, mut intake: Intake, expected: &Expe
             {
                 let provenance =
                     &mut record.get_mut("outcome").expect("prepared outcome")["provenance"];
-                if let Some(link) = provenance["issue_link"].as_object_mut() {
+                if let Some(link) = provenance
+                    .get_mut("issue_link")
+                    .and_then(Value::as_object_mut)
+                {
                     if let Some(key) = link.remove("legacy_key") {
                         let scope = key["scope"].as_str().expect("prepared Task scope");
                         let work = key["work_id"].as_str().expect("prepared Task work ID");

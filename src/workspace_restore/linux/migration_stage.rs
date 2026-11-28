@@ -9,7 +9,7 @@ use super::*;
 use crate::cli::{MigrationStageArgs, MigrationStageMode};
 use crate::config_git::migration::prepared_records::PreparedRecord;
 use crate::config_git::migration::{
-    Area, PreparedQueen, PreparedResources, ReviewedScopes, with_scope_mapping,
+    Area, PreparedProjects, PreparedQueen, PreparedResources, ReviewedScopes, with_scope_mapping,
 };
 use crate::config_v2::{require_inactive_destination, verify_descriptor};
 use crate::dolt::{INITIAL_SCHEMA, issue_writer::new_uuid_v7};
@@ -18,10 +18,12 @@ use crate::workspace_init::POLICY_REVISION;
 #[path = "migration_directive_artifact.rs"]
 mod directive_artifact;
 mod issue_resources;
+mod projects;
 mod resources;
 mod tasks;
 
 use issue_resources::IssueResources;
+use projects::{IssueIds, StagedProjects};
 use resources::StagedResources;
 use tasks::{COUNTER, TaskImport};
 
@@ -98,20 +100,29 @@ fn prepare(
         .ok_or_else(|| HiveError::new(ErrorCode::IoError, "Could not read the migration time."))?;
 
     let task_plan = args.tasks.then(|| reviewed.prepare_tasks()).transpose()?;
+    let project_plan = reviewed.prepare_projects(task_plan.as_ref())?;
     let tasks = task_plan.as_ref().map(|plan| plan.staging_tasks());
-    let intake = reviewed.directive_artifacts_for_staging(tasks.as_deref())?;
+    let intake =
+        reviewed.directive_artifacts_for_staging(tasks.as_deref(), project_plan.as_ref())?;
     let issue_resource_reviews = reviewed.prepare_issue_resources(tasks.as_deref())?;
     let task_import = tasks.map(|tasks| TaskImport::new(tasks, now)).transpose()?;
     let issue_resources =
         IssueResources::new(issue_resource_reviews.as_deref(), task_import.as_ref())?;
     let issue_count = task_import.as_ref().map_or(0, TaskImport::len);
 
+    let issue_ids = project_plan.as_ref().map(|_| {
+        task_import
+            .iter()
+            .flat_map(TaskImport::assigned_issues)
+            .collect()
+    });
     let rows = ImportRows {
         areas: &areas,
         queens,
         resources: reviewed.resources.as_ref(),
         tasks: task_import.as_ref(),
         issue_resources: &issue_resources,
+        projects: project_plan.as_ref().zip(issue_ids.as_ref()),
         records: intake
             .as_ref()
             .map_or(&[], |intake| intake.records.as_slice()),
@@ -144,6 +155,7 @@ fn prepare(
             &installed.query(&db, issue_resources::COUNT)?,
             &issue_resources::count(0),
         )?;
+        StagedProjects::verify_rollback(&installed, &db)?;
         directive_artifact::Expected::verify_empty(&installed, &db)?;
         None
     } else {
@@ -160,7 +172,7 @@ fn prepare(
                     args.tasks,
                     queens.is_empty(),
                     rows.resources.is_some(),
-                    intake.is_some(),
+                    intake.is_some() || rows.projects.is_some(),
                 ) {
                     (false, true, false, false) => "Import reviewed Hive v1 scopes",
                     (true, true, false, false) => "Import reviewed Hive v1 scopes and Tasks",
@@ -197,6 +209,9 @@ fn prepare(
             .verify_committed(&installed, &db, &confirmed)?;
         for (sql, rows) in issue_resources.checks(Some(&confirmed)) {
             verify_rows(&installed.query(&db, &sql)?, rows)?;
+        }
+        for (sql, rows) in expected.projects.checks(Some(&confirmed)) {
+            verify_rows(&installed.query(&db, &sql)?, &rows)?;
         }
         expected
             .records
@@ -320,6 +335,11 @@ fn prepare(
         .resources
         .add_report(&mut report, reviewed.resources.as_ref(), dry_run);
     issue_resources.add_report(&mut report, dry_run);
+    if let Some((projects, ids)) = rows.projects {
+        expected
+            .projects
+            .add_report(&mut report, projects, ids, dry_run);
+    }
     let include_reviewed_records = intake.is_some();
     if let Some(intake) = intake {
         directive_artifact::add_report(&mut report, intake, &expected.records);
@@ -339,6 +359,7 @@ fn prepare(
     for (selected, label) in [
         (args.tasks, "tasks"),
         (reviewed.resources.is_some(), "resources"),
+        (project_plan.is_some(), "projects"),
         (report.get("queen_preparation").is_some(), "queen_souls"),
         (include_reviewed_records, "directives_artifacts"),
     ] {
@@ -468,6 +489,7 @@ struct ImportRows<'a> {
     resources: Option<&'a PreparedResources<'a>>,
     tasks: Option<&'a TaskImport<'a>>,
     issue_resources: &'a IssueResources<'a>,
+    projects: Option<(&'a PreparedProjects<'a>, &'a IssueIds<'a>)>,
     records: &'a [PreparedRecord],
 }
 
@@ -476,6 +498,7 @@ struct Expected {
     bots: Vec<Value>,
     counts: [Value; 1],
     resources: StagedResources,
+    projects: StagedProjects,
     records: directive_artifact::Expected,
 }
 
@@ -541,7 +564,12 @@ fn apply_rows(
         writeln!(input, "{sql};").map_err(io_error)?;
         checks.push(expected.to_vec());
     }
-    let records = directive_artifact::append(&mut input, rows.records, rows.tasks, now)?;
+    let projects = StagedProjects::append(&mut input, rows.projects, now)?;
+    for (sql, expected) in projects.transaction_checks() {
+        writeln!(input, "{sql};").map_err(io_error)?;
+        checks.push(expected);
+    }
+    let records = directive_artifact::append(&mut input, rows.records, rows.tasks, &projects, now)?;
     for (sql, expected) in records.transaction_checks() {
         writeln!(input, "{sql};").map_err(io_error)?;
         checks.push(expected);
@@ -576,6 +604,7 @@ fn apply_rows(
         bots: bots.into_values().collect(),
         counts: expected_counts,
         resources,
+        projects,
         records,
     })
 }

@@ -235,6 +235,40 @@ The section requires a `bindings` array of objects. Each entry requires a `resou
 
 The report lists Resource outcomes in manifest order. A prepared outcome contains the Resource ID, Area ID and SHA-256 of the exact URI bytes. A held outcome contains the Resource ID and a reason code. Prepared rows remain internal, including the Resource name, kind, and URI. Preparing an Area link creates no Project membership, Issue link, or standalone Artifact link provenance.
 
+##### Optional Projects and Issue memberships
+
+Add the top-level `project_membership` object to a version 1 scope mapping to select reviewed Projects and their explicit Issue memberships. The same mapping header binds these decisions to the verified Git commit, v1 policy pin, and target workspace ID.
+
+```json
+{
+  "project_membership": {
+    "projects": [
+      {
+        "id": "00000000-0000-7000-8000-000000000004",
+        "name": "Example Delivery",
+        "status": "active"
+      }
+    ],
+    "memberships": [
+      {
+        "project_id": "00000000-0000-7000-8000-000000000004",
+        "legacy_key": {"scope": "example-app", "work_id": "verify-release"},
+        "source_git_blob_sha": "2222222222222222222222222222222222222222",
+        "decision": "link"
+      }
+    ]
+  }
+}
+```
+
+Each Project has a distinct lowercase UUIDv7, a reviewed name of 1–255 characters with no control characters or surrounding whitespace, and an explicit `active`, `completed`, or `archived` status. An optional description must be nonblank, fit the 65,535-byte SQL `TEXT` limit, and use only tab and line endings as control characters. Both arrays take named objects. A null section, positional arrays in place of objects, duplicate JSON members, unknown fields, malformed identifiers, and unsupported decisions fail as invalid mapping input. Omit the section to leave Projects outside the plan or stage. Use an empty `memberships` array to review Projects independently.
+
+Use the Task intake's exact qualified key and committed README blob ID for each membership. Select `link` to import it when both endpoints are prepared, `unresolved` to hold an undecided relationship, or `exclude` to hold an explicitly excluded relationship. Tasks can join more than one Project through separately reviewed rows. A Project can span Areas through its member Issues. Directory names and Area or Resource mappings supply no membership decisions.
+
+Pass `--tasks` to evaluate membership endpoints. Without it, Projects can prepare and membership endpoints remain unresolved. Held or absent Projects and Tasks, missing README evidence, and undecided links hold as `unresolved_project_membership`. An explicitly excluded link or an externally owned Task holds as `excluded_project_membership` once its source binding is verified. A stale blob holds as `project_membership_binding_mismatch`. Duplicate Task records hold a membership as `ambiguous_project_member_task`. Repeated Project IDs or repeated membership pairs hold every row in that group. The reason distinguishes duplicate declarations from conflicting definitions, blob IDs, or decisions.
+
+The Project section reports counts and outcomes in manifest order. It uses Project IDs, digests of names and descriptions, and the same qualified-key digest as staged Tasks. A prepared membership only receives its Issue ID in staging from the existing qualified Task assignment. The decision does not change Task eligibility, numbering, status, or Area. A Task held by Task preparation receives no Issue ID or number.
+
 #### Read-only Task intake and preparation
 
 Add `--tasks` to the scope plan command to classify Task bundles in the same verified snapshot using the same scope decisions and mapping file. The result adds `task_intake` with `coverage: partial`, counts of inventoried, prepared, held, and excluded bundles, and outcomes sorted by `(scope, work_id, source_path)`. Prepared, held, and excluded counts sum to the inventoried count. It inventories immediate bundle directories in the three v1 lifecycle directories. Scope navigation and supporting files stay in the verified source inventory. An absent regular `README.md` yields the bundle path, null blob digests, and a `missing_task_entrypoint` hold when the bundle otherwise qualifies for inspection.
@@ -351,6 +385,14 @@ A qualifying row reports `outcome.status: prepared`, the selected target ID and 
 
 The preparation report is partial and read-only. Unreviewed candidates and Artifact bundles remain subject to the intake hold rules. Target identity and constraints still require a later inactive-target staging check.
 
+#### Preparing standalone Artifact joins
+
+Keep `links` set to `none` for a standalone Artifact with zero joins. To retain a reviewed multi-scope set, supply a named object instead. The object accepts optional `area_ids`, `project_ids`, `resource_ids`, and `issues` arrays. Each Issue entry identifies one qualified Task by `legacy_key` (`scope` and `work_id`), `area_id`, exact committed `source_path` for its `README.md`, and `source_git_blob_sha`.
+
+The planner verifies the entire set under the same source commit, policy pin, and target workspace. Area IDs must match prepared scopes, Resources must be selected by prepared `resource_bindings`, and Project IDs must match prepared `project_membership` Projects. Issues must match eligible Tasks by their qualified key, path, Git blob, and mapped Area. An empty explicit object or any missing, held, stale, repeated, or ambiguous endpoint holds the entire Artifact as `unresolved_artifact_links`. A requested join cannot be omitted during staging. Related Area, Project, Resource, and Issue relationships do not supply additional Artifact joins.
+
+Use `--tasks` to make the required Issues eligible during staging. The private transaction inserts the exact reviewed join set after all endpoints exist. Issue links resolve to IDs assigned in that transaction. The report records IDs and digests, including the final Issue ID set in staging. The committed validator checks all endpoints. Runtime body disclosure continues to require coverage of all joined scopes.
+
 #### Preparing work-scoped Artifacts
 
 Use `provenance.kind` of `work_scoped_artifact` for a reviewed Markdown file directly under `tasks/<scope>/<lifecycle>/<work-id>/artifacts/`. Bind the review to the Artifact path and Git blob, and supply its explicit v1 kind, reviewed author and source references, and historical archival decision as for a standalone Artifact.
@@ -431,8 +473,9 @@ Select additional surfaces in the same reviewed mapping against that source comm
 
 - Pass `--tasks` to stage prepared Task rows. Issue numbers follow lexicographic `(scope, work_id)` order even when parent placement requires a different insertion order. The transaction inserts Issues in parent order, then their prerequisites, and advances the Issue counter. It preserves reviewed timestamps at UTC microsecond precision, and stores titles, body, criteria, closure actor and resolution from their reviewed source bytes. The transaction accepts up to 64 MiB of Task body bytes including repeated blobs.
 - Supply `resource_bindings` to stage prepared Resources and their explicit Area links. With `--tasks`, supply `issue_resource_bindings` to stage the separately reviewed Issue links after both endpoints.
+- Supply `project_membership` to stage prepared Projects. Add `--tasks` for reviewed membership links. The transaction inserts the links after their Issue and Project rows and verifies both tables against the committed staged snapshot or verifies emptiness after dry-run rollback.
 - Supply `queen_assets` and `queen_preparation` to stage prepared Queen Souls and Bot registry rows. The CLI commits the exact reviewed Soul bytes to the paired asset repository and verifies the commit before inserting any Bots. Historical Memory stays held and `bot_memories` remains empty.
-- Supply `reviewed_records` to stage prepared Directives in supersession order and prepared standalone Artifacts. The review preserves historical fields and committed title and body bytes. `--include-directives-artifacts` selects this intake in the read-only plan. Use `--tasks` to stage reviewed work-scoped Artifacts whose owning Tasks are eligible in the same transaction. The importer resolves the Issue join through that transaction's assigned Task IDs and writes an Area join only for an explicit `area_link`. It verifies exact committed Issue and Area joins and checks their absence after rollback. Standalone Artifacts retain zero joins.
+- Supply `reviewed_records` to stage prepared Directives in supersession order and prepared standalone Artifacts. The review preserves historical fields and committed title and body bytes. `--include-directives-artifacts` selects this intake in the read-only plan. Use `--tasks` to stage reviewed work-scoped Artifacts whose owning Tasks are eligible in the same transaction. The importer resolves the Issue join through that transaction's assigned Task IDs and writes an Area join only for an explicit `area_link`. It verifies the exact committed Artifact join tables and checks their absence after rollback. Standalone Artifacts retain either their explicit reviewed set or zero joins.
 
 Both modes insert the selected rows inside one guarded Dolt transaction on a private disposable copy. Dry-run checks the exercised rows and rolls back, then verifies the original clean Dolt baseline and empty import tables. Staged import creates one Dolt commit extending that baseline, compares the staged surfaces to their committed rows and validates the committed schema and records using the paired asset commit. The CLI verifies the exact clean source again after preparation. Staged import syncs and publishes the verified payload atomically to the inactive target. Neither mode registers or starts a workspace or changes either contract's XDG configuration.
 

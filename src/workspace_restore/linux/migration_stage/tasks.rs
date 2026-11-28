@@ -165,6 +165,12 @@ impl<'a> TaskImport<'a> {
             .then_some(task.id.as_str())
     }
 
+    pub(super) fn assigned_issues(&self) -> impl Iterator<Item = ((&str, &str), &str)> {
+        self.tasks
+            .iter()
+            .map(|assigned| (assigned.task.key, assigned.id.as_str()))
+    }
+
     pub(super) fn dependency_count(&self) -> usize {
         self.dependencies.len()
     }

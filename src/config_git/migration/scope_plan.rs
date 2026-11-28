@@ -12,6 +12,7 @@ use url::{Host, Url};
 use super::issue_resources::{self, IssueResourceOutcome};
 use super::json_object::{self, Object};
 use super::prepared_records::Intake;
+use super::projects::{self, PreparedProjects};
 use super::queen_assets::{self, QueenAssets, SoulReview};
 use super::queen_preparation::{Preparation, PreparedQueen, QueenMapping};
 use super::reviewed_records::{Review, timestamp};
@@ -46,6 +47,8 @@ struct Mapping {
     queen_preparation: Option<Vec<QueenMapping>>,
     #[serde(default, deserialize_with = "resources::deserialize_section")]
     resource_bindings: Option<resources::Bindings>,
+    #[serde(default, deserialize_with = "projects::deserialize_section")]
+    project_membership: Option<projects::Mapping>,
     #[serde(default, deserialize_with = "issue_resources::optional_list")]
     issue_resource_bindings: Option<Vec<issue_resources::Binding>>,
     #[serde(
@@ -175,10 +178,18 @@ pub(crate) fn plan(
             || (include_directives_artifacts && reviewed.artifact_reviews_need_tasks()))
         .then(|| reviewed.prepare_tasks())
         .transpose()?;
+        let projects = reviewed.prepare_projects(if include_tasks {
+            task_plan.as_ref()
+        } else {
+            None
+        })?;
         let tasks = task_plan.as_ref().map(task_intake::TaskPlan::staging_tasks);
+        if let Some(projects) = &projects {
+            report["project_membership"] = projects.report(None);
+        }
         if include_directives_artifacts {
             report["directive_artifact_intake"] = reviewed
-                .scan_directive_artifacts(false, tasks.as_deref())?
+                .scan_directive_artifacts(false, tasks.as_deref(), projects.as_ref())?
                 .report;
             if let Some(observed_at) = reviewed.directive_observation() {
                 report["directive_observed_at"] = json!(observed_at);
@@ -248,6 +259,17 @@ impl ReviewedScopes<'_> {
         task_intake::prepare(records, &outcomes, &self.mapping.task_reviews, &git)
     }
 
+    pub(crate) fn prepare_projects(
+        &self,
+        tasks: Option<&task_intake::TaskPlan<'_>>,
+    ) -> Result<Option<PreparedProjects<'_>>, HiveError> {
+        self.mapping
+            .project_membership
+            .as_ref()
+            .map(|mapping| mapping.prepare(tasks))
+            .transpose()
+    }
+
     pub(crate) fn prepare_issue_resources(
         &self,
         tasks: Option<&[task_intake::StagingTask<'_>]>,
@@ -271,11 +293,12 @@ impl ReviewedScopes<'_> {
     pub(crate) fn directive_artifacts_for_staging(
         &self,
         tasks: Option<&[StagingTask<'_>]>,
+        projects: Option<&PreparedProjects<'_>>,
     ) -> Result<Option<Intake>, HiveError> {
         self.mapping
             .reviewed_records
             .as_ref()
-            .map(|_| self.scan_directive_artifacts(true, tasks))
+            .map(|_| self.scan_directive_artifacts(true, tasks, projects))
             .transpose()
     }
 
@@ -287,6 +310,7 @@ impl ReviewedScopes<'_> {
         &self,
         prepare_storage: bool,
         tasks: Option<&[StagingTask<'_>]>,
+        projects: Option<&PreparedProjects<'_>>,
     ) -> Result<Intake, HiveError> {
         let scopes = self
             .scopes
@@ -304,7 +328,7 @@ impl ReviewedScopes<'_> {
                 &self.mapping.workspace_id,
                 tasks,
                 self.scopes.iter().map(|scope| &scope.outcome),
-                std::iter::empty(),
+                projects.into_iter().flat_map(PreparedProjects::project_ids),
                 self.resources.as_ref(),
             ),
         )
