@@ -24,6 +24,10 @@ mod directive_artifact_staging;
 mod mixed_staging;
 
 #[cfg(target_os = "linux")]
+#[path = "migration/project_staging.rs"]
+mod project_staging;
+
+#[cfg(target_os = "linux")]
 #[path = "migration/queen_staging.rs"]
 mod queen_staging;
 

@@ -241,7 +241,54 @@ pub(super) fn prepare<'a>(
     })
 }
 
+pub(super) enum TaskSource<'a> {
+    Duplicate,
+    Unique {
+        oid: Option<&'a str>,
+        state: TaskState,
+    },
+}
+
+pub(super) enum TaskState {
+    Prepared,
+    Held,
+    Excluded,
+}
+
+pub(super) fn task_key_digest((scope, work_id): Key<'_>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(scope);
+    digest.update(b"\0");
+    digest.update(work_id);
+    format!("{:x}", digest.finalize())
+}
+
 impl TaskPlan<'_> {
+    pub(super) fn member_source(&self, key: Key<'_>) -> Option<TaskSource<'_>> {
+        // Intake sorts by qualified key, with all lifecycle copies contiguous.
+        let index = self.records.partition_point(|record| record.key() < key);
+        let record = self
+            .records
+            .get(index)
+            .filter(|record| record.key() == key)?;
+        if self
+            .records
+            .get(index + 1)
+            .is_some_and(|record| record.key() == key)
+        {
+            return Some(TaskSource::Duplicate);
+        }
+        let state = match self.outcomes[index] {
+            Outcome::Prepared { .. } => TaskState::Prepared,
+            Outcome::Held { .. } => TaskState::Held,
+            Outcome::Excluded { .. } => TaskState::Excluded,
+        };
+        Some(TaskSource::Unique {
+            oid: record.blob_oid.as_deref(),
+            state,
+        })
+    }
+
     pub(crate) fn staging_tasks(&self) -> Vec<StagingTask<'_>> {
         self.records
             .iter()
@@ -351,12 +398,8 @@ impl TaskPlan<'_> {
 
 impl Record {
     fn staging_locator(&self) -> Value {
-        let mut key = Sha256::new();
-        key.update(&self.scope);
-        key.update(b"\0");
-        key.update(&self.work_id);
         json!({
-            "legacy_key_sha256": format!("{:x}", key.finalize()),
+            "legacy_key_sha256": task_key_digest(self.key()),
             "source_path_sha256": format!("{:x}", Sha256::digest(&self.path)),
             "source_git_blob_sha": self.blob_oid, "source_raw_sha256": self.raw_sha256,
             "lifecycle": self.lifecycle,
