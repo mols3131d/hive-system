@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::scope_plan::{ScopeOutcome, is_portable_scope};
-use super::task_provenance::{Prepared, Reviews, SourceBody, TaskReview};
+use super::task_graph::{Node, held_nodes};
+use super::task_provenance::{Key, Prepared, Reviews, SourceBody, TaskReview};
 use super::{Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
 use crate::config_file::{parse_v2, parse_v2_projection, present};
@@ -21,13 +22,26 @@ enum Lifecycle {
     Archive,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum CandidateStatus {
+pub(super) enum CandidateStatus {
     Backlog,
     Todo,
     Done,
     Cancelled,
+}
+
+impl CandidateStatus {
+    pub(super) fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Cancelled)
+    }
+
+    pub(super) fn relation_hold(self) -> Reason {
+        match self {
+            Self::Done => Reason::UnresolvedCompletionObligation,
+            _ => Reason::UnresolvedTaskRelations,
+        }
+    }
 }
 
 pub(super) struct Record {
@@ -121,7 +135,7 @@ enum Outcome<'a> {
     Prepared {
         area_id: &'a str,
         candidate_status: CandidateStatus,
-        provenance: Prepared<'a>,
+        provenance: Box<Prepared>,
     },
     Held {
         reason_codes: Vec<Reason>,
@@ -135,68 +149,107 @@ enum Outcome<'a> {
     },
 }
 
-pub(super) fn report(
+pub(super) struct TaskPlan<'a> {
     records: Vec<Record>,
-    scopes: &BTreeMap<&str, &ScopeOutcome<'_>>,
+    outcomes: Vec<Outcome<'a>>,
+}
+
+pub(super) fn prepare<'a>(
+    records: Vec<Record>,
+    scopes: &BTreeMap<&str, &ScopeOutcome<'a>>,
     task_reviews: &[TaskReview],
     git: &impl Fn() -> Result<Command, HiveError>,
-) -> Result<Value, HiveError> {
+) -> Result<TaskPlan<'a>, HiveError> {
     let mut counts = HashMap::new();
     for record in &records {
-        *counts
-            .entry((record.scope.as_str(), record.work_id.as_str()))
-            .or_insert(0) += 1;
+        *counts.entry(record.key()).or_insert(0) += 1;
     }
     let reviews = Reviews::new(task_reviews, &counts)?;
     let mut source_bodies = HashMap::new();
-    let mut excluded = 0;
-    let mut prepared = 0;
-    let mut tasks = Vec::with_capacity(records.len());
+    let mut outcomes = Vec::with_capacity(records.len());
+    let mut nodes = Vec::with_capacity(records.len());
     for record in &records {
         let scope = scopes[record.scope.as_str()];
-        let outcome = match scope {
-            ScopeOutcome::Excluded { reason } => Outcome::Excluded { reason: *reason },
-            _ => {
-                let duplicate = counts[&(record.scope.as_str(), record.work_id.as_str())] > 1;
-                let reason_codes = record.hold_reasons(scope, duplicate);
-                match (scope, record.classification.candidate) {
-                    (ScopeOutcome::Mapped { area }, Ok(status)) if reason_codes.is_empty() => {
-                        record.candidate_outcome(
-                            status,
-                            &area.id,
-                            &reviews,
-                            &mut source_bodies,
-                            git,
-                        )?
-                    }
-                    _ => Outcome::Held {
-                        reason_codes,
-                        candidate_status: None,
-                        area_id: None,
-                    },
-                }
-            }
+        let outcome = record.assess(
+            scope,
+            counts[&record.key()] == 1,
+            &reviews,
+            &mut source_bodies,
+            git,
+        )?;
+        let status = match outcome {
+            Outcome::Prepared {
+                candidate_status, ..
+            } => Some(candidate_status),
+            _ => None,
         };
-        match outcome {
-            Outcome::Prepared { .. } => prepared += 1,
-            Outcome::Excluded { .. } => excluded += 1,
-            Outcome::Held { .. } => {}
-        }
-        tasks.push(record.report(outcome));
+        // A verified declaration can veto preparation of another Task even
+        // when this Task has no usable Area, metadata, or provenance.
+        let source_reviews = match (scope, record.blob_oid.as_deref()) {
+            (ScopeOutcome::Excluded { .. }, _) | (_, None) => &[],
+            (_, Some(oid)) => reviews.source_bound(record.key(), oid),
+        };
+        nodes.push(Node {
+            key: record.key(),
+            source_reviews,
+            status,
+        });
+        outcomes.push(outcome);
     }
-    Ok(json!({
-        "coverage": "partial",
-        "counts": {
-            "inventoried": tasks.len(),
-            "held": tasks.len() - excluded - prepared,
-            "excluded": excluded,
-            "prepared": prepared,
-        },
-        "tasks": tasks,
-    }))
+
+    for (outcome, held) in outcomes.iter_mut().zip(held_nodes(&nodes)) {
+        if held
+            && let Outcome::Prepared {
+                area_id,
+                candidate_status,
+                ..
+            } = *outcome
+        {
+            *outcome = Outcome::Held {
+                reason_codes: vec![candidate_status.relation_hold()],
+                candidate_status: Some(candidate_status),
+                area_id: Some(area_id),
+            };
+        }
+    }
+    Ok(TaskPlan { records, outcomes })
+}
+
+impl TaskPlan<'_> {
+    pub(super) fn report(self) -> Value {
+        let mut excluded = 0;
+        let mut prepared = 0;
+        let tasks: Vec<_> = self
+            .records
+            .iter()
+            .zip(self.outcomes)
+            .map(|(record, outcome)| {
+                match outcome {
+                    Outcome::Prepared { .. } => prepared += 1,
+                    Outcome::Excluded { .. } => excluded += 1,
+                    Outcome::Held { .. } => {}
+                }
+                record.report(outcome)
+            })
+            .collect();
+        json!({
+            "coverage": "partial",
+            "counts": {
+                "inventoried": tasks.len(),
+                "held": tasks.len() - excluded - prepared,
+                "excluded": excluded,
+                "prepared": prepared,
+            },
+            "tasks": tasks,
+        })
+    }
 }
 
 impl Record {
+    fn key(&self) -> Key<'_> {
+        (&self.scope, &self.work_id)
+    }
+
     fn hold_reasons(&self, scope: &ScopeOutcome<'_>, duplicate: bool) -> Vec<Reason> {
         let mut reasons = Vec::new();
         if duplicate {
@@ -221,12 +274,44 @@ impl Record {
         reasons
     }
 
+    fn assess<'a, 'record>(
+        &'record self,
+        scope: &ScopeOutcome<'a>,
+        unique: bool,
+        reviews: &Reviews<'_>,
+        source_bodies: &mut HashMap<&'record str, SourceBody>,
+        git: &impl Fn() -> Result<Command, HiveError>,
+    ) -> Result<Outcome<'a>, HiveError> {
+        if let ScopeOutcome::Excluded { reason } = scope {
+            return Ok(Outcome::Excluded { reason: *reason });
+        }
+        let reason_codes = self.hold_reasons(scope, !unique);
+        let hold = |reason_codes| Outcome::Held {
+            reason_codes,
+            candidate_status: None,
+            area_id: None,
+        };
+        let area = match scope {
+            ScopeOutcome::Mapped { area } if unique && is_slug(&self.work_id) => area,
+            _ => return Ok(hold(reason_codes)),
+        };
+        let binding = self.blob_oid.as_deref().map_or(Ok(None), |oid| {
+            reviews.for_preparation(self.key(), oid, &area.id)
+        });
+        match self.classification.candidate {
+            Ok(status) if reason_codes.is_empty() => {
+                self.candidate_outcome(status, &area.id, binding, source_bodies, git)
+            }
+            _ => Ok(hold(reason_codes)),
+        }
+    }
+
     fn candidate_outcome<'a, 'record>(
         &'record self,
         status: CandidateStatus,
         area_id: &'a str,
-        reviews: &Reviews<'_>,
-        source_bodies: &'a mut HashMap<&'record str, SourceBody>,
+        review: Result<Option<&TaskReview>, Reason>,
+        source_bodies: &mut HashMap<&'record str, SourceBody>,
         git: &impl Fn() -> Result<Command, HiveError>,
     ) -> Result<Outcome<'a>, HiveError> {
         let held = |reason_codes| Outcome::Held {
@@ -234,40 +319,37 @@ impl Record {
             candidate_status: Some(status),
             area_id: Some(area_id),
         };
-        let todo = matches!(status, CandidateStatus::Todo);
-        if matches!(status, CandidateStatus::Backlog | CandidateStatus::Todo) {
-            let oid = self.blob_oid.as_deref().expect("classified Task blob");
-            match reviews.get(&self.scope, &self.work_id, oid, area_id) {
-                Ok(Some(review)) => {
-                    let body = match source_bodies.entry(oid) {
-                        Entry::Occupied(entry) => entry.into_mut(),
-                        Entry::Vacant(entry) => {
-                            let bytes = snapshot_object(git, "blob", oid, self.blob_size)?;
-                            entry.insert(SourceBody::from_verified_blob(bytes)?)
-                        }
-                    };
-                    return Ok(match review.prepare(body, todo) {
-                        Ok(provenance) => Outcome::Prepared {
-                            area_id,
-                            candidate_status: status,
-                            provenance,
-                        },
-                        Err(reasons) => held(reasons),
-                    });
-                }
-                Ok(None) => {}
-                Err(reason) => return Ok(held(vec![reason])),
+        match review {
+            Ok(Some(review)) => {
+                let oid = self.blob_oid.as_deref().expect("classified Task blob");
+                let body = match source_bodies.entry(oid) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let bytes = snapshot_object(git, "blob", oid, self.blob_size)?;
+                        entry.insert(SourceBody::from_verified_blob(bytes)?)
+                    }
+                };
+                Ok(match review.prepare(body, status) {
+                    Ok(provenance) => Outcome::Prepared {
+                        area_id,
+                        candidate_status: status,
+                        provenance: Box::new(provenance),
+                    },
+                    Err(reasons) => held(reasons),
+                })
             }
+            Ok(None) => {
+                let mut reasons = vec![
+                    Reason::IncompleteHistoricalProvenance,
+                    status.relation_hold(),
+                ];
+                if status == CandidateStatus::Todo {
+                    reasons.push(Reason::UnverifiedAcceptanceCriteria);
+                }
+                Ok(held(reasons))
+            }
+            Err(reason) => Ok(held(vec![reason])),
         }
-        let mut reasons = vec![Reason::IncompleteHistoricalProvenance];
-        reasons.push(match status {
-            CandidateStatus::Done => Reason::UnresolvedCompletionObligation,
-            _ => Reason::UnresolvedTaskRelations,
-        });
-        if todo {
-            reasons.push(Reason::UnverifiedAcceptanceCriteria);
-        }
-        Ok(held(reasons))
     }
 
     fn report(&self, outcome: Outcome<'_>) -> Value {

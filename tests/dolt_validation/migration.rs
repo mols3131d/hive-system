@@ -16,6 +16,7 @@ use super::{ADMIN, Fixture, id, storage_state};
 mod directive_artifact;
 
 const POLICY_PIN: &str = "0e584830a7eff314d85b7af8c6f8cd69e735730a";
+const EARLIER_POLICY_PIN: &str = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
 const FORM_FEED_CRITERIA: &str = "A\x0cB";
 const REVISION: u32 = 4;
 const AREA_GENERAL: u32 = 0x101;
@@ -2222,7 +2223,7 @@ fn cli_migration_plan_redacts_malformed_scope_and_bot_directories() {
     assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
     assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
 
-    let older_pin = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
+    let older_pin = EARLIER_POLICY_PIN;
     fs::write(
         source.join("AGENTS.md"),
         format!("hive-system@{older_pin}\n"),
@@ -3790,6 +3791,679 @@ fn cli_migration_plan_prepares_only_exact_reviews_of_independent_tasks() {
     mapping["task_reviews"][0]["legacy_key"]["work_id"] = json!("nonexistent");
     fs::write(&mapping_file, serde_json::to_vec(&mapping).unwrap()).unwrap();
     assert_eq!(plan(&args, 2)["error"]["code"], "INVALID_CONFIG");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
+    for policy_pin in [POLICY_PIN, EARLIER_POLICY_PIN] {
+        check_terminal_provenance_and_graph(policy_pin);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_terminal_provenance_and_graph(policy_pin: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = temp.path().join("config");
+    let source = temp.path().join("source");
+    init_git(
+        &source,
+        &home,
+        "Synthetic operator",
+        "operator@sample.invalid",
+    );
+    fs::write(
+        source.join("AGENTS.md"),
+        format!("hive-system@{policy_pin}\n"),
+    )
+    .unwrap();
+    if policy_pin == POLICY_PIN {
+        fs::write(
+            source.join("hive.yml"),
+            "version: 1\ncoordination:\n  mode: local\n",
+        )
+        .unwrap();
+    }
+
+    let actor = "synthetic:release-reviewer";
+    let outcome = "Approved synthetic verification and archived the release checklist.";
+    let acceptance = "Cancellation of `_hive-userdata/widget` was accepted as a scope change.";
+    let second_acceptance =
+        "Cancellation of `_general/widget-extra` was accepted as a scope change.";
+    let wrong_scope = "Cancellation of `example-scope/widget` was accepted as a scope change.";
+    let created = "2026-04-01T10:00:00Z";
+    let updated = "2026-04-03T11:00:00+01:00";
+    let closed = "2026-04-02T10:00:00Z";
+    let body = format!(
+        "# Synthetic release check\n\nCreated: {created}\nClosed: {closed}\n\
+         Updated: {updated}\nClosed by: {actor}\nOutcome: {outcome}\n"
+    );
+    let parent_body = format!(
+        "{body}\n## Historical scope review\n\n{acceptance}\r\n\r\n{second_acceptance}\n\n{wrong_scope}\n\n```text\n{acceptance}\n```\n"
+    );
+    let cancelled_body =
+        format!("{body}\nCancellation: workspace widget superseded by the plan.\n");
+    let todo_criteria = "- [ ] Verify the replacement workspace widget.";
+    let todo_body = format!("{body}\n## Acceptance\n\n{todo_criteria}\n");
+    let claim = "claim: {id: synthetic-assignment, holder: synthetic-holder}\n";
+    let fixtures = [
+        (
+            "_general/active/widget",
+            "done",
+            "priority: low\n",
+            parent_body.as_str(),
+        ),
+        (
+            "_hive-userdata/archive/widget",
+            "cancelled",
+            "",
+            cancelled_body.as_str(),
+        ),
+        (
+            "_general/archive/widget-extra",
+            "cancelled",
+            "",
+            cancelled_body.as_str(),
+        ),
+        (
+            "_general/archive/prepare-release",
+            "done",
+            "",
+            parent_body.as_str(),
+        ),
+        ("_general/archive/verify-release", "done", "", body.as_str()),
+        ("_general/archive/follow-up", "done", "", body.as_str()),
+        (
+            "_general/archive/missing-scope-acceptance",
+            "done",
+            "",
+            parent_body.as_str(),
+        ),
+        (
+            "_general/archive/child-without-approval",
+            "cancelled",
+            "",
+            cancelled_body.as_str(),
+        ),
+        ("_general/archive/held-closure", "done", "", body.as_str()),
+        (
+            "_general/archive/uses-held-prerequisite",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/transitively-held",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/missing-prerequisite",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/uses-cancelled-prerequisite",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/independent-cancellation",
+            "cancelled",
+            "",
+            cancelled_body.as_str(),
+        ),
+        (
+            "_general/archive/unfinished-parent",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/active/unfinished-child",
+            "todo",
+            "",
+            todo_body.as_str(),
+        ),
+        (
+            "_general/archive/incomplete-parent-list",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_hive-userdata/archive/unlisted-child",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/uses-incomplete-parent",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/metadata-parent",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/metadata-child",
+            "done",
+            "unknown: true\n",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/duplicate-parent",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/duplicate-child",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/active/duplicate-child",
+            "done",
+            "",
+            todo_body.as_str(),
+        ),
+        ("_general/archive/cycle-parent", "done", "", body.as_str()),
+        ("_general/archive/cycle-child", "done", "", body.as_str()),
+        (
+            "_general/archive/depends-on-cycle",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        ("_general/active/claimed-done", "done", claim, body.as_str()),
+        (
+            "_general/archive/claimed-cancelled",
+            "cancelled",
+            claim,
+            cancelled_body.as_str(),
+        ),
+        (
+            "_general/active/pending-review",
+            "review",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/active/claimed-todo",
+            "todo",
+            claim,
+            todo_body.as_str(),
+        ),
+        (
+            "_general/archive/uses-claimed-prerequisite",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/bad-closure-order",
+            "done",
+            "",
+            body.as_str(),
+        ),
+    ];
+    for (bundle, state, fields, body) in fixtures {
+        let file = source.join(format!("tasks/{bundle}/README.md"));
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            file,
+            format!(
+                "---\ndescription: Synthetic release task\nstatus: {state}\n{fields}---\n{body}"
+            ),
+        )
+        .unwrap();
+    }
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic terminal and graph evidence"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let workspace = id(1);
+    let general = id(AREA_GENERAL);
+    let userdata = id(AREA_USERDATA);
+    let key = |scope: &str, name: &str| json!({"scope": scope, "work_id": name});
+    let local = |name: &str| key("_general", name);
+    let range = |body: &str, evidence: &str| {
+        let start = body.find(evidence).unwrap();
+        json!({"start": start, "end": start + evidence.len()})
+    };
+    let child = |key: Value| json!({"legacy_key": key});
+    let reviews: Vec<_> = fixtures.iter()
+        .filter(|(bundle, ..)| *bundle != "_general/active/duplicate-child")
+        .map(|(bundle, state, _, body)| {
+        let (scope, rest) = bundle.split_once('/').unwrap();
+        let (_, name) = rest.split_once('/').unwrap();
+        let area = if scope == "_general" { &general } else { &userdata };
+        let mut relations = json!({"parent": null, "prerequisites": [], "children": []});
+        match (scope, name) {
+            ("_general", "widget") => {
+                relations["prerequisites"] = json!([local("verify-release"), local("prepare-release")]);
+                relations["children"] = json!([
+                    {"legacy_key": key("_hive-userdata", "widget"), "scope_acceptance": range(body, acceptance)},
+                    {"legacy_key": local("widget-extra"), "scope_acceptance": range(body, second_acceptance)},
+                ]);
+            }
+            ("_hive-userdata", "widget") | (_, "widget-extra") => relations["parent"] = local("widget"),
+            (_, "follow-up") => relations["prerequisites"] = json!([local("widget")]),
+            (_, "missing-scope-acceptance") => {
+                relations["children"] = json!([child(local("child-without-approval"))]);
+            }
+            (_, "child-without-approval") => relations["parent"] = local("missing-scope-acceptance"),
+            (_, "uses-held-prerequisite") => relations["prerequisites"] = json!([local("held-closure")]),
+            (_, "transitively-held") => relations["prerequisites"] = json!([local("uses-held-prerequisite")]),
+            (_, "missing-prerequisite") => relations["prerequisites"] = json!([local("unrecorded")]),
+            (_, "uses-cancelled-prerequisite") => {
+                relations["prerequisites"] = json!([local("independent-cancellation")]);
+            }
+            (_, "unfinished-parent") => relations["children"] = json!([child(local("unfinished-child"))]),
+            (_, "unfinished-child") => relations["parent"] = local("unfinished-parent"),
+            (_, "unlisted-child") => relations["parent"] = local("incomplete-parent-list"),
+            (_, "uses-incomplete-parent") => {
+                relations["prerequisites"] = json!([local("incomplete-parent-list")]);
+            }
+            (_, "metadata-child") => relations["parent"] = local("metadata-parent"),
+            (_, "duplicate-child") if rest.starts_with("archive/") => {
+                relations["parent"] = local("duplicate-parent");
+            }
+            (_, "cycle-parent") => relations["children"] = json!([child(local("cycle-child"))]),
+            (_, "cycle-child") => {
+                relations["parent"] = local("cycle-parent");
+                relations["prerequisites"] = json!([local("cycle-parent")]);
+            }
+            (_, "depends-on-cycle") => relations["prerequisites"] = json!([local("cycle-parent")]),
+            (_, "uses-claimed-prerequisite") => relations["prerequisites"] = json!([local("claimed-done")]),
+            _ => {}
+        }
+        let mut review = json!({
+            "legacy_key": key(scope, name),
+            "source_git_blob_sha": git_text(&source, &home, &["rev-parse", &format!("HEAD:tasks/{bundle}/README.md")]),
+            "area_id": area,
+            "relations": relations,
+            "created_at": range(body, created),
+            "updated_at": range(body, updated),
+        });
+            if matches!(*state, "done" | "cancelled") {
+            review["closure"] = json!({
+                "closed_at": range(body, closed),
+                "closed_by_ref": range(body, actor),
+                "resolution_note": range(body, outcome),
+            });
+        }
+            if name == "held-closure" {
+                review["closure"].as_object_mut().unwrap().remove("closed_by_ref");
+            }
+        if name == "bad-closure-order" {
+            review["created_at"] = range(body, updated);
+        }
+        if *state == "todo" {
+            review["acceptance_criteria"] = range(body, todo_criteria);
+        }
+        review
+    }).collect();
+    let mut mapping = json!({
+        "version": 1, "source_commit": commit, "policy_pin": policy_pin, "workspace_id": workspace,
+        "scopes": [
+            {"scope": "_general", "decision": {"kind":"area","area":{"id":general,"slug":"general","name":"General"}}},
+            {"scope": "_hive-userdata", "decision": {"kind":"area","area":{"id":userdata,"slug":"operations","name":"Operations"}}}
+        ],
+        "task_reviews": reviews,
+    });
+    let file = temp.path().join("review.json");
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+        "--workspace-id",
+        &workspace,
+        "--mapping-file",
+        file.to_str().unwrap(),
+        "--tasks",
+    ];
+    let run = |mapping: &str, status| {
+        fs::write(&file, mapping).unwrap();
+        migration_cli(&home, &config, "migration-plan", &args, status)
+    };
+    let plan = |mapping: &Value| run(&mapping.to_string(), 0)["data"]["task_intake"].clone();
+    let index = fs::read(source.join(".git/index")).unwrap();
+    let report = plan(&mapping);
+    assert_eq!(report, plan(&mapping));
+    let rows = |report: &Value| -> BTreeMap<String, Value> {
+        report["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let k = &row["legacy_key"];
+                let key = format!(
+                    "{}/{}",
+                    k["scope"].as_str().unwrap(),
+                    k["work_id"].as_str().unwrap()
+                );
+                (key, row["outcome"].clone())
+            })
+            .collect()
+    };
+    let outcomes = rows(&report);
+    assert_eq!(
+        report["counts"],
+        json!({
+            "inventoried": fixtures.len(), "prepared": 7, "held": fixtures.len() - 7, "excluded": 0
+        })
+    );
+    let parent = &outcomes["_general/widget"];
+    assert_eq!(parent["status"], "prepared");
+    assert_eq!(parent["candidate_status"], "done");
+    assert_eq!(parent["provenance"]["priority"], 2);
+    assert_eq!(
+        parent["provenance"]["closure"],
+        json!({
+            "closed_at": {"value": closed, "body_range": range(&parent_body, closed)},
+            "closed_by_ref": {"sha256": sha256_hex(actor.as_bytes()), "body_range": range(&parent_body, actor)},
+            "resolution_note": {"sha256": sha256_hex(outcome.as_bytes()), "body_range": range(&parent_body, outcome)},
+        })
+    );
+    assert_eq!(
+        parent["provenance"]["relations"],
+        json!({
+            "parent": null,
+            "prerequisites": [local("prepare-release"), local("verify-release")],
+            "children": [
+                {"legacy_key": local("widget-extra"),
+                 "scope_acceptance": {"sha256": sha256_hex(second_acceptance.as_bytes()),
+                    "body_range": range(&parent_body, second_acceptance)}},
+                {"legacy_key": key("_hive-userdata", "widget"),
+                 "scope_acceptance": {"sha256": sha256_hex(acceptance.as_bytes()),
+                    "body_range": range(&parent_body, acceptance)}},
+            ],
+        })
+    );
+    let child = &outcomes["_hive-userdata/widget"];
+    assert_eq!(child["status"], "prepared");
+    assert_eq!(child["candidate_status"], "cancelled");
+    assert_eq!(child["provenance"]["priority"], Value::Null);
+    assert_eq!(child["provenance"]["relations"]["parent"], local("widget"));
+    assert_eq!(outcomes["_general/widget-extra"]["status"], "prepared");
+    assert_eq!(
+        outcomes["_general/prepare-release"]["provenance"]["relations"]["children"],
+        json!([])
+    );
+    assert_eq!(outcomes["_general/follow-up"]["status"], "prepared");
+    assert_eq!(
+        outcomes["_general/independent-cancellation"]["status"],
+        "prepared"
+    );
+    for name in [
+        "missing-scope-acceptance",
+        "uses-held-prerequisite",
+        "transitively-held",
+        "missing-prerequisite",
+        "uses-cancelled-prerequisite",
+        "unfinished-parent",
+        "incomplete-parent-list",
+        "uses-incomplete-parent",
+        "metadata-parent",
+        "duplicate-parent",
+        "cycle-parent",
+        "cycle-child",
+        "depends-on-cycle",
+        "uses-claimed-prerequisite",
+    ] {
+        assert_eq!(
+            outcomes[&format!("_general/{name}")]["reason_codes"],
+            json!(["unresolved_completion_obligation"]),
+            "{name}"
+        );
+    }
+    for (name, reason) in [
+        ("child-without-approval", "unresolved_task_relations"),
+        ("unfinished-child", "unresolved_task_relations"),
+        ("held-closure", "incomplete_historical_provenance"),
+        ("bad-closure-order", "incomplete_historical_provenance"),
+        ("claimed-done", "invalid_legacy_state"),
+        ("claimed-cancelled", "invalid_legacy_state"),
+        ("pending-review", "missing_typed_submission_evidence"),
+        (
+            "claimed-todo",
+            if policy_pin == POLICY_PIN {
+                "execution_needs_reconciliation"
+            } else {
+                "invalid_legacy_state"
+            },
+        ),
+        ("metadata-child", "unsupported_task_metadata"),
+    ] {
+        assert_eq!(
+            outcomes[&format!("_general/{name}")]["reason_codes"],
+            json!([reason]),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        outcomes["_hive-userdata/unlisted-child"]["reason_codes"],
+        json!(["unresolved_completion_obligation"])
+    );
+    let duplicates: Vec<_> = report["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["legacy_key"] == local("duplicate-child"))
+        .collect();
+    assert_eq!(duplicates.len(), 2);
+    for row in duplicates {
+        assert_eq!(
+            row["outcome"]["reason_codes"],
+            json!(["duplicate_legacy_work_id"])
+        );
+    }
+    for raw in [
+        actor,
+        outcome,
+        acceptance,
+        todo_criteria,
+        "synthetic-holder",
+        "issue_number",
+    ] {
+        assert!(!report.to_string().contains(raw), "report exposed {raw}");
+    }
+
+    let witness_in_code = parent_body.rfind(acceptance).unwrap();
+    for (label, child_index, proof) in [
+        ("empty range", 0, json!({"start": 0, "end": 0})),
+        ("ordinary outcome", 0, range(&parent_body, outcome)),
+        ("copied sibling witness", 1, range(&parent_body, acceptance)),
+        (
+            "same work ID in another scope",
+            0,
+            range(&parent_body, wrong_scope),
+        ),
+        (
+            "quoted as code",
+            0,
+            json!({
+                "start": witness_in_code, "end": witness_in_code + acceptance.len(),
+            }),
+        ),
+    ] {
+        let mut invalid = mapping.clone();
+        invalid["task_reviews"][0]["relations"]["children"][child_index]["scope_acceptance"] =
+            proof;
+        let invalid_proof = rows(&plan(&invalid));
+        for name in [
+            "_general/widget",
+            "_hive-userdata/widget",
+            "_general/widget-extra",
+            "_general/follow-up",
+        ] {
+            assert_eq!(invalid_proof[name]["status"], "held", "{label}: {name}");
+        }
+        assert_eq!(
+            invalid_proof["_general/widget"]["reason_codes"],
+            json!(["unresolved_completion_obligation"]),
+            "{label}",
+        );
+        assert_eq!(
+            invalid_proof["_general/verify-release"]["status"],
+            "prepared"
+        );
+    }
+
+    let review_index = mapping["task_reviews"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|review| review["legacy_key"] == key("_hive-userdata", "unlisted-child"))
+        .unwrap();
+    let mut unmapped = mapping.clone();
+    unmapped["scopes"].as_array_mut().unwrap().pop();
+
+    let mut repeated = mapping.clone();
+    let mut alternate = mapping["task_reviews"][review_index].clone();
+    alternate["relations"]["parent"] = Value::Null;
+    repeated["task_reviews"]
+        .as_array_mut()
+        .unwrap()
+        .push(alternate);
+
+    let mut missing_closure = mapping.clone();
+    missing_closure["task_reviews"][review_index]
+        .as_object_mut()
+        .unwrap()
+        .remove("closure");
+
+    for (manifest, reason) in [
+        (unmapped, "ambiguous_scope_or_collision"),
+        (repeated, "conflicting_task_review"),
+        (missing_closure, "incomplete_historical_provenance"),
+    ] {
+        let held = rows(&plan(&manifest));
+        assert_eq!(
+            held["_hive-userdata/unlisted-child"]["reason_codes"],
+            json!([reason])
+        );
+        for name in [
+            "_general/incomplete-parent-list",
+            "_general/uses-incomplete-parent",
+        ] {
+            assert_eq!(held[name]["status"], "held", "{reason}: {name}");
+            assert_eq!(
+                held[name]["reason_codes"],
+                json!(["unresolved_completion_obligation"])
+            );
+        }
+        assert_eq!(held["_general/verify-release"]["status"], "prepared");
+    }
+
+    // An assertion with a stale blob cannot veto preparation of another Task.
+    let mut stale = mapping.clone();
+    stale["task_reviews"][review_index]["source_git_blob_sha"] = json!("0".repeat(40));
+    let stale = rows(&plan(&stale));
+    assert_eq!(
+        stale["_hive-userdata/unlisted-child"]["reason_codes"],
+        json!(["task_review_binding_mismatch"])
+    );
+    assert_eq!(
+        stale["_general/incomplete-parent-list"]["status"],
+        "prepared"
+    );
+    assert_eq!(
+        stale["_general/uses-incomplete-parent"]["status"],
+        "prepared"
+    );
+
+    let positional_range = |evidence| {
+        let selection = range(&parent_body, evidence);
+        json!([selection["start"], selection["end"]])
+    };
+    let parent_review = &mapping["task_reviews"][0];
+    for (pointer, positional) in [
+        (
+            "/relations",
+            json!([
+                null,
+                parent_review["relations"]["prerequisites"],
+                parent_review["relations"]["children"]
+            ]),
+        ),
+        ("/relations/parent", json!(["_general", "widget"])),
+        (
+            "/relations/prerequisites/0",
+            json!(["_general", "prepare-release"]),
+        ),
+        (
+            "/relations/children/0",
+            json!([
+                key("_hive-userdata", "widget"),
+                range(&parent_body, acceptance)
+            ]),
+        ),
+        (
+            "/relations/children/0/legacy_key",
+            json!(["_hive-userdata", "widget"]),
+        ),
+        (
+            "/relations/children/0/scope_acceptance",
+            positional_range(acceptance),
+        ),
+        (
+            "/closure",
+            json!([
+                range(&parent_body, closed),
+                range(&parent_body, actor),
+                range(&parent_body, outcome)
+            ]),
+        ),
+        ("/closure/closed_at", positional_range(closed)),
+    ] {
+        let mut malformed = mapping.clone();
+        *malformed["task_reviews"][0].pointer_mut(pointer).unwrap() = positional;
+        let rejected = run(&malformed.to_string(), 2);
+        assert_eq!(rejected["error"]["code"], "INVALID_CONFIG", "{pointer}");
+        assert!(rejected.get("data").is_none());
+    }
+    let manifest = mapping.to_string();
+    for (field, replacement) in [
+        ("\"children\":", "\"unknown\":null,\"children\":"),
+        ("\"parent\":null", "\"parent\":null,\"parent\":null"),
+        ("\"closed_at\":", "\"closed_at\":null,\"closed_at\":"),
+        ("\"start\":", "\"start\":0,\"start\":"),
+    ] {
+        assert!(manifest.contains(field));
+        let rejected = run(&manifest.replacen(field, replacement, 1), 2);
+        assert_eq!(rejected["error"]["code"], "INVALID_CONFIG", "{replacement}");
+        assert!(rejected.get("data").is_none());
+    }
+    mapping["task_reviews"][0]["relations"]
+        .as_object_mut()
+        .unwrap()
+        .remove("children");
+    let incomplete_review = rows(&plan(&mapping));
+    assert_eq!(
+        incomplete_review["_general/widget"]["reason_codes"],
+        json!(["unresolved_completion_obligation"])
+    );
+    assert_eq!(fs::read(source.join(".git/index")).unwrap(), index);
+    assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+    assert!(!config.exists());
 }
 
 #[cfg(target_os = "linux")]

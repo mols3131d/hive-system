@@ -166,9 +166,10 @@ pub(crate) fn plan(
                     claims_supported,
                 )?;
                 report["task_intake"] =
-                    task_intake::report(records, &outcomes, reviewed.task_reviews, &|| {
+                    task_intake::prepare(records, &outcomes, reviewed.task_reviews, &|| {
                         reviewed.reader.command()
-                    })?;
+                    })?
+                    .report();
             }
             if include_directives_artifacts {
                 report["directive_artifact_intake"] = directive_artifact_intake::report(
@@ -606,7 +607,7 @@ fn unresolved_link_destination(before: &str) -> bool {
         .is_some_and(|prefix| prefix.trim_end().ends_with(']'))
 }
 
-fn closed_raw_html_block(raw: &str) -> bool {
+pub(super) fn closed_raw_html_block(raw: &str) -> bool {
     let raw = raw.trim();
     if raw.starts_with("<!--") {
         let mut remaining = raw;
