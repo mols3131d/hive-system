@@ -177,6 +177,7 @@ pub(crate) struct TaskPlan<'a> {
 
 pub(crate) struct StagingTask<'a> {
     pub(crate) key: (&'a str, &'a str),
+    pub(crate) blob_oid: &'a str,
     pub(crate) area_id: &'a str,
     pub(crate) status: &'static str,
     pub(crate) locator: Value,
@@ -258,6 +259,7 @@ impl TaskPlan<'_> {
                 let oid = record.blob_oid.as_deref().expect("prepared Task blob");
                 Some(StagingTask {
                     key: record.key(),
+                    blob_oid: oid,
                     area_id,
                     status: candidate_status.as_str(),
                     locator: record.staging_locator(),
@@ -349,14 +351,18 @@ impl TaskPlan<'_> {
     }
 }
 
+pub(super) fn task_key_digest((scope, work_id): Key<'_>) -> String {
+    let mut key = Sha256::new();
+    key.update(scope);
+    key.update(b"\0");
+    key.update(work_id);
+    format!("{:x}", key.finalize())
+}
+
 impl Record {
     fn staging_locator(&self) -> Value {
-        let mut key = Sha256::new();
-        key.update(&self.scope);
-        key.update(b"\0");
-        key.update(&self.work_id);
         json!({
-            "legacy_key_sha256": format!("{:x}", key.finalize()),
+            "legacy_key_sha256": task_key_digest(self.key()),
             "source_path_sha256": format!("{:x}", Sha256::digest(&self.path)),
             "source_git_blob_sha": self.blob_oid, "source_raw_sha256": self.raw_sha256,
             "lifecycle": self.lifecycle,

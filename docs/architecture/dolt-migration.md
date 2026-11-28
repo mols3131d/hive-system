@@ -271,6 +271,24 @@ A `prepared` outcome records the candidate status and mapped Area ID, exact time
 
 Execution and unclaimed review holds still apply even when a Task has a review entry. Reconcile execution by verifying stop and ownership and review by supplying typed submission evidence. Title overrides and label projection remain downstream.
 
+##### Optional Issue Resource bindings
+
+Supply the top-level `issue_resource_bindings` array in the same version 1 mapping and pass `--tasks` to either `migration-plan` or `migration-stage`. Each object binds a qualified legacy Task and its exact committed README Git blob ID to a Resource UUIDv7 selected in `resource_bindings`.
+
+```json
+[
+  {
+    "legacy_key": {"scope": "example-app", "work_id": "review-release"},
+    "source_git_blob_sha": "3333333333333333333333333333333333333333",
+    "resource_id": "00000000-0000-7000-8000-000000000003"
+  }
+]
+```
+
+The Task must be eligible for Issue import, the blob must match the verified Task entrypoint, and the prepared Resource must belong to the Task's mapped Area. Missing and held endpoints, mismatched blobs, and Resources from a different Area hold the link. Duplicate Task and Resource pairs and malformed declarations are invalid. Omit the array to leave Issue links unselected. URLs in Task prose, Area membership, and Task relationships never select a link.
+
+The plan reports the qualified Task key digest, Resource ID and hold reason when applicable. Staging adds the mapped Issue ID for each link exercised inside the private transaction. It checks the exact `issue_resources` pairs within the transaction and at the committed snapshot, or verifies zero retained links after dry-run rollback. Stage counts reconcile the declared links with imported and held outcomes.
+
 #### Read-only Directive and Artifact intake
 
 Add `--include-directives-artifacts` to `workspace migration-plan` to produce the partial `directive_artifact_intake` report. The CLI uses the same version 1 scope mapping and reads selected Markdown by verified Git blob ID during the same source checks. Each row gives a workspace-relative source locator, surface, Git blob ID, byte size, and outcome. `source_raw_sha256` is populated for blobs read for metadata inspection. Without reviewed records, each surface count reconciles `inventoried` with `held` and `excluded`. Exit status zero means the requested classification completed.
@@ -404,7 +422,7 @@ The command classifies scopes from the verified commit and reviewed mapping. It 
 Select additional surfaces in the same reviewed mapping against that source commit, policy pin, and intended target UUID.
 
 - Pass `--tasks` to stage prepared Task rows. Issue numbers follow lexicographic `(scope, work_id)` order even when parent placement requires a different insertion order. The transaction inserts Issues in parent order, then their prerequisites, and advances the Issue counter. It preserves reviewed timestamps at UTC microsecond precision, and stores titles, body, criteria, closure actor and resolution from their reviewed source bytes. The transaction accepts up to 64 MiB of Task body bytes including repeated blobs.
-- Supply `resource_bindings` to stage prepared Resources and their explicit Area links.
+- Supply `resource_bindings` to stage prepared Resources and their explicit Area links. With `--tasks`, supply `issue_resource_bindings` to stage the separately reviewed Issue links after both endpoints.
 - Supply `queen_assets` and `queen_preparation` to stage prepared Queen Souls and Bot registry rows. The CLI commits the exact reviewed Soul bytes to the paired asset repository and verifies the commit before inserting any Bots. Historical Memory stays held and `bot_memories` remains empty.
 - Supply `reviewed_records` to stage prepared Directives in supersession order and prepared standalone Artifacts. The review preserves historical fields and committed title and body bytes. `--include-directives-artifacts` selects this intake in the read-only plan. Work-scoped Artifacts remain held and staging verifies zero Artifact links for this slice.
 

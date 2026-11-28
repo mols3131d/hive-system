@@ -17,9 +17,11 @@ use crate::workspace_init::POLICY_REVISION;
 
 #[path = "migration_directive_artifact.rs"]
 mod directive_artifact;
+mod issue_resources;
 mod resources;
 mod tasks;
 
+use issue_resources::IssueResources;
 use resources::StagedResources;
 use tasks::{COUNTER, TaskImport};
 
@@ -97,10 +99,11 @@ fn prepare(
         .ok_or_else(|| HiveError::new(ErrorCode::IoError, "Could not read the migration time."))?;
 
     let task_plan = args.tasks.then(|| reviewed.prepare_tasks()).transpose()?;
-    let task_import = task_plan
-        .as_ref()
-        .map(|plan| TaskImport::new(plan.staging_tasks(), now))
-        .transpose()?;
+    let tasks = task_plan.as_ref().map(|plan| plan.staging_tasks());
+    let issue_resource_reviews = reviewed.prepare_issue_resources(tasks.as_deref())?;
+    let task_import = tasks.map(|tasks| TaskImport::new(tasks, now)).transpose()?;
+    let issue_resources =
+        IssueResources::new(issue_resource_reviews.as_deref(), task_import.as_ref())?;
     let issue_count = task_import.as_ref().map_or(0, TaskImport::len);
 
     let rows = ImportRows {
@@ -108,6 +111,7 @@ fn prepare(
         queens,
         resources: reviewed.resources.as_ref(),
         tasks: task_import.as_ref(),
+        issue_resources: &issue_resources,
         records: intake
             .as_ref()
             .map_or(&[], |intake| intake.records.as_slice()),
@@ -136,6 +140,10 @@ fn prepare(
         verify_rows(&installed.query(&db, COUNTS)?, &counts(0, 0, 0, 0))?;
         verify_rows(&installed.query(&db, COUNTER)?, &counter(0))?;
         StagedResources::verify_rollback(&installed, &db)?;
+        verify_rows(
+            &installed.query(&db, issue_resources::COUNT)?,
+            &issue_resources::count(0),
+        )?;
         directive_artifact::Expected::verify_empty(&installed, &db)?;
         None
     } else {
@@ -187,6 +195,9 @@ fn prepare(
         expected
             .resources
             .verify_committed(&installed, &db, &confirmed)?;
+        for (sql, rows) in issue_resources.checks(Some(&confirmed)) {
+            verify_rows(&installed.query(&db, &sql)?, rows)?;
+        }
         expected
             .records
             .verify_committed(&installed, &db, &confirmed)?;
@@ -308,6 +319,7 @@ fn prepare(
     expected
         .resources
         .add_report(&mut report, reviewed.resources.as_ref(), dry_run);
+    issue_resources.add_report(&mut report, dry_run);
     let include_reviewed_records = intake.is_some();
     if let Some(intake) = intake {
         directive_artifact::add_report(&mut report, intake);
@@ -451,6 +463,7 @@ struct ImportRows<'a> {
     queens: &'a [PreparedQueen],
     resources: Option<&'a PreparedResources<'a>>,
     tasks: Option<&'a TaskImport<'a>>,
+    issue_resources: &'a IssueResources<'a>,
     records: &'a [PreparedRecord],
 }
 
@@ -519,6 +532,11 @@ fn apply_rows(
     } else {
         (0, 0)
     };
+    rows.issue_resources.append_sql(&mut input)?;
+    for (sql, expected) in rows.issue_resources.checks(None) {
+        writeln!(input, "{sql};").map_err(io_error)?;
+        checks.push(expected.to_vec());
+    }
     let records = directive_artifact::append(&mut input, rows.records, now)?;
     for (sql, expected) in records.transaction_checks() {
         writeln!(input, "{sql};").map_err(io_error)?;

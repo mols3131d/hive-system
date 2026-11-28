@@ -211,6 +211,12 @@ impl<'a> TaskImport<'a> {
         checks
     }
 
+    pub(super) fn issue_ids(&self) -> impl Iterator<Item = ((&str, &str), &str)> {
+        self.tasks
+            .iter()
+            .map(|task| (task.task.key, task.id.as_str()))
+    }
+
     pub(super) fn id_map(&self) -> Vec<Value> {
         self.tasks
             .iter()
