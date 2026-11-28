@@ -31,6 +31,10 @@ mod queen_staging;
 #[path = "migration/resource_staging.rs"]
 mod resource_staging;
 
+#[cfg(target_os = "linux")]
+#[path = "migration/task_labels.rs"]
+mod task_labels;
+
 const POLICY_PIN: &str = "0e584830a7eff314d85b7af8c6f8cd69e735730a";
 const REVISION: u32 = 4;
 const AREA_GENERAL: u32 = 0x101;

@@ -38,6 +38,8 @@ mod project;
 #[cfg(any(test, target_os = "linux"))]
 mod receipt_history;
 mod records;
+#[cfg(target_os = "linux")]
+pub(crate) use records::is_canonical_label_name;
 pub(crate) mod resource;
 #[cfg(unix)]
 mod scope;

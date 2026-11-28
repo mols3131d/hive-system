@@ -115,6 +115,7 @@ enum Reason {
     UnresolvedTaskRelations,
     UnverifiedAcceptanceCriteria,
     UnverifiedTaskLabels,
+    TaskLabelCollationCollision,
     UnsupportedTaskMetadata,
     NavigationOnly,
     DirectiveBundleSupport,

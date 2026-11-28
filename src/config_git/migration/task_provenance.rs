@@ -171,7 +171,7 @@ pub(super) struct SourceBody {
     title_source: TitleSource,
     title_sha256: String,
     priority: Option<u8>,
-    has_tags: bool,
+    pub(super) labels: Vec<String>,
 }
 
 impl SourceBody {
@@ -200,7 +200,12 @@ impl SourceBody {
             title_sha256: format!("{:x}", Sha256::digest(title)),
             title: title.to_owned(),
             priority,
-            has_tags: metadata.tags.is_some(),
+            labels: metadata
+                .tags
+                .into_iter()
+                .flatten()
+                .map(|tag| tag.trim().to_owned())
+                .collect(),
             text,
         })
     }
@@ -297,6 +302,7 @@ pub(crate) struct StagingFields<'a> {
     pub(crate) body_sha256: &'a str,
     pub(crate) criteria: Option<&'a str>,
     pub(crate) priority: Option<u8>,
+    pub(crate) labels: &'a [String],
     pub(crate) created_at: OffsetDateTime,
     pub(crate) updated_at: OffsetDateTime,
     pub(crate) closure: Option<StagingClosure<'a>>,
@@ -331,6 +337,7 @@ impl Prepared {
                 .as_ref()
                 .map(|evidence| selected(evidence.body_range)),
             priority: self.priority,
+            labels: &source.labels,
             created_at: self.created_at.instant,
             updated_at: self.updated_at.instant,
             closure: self.closure.as_ref().map(|closure| StagingClosure {
@@ -443,6 +450,7 @@ impl TaskReview {
         &self,
         source: &SourceBody,
         status: CandidateStatus,
+        check_labels_at_staging: bool,
     ) -> Result<Prepared, Vec<Reason>> {
         let body = &source.text[source.body_start..];
         let terminal = status.is_terminal();
@@ -475,7 +483,7 @@ impl TaskReview {
         {
             reasons.push(Reason::UnverifiedAcceptanceCriteria);
         }
-        if source.has_tags {
+        if !check_labels_at_staging && !source.labels.is_empty() {
             reasons.push(Reason::UnverifiedTaskLabels);
         }
         if !reasons.is_empty() {

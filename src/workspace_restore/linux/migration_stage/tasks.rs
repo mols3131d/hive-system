@@ -1,11 +1,11 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque, btree_map::Entry};
 use std::io::Write;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
-use super::{io_error, sql_text, unverified};
+use super::{io_error, labels, sql_text, unverified};
 use crate::config_git::migration::StagingTask;
 use crate::dolt::issue_writer::new_uuid_v7;
 use crate::error::{ErrorCode, HiveError};
@@ -20,6 +20,13 @@ struct AssignedTask<'a> {
     parent: Option<usize>,
     prerequisites: Vec<usize>,
     scope_acceptance: Vec<usize>,
+    label_ids: Vec<String>,
+}
+
+struct Label<'a> {
+    name: &'a str,
+    id: String,
+    revision: String,
 }
 
 pub(super) struct TaskImport<'a> {
@@ -28,6 +35,10 @@ pub(super) struct TaskImport<'a> {
     rows: Vec<Value>,
     dependencies: Vec<Value>,
     dependency_count: [Value; 1],
+    labels: Vec<Label<'a>>,
+    label_rows: Vec<Value>,
+    label_links: Vec<Value>,
+    label_counts: [Value; 1],
 }
 
 impl<'a> TaskImport<'a> {
@@ -89,6 +100,7 @@ impl<'a> TaskImport<'a> {
                 number: index + 1,
                 id: new_uuid_v7(now)?,
                 revision: new_uuid_v7(now)?,
+                label_ids: Vec::new(),
             });
         }
         let mut placement = Vec::with_capacity(assigned.len());
@@ -121,12 +133,49 @@ impl<'a> TaskImport<'a> {
             )
             .collect();
         let dependency_count = [json!({"dependencies": dependencies.len()})];
+        let mut labels = BTreeMap::new();
+        let mut label_links = Vec::new();
+        for task in &mut assigned {
+            for name in task.task.fields.labels.iter().map(String::as_str) {
+                let label = match labels.entry(name) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => entry.insert(Label {
+                        name,
+                        id: new_uuid_v7(now)?,
+                        revision: new_uuid_v7(now)?,
+                    }),
+                };
+                task.label_ids.push(label.id.clone());
+                label_links.push((task.id.as_str(), label.id.clone()));
+            }
+            task.label_ids.sort_unstable();
+        }
+        label_links.sort_unstable();
+        let label_counts = [json!({"labels": labels.len(), "links": label_links.len()})];
+        let label_links = label_links
+            .into_iter()
+            .map(|(issue, label)| json!({"issue_id": issue, "label_id": label}))
+            .collect();
+        let mut labels: Vec<_> = labels.into_values().collect();
+        labels.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        let label_rows = labels
+            .iter()
+            .map(|label| {
+                json!({
+                    "id": label.id, "name_sha256": sha256(label.name), "revision": label.revision,
+                })
+            })
+            .collect();
         Ok(Self {
             tasks: assigned,
             placement,
             rows,
             dependencies,
             dependency_count,
+            labels,
+            label_rows,
+            label_links,
+            label_counts,
         })
     }
 
@@ -139,6 +188,16 @@ impl<'a> TaskImport<'a> {
     }
 
     pub(super) fn append_sql(&self, input: &mut impl Write) -> Result<(), HiveError> {
+        for label in &self.labels {
+            writeln!(
+                input,
+                "INSERT INTO labels (id, name, revision) VALUES ({}, {}, {});",
+                sql_text(&label.id),
+                sql_text(label.name),
+                sql_text(&label.revision),
+            )
+            .map_err(io_error)?;
+        }
         for &index in &self.placement {
             let task = &self.tasks[index];
             let fields = &task.task.fields;
@@ -167,6 +226,15 @@ impl<'a> TaskImport<'a> {
         }
         // Both endpoint IDs exist before putting any prerequisite into the graph.
         for task in &self.tasks {
+            for label_id in &task.label_ids {
+                writeln!(
+                    input,
+                    "INSERT INTO issue_labels (issue_id, label_id) VALUES ({}, {});",
+                    sql_text(&task.id),
+                    sql_text(label_id),
+                )
+                .map_err(io_error)?;
+            }
             for &prerequisite in &task.prerequisites {
                 writeln!(
                     input,
@@ -208,6 +276,18 @@ impl<'a> TaskImport<'a> {
         if !self.dependencies.is_empty() {
             checks.push((format!("SELECT issue_id, prerequisite_id FROM issue_dependencies{snapshot} ORDER BY issue_id, prerequisite_id"), self.dependencies.as_slice()));
         }
+        checks.push((labels::count_sql(&snapshot), &self.label_counts));
+        if !self.label_rows.is_empty() {
+            checks.push((format!(
+                "SELECT id, LOWER(SHA2(CAST(name AS BINARY), 256)) AS name_sha256, revision, description FROM labels{snapshot} ORDER BY id"
+            ), &self.label_rows));
+            checks.push((
+                format!(
+                    "SELECT issue_id, label_id FROM issue_labels{snapshot} ORDER BY issue_id, label_id"
+                ),
+                &self.label_links,
+            ));
+        }
         checks
     }
 
@@ -232,6 +312,9 @@ impl<'a> TaskImport<'a> {
                         .map(|&index| self.tasks[index].id.as_str())
                         .collect::<Vec<_>>()
                 );
+                if !task.label_ids.is_empty() {
+                    row["label_ids"] = json!(task.label_ids);
+                }
                 if !task.scope_acceptance.is_empty() {
                     row["cancelled_child_scope_acceptance"] = json!(
                         task.scope_acceptance
