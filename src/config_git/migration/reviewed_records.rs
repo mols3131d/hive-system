@@ -7,6 +7,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use super::artifact_archive::ArchiveReview;
 use super::directive_artifact_intake::{ArtifactKind, Candidate, DirectiveStatus};
 use super::directive_history::{DirectiveHistory, Edges};
+use super::directive_scope::{DirectiveScope, ScopeReview};
 use super::prepared_records::{ArtifactFields, DirectiveFields, Fields};
 use super::scope_plan::portable_reference;
 use super::standalone_artifact::{JoinContext, LinkReview};
@@ -51,6 +52,8 @@ fn deserialize_title<'de, D: Deserializer<'de>>(
 enum Provenance {
     ProposedDirective {
         area_id: String,
+        #[serde(default, deserialize_with = "super::json_object::deserialize")]
+        scope: ScopeReview,
         source_ref: String,
         issuer_ref: String,
         created_at: String,
@@ -176,6 +179,14 @@ impl Review {
         }
     }
 
+    pub(super) fn directive_scope(&self) -> Option<&ScopeReview> {
+        match &self.provenance {
+            Provenance::ProposedDirective { scope, .. } => Some(scope),
+            Provenance::DirectiveHistory(history) => Some(&history.scope),
+            _ => None,
+        }
+    }
+
     pub(super) fn prepare(
         &self,
         candidate: &Candidate,
@@ -193,10 +204,11 @@ impl Review {
                     updated_at,
                     supersession,
                     approval_and_validity,
+                    ..
                 },
                 Candidate::Directive {
                     status: DirectiveStatus::Proposed,
-                    area_id: mapped,
+                    scope: DirectiveScope::Area { area_id: mapped },
                     ..
                 },
             ) => {
@@ -215,7 +227,9 @@ impl Review {
                 }
                 Ok(Fields::Directive(DirectiveFields {
                     status: DirectiveStatus::Proposed,
-                    area_id: area_id.clone(),
+                    scope: DirectiveScope::Area {
+                        area_id: area_id.clone(),
+                    },
                     source_ref: source_ref.clone(),
                     issuer_ref: issuer_ref.clone(),
                     created_at: created_at.clone(),
@@ -229,7 +243,9 @@ impl Review {
             (
                 Provenance::DirectiveHistory(history),
                 Candidate::Directive {
-                    status, area_id, ..
+                    status,
+                    scope: DirectiveScope::Area { area_id },
+                    ..
                 },
             ) => history.prepare(*status, area_id, observed_at),
             (

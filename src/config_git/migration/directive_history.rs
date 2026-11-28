@@ -5,6 +5,7 @@ use time::OffsetDateTime;
 
 use super::Reason;
 use super::directive_artifact_intake::DirectiveStatus;
+use super::directive_scope::{DirectiveScope, ScopeReview};
 use super::prepared_records::{DirectiveFields, Fields};
 use super::reviewed_records::{Review, actor_ref, timestamp, validate_historical_source};
 use super::scope_plan::portable_reference;
@@ -12,8 +13,11 @@ use super::scope_plan::portable_reference;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DirectiveHistory {
+    #[serde(deserialize_with = "super::json_object::string_enum")]
     status: DirectiveStatus,
     area_id: String,
+    #[serde(default, deserialize_with = "super::json_object::deserialize")]
+    pub(super) scope: ScopeReview,
     source_ref: String,
     issuer_ref: String,
     created_at: String,
@@ -30,7 +34,7 @@ enum Approval {
         valid_from: Option<String>,
         expires_at: Option<String>,
     },
-    Unresolved,
+    Unresolved {},
 }
 
 #[derive(Deserialize)]
@@ -40,7 +44,7 @@ pub(super) enum Edges {
         replacement: Option<String>,
         replaces: Option<String>,
     },
-    Unresolved,
+    Unresolved {},
 }
 
 impl DirectiveHistory {
@@ -57,7 +61,7 @@ impl DirectiveHistory {
             return Err(Reason::AmbiguousScopeOrCollision);
         }
         match &self.supersession {
-            Edges::Unresolved => return Err(Reason::InvalidSupersessionChain),
+            Edges::Unresolved {} => return Err(Reason::InvalidSupersessionChain),
             Edges::Reviewed {
                 replacement: Some(_),
                 ..
@@ -104,7 +108,9 @@ impl DirectiveHistory {
         }
         Ok(Fields::Directive(DirectiveFields {
             status,
-            area_id: self.area_id.clone(),
+            scope: DirectiveScope::Area {
+                area_id: self.area_id.clone(),
+            },
             source_ref: self.source_ref.clone(),
             issuer_ref: self.issuer_ref.clone(),
             created_at: self.created_at.clone(),
@@ -121,7 +127,7 @@ pub(super) struct ReviewedDirective<'a> {
     pub(super) key: &'a str,
     pub(super) row: usize,
     pub(super) review: &'a Review,
-    pub(super) prepared: bool,
+    pub(super) scope: Option<DirectiveScope>,
 }
 
 pub(super) enum LinkDecision<'a> {
@@ -140,7 +146,7 @@ struct Node<'a> {
 
 impl Node<'_> {
     fn ready(&self) -> bool {
-        matches!(self.rows.as_slice(), [record] if record.prepared &&
+        matches!(self.rows.as_slice(), [record] if record.scope.is_some() &&
             matches!(record.review.directive_edges(), Some(Edges::Reviewed { .. })))
     }
 
@@ -152,6 +158,10 @@ impl Node<'_> {
                 .claims_to_replace
                 .iter()
                 .all(|claim| self.incoming.as_slice() == [*claim])
+    }
+
+    fn scope(&self) -> Option<&DirectiveScope> {
+        self.rows.first().and_then(|record| record.scope.as_ref())
     }
 }
 
@@ -209,7 +219,15 @@ pub(super) fn resolve_links<'a>(
         // With at most one incoming and one outgoing edge per node, a connected
         // component has a cycle precisely when it has as many edges as nodes.
         let edge_count: usize = component.iter().map(|node| node.outgoing.len()).sum();
-        if edge_count >= component.len() || component.iter().any(|node| !node.valid()) {
+        if edge_count >= component.len()
+            || component.iter().any(|node| {
+                !node.valid()
+                    || node
+                        .outgoing
+                        .iter()
+                        .any(|next| node.scope() != nodes[next].scope())
+            })
+        {
             decisions.extend(
                 component
                     .iter()

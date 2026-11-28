@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use url::{Host, Url};
 
+use super::directive_scope::DirectiveContext;
 use super::issue_resources::{self, IssueResourceOutcome};
 use super::json_object::{self, Object};
 use super::prepared_records::Intake;
@@ -373,7 +374,13 @@ impl ReviewedScopes<'_> {
             self.reader,
             &scopes,
             self.mapping.reviewed_records.as_deref(),
-            self.directive_observed_at,
+            &DirectiveContext {
+                observed_at: self.directive_observed_at,
+                project_ids: projects
+                    .into_iter()
+                    .flat_map(PreparedProjects::project_ids)
+                    .collect(),
+            },
             prepare_storage,
             &JoinContext::new(
                 &self.mapping.workspace_id,

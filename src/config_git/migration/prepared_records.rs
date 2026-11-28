@@ -11,6 +11,7 @@ pub(crate) use super::work_artifact::IssueLink;
 use super::work_artifact::WorkScope;
 
 pub(crate) use super::directive_artifact_intake::{ArtifactKind, DirectiveStatus};
+pub(crate) use super::directive_scope::DirectiveScope;
 
 pub(crate) struct Intake {
     pub(crate) report: Value,
@@ -35,7 +36,7 @@ pub(crate) enum Fields {
 
 pub(crate) struct DirectiveFields {
     pub(crate) status: DirectiveStatus,
-    pub(crate) area_id: String,
+    pub(crate) scope: DirectiveScope,
     pub(crate) issuer_ref: String,
     pub(crate) source_ref: String,
     pub(crate) approval_ref: Option<String>,

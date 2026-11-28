@@ -16,6 +16,7 @@ use crate::config_file::{Coordination, ScopedDirectory};
 mod artifact_archive;
 mod directive_artifact_intake;
 mod directive_history;
+mod directive_scope;
 mod issue_resources;
 mod json_object;
 pub(crate) mod prepared_records;
@@ -143,6 +144,7 @@ enum Reason {
     UnverifiedDirectiveValidity,
     UnresolvedSupersessionGraph,
     InvalidSupersessionChain,
+    UnresolvedDirectiveProject,
     UnverifiedArtifactAuthor,
     UnverifiedArtifactRetention,
     UnresolvedParentTask,
