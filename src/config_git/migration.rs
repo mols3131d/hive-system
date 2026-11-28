@@ -20,7 +20,7 @@ mod reviewed_records;
 mod scope_plan;
 mod task_intake;
 mod task_provenance;
-pub(crate) use scope_plan::plan;
+pub(crate) use scope_plan::{Area, ReviewedScopes, plan, with_scope_mapping};
 
 const MAX_INVENTORY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ENTRIES: usize = 10_000;

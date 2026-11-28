@@ -1679,6 +1679,7 @@ Two lines.
             .hive()
             .env("XDG_STATE_HOME", fixture.0.join("unused-restore-state"))
             .env("XDG_CONFIG_HOME", fixture.0.join("unused-restore-config"))
+            .env("XDG_DATA_HOME", fixture.0.join("restore-data"))
             .args(["--contract", "2", "--json", "backup", "restore", "--source"])
             .arg(source)
             .args(["--target", target])
@@ -1761,11 +1762,15 @@ Two lines.
     assert_eq!(repo_state["remotes"], serde_json::json!({}));
     assert_eq!(repo_state["backups"], serde_json::json!({}));
     substitute_legacy_bundle();
-    let legacy = response(run_restore(&backup, "new restored"), 0);
+    // Backup restore continues to accept an explicitly selected XDG default.
+    let legacy_target = "restore-data/hive/v2/userdata";
+    let legacy_root = fixture.0.join(legacy_target);
+    fs::create_dir_all(legacy_root.parent().unwrap()).unwrap();
+    let legacy = response(run_restore(&backup, legacy_target), 0);
     assert_eq!(legacy["data"]["active_root"], "inactive");
     assert_eq!(legacy["data"]["asset_commit"], manifest["asset_git_commit"]);
     assert_eq!(
-        fs::read_link(fixture.0.join("new restored/assets").join(linked_soul)).unwrap(),
+        fs::read_link(legacy_root.join("assets").join(linked_soul)).unwrap(),
         Path::new("SOUL.md")
     );
     fs::write(&backup_bundle, saved_bundle).unwrap();

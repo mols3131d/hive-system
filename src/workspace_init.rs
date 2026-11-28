@@ -9,7 +9,9 @@ use crate::error::HiveError;
 mod linux;
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{Installed, fd_path, inspect_empty_target, probe_versions, sync_tree};
+pub(crate) use linux::{
+    Installed, POLICY_REVISION, fd_path, inspect_empty_target, probe_versions, sync_tree,
+};
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
     inspect_target_parent, lock_target, require_entries, restrict_db_modes, same_directory,

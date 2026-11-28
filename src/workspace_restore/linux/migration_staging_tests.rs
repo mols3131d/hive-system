@@ -64,6 +64,34 @@ fn inactive_admission_rejects_overlap_occupied_symlink_and_locked_target() {
 }
 
 #[test]
+fn inactive_destination_refuses_an_intervening_target_or_parent_replacement() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let parent = root.path().join("parent");
+    let output = parent.join("output");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&parent).unwrap();
+    let (target, _) = InactiveTarget::inspect(&source, &output).unwrap();
+    fs::create_dir(&output).unwrap();
+    assert!(matches!(
+        target.check_destination(WORKSPACE_ID),
+        Err(HiveError {
+            code: ErrorCode::AlreadyExists,
+            ..
+        })
+    ));
+    fs::rename(&parent, root.path().join("displaced")).unwrap();
+    fs::create_dir(&parent).unwrap();
+    assert!(matches!(
+        target.check_destination(WORKSPACE_ID),
+        Err(HiveError {
+            code: ErrorCode::ConcurrentChange,
+            ..
+        })
+    ));
+}
+
+#[test]
 #[ignore = "requires installed Dolt 2.7.6 and native Git"]
 fn scope_transaction_rollback_failure_and_committed_inactive_publication() {
     let root = tempfile::tempdir().unwrap();
@@ -189,7 +217,7 @@ fn scope_transaction_rollback_failure_and_committed_inactive_publication() {
         query("SELECT COUNT(*) AS commits FROM dolt_log"),
         [json!({"commits": 3})]
     );
-    verify_staged_db(&installed, &db, WORKSPACE_ID, &confirmed).unwrap();
+    verify_staged_db(&installed, &db, WORKSPACE_ID, Some(&confirmed)).unwrap();
     assert_eq!(query(COUNTS), [counts(2)]);
     assert_eq!(
         query(&format!(
