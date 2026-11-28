@@ -992,7 +992,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         ),
         (
             "tasks/valid-spaced-link/README.md",
-            "# Project navigation\n\nAn example <span hidden> https://forge.example/synthetic/other </span>\n\nProject: [Owner]( https://forge.example/synthetic/app )\n",
+            "# Project navigation\n\nExamples <span hidden> https://forge.example/synthetic/other </span> and <code> https://forge.example/synthetic/other </code>\n\nProject: [Owner]( https://forge.example/synthetic/app )\n",
         ),
         (
             "tasks/valid-angle-link/README.md",
@@ -1013,6 +1013,18 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         (
             "tasks/apparent-html-close/README.md",
             "<div title=\"</div>\">\n\nProject: https://forge.example/synthetic/app\n\n</div>\n",
+        ),
+        (
+            "tasks/inline-wrapper-across-blocks/README.md",
+            "Intro <div hidden>\n\nProject: https://forge.example/synthetic/app\n\nEnd </div>\n",
+        ),
+        (
+            "tasks/unclosed-inline-span/README.md",
+            "Intro <span hidden>\n\nProject: https://forge.example/synthetic/app\n",
+        ),
+        (
+            "tasks/nested-inline-tags/README.md",
+            "Example <span hidden> <code> hidden </code> </span>\n\nProject: https://forge.example/synthetic/app\n",
         ),
     ] {
         let file = source.join(path);
@@ -1148,6 +1160,15 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             area("valid-angle-link", 0x11d, "valid-angle", json!([
                 evidence("tasks/valid-angle-link/README.md", app_ref)
             ])),
+            area("inline-wrapper-across-blocks", 0x11e, "inline-wrapper", json!([
+                evidence("tasks/inline-wrapper-across-blocks/README.md", app_ref)
+            ])),
+            area("unclosed-inline-span", 0x11f, "unclosed-span", json!([
+                evidence("tasks/unclosed-inline-span/README.md", app_ref)
+            ])),
+            area("nested-inline-tags", 0x120, "nested-inline", json!([
+                evidence("tasks/nested-inline-tags/README.md", app_ref)
+            ])),
         ]
     });
     mapping["scopes"][0]["decision"]["area"]["name"] = json!(local_path);
@@ -1170,7 +1191,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(data["source"], snapshot["data"]["source"]);
     assert_eq!(data["inventory"], snapshot["data"]["inventory"]);
     assert_eq!(data["target"], json!({"workspace_id": workspace}));
-    assert_eq!(data["scopes"].as_array().unwrap().len(), 31);
+    assert_eq!(data["scopes"].as_array().unwrap().len(), 34);
     let outcomes = |report: &Value| {
         report["scopes"]
             .as_array()
@@ -1229,6 +1250,9 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         "broken-angle-link",
         "hidden-across-blocks",
         "apparent-html-close",
+        "inline-wrapper-across-blocks",
+        "unclosed-inline-span",
+        "nested-inline-tags",
     ] {
         assert_eq!(mapped[scope], held, "{scope}");
     }

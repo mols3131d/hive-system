@@ -339,7 +339,7 @@ fn entrypoint_reference(bytes: &[u8]) -> Option<&str> {
     }
 
     let events: Vec<_> = Parser::new(body).into_offset_iter().collect();
-    let html_blocks = prose_blocks_with_html(&events);
+    let html_blocks = closed_inline_html_blocks(&events)?;
     let mut skipped = 0;
     let mut reference = None;
     for (event, range) in events {
@@ -448,11 +448,18 @@ fn closed_raw_html_block(raw: &str) -> bool {
         .is_some_and(|contents| !contents.contains('<'))
 }
 
-fn prose_blocks_with_html(events: &[(Event<'_>, Range<usize>)]) -> HashSet<Range<usize>> {
+fn closed_inline_html_blocks(
+    events: &[(Event<'_>, Range<usize>)],
+) -> Option<HashSet<Range<usize>>> {
     let mut prose = Vec::new();
     let mut html_blocks = HashSet::new();
     let mut image_depth = 0;
+    let mut expected_close = None;
     for (event, range) in events {
+        // A raw pair must close before crossing any Markdown element boundary.
+        if expected_close.is_some() && matches!(event, Event::Start(_) | Event::End(_)) {
+            return None;
+        }
         match event {
             Event::Start(Tag::Image { .. }) => image_depth += 1,
             Event::End(TagEnd::Image) => image_depth -= 1,
@@ -460,15 +467,29 @@ fn prose_blocks_with_html(events: &[(Event<'_>, Range<usize>)]) -> HashSet<Range
             Event::End(TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item) => {
                 prose.pop();
             }
-            Event::InlineHtml(html) if image_depth == 0 && !html.starts_with("<!--") => {
-                if let Some(&block) = prose.last() {
+            Event::InlineHtml(html) if image_depth == 0 => {
+                if html.starts_with("<!--") {
+                    if !closed_raw_html_block(html) {
+                        return None;
+                    }
+                } else if let Some(close) = expected_close.take() {
+                    if html.as_ref() != close {
+                        return None;
+                    }
+                } else {
+                    let &block = prose.last()?;
+                    expected_close = Some(match html.as_ref() {
+                        "<code>" => "</code>",
+                        "<span hidden>" => "</span>",
+                        _ => return None,
+                    });
                     html_blocks.insert(block.clone());
                 }
             }
             _ => {}
         }
     }
-    html_blocks
+    expected_close.is_none().then_some(html_blocks)
 }
 
 fn agree<'a>(reference: &mut Option<&'a str>, candidate: &'a str) -> Option<()> {
