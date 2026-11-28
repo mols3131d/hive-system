@@ -10,7 +10,7 @@ use super::task_graph::{Node, held_nodes};
 use super::task_provenance::{Key, Prepared, Relations, Reviews, SourceBody, TaskReview};
 use super::{Inventory, Reason, snapshot_object};
 use crate::cli::is_slug;
-use crate::config_file::parse_v2;
+use crate::config_file::{parse_v2, parse_v2_projection, present};
 use crate::error::HiveError;
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq, Serialize)]
@@ -51,7 +51,13 @@ pub(super) struct Record {
     blob_oid: Option<String>,
     blob_size: usize,
     raw_sha256: Option<String>,
-    classification: Result<CandidateStatus, Reason>,
+    classification: Classification,
+}
+
+#[derive(Clone, Copy)]
+struct Classification {
+    candidate: Result<CandidateStatus, Reason>,
+    execution_needs_reconciliation: bool,
 }
 
 pub(super) fn read_records(
@@ -90,7 +96,10 @@ pub(super) fn read_records(
             blob_oid: None,
             blob_size: 0,
             raw_sha256: None,
-            classification: Err(Reason::MissingTaskEntrypoint),
+            classification: Classification {
+                candidate: Err(Reason::MissingTaskEntrypoint),
+                execution_needs_reconciliation: false,
+            },
         };
         if let Some(blob) = inventory.entries.get(&readme)
             && let Some(size) = blob.size
@@ -233,6 +242,30 @@ impl Record {
         (&self.scope, &self.work_id)
     }
 
+    fn hold_reasons(&self, scope: &ScopeOutcome<'_>, duplicate: bool) -> Vec<Reason> {
+        let mut reasons = Vec::new();
+        if duplicate {
+            reasons.push(Reason::DuplicateLegacyWorkId);
+        }
+        if !is_slug(&self.work_id) {
+            reasons.push(Reason::InvalidLegacyState);
+        }
+        if let ScopeOutcome::Held { reason } = scope {
+            reasons.push(*reason);
+        }
+        if let Err(reason) = self.classification.candidate
+            && !reasons.contains(&reason)
+        {
+            reasons.push(reason);
+        }
+        if self.classification.execution_needs_reconciliation
+            && !reasons.contains(&Reason::ExecutionNeedsReconciliation)
+        {
+            reasons.push(Reason::ExecutionNeedsReconciliation);
+        }
+        reasons
+    }
+
     fn assess<'a, 'review, 'record>(
         &'record self,
         scope: &ScopeOutcome<'a>,
@@ -241,33 +274,18 @@ impl Record {
         source_bodies: &mut HashMap<&'record str, SourceBody>,
         git: &impl Fn() -> Result<Command, HiveError>,
     ) -> Result<(Outcome<'a>, Option<&'review Relations>), HiveError> {
-        let hold = |reason| {
-            let mut reason_codes = vec![reason];
-            if !matches!(reason, Reason::ExecutionNeedsReconciliation)
-                && matches!(
-                    self.classification,
-                    Err(Reason::ExecutionNeedsReconciliation)
-                )
-            {
-                reason_codes.push(Reason::ExecutionNeedsReconciliation);
-            }
-            (
-                Outcome::Held {
-                    reason_codes,
-                    candidate_status: None,
-                    area_id: None,
-                },
-                None,
-            )
+        if let ScopeOutcome::Excluded { reason } = scope {
+            return Ok((Outcome::Excluded { reason: *reason }, None));
+        }
+        let reason_codes = self.hold_reasons(scope, !unique);
+        let hold = |reason_codes| Outcome::Held {
+            reason_codes,
+            candidate_status: None,
+            area_id: None,
         };
         let area = match scope {
-            ScopeOutcome::Excluded { reason } => {
-                return Ok((Outcome::Excluded { reason: *reason }, None));
-            }
-            _ if !unique => return Ok(hold(Reason::DuplicateLegacyWorkId)),
-            _ if !is_slug(&self.work_id) => return Ok(hold(Reason::InvalidLegacyState)),
-            ScopeOutcome::Held { reason } => return Ok(hold(*reason)),
-            ScopeOutcome::Mapped { area } => area,
+            ScopeOutcome::Mapped { area } if unique && is_slug(&self.work_id) => area,
+            _ => return Ok((hold(reason_codes), None)),
         };
         let binding = self
             .blob_oid
@@ -277,9 +295,11 @@ impl Record {
             .as_ref()
             .ok()
             .and_then(|review| review.and_then(|review| review.relations.as_ref()));
-        let outcome = match self.classification {
-            Err(reason) => hold(reason).0,
-            Ok(status) => self.candidate_outcome(status, &area.id, binding, source_bodies, git)?,
+        let outcome = match self.classification.candidate {
+            Ok(status) if reason_codes.is_empty() => {
+                self.candidate_outcome(status, &area.id, binding, source_bodies, git)?
+            }
+            _ => hold(reason_codes),
         };
         Ok((outcome, relations))
     }
@@ -351,22 +371,24 @@ impl Record {
 #[serde(deny_unknown_fields)]
 pub(super) struct Frontmatter {
     pub(super) description: String,
+    #[serde(default, deserialize_with = "present")]
     pub(super) title: Option<String>,
-    #[serde(default, deserialize_with = "present_value")]
+    #[serde(default, deserialize_with = "present")]
     status: Option<Value>,
-    #[serde(default, deserialize_with = "present_value")]
+    #[serde(default, deserialize_with = "present")]
     claim: Option<Value>,
-    #[serde(default, deserialize_with = "present_value")]
+    #[serde(default, deserialize_with = "present")]
     pub(super) priority: Option<Value>,
-    #[serde(default, deserialize_with = "present_value")]
+    #[serde(default, deserialize_with = "present")]
     pub(super) tags: Option<Vec<String>>,
 }
 
-fn present_value<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
-    deserializer: D,
-) -> Result<Option<T>, D::Error> {
-    // Present fields are decoded as their declared type, including explicit null.
-    T::deserialize(deserializer).map(Some)
+#[derive(Deserialize)]
+struct ExecutionFields {
+    #[serde(default, deserialize_with = "present")]
+    status: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    claim: Option<Claim>,
 }
 
 #[derive(Deserialize)]
@@ -376,23 +398,71 @@ struct Claim {
     holder: String,
 }
 
-fn classify(
-    bytes: &[u8],
+fn classify(bytes: &[u8], lifecycle: Lifecycle, claims_supported: bool) -> Classification {
+    let mut classification = Classification {
+        candidate: Err(Reason::UnsupportedTaskMetadata),
+        execution_needs_reconciliation: false,
+    };
+    let Some((header, body)) = split_record(bytes) else {
+        return classification;
+    };
+    let Ok(metadata) = parse_v2::<Frontmatter>(header, "v1 Task frontmatter") else {
+        // A malformed unrelated field must not erase independently readable
+        // execution evidence. The typed projection rejects duplicate execution fields.
+        classification.execution_needs_reconciliation = lifecycle == Lifecycle::Active
+            && parse_v2_projection::<ExecutionFields>(header, "v1 Task execution metadata")
+                .is_ok_and(|fields| {
+                    classify_state(
+                        Ok(fields.status.as_deref()),
+                        Ok(fields.claim),
+                        lifecycle,
+                        claims_supported,
+                    )
+                    .is_err_and(|reason| reason == Reason::ExecutionNeedsReconciliation)
+                });
+        return classification;
+    };
+    let status = metadata
+        .status
+        .as_ref()
+        .map(|status| status.as_str().ok_or(Reason::InvalidLegacyState))
+        .transpose();
+    let claim = metadata
+        .claim
+        .as_ref()
+        .map(Claim::deserialize)
+        .transpose()
+        .map_err(|_| Reason::InvalidLegacyState);
+    let state = classify_state(status, claim, lifecycle, claims_supported);
+    classification.execution_needs_reconciliation =
+        state.is_err_and(|reason| reason == Reason::ExecutionNeedsReconciliation);
+    if !metadata.description.trim().is_empty() {
+        classification.candidate = if state.is_ok() || classification.execution_needs_reconciliation
+        {
+            validate_metadata(&metadata, body, lifecycle).and(state)
+        } else {
+            state
+        };
+    }
+    classification
+}
+
+fn classify_state(
+    status: Result<Option<&str>, Reason>,
+    claim: Result<Option<Claim>, Reason>,
     lifecycle: Lifecycle,
     claims_supported: bool,
 ) -> Result<CandidateStatus, Reason> {
-    let text = std::str::from_utf8(bytes).map_err(|_| Reason::UnsupportedTaskMetadata)?;
-    let (metadata, body) = parse_record(text).ok_or(Reason::UnsupportedTaskMetadata)?;
-    let claimed = metadata.claim.is_some();
-    if let Some(claim) = metadata.claim {
-        let claim: Claim = serde_json::from_value(claim).map_err(|_| Reason::InvalidLegacyState)?;
-        if !claims_supported || claim.id.trim().is_empty() || claim.holder.trim().is_empty() {
-            return Err(Reason::InvalidLegacyState);
-        }
+    let status = status?;
+    let claim = claim?;
+    let claimed = claim.is_some();
+    if let Some(claim) = claim
+        && (!claims_supported || claim.id.trim().is_empty() || claim.holder.trim().is_empty())
+    {
+        return Err(Reason::InvalidLegacyState);
     }
-    let status = metadata.status.as_ref().and_then(Value::as_str);
     let candidate = match (lifecycle, status, claimed) {
-        (Lifecycle::Backlog, None, false) if metadata.status.is_none() => CandidateStatus::Backlog,
+        (Lifecycle::Backlog, None, false) => CandidateStatus::Backlog,
         (Lifecycle::Active, Some("todo"), false) => CandidateStatus::Todo,
         (Lifecycle::Active | Lifecycle::Archive, Some("done"), false) => CandidateStatus::Done,
         (Lifecycle::Archive, Some("cancelled"), false) => CandidateStatus::Cancelled,
@@ -408,6 +478,14 @@ fn classify(
         }
         _ => return Err(Reason::InvalidLegacyState),
     };
+    Ok(candidate)
+}
+
+fn validate_metadata(
+    metadata: &Frontmatter,
+    body: &str,
+    lifecycle: Lifecycle,
+) -> Result<(), Reason> {
     if metadata.priority.as_ref().is_some_and(|priority| {
         lifecycle == Lifecycle::Archive
             || !matches!(priority.as_str(), Some("high" | "normal" | "low"))
@@ -431,20 +509,18 @@ fn classify(
     if resolve_title(metadata.title.as_deref(), &metadata.description, body).is_none() {
         return Err(Reason::MissingOrConflictingTitle);
     }
-    Ok(candidate)
+    Ok(())
 }
 
-pub(super) fn parse_record(text: &str) -> Option<(Frontmatter, &str)> {
+fn split_record(bytes: &[u8]) -> Option<(&[u8], &str)> {
+    let text = std::str::from_utf8(bytes).ok()?;
     let mut lines = text.split_inclusive('\n');
     let delimiter = |line: &str| matches!(line, "---\n" | "---\r\n" | "---");
     let start = lines.next().filter(|line| delimiter(line))?.len();
     let mut end = start;
     for line in lines {
         if delimiter(line) {
-            let metadata: Frontmatter =
-                parse_v2(&text.as_bytes()[start..end], "v1 Task frontmatter").ok()?;
-            return (!metadata.description.trim().is_empty())
-                .then_some((metadata, &text[end + line.len()..]));
+            return Some((&bytes[start..end], &text[end + line.len()..]));
         }
         end += line.len();
         if end - start > crate::config_file::MAX_FILE_BYTES {
@@ -452,6 +528,12 @@ pub(super) fn parse_record(text: &str) -> Option<(Frontmatter, &str)> {
         }
     }
     None
+}
+
+pub(super) fn parse_record(text: &str) -> Option<(Frontmatter, &str)> {
+    let (header, body) = split_record(text.as_bytes())?;
+    let metadata: Frontmatter = parse_v2(header, "v1 Task frontmatter").ok()?;
+    (!metadata.description.trim().is_empty()).then_some((metadata, body))
 }
 
 #[derive(Clone, Copy, Serialize)]

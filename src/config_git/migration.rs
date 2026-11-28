@@ -1,13 +1,16 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
+use std::time::SystemTime;
 
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::*;
+use crate::cli::is_slug;
 use crate::config_file::{Coordination, ScopedDirectory};
 
 mod scope_plan;
@@ -22,6 +25,23 @@ const MAX_TREE_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EXCLUDE_BYTES: usize = 64 * 1024;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
+
+pub(super) fn is_portable_bot_memory_locator(bot: &str, memory_scope: Option<&str>) -> bool {
+    fn portable_slug(slug: &str) -> bool {
+        slug.len() <= 100
+            && is_slug(slug)
+            && !matches!(slug, "con" | "prn" | "aux" | "nul")
+            && !slug
+                .strip_prefix("com")
+                .or_else(|| slug.strip_prefix("lpt"))
+                .is_some_and(|suffix| suffix.len() == 1 && suffix.as_bytes()[0].is_ascii_digit())
+    }
+
+    portable_slug(bot)
+        && memory_scope.is_none_or(|scope| {
+            matches!(scope, "_general" | "_hive-userdata") || portable_slug(scope)
+        })
+}
 
 pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveError> {
     verified_source(source, revision, |source, inventory, _| {
@@ -67,7 +87,7 @@ impl InventoryEntry {
     }
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Reason {
     AmbiguousScopeOrCollision,
@@ -130,7 +150,21 @@ fn verified_source<T>(
             "The v1 source must have a readable standalone Git index.",
         )
     };
-    fs::write(&index_path, &source_index).map_err(|_| unsupported_index())?;
+    let mut copy = fs::File::create(&index_path).map_err(|_| unsupported_index())?;
+    let modified = source_index.stat.modified;
+    // Git compares this timestamp to cached worktree mtimes to detect racy entries.
+    copy.write_all(&source_index.bytes)
+        .and_then(|()| copy.set_modified(modified))
+        .map_err(|_| unsupported_index())?;
+    if copy
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        != Some(modified)
+    {
+        return Err(unsupported_index());
+    }
+    drop(copy);
     // Decode the copy with no source Git directory or shared index available.
     // A split index must fail here before status can refresh source metadata.
     let index_probe = execute_asset(
@@ -206,21 +240,67 @@ fn verified_source<T>(
     result
 }
 
-fn read_local_index(git_dir: &ScopedDirectory) -> Result<Vec<u8>, HiveError> {
-    git_dir
-        .read_bounded(&[OsStr::new("index")], MAX_INDEX_BYTES)
-        .map_err(|error| {
-            HiveError::new(
-                error.code,
-                "Could not read the v1 source Git index within 16 MiB.",
-            )
-        })?
+#[derive(PartialEq, Eq)]
+struct IndexSnapshot {
+    bytes: Vec<u8>,
+    stat: IndexStat,
+}
+
+#[derive(PartialEq, Eq)]
+struct IndexStat {
+    identity: (u64, u64),
+    modified: SystemTime,
+    changed: (i64, i64),
+    len: u64,
+}
+
+impl IndexStat {
+    fn read(file: &fs::File) -> std::io::Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            identity: (metadata.dev(), metadata.ino()),
+            modified: metadata.modified()?,
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            len: metadata.len(),
+        })
+    }
+}
+
+fn read_local_index(git_dir: &ScopedDirectory) -> Result<IndexSnapshot, HiveError> {
+    let file = git_dir
+        .open_regular(OsStr::new("index"))
+        .map_err(|error| HiveError::new(error.code, "Could not open the v1 source Git index."))?
         .ok_or_else(|| {
             HiveError::new(
                 ErrorCode::AuthorityUnverified,
                 "The v1 source Git index is missing.",
             )
-        })
+        })?;
+    let unreadable = |_| {
+        HiveError::new(
+            ErrorCode::IoError,
+            "Could not read the v1 source Git index.",
+        )
+    };
+    let stat = IndexStat::read(&file).map_err(unreadable)?;
+    let mut bytes = Vec::new();
+    (&file)
+        .take(MAX_INDEX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() > MAX_INDEX_BYTES {
+        return Err(HiveError::new(
+            ErrorCode::InvalidConfig,
+            "The v1 source Git index exceeds 16 MiB.",
+        ));
+    }
+    if bytes.len() as u64 != stat.len || IndexStat::read(&file).map_err(unreadable)? != stat {
+        return Err(HiveError::new(
+            ErrorCode::ConcurrentChange,
+            "The v1 source Git index changed while it was read.",
+        ));
+    }
+    Ok(IndexSnapshot { bytes, stat })
 }
 
 fn read_local_exclude(git_dir: &ScopedDirectory) -> Result<Option<Vec<u8>>, HiveError> {

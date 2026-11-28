@@ -175,13 +175,36 @@ fn is_remote_alias(alias: &str) -> bool {
 }
 
 fn parse<T: de::DeserializeOwned>(bytes: &[u8], source: &str) -> Result<T, HiveError> {
-    deserialize_yaml(yaml_input(bytes, source)?, source)
+    deserialize_yaml(
+        yaml_input(bytes, source)?,
+        source,
+        DuplicateKeyPolicy::Error,
+    )
 }
 
 #[cfg(unix)]
 pub(crate) fn parse_v2<T: de::DeserializeOwned>(
     bytes: &[u8],
     source: &str,
+) -> Result<T, HiveError> {
+    parse_v2_with_duplicate_policy(bytes, source, DuplicateKeyPolicy::Error)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn parse_v2_projection<T: de::DeserializeOwned>(
+    bytes: &[u8],
+    source: &str,
+) -> Result<T, HiveError> {
+    // The typed projection rejects repeated fields it reads. Unrelated keys
+    // still pass through the bounded YAML scan and deserializer.
+    parse_v2_with_duplicate_policy(bytes, source, DuplicateKeyPolicy::PassThrough)
+}
+
+#[cfg(unix)]
+fn parse_v2_with_duplicate_policy<T: de::DeserializeOwned>(
+    bytes: &[u8],
+    source: &str,
+    duplicate_keys: DuplicateKeyPolicy,
 ) -> Result<T, HiveError> {
     use serde_saphyr::granit_parser::{self, Event, Parser};
 
@@ -213,7 +236,7 @@ pub(crate) fn parse_v2<T: de::DeserializeOwned>(
             _ => {}
         }
     }
-    deserialize_yaml(input, source)
+    deserialize_yaml(input, source, duplicate_keys)
 }
 
 fn yaml_input<'a>(bytes: &'a [u8], source: &str) -> Result<&'a str, HiveError> {
@@ -223,7 +246,11 @@ fn yaml_input<'a>(bytes: &'a [u8], source: &str) -> Result<&'a str, HiveError> {
     str::from_utf8(bytes).map_err(|_| invalid(format!("{source} must be UTF-8")))
 }
 
-fn deserialize_yaml<T: de::DeserializeOwned>(input: &str, source: &str) -> Result<T, HiveError> {
+fn deserialize_yaml<T: de::DeserializeOwned>(
+    input: &str,
+    source: &str,
+    duplicate_keys: DuplicateKeyPolicy,
+) -> Result<T, HiveError> {
     let options = serde_saphyr::options! {
         budget: serde_saphyr::budget! {
             max_documents: 1,
@@ -232,7 +259,7 @@ fn deserialize_yaml<T: de::DeserializeOwned>(input: &str, source: &str) -> Resul
             max_anchors: 0,
             max_aliases: 0,
         },
-        duplicate_keys: DuplicateKeyPolicy::Error,
+        duplicate_keys: duplicate_keys,
         merge_keys: MergeKeyPolicy::Error,
         no_schema: true,
         strict_booleans: true,

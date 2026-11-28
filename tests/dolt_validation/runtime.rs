@@ -1991,6 +1991,38 @@ fn issue_create_writer_fixture(
     let decision_path = root.join("create-decision.json");
     let body_path = root.join("issue-body.md");
     let marker = state.join("pending-request.json");
+    let invoke_create = |request: &str, area: &str, title: &str, body: Option<&str>, exit| {
+        let mut args = vec![
+            "issue",
+            "create",
+            "--workspace-id",
+            &workspace,
+            "--database",
+            "db",
+            "--port",
+            port,
+            "--area",
+            area,
+            "--type",
+            "task",
+            "--title",
+            title,
+            "--actor",
+            actor,
+            "--request-id",
+            request,
+            "--evidence-file",
+            decision_path.to_str().unwrap(),
+        ];
+        if let Some(body) = body {
+            fs::write(&body_path, body).unwrap();
+            args.extend(["--file", body_path.to_str().unwrap()]);
+        }
+        let report = run(&args, exit);
+        assert_eq!(report["command"], "issue create");
+        assert!(!report.to_string().contains("fixture-create-authorization"));
+        report
+    };
     let create =
         |request: &str, area: &str, title: &str, body: Option<&str>, expiry_hours: i64, exit| {
             let payload = serde_json::json!([
@@ -2019,36 +2051,7 @@ fn issue_create_writer_fixture(
                 }
             });
             fs::write(&decision_path, evidence.to_string()).unwrap();
-            let mut args = vec![
-                "issue",
-                "create",
-                "--workspace-id",
-                &workspace,
-                "--database",
-                "db",
-                "--port",
-                port,
-                "--area",
-                area,
-                "--type",
-                "task",
-                "--title",
-                title,
-                "--actor",
-                actor,
-                "--request-id",
-                request,
-                "--evidence-file",
-                decision_path.to_str().unwrap(),
-            ];
-            if let Some(body) = body {
-                fs::write(&body_path, body).unwrap();
-                args.extend(["--file", body_path.to_str().unwrap()]);
-            }
-            let report = run(&args, exit);
-            assert_eq!(report["command"], "issue create");
-            assert!(!report.to_string().contains("fixture-create-authorization"));
-            report
+            invoke_create(request, area, title, body, exit)
         };
 
     let title = "Fixture café";
@@ -2135,7 +2138,26 @@ fn issue_create_writer_fixture(
             6
         )
     );
-    let replayed = create(&request, &area, title, Some(body), 1, 0);
+    let missing_ack = stored_receipt(&mut reader, &request);
+    let saved_decision = fs::read(&decision_path).unwrap();
+    let new_request = random_uuid();
+    let refused = invoke_create(&new_request, &area, title, Some(body), 7);
+    assert_eq!(refused["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert_eq!(fs::read(&decision_path).unwrap(), saved_decision);
+    assert_eq!(storage_state(&mut reader), after);
+    assert_eq!(stored_receipt(&mut reader, &request), missing_ack);
+    assert_eq!(
+        reader
+            .exec_first::<String, _, _>(
+                "SELECT request_id FROM operation_receipts WHERE request_id = ?",
+                (&new_request,),
+            )
+            .unwrap(),
+        None
+    );
+    assert!(!marker.exists());
+
+    let replayed = invoke_create(&request, &area, title, Some(body), 0);
     assert_eq!(replayed["data"]["outcome"], "replayed");
     assert_eq!(replayed["data"]["result"], *result);
     assert_eq!(replayed["data"]["confirmed_commit"], after.0);
@@ -2147,11 +2169,6 @@ fn issue_create_writer_fixture(
     assert_eq!(conflict["error"]["code"], "REQUEST_CONFLICT");
     assert_eq!(storage_state(&mut reader), after);
 
-    let missing_ack: (String, String, String, String, String, String, String, String) = reader.exec_first(
-        "SELECT kind, actor_ref, fingerprint, authorization_ref, base_commit,
-                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ'), workflow_evidence_json, result_json
-           FROM operation_receipts WHERE request_id = ?", (&request,),
-    ).unwrap().unwrap();
     let mut current = connect("writer");
     let mut insert_tables: Vec<String> = current
         .query(
@@ -2230,7 +2247,8 @@ fn issue_create_writer_fixture(
         .unwrap()
         .unwrap();
     assert!(no_body);
-    let observed_commit = storage_state(&mut reader).0;
+    let inspection_snapshot = storage_state(&mut reader);
+    let observed_commit = &inspection_snapshot.0;
     let invocation = id(86);
     let now = fixture_now();
     let inspection = serde_json::json!({
@@ -2271,8 +2289,11 @@ fn issue_create_writer_fixture(
     );
     assert_eq!(inspected["data"]["result"], *result);
     assert_eq!(inspected["data"]["confirmed_commit"], after.0);
-    assert_eq!(inspected["context"]["db_commit"], observed_commit);
+    assert_eq!(inspected["context"]["db_commit"], observed_commit.as_str());
     assert!(inspected["data"]["current_claim"].is_null());
+    assert_eq!(storage_state(&mut reader), inspection_snapshot);
+    assert_eq!(stored_receipt(&mut reader, &request), missing_ack);
+    assert!(!marker.exists());
 
     drop(current);
     drop(reader);

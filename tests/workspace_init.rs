@@ -1954,3 +1954,213 @@ Two lines.
         .as_bytes()
     );
 }
+
+#[test]
+#[ignore = "requires pinned Dolt, native Git, local TCP and Linux pidfds"]
+fn issue_create_refuses_paired_inactive_restore_and_succeeds_at_registered_root() {
+    use sha2::{Digest, Sha256};
+
+    let fixture = Fixture::new();
+    let root = fixture.dir("workspace");
+    let restored = fixture.0.join("restored");
+    let xdg = fixture.dir("xdg");
+    let home = fixture.dir("home");
+    let bin = fixture.dir("bin");
+    let dolt = PathBuf::from(std::env::var_os("HIVE_DOLT_BIN").unwrap());
+    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    symlink(&dolt, bin.join("dolt")).unwrap();
+    symlink(&git, bin.join("git")).unwrap();
+    let hive = || {
+        let mut command = fixture.hive();
+        command
+            .env("HOME", &home)
+            .env("XDG_STATE_HOME", &xdg)
+            .env("XDG_CONFIG_HOME", &home)
+            .args(["--contract", "2", "--json"]);
+        command
+    };
+    let initialized = response(
+        hive()
+            .args(["workspace", "init", "--register-runtime", "--target"])
+            .arg(&root)
+            .output()
+            .unwrap(),
+        0,
+    );
+    let workspace = initialized["data"]["workspace_id"].as_str().unwrap();
+    let state = xdg.join("hive/v2/workspaces").join(workspace);
+    let active_root = state.join("active-root.json");
+    let registration = fs::read(&active_root).unwrap();
+    let marker = state.join("pending-request.json");
+
+    let sql = |path: &Path, statement: &str| {
+        let output = Command::new(&dolt)
+            .current_dir(path.join("db"))
+            .env_clear()
+            .env("HOME", &home)
+            .env("DOLT_ROOT_PATH", &home)
+            .env("DOLT_DISABLE_VERSION_CHECKS", "true")
+            .env("DOLT_DISABLE_EVENT_FLUSH", "true")
+            .args(["sql", "-r", "json", "-q", statement])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        output.stdout
+    };
+    let area = "01900000-0000-7000-8000-000000000007";
+    sql(&root, &format!(
+        "INSERT INTO areas (id, slug, name, revision)
+         VALUES ('{area}', 'synthetic', 'Synthetic Area', '01900000-0000-7000-8000-000000000008');
+         CALL DOLT_COMMIT('-am', 'Seed allocatable fixture', '--author', 'Synthetic <test@example.invalid>');"
+    ));
+    let backup = response(
+        hive()
+            .arg("--workspace")
+            .arg(&root)
+            .args(["backup", "create", "--destination", "paired"])
+            .output()
+            .unwrap(),
+        0,
+    );
+    let restore = response(
+        hive()
+            .args(["backup", "restore", "--source", "paired", "--target"])
+            .arg(&restored)
+            .output()
+            .unwrap(),
+        0,
+    );
+    assert_eq!(restore["data"]["active_root"], "inactive");
+    assert_eq!(restore["data"]["workspace_id"], workspace);
+    assert_eq!(
+        restore["data"]["asset_commit"],
+        backup["data"]["manifest"]["asset_git_commit"]
+    );
+
+    let request = "01900000-0000-4000-8000-000000000007";
+    let actor = "synthetic-planner";
+    let title = "Synthetic inactive-copy write";
+    let payload = serde_json::json!([
+        1,
+        "issue.create",
+        workspace,
+        area,
+        actor,
+        "task",
+        title,
+        null
+    ]);
+    let decision = fixture.0.join("create-decision.json");
+    let evidence = serde_json::to_vec(&serde_json::json!({
+        "decision": "allow",
+        "evidence": {
+            "version": 1, "operation": "issue.create", "workspace_id": workspace,
+            "request_id": request, "area_id": area, "actor_ref": actor,
+            "fingerprint": format!("{:x}", Sha256::digest(payload.to_string().as_bytes())),
+            "authorization_ref": "fixture-authorization", "evidence_id": "fixture-evidence",
+            "revision": "r1", "source_ref": "fixture-source", "issuer_ref": "fixture-issuer",
+            "valid_from": "2000-01-01T00:00:00Z", "expires_at": "2099-01-01T00:00:00Z",
+            "withdrawn": false,
+        }
+    }))
+    .unwrap();
+    fs::write(&decision, &evidence).unwrap();
+
+    let available = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = available.local_addr().unwrap().port().to_string();
+    let create_at = |target: &Path| {
+        hive()
+            .arg("--workspace")
+            .arg(target)
+            .args([
+                "issue",
+                "create",
+                "--workspace-id",
+                workspace,
+                "--database",
+                "db",
+                "--port",
+                &port,
+                "--area",
+                area,
+                "--type",
+                "task",
+                "--title",
+                title,
+                "--actor",
+                actor,
+                "--request-id",
+                request,
+                "--evidence-file",
+            ])
+            .arg(&decision)
+            .output()
+    };
+    let snapshot = |path: &Path| {
+        let rows: Value = serde_json::from_slice(&sql(path,
+            "SELECT DOLT_HASHOF('HEAD') AS head,
+                    DOLT_HASHOF_DB('WORKING') AS working, DOLT_HASHOF_DB('STAGED') AS staged,
+                    (SELECT next_value FROM workspace_counters WHERE name = 'issue_number') AS next_issue,
+                    (SELECT COUNT(*) FROM operation_receipts) AS receipts"
+        )).unwrap();
+        rows["rows"][0].clone()
+    };
+    let before = snapshot(&root);
+    let restored_before = snapshot(&restored);
+    assert_eq!(before["head"], restore["data"]["db_commit"]);
+    assert_eq!(before["next_issue"], 1);
+    assert_eq!(before["receipts"], 0);
+    assert_eq!(restored_before, before);
+    let refused = response(create_at(&restored).unwrap(), 7);
+    assert_eq!(refused["error"]["code"], "AUTHORITY_UNVERIFIED");
+    assert_eq!(
+        refused["error"]["message"],
+        "Local state does not match the selected workspace ID and canonical root."
+    );
+    assert_eq!(snapshot(&root), before);
+    assert_eq!(snapshot(&restored), restored_before);
+    assert_eq!(fs::read(&active_root).unwrap(), registration);
+    assert!(!marker.exists());
+
+    drop(available);
+    response(
+        hive()
+            .arg("--workspace")
+            .arg(&root)
+            .args(["workspace", "start", "--port", &port, "--dolt-bin"])
+            .arg(&dolt)
+            .output()
+            .unwrap(),
+        0,
+    );
+    let written = create_at(&root);
+    let stopped = response(
+        hive()
+            .arg("--workspace")
+            .arg(&root)
+            .args(["workspace", "stop"])
+            .output()
+            .unwrap(),
+        0,
+    );
+    assert_eq!(stopped["data"]["process_exit"], "pidfd_verified");
+    let written = response(written.unwrap(), 0);
+    assert_eq!(written["data"]["outcome"], "confirmed");
+    assert_eq!(written["data"]["request_id"], request);
+    assert_eq!(written["data"]["result"]["number"], 1);
+    assert_eq!(written["data"]["base_commit"], before["head"]);
+    let after = snapshot(&root);
+    assert_eq!(written["data"]["confirmed_commit"], after["head"]);
+    assert_ne!(after["head"], before["head"]);
+    assert_eq!(after["next_issue"], 2);
+    assert_eq!(after["receipts"], 1);
+    assert_eq!(snapshot(&restored), restored_before);
+    assert_eq!(fs::read(active_root).unwrap(), registration);
+    assert_eq!(fs::read(decision).unwrap(), evidence);
+    assert!(!marker.exists());
+    assert!(!state.join("server.json").exists());
+}
