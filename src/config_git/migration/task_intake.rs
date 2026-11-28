@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::process::Command;
 
+use pulldown_cmark::{Event, HeadingLevel, Parser, Tag};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -476,29 +477,39 @@ pub(super) fn resolve_title<'a>(
     if let Some(title) = title.filter(|title| valid(title)) {
         return Some((title, TitleSource::FrontmatterTitle));
     }
-    // Recognize a leading ATX H1. Defer other plausible headings until full
-    // Markdown parsing can distinguish headings from nested blocks and examples.
-    let mut lines = body.lines().filter(|line| !line.trim().is_empty());
-    let first = lines.next().unwrap_or_default();
-    let h1 = |line: &str| line == "#" || line.starts_with("# ") || line.starts_with("#\t");
-    if (std::iter::once(first).filter(|line| !h1(line)))
-        .chain(lines)
-        .any(|line| {
-            let line = line.trim();
-            h1(line) || (!line.is_empty() && line.bytes().all(|byte| byte == b'='))
-        })
-    {
-        return None;
-    }
-    let heading = first.get(1..).filter(|_| h1(first)).map(str::trim);
-    let heading = heading.map(|value| {
+    let mut headings = Parser::new(body)
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            matches!(
+                event,
+                Event::Start(Tag::Heading {
+                    level: HeadingLevel::H1,
+                    ..
+                })
+            )
+            .then_some(range.start)
+        });
+    let heading = if let Some(start) = headings.next() {
+        // Only a single leading unindented ATX H1 can supply the title.
+        let prefix = &body[..start];
+        let line = body[start..].lines().next()?.strip_prefix('#')?;
+        if !prefix.trim().is_empty()
+            || (!prefix.is_empty() && !prefix.ends_with('\n'))
+            || !(line.is_empty() || line.starts_with([' ', '\t']))
+            || headings.next().is_some()
+        {
+            return None;
+        }
+        let value = line.trim();
         let unclosed = value.trim_end_matches('#');
-        if unclosed.is_empty() || unclosed.ends_with([' ', '\t']) {
+        Some(if unclosed.is_empty() || unclosed.ends_with([' ', '\t']) {
             unclosed.trim_end()
         } else {
             value
-        }
-    });
+        })
+    } else {
+        None
+    };
     heading
         .filter(|heading| valid(heading))
         .map(|heading| (heading, TitleSource::Heading))

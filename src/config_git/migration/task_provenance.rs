@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
+use super::json_object::{self, Object};
 use super::scope_plan::is_portable_scope;
 use super::task_intake::{TitleSource, parse_record, resolve_title};
 use super::{Reason, is_full_lowercase_oid};
 use crate::cli::is_slug;
 use crate::dolt::is_uuid_v7;
+use crate::dolt::issue_update::valid_text;
 use crate::error::{ErrorCode, HiveError};
 
 type Key<'a> = (&'a str, &'a str);
@@ -17,12 +19,16 @@ type Key<'a> = (&'a str, &'a str);
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TaskReview {
+    #[serde(deserialize_with = "json_object::deserialize")]
     legacy_key: LegacyKey,
     source_git_blob_sha: String,
     area_id: String,
     relations: Option<Relations>,
+    #[serde(default, deserialize_with = "optional_body_range")]
     created_at: Option<BodyRange>,
+    #[serde(default, deserialize_with = "optional_body_range")]
     updated_at: Option<BodyRange>,
+    #[serde(default, deserialize_with = "optional_body_range")]
     acceptance_criteria: Option<BodyRange>,
 }
 
@@ -52,6 +58,12 @@ impl BodyRange {
     fn select(self, body: &str) -> Option<&str> {
         body.get(self.start as usize..self.end as usize)
     }
+}
+
+fn optional_body_range<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<BodyRange>, D::Error> {
+    Option::<Object<BodyRange>>::deserialize(deserializer).map(|range| range.map(|object| object.0))
 }
 
 pub(super) struct Reviews<'a>(HashMap<Key<'a>, Option<&'a TaskReview>>);
@@ -173,24 +185,30 @@ impl<'a> Timestamp<'a> {
     fn select(range: Option<BodyRange>, body: &'a str) -> Option<(Self, OffsetDateTime)> {
         let body_range = range?;
         let value = body_range.select(body)?;
-        // Require an explicit offset and precision representable by DATETIME(6).
-        // RFC 3339 permits an unknown offset and leap seconds, which aren't
-        // usable as exact timestamps in the target.
-        if value.len() > 32 || value.ends_with("-00:00") || value.get(17..19) == Some("60") {
-            return None;
-        }
-        if let Some((_, fraction)) = value.split_once('.')
-            && fraction.bytes().take_while(u8::is_ascii_digit).count() > 6
-        {
-            return None;
-        }
-        let instant = OffsetDateTime::parse(value, &Rfc3339)
-            .ok()?
-            .checked_to_offset(UtcOffset::UTC)?;
-        (1000..=9999)
-            .contains(&instant.year())
-            .then_some((Self { value, body_range }, instant))
+        let instant = parse_historical_timestamp(value)?;
+        Some((Self { value, body_range }, instant))
     }
+}
+
+fn parse_historical_timestamp(value: &str) -> Option<OffsetDateTime> {
+    // The time parser accepts any separator byte. Require T or t, a known
+    // offset, and a timestamp representable by DATETIME(6).
+    if !matches!(value.as_bytes().get(10), Some(b'T' | b't'))
+        || value.len() > 32
+        || value.ends_with("-00:00")
+        || value.get(17..19) == Some("60")
+    {
+        return None;
+    }
+    if let Some((_, fraction)) = value.split_once('.')
+        && fraction.bytes().take_while(u8::is_ascii_digit).count() > 6
+    {
+        return None;
+    }
+    let instant = OffsetDateTime::parse(value, &Rfc3339)
+        .ok()?
+        .checked_to_offset(UtcOffset::UTC)?;
+    (1000..=9999).contains(&instant.year()).then_some(instant)
 }
 
 #[derive(Serialize)]
@@ -211,13 +229,7 @@ impl TaskReview {
             .filter(|((_, created), (_, updated))| created <= updated);
         let criteria = self.acceptance_criteria.and_then(|body_range| {
             let text = body_range.select(body)?;
-            // acceptance_criteria is a target TEXT column.
-            (text.len() <= 65_535
-                && !text.trim().is_empty()
-                && !text
-                    .chars()
-                    .any(|c| c.is_control() && !matches!(c, '\t' | '\r' | '\n')))
-            .then(|| Criteria {
+            valid_text(text).then(|| Criteria {
                 body_range,
                 sha256: format!("{:x}", Sha256::digest(text)),
             })

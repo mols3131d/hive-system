@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
+use super::json_object::{self, Object};
 use super::task_provenance::TaskReview;
 use super::{
     AssetObjectReader, Inventory, Reason, is_portable_bot_memory_locator, snapshot_object,
@@ -26,7 +27,7 @@ struct Mapping {
     policy_pin: String,
     workspace_id: String,
     scopes: Vec<ScopeMapping>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "json_object::deserialize_vec")]
     task_reviews: Vec<TaskReview>,
 }
 
@@ -126,7 +127,7 @@ pub(crate) fn plan(
     let input = read_regular(mapping_file)
         .map_err(|error| HiveError::new(error.code, "Could not read the scope mapping file."))?
         .ok_or_else(|| invalid("The scope mapping file is missing."))?;
-    let mapping: Mapping = serde_json::from_slice(&input)
+    let Object(mapping) = serde_json::from_slice::<Object<Mapping>>(&input)
         .map_err(|_| invalid("The scope mapping must match the versioned JSON format."))?;
     if mapping.version != 1 {
         return Err(invalid("The scope mapping version is unsupported."));

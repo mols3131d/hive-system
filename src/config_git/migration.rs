@@ -13,6 +13,7 @@ use super::*;
 use crate::cli::is_slug;
 use crate::config_file::{Coordination, ScopedDirectory};
 
+mod json_object;
 mod scope_plan;
 mod task_intake;
 mod task_provenance;
