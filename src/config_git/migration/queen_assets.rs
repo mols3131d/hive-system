@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{AssetObjectReader, Inventory, InventoryEntry, snapshot_object};
+use super::{
+    AssetObjectReader, Inventory, InventoryEntry, is_portable_bot_memory_locator, snapshot_object,
+};
 use crate::cli::is_slug;
 use crate::config_file::{MAX_FILE_BYTES, parse_v2};
 use crate::config_git::is_full_lowercase_oid;
@@ -116,7 +119,7 @@ pub(super) fn classify<'a>(
                 let mut outcome = Outcome::Held {
                     reason: Reason::InvalidSoulOrSlug,
                 };
-                if portable_slug(relative)
+                if is_portable_bot_memory_locator(relative, None)
                     && slug_counts[relative] == 1
                     && !soul_aliases.contains(relative)
                     && let Some((soul, size)) =
@@ -148,7 +151,6 @@ pub(super) fn classify<'a>(
             continue;
         };
         let Some(size) = entry.size else { continue };
-        let safe_id = portable_slug(id);
         let leaf = child.rsplit('/').next().unwrap_or(child);
         if child == "README.md" || leaf == "AGENTS.md" {
             report.bots_soul.push(record(
@@ -160,11 +162,11 @@ pub(super) fn classify<'a>(
             ));
         } else if child == "MEMORY.md" || child.starts_with("memory/") {
             let navigation = child == "MEMORY.md"
-                && safe_id
+                && is_portable_bot_memory_locator(id, None)
                 && size <= MAX_FILE_BYTES
                 && navigation_only(
                     &snapshot_object(&|| reader.command(), "blob", &entry.oid, size)?,
-                    &format!("bots/{id}"),
+                    id,
                     inventory,
                 );
             if navigation {
@@ -208,43 +210,32 @@ fn valid_slug(slug: &str) -> bool {
     slug.len() <= 100 && is_slug(slug)
 }
 
-pub(super) fn portable_slug(slug: &str) -> bool {
-    valid_slug(slug) && !device_name(slug)
-}
-
-fn device_name(stem: &str) -> bool {
-    matches!(stem, "con" | "prn" | "aux" | "nul")
-        || stem
-            .strip_prefix("com")
-            .or_else(|| stem.strip_prefix("lpt"))
-            .is_some_and(|suffix| suffix.len() == 1 && suffix.as_bytes()[0].is_ascii_digit())
-}
-
 fn portable_bot_path(path: &str) -> bool {
     let Some(relative) = path.strip_prefix("bots/") else {
         return false;
     };
     let (directories, file) = relative.rsplit_once('/').unwrap_or(("", relative));
     if !directories.is_empty() {
-        let mut components = directories.split('/');
-        if !components.next().is_some_and(portable_slug) {
-            return false;
-        }
-        let mut components = components.peekable();
-        if components.peek() == Some(&"memory") {
+        let mut components = directories.split('/').peekable();
+        let bot = components.next().unwrap_or_default();
+        let memory_scope = if components.peek() == Some(&"memory") {
             components.next();
-            if matches!(components.peek(), Some(&("_general" | "_hive-userdata"))) {
-                components.next();
-            }
-        }
-        if !components.all(portable_slug) {
+            components.next()
+        } else {
+            None
+        };
+        if !is_portable_bot_memory_locator(bot, memory_scope)
+            || !components.all(|component| is_portable_bot_memory_locator(component, None))
+        {
             return false;
         }
     }
+    let stem = file.split('.').next().unwrap_or_default();
+    // Device stems are at most four bytes. File stems can exceed the Bot slug limit.
     matches!(file, "SOUL.md" | "README.md" | "AGENTS.md" | "MEMORY.md")
         || (file.len() <= 255
             && file.split('.').all(is_slug)
-            && !device_name(file.split('.').next().unwrap_or_default()))
+            && (stem.len() > 4 || is_portable_bot_memory_locator(stem, None)))
 }
 
 #[derive(Deserialize)]
@@ -303,20 +294,31 @@ fn valid_soul(bytes: &[u8], slug: &str) -> bool {
     {
         return false;
     }
-    let mut lines = body.lines().filter(|line| !line.trim().is_empty());
-    if !lines.next().is_some_and(|line| {
-        line.strip_prefix("# ")
-            .is_some_and(|heading| !heading.trim().is_empty())
-            && !identity_declaration(line)
-    }) || lines.next() != Some("## Identity")
-    {
+    let mut offset = 0;
+    let mut lines = body
+        .split_inclusive('\n')
+        .map(|line| {
+            offset += line.len();
+            (offset, line.trim_end_matches(['\r', '\n']))
+        })
+        .filter(|(_, line)| !line.trim().is_empty());
+    let Some((_, title_line)) = lines.next().filter(|(_, line)| line.starts_with("# ")) else {
+        return false;
+    };
+    let mut title = String::new();
+    for event in Parser::new(title_line) {
+        if let Event::Text(text) | Event::Code(text) = event {
+            title.push_str(&text);
+        }
+    }
+    if title.trim().is_empty() || !lines.next().is_some_and(|(_, line)| line == "## Identity") {
         return false;
     }
     let mut fields = BTreeMap::new();
-    let mut purpose = false;
-    for line in lines.by_ref() {
+    let mut purpose = None;
+    for (end, line) in lines {
         if line == "## Purpose" {
-            purpose = true;
+            purpose = Some(&body[end..]);
             break;
         }
         let Some((key, value)) = line
@@ -329,67 +331,92 @@ fn valid_soul(bytes: &[u8], slug: &str) -> bool {
             return false;
         }
     }
-    let purpose_text = lines.next();
-    purpose
-        && fields.len() == 3
+    let Some(purpose) = purpose else {
+        return false;
+    };
+    fields.len() == 3
         && fields.get("ID") == Some(&slug)
         && fields.get("Layer") == Some(&"1 — Manager")
         && fields.get("Name").is_some_and(|name| {
             !name.trim().is_empty()
                 && name.chars().count() <= 255
                 && !name.chars().any(char::is_control)
+                && (title.trim() == name.trim() || !identity_declaration(&title, true))
         })
-        && purpose_text.is_some_and(|line| !line.trim_start().starts_with('#'))
-        && !purpose_text
-            .into_iter()
-            .chain(lines)
-            .any(identity_declaration)
+        && purpose
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| !line.trim_start().starts_with('#'))
+        && !has_identity_declaration(purpose)
 }
 
-fn identity_declaration(line: &str) -> bool {
-    let mut text = line.trim();
-    loop {
-        if let Some(quoted) = text.strip_prefix('>') {
-            text = quoted.trim_start();
-            continue;
+fn has_identity_declaration(markdown: &str) -> bool {
+    let mut text = String::new();
+    let mut heading = false;
+    for event in Parser::new(markdown) {
+        match event {
+            Event::Text(value) | Event::Code(value) => {
+                text.push_str(&value);
+                continue;
+            }
+            Event::SoftBreak | Event::HardBreak if heading => {
+                text.push(' ');
+                continue;
+            }
+            Event::Start(Tag::Heading { .. } | Tag::Item | Tag::Paragraph)
+            | Event::End(TagEnd::Heading(_) | TagEnd::Item | TagEnd::Paragraph)
+            | Event::SoftBreak
+            | Event::HardBreak => {}
+            _ => continue,
         }
-        let Some((marker, content)) = text.split_once(char::is_whitespace) else {
-            break;
-        };
-        let ordered = marker
-            .strip_suffix(['.', ')'])
-            .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
-        if !matches!(marker, "-" | "+" | "*") && !ordered {
-            break;
+        if identity_declaration(&text, heading) {
+            return true;
         }
-        text = content.trim_start();
+        text.clear();
+        match event {
+            Event::Start(Tag::Heading { .. }) => heading = true,
+            Event::End(TagEnd::Heading(_)) => heading = false,
+            _ => {}
+        }
     }
-    let heading = text.trim_start_matches('#');
-    let is_heading = heading.len() != text.len() && heading.starts_with(char::is_whitespace);
-    if is_heading {
-        text = heading.trim().trim_end_matches('#').trim_end();
-    }
-    let key = text
-        .split_once(':')
-        .map_or(text, |(key, _)| key)
-        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '*' | '_' | '`'))
+    identity_declaration(&text, heading)
+}
+
+fn identity_declaration(text: &str, heading: bool) -> bool {
+    let label_text = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
         .to_ascii_lowercase();
-    identity_field(&key)
-        || matches!(key.as_str(), "identity" | "purpose")
-        || (is_heading
-            && key
-                .split_once(char::is_whitespace)
-                .is_some_and(|(field, _)| identity_field(field)))
+    let label_text = label_text.trim_start_matches(['*', '_', '`']).trim_start();
+    [
+        "id",
+        "bot id",
+        "bot-id",
+        "bot_id",
+        "slug",
+        "name",
+        "display name",
+        "layer",
+        "role",
+        "identity",
+        "purpose",
+    ]
+    .into_iter()
+    .any(|field| {
+        label_text.strip_prefix(field).is_some_and(|rest| {
+            let rest = rest.trim_start_matches(['*', '_', '`']);
+            let value = rest.trim_start();
+            value.is_empty()
+                || value.starts_with([':', '=', '–', '—'])
+                || value == "-"
+                || value.starts_with("- ")
+                || (heading && rest.starts_with(' '))
+        })
+    })
 }
 
-fn identity_field(key: &str) -> bool {
-    matches!(
-        key,
-        "id" | "bot id" | "bot-id" | "bot_id" | "slug" | "name" | "display name" | "layer" | "role"
-    )
-}
-
-fn navigation_only(bytes: &[u8], directory: &str, inventory: &Inventory) -> bool {
+fn navigation_only(bytes: &[u8], bot: &str, inventory: &Inventory) -> bool {
     let Some((header, body)) = split_document(bytes) else {
         return false;
     };
@@ -422,13 +449,13 @@ fn navigation_only(bytes: &[u8], directory: &str, inventory: &Inventory) -> bool
         else {
             return false;
         };
-        if !(portable_slug(scope) || matches!(scope, "_general" | "_hive-userdata"))
+        if !is_portable_bot_memory_locator(bot, Some(scope))
             || (label != scope
                 && label.replace(' ', "-").to_ascii_lowercase() != scope.trim_start_matches('_'))
             || !links.insert(target)
             || !inventory
                 .entries
-                .get(&format!("{directory}/{target}"))
+                .get(&format!("bots/{bot}/{target}"))
                 .is_some_and(|entry| !entry.is_directory())
         {
             return false;

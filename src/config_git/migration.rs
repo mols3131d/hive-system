@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::*;
+use crate::cli::is_slug;
 use crate::config_file::{Coordination, ScopedDirectory};
 
 mod queen_assets;
@@ -23,6 +24,23 @@ const MAX_TREE_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EXCLUDE_BYTES: usize = 64 * 1024;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
+
+pub(super) fn is_portable_bot_memory_locator(bot: &str, memory_scope: Option<&str>) -> bool {
+    fn portable_slug(slug: &str) -> bool {
+        slug.len() <= 100
+            && is_slug(slug)
+            && !matches!(slug, "con" | "prn" | "aux" | "nul")
+            && !slug
+                .strip_prefix("com")
+                .or_else(|| slug.strip_prefix("lpt"))
+                .is_some_and(|suffix| suffix.len() == 1 && suffix.as_bytes()[0].is_ascii_digit())
+    }
+
+    portable_slug(bot)
+        && memory_scope.is_none_or(|scope| {
+            matches!(scope, "_general" | "_hive-userdata") || portable_slug(scope)
+        })
+}
 
 pub(crate) fn preflight(source: &Path, revision: &str) -> Result<Value, HiveError> {
     verified_source(source, revision, |source, inventory, _| {

@@ -973,6 +973,46 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             "tasks/good-percent/README.md",
             "# Project navigation\n\n[Project](https://forge.example/synthetic/app%20one)\n",
         ),
+        (
+            "tasks/inline-code-tag/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <code> https://forge.example/synthetic/app </code>\n",
+        ),
+        (
+            "tasks/hidden-span/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app <span hidden> https://forge.example/synthetic/app </span>\n",
+        ),
+        (
+            "tasks/hidden-image-alt/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app ![ https://forge.example/synthetic/app ](example.png)\n",
+        ),
+        (
+            "tasks/broken-spaced-link/README.md",
+            "# Project navigation\n\nProject: /home/synthetic/private/app Owner]( https://forge.example/synthetic/app )\n",
+        ),
+        (
+            "tasks/valid-spaced-link/README.md",
+            "# Project navigation\n\nAn example <span hidden> https://forge.example/synthetic/other </span>\n\nProject: [Owner]( https://forge.example/synthetic/app )\n",
+        ),
+        (
+            "tasks/valid-angle-link/README.md",
+            "[Owner]( <https://forge.example/synthetic/app> )\n\n<https://forge.example/synthetic/app>\n",
+        ),
+        (
+            "tasks/broken-angle-link/README.md",
+            "Owner]( <https://forge.example/synthetic/app> )\n",
+        ),
+        (
+            "tasks/hidden-across-blocks/README.md",
+            "<div hidden>\n\nProject: https://forge.example/synthetic/app\n\n</div>\n",
+        ),
+        (
+            "tasks/visible-after-html-block/README.md",
+            "<div hidden>\nhttps://forge.example/synthetic/other\n</div>\n\nProject: https://forge.example/synthetic/app\n",
+        ),
+        (
+            "tasks/apparent-html-close/README.md",
+            "<div title=\"</div>\">\n\nProject: https://forge.example/synthetic/app\n\n</div>\n",
+        ),
     ] {
         let file = source.join(path);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -1077,6 +1117,36 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
             area("good-percent", 0x113, "good-percent", json!([
                 evidence("tasks/good-percent/README.md", "https://forge.example/synthetic/app%20one")
             ])),
+            area("inline-code-tag", 0x114, "inline-code", json!([
+                evidence("tasks/inline-code-tag/README.md", app_ref)
+            ])),
+            area("hidden-span", 0x115, "hidden-span", json!([
+                evidence("tasks/hidden-span/README.md", app_ref)
+            ])),
+            area("hidden-image-alt", 0x116, "hidden-image", json!([
+                evidence("tasks/hidden-image-alt/README.md", app_ref)
+            ])),
+            area("broken-spaced-link", 0x117, "broken-spaced", json!([
+                evidence("tasks/broken-spaced-link/README.md", app_ref)
+            ])),
+            area("valid-spaced-link", 0x118, "valid-spaced", json!([
+                evidence("tasks/valid-spaced-link/README.md", app_ref)
+            ])),
+            area("broken-angle-link", 0x119, "broken-angle", json!([
+                evidence("tasks/broken-angle-link/README.md", app_ref)
+            ])),
+            area("hidden-across-blocks", 0x11a, "hidden-blocks", json!([
+                evidence("tasks/hidden-across-blocks/README.md", app_ref)
+            ])),
+            area("visible-after-html-block", 0x11b, "visible-after-html", json!([
+                evidence("tasks/visible-after-html-block/README.md", app_ref)
+            ])),
+            area("apparent-html-close", 0x11c, "apparent-close", json!([
+                evidence("tasks/apparent-html-close/README.md", app_ref)
+            ])),
+            area("valid-angle-link", 0x11d, "valid-angle", json!([
+                evidence("tasks/valid-angle-link/README.md", app_ref)
+            ])),
         ]
     });
     mapping["scopes"][0]["decision"]["area"]["name"] = json!(local_path);
@@ -1099,7 +1169,7 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(data["source"], snapshot["data"]["source"]);
     assert_eq!(data["inventory"], snapshot["data"]["inventory"]);
     assert_eq!(data["target"], json!({"workspace_id": workspace}));
-    assert_eq!(data["scopes"].as_array().unwrap().len(), 21);
+    assert_eq!(data["scopes"].as_array().unwrap().len(), 31);
     let outcomes = |report: &Value| {
         report["scopes"]
             .as_array()
@@ -1118,6 +1188,9 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
     assert_eq!(mapped["_hive-userdata"]["status"], "mapped");
     assert_eq!(mapped["hive-system"]["status"], "mapped");
     assert_eq!(mapped["good-percent"]["status"], "mapped");
+    assert_eq!(mapped["valid-spaced-link"]["status"], "mapped");
+    assert_eq!(mapped["visible-after-html-block"]["status"], "mapped");
+    assert_eq!(mapped["valid-angle-link"]["status"], "mapped");
     assert_eq!(
         mapped["synth-app"],
         json!({"status": "mapped", "area": {
@@ -1148,6 +1221,13 @@ fn cli_migration_plan_maps_and_holds_scopes_from_the_verified_snapshot() {
         "quoted-fence-only",
         "broken-link-only",
         "bad-percent",
+        "inline-code-tag",
+        "hidden-span",
+        "hidden-image-alt",
+        "broken-spaced-link",
+        "broken-angle-link",
+        "hidden-across-blocks",
+        "apparent-html-close",
     ] {
         assert_eq!(mapped[scope], held, "{scope}");
     }
@@ -1258,12 +1338,24 @@ fn cli_migration_plan_redacts_malformed_scope_and_bot_directories() {
         "bots/Synthetic Private Bot/memory/portable-scope",
         "bots/synthetic.private.bot/memory/portable-scope",
     ];
+    let device_bot_path = "bots/aux/memory/_general";
+    let device_scope_path = "bots/clean/memory/aux";
+    let general_memory = "bots/clean/memory/_general";
+    let userdata_memory = "bots/clean/memory/_hive-userdata";
+    let unsplit_memory = "bots/clean/memory/_hive";
     let reference = "https://forge.example/synthetic/portable";
     let mut evidence = Vec::new();
     for path in malformed_bot_paths
         .into_iter()
         .chain(portable_paths)
         .chain(malformed_scope_paths)
+        .chain([
+            device_bot_path,
+            device_scope_path,
+            general_memory,
+            userdata_memory,
+            unsplit_memory,
+        ])
         .rev()
     {
         let entrypoint = if path.starts_with("bots/") {
@@ -1292,34 +1384,55 @@ fn cli_migration_plan_redacts_malformed_scope_and_bot_directories() {
     let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
     let workspace = id(1);
     let map = root.path().join("mapping.json");
-    let input = json!({
+    let mut input = json!({
         "version": 1,
         "source_commit": commit,
         "policy_pin": POLICY_PIN,
         "workspace_id": workspace,
-        "scopes": [{
-            "scope": "portable-scope",
-            "decision": {
-                "kind": "area",
-                "area": {"id": id(AREA_APP), "slug": "portable", "name": "Portable project"},
-                "project_evidence": evidence,
-            }
-        }],
+        "scopes": [
+            {
+                "scope": "portable-scope",
+                "decision": {
+                    "kind": "area",
+                    "area": {"id": id(AREA_APP), "slug": "portable", "name": "Portable project"},
+                    "project_evidence": evidence,
+                }
+            },
+            {
+                "scope": "aux",
+                "decision": {
+                    "kind": "area",
+                    "area": {"id": id(0x104), "slug": "synthetic-device", "name": "Synthetic project"},
+                    "project_evidence": [{
+                        "path": format!("{device_scope_path}/MEMORY.md"),
+                        "canonical_ref": reference
+                    }]
+                }
+            },
+            {"scope": "_general", "decision": {"kind": "area", "area": {
+                "id": id(AREA_GENERAL), "slug": "general", "name": "General"
+            }}},
+            {"scope": "_hive-userdata", "decision": {"kind": "area", "area": {
+                "id": id(AREA_USERDATA), "slug": "operations", "name": "Workspace operations"
+            }}},
+        ],
     });
     fs::write(&map, serde_json::to_vec(&input).unwrap()).unwrap();
-    let args = [
-        "--source",
-        source.to_str().unwrap(),
-        "--source-commit",
-        &commit,
-        "--workspace-id",
-        &workspace,
-        "--mapping-file",
-        map.to_str().unwrap(),
-    ];
-    let plan = || migration_cli(&home, &config, "migration-plan", &args, 0);
-    let report = plan();
-    assert_eq!(report, plan());
+    let plan = |revision| {
+        let args = [
+            "--source",
+            source.to_str().unwrap(),
+            "--source-commit",
+            revision,
+            "--workspace-id",
+            &workspace,
+            "--mapping-file",
+            map.to_str().unwrap(),
+        ];
+        migration_cli(&home, &config, "migration-plan", &args, 0)
+    };
+    let report = plan(&commit);
+    assert_eq!(report, plan(&commit));
     let encoded = report.to_string();
     for private in [
         malformed_scope,
@@ -1327,6 +1440,9 @@ fn cli_migration_plan_redacts_malformed_scope_and_bot_directories() {
         "synthetic.private.bot",
     ] {
         assert!(!encoded.contains(private), "leaked {private}");
+    }
+    for path in [device_bot_path, device_scope_path, unsplit_memory] {
+        assert!(!encoded.contains(&json!(path).to_string()), "leaked {path}");
     }
     let scopes = report["data"]["scopes"].as_array().unwrap();
     let scope_digest = sha256_hex(malformed_scope.as_bytes());
@@ -1354,7 +1470,64 @@ fn cli_migration_plan_redacts_malformed_scope_and_bot_directories() {
             "outcome": held,
         })),
     );
+    let scope = |key| scopes.iter().find(|scope| scope["scope"] == key).unwrap();
+    assert_eq!(
+        scope("_general"),
+        &json!({
+            "scope": "_general",
+            "source_paths": [general_memory, "bots/queen-synth/memory/_general", "tasks/_general"],
+            "source_path_sha256s": [digest_path(device_bot_path)],
+            "outcome": held,
+        }),
+    );
+    assert_eq!(
+        scope("aux"),
+        &json!({
+            "scope": "aux",
+            "source_paths": [],
+            "source_path_sha256s": [digest_path(device_scope_path)],
+            "outcome": held,
+        }),
+    );
+    assert_eq!(
+        scope("_hive-userdata")["source_paths"],
+        json!([
+            userdata_memory,
+            "directives/_hive-userdata",
+            "tasks/_hive-userdata"
+        ]),
+    );
+    assert_eq!(scope("_hive-userdata")["outcome"]["status"], "mapped");
+    assert_eq!(scope("_hive")["source_paths"], json!(["tasks/_hive"]));
+    assert_eq!(
+        scope("_hive")["source_path_sha256s"],
+        json!([digest_path(unsplit_memory)]),
+    );
+    assert_eq!(scope("_hive")["outcome"]["reason"], "unsplit_legacy_scope");
     assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+
+    let older_pin = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
+    fs::write(
+        source.join("AGENTS.md"),
+        format!("hive-system@{older_pin}\n"),
+    )
+    .unwrap();
+    fs::remove_file(source.join("hive.yml")).unwrap();
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Use the older synthetic policy pin"],
+    );
+    let older_commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    input["source_commit"] = json!(older_commit);
+    input["policy_pin"] = json!(older_pin);
+    fs::write(&map, serde_json::to_vec(&input).unwrap()).unwrap();
+    assert_eq!(
+        plan(&older_commit)["data"]["scopes"],
+        report["data"]["scopes"]
+    );
     assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
 }
 
@@ -1399,6 +1572,27 @@ fn check_queen_asset_intake(policy_pin: &str) {
     };
     let exact_soul = soul("queen-synth", "1 — Manager").replace('\n', "\r\n");
     write("bots/queen-synth/SOUL.md", exact_soul.as_bytes());
+    let compatible = [
+        (
+            "identity-steward",
+            soul("identity-steward", "1 — Manager")
+                .replace("# Synthetic Queen", "# Identity Steward")
+                .replace(
+                    "- Name: Synthetic Private Display",
+                    "- Name: Identity Steward",
+                ),
+        ),
+        (
+            "purpose-duties",
+            format!(
+                "{}\n- Role-specific review duties are described in [Agent Layout](https://example.invalid/agent-layout).\n- Role assignments follow the review policy.\n",
+                soul("purpose-duties", "1 — Manager")
+            ),
+        ),
+    ];
+    for (slug, contents) in &compatible {
+        write(&format!("bots/{slug}/SOUL.md"), contents.as_bytes());
+    }
     for (slug, layer) in [
         ("worker", "2 — Coordinator"),
         ("wrong-id", "1 — Manager"),
@@ -1422,6 +1616,13 @@ fn check_queen_asset_intake(policy_pin: &str) {
         ("conflict-heading", "### Layer: 2 — Coordinator ###"),
         ("conflict-heading-section", "### Role\n\nCoordinator"),
         ("conflict-setext", "Role\n----\nCoordinator"),
+        ("conflict-multiword-atx", "### Bot ID different-queen"),
+        ("conflict-bold-atx", "### **Bot ID** different-queen"),
+        ("conflict-multiword-setext", "Bot ID different-queen\n---"),
+        ("conflict-empty-field", "* **Display Name**:"),
+        ("conflict-empty-heading", "### **Bot ID**"),
+        ("conflict-malformed-field", "* **Bot ID = different-queen"),
+        ("conflict-dash-field", "* Role - Coordinator"),
     ];
     for (slug, declaration) in conflicting {
         write(
@@ -1429,6 +1630,12 @@ fn check_queen_asset_intake(policy_pin: &str) {
             format!("{}\n{declaration}\n", soul(slug, "1 — Manager")).as_bytes(),
         );
     }
+    write(
+        "bots/conflict-leading/SOUL.md",
+        soul("conflict-leading", "1 — Manager")
+            .replace("# Synthetic Queen", "# Bot ID different-queen")
+            .as_bytes(),
+    );
     write(
         "bots/missing/README.md",
         b"Synthetic private routing sentinel.",
@@ -1473,7 +1680,24 @@ fn check_queen_asset_intake(policy_pin: &str) {
             .as_bytes(),
     );
     write("bots/stale/memory/_general/MEMORY.md", nav);
+    let device_bot_scope = "bots/aux/memory/_general";
+    let device_memory_scope = "bots/clean/memory/aux";
+    let reserved_memory = [
+        ("_general", "bots/clean/memory/_general"),
+        ("_hive-userdata", "bots/clean/memory/_hive-userdata"),
+    ];
+    for (_, directory) in reserved_memory {
+        write(&format!("{directory}/MEMORY.md"), nav);
+    }
+    let mut clean_nav = nav.to_vec();
+    clean_nav.extend(b"- [Hive Userdata](memory/_hive-userdata/MEMORY.md)\n");
+    write("bots/clean/MEMORY.md", &clean_nav);
     let nonportable_paths = [
+        (
+            "bot_memories_historical",
+            "bots/aux/memory/_general/MEMORY.md",
+        ),
+        ("bot_memories_historical", "bots/clean/memory/aux/MEMORY.md"),
         (
             "bot_memories_historical",
             "bots/queen-synth/memory/Host:Path/MEMORY.md",
@@ -1547,13 +1771,16 @@ fn check_queen_asset_intake(policy_pin: &str) {
     mapping["queen_assets"] = json!([
         review("queen-synth"), review("worker"), review("wrong-id"), review("collision"),
         review("repeat-review"), review("repeat-review"), review("alias"), review("binary"),
-        review("bad-metadata"), review("aux"),
+        review("bad-metadata"), review("aux"), review("conflict-leading"),
         {"slug": "stale", "source_git_blob_sha": "1111111111111111111111111111111111111111"}
     ]);
-    mapping["queen_assets"]
-        .as_array_mut()
-        .unwrap()
-        .extend(conflicting.iter().map(|(slug, _)| review(slug)));
+    mapping["queen_assets"].as_array_mut().unwrap().extend(
+        conflicting
+            .iter()
+            .map(|(slug, _)| *slug)
+            .chain(compatible.iter().map(|(slug, _)| *slug))
+            .map(review),
+    );
     let report = run(&mapping, 0);
     let assets = &report["data"]["queen_assets"];
     let find = |surface: &str, path: &str| {
@@ -1576,6 +1803,18 @@ fn check_queen_asset_intake(policy_pin: &str) {
         candidate["source_raw_sha256"],
         sha256_hex(exact_soul.as_bytes())
     );
+    for (slug, contents) in &compatible {
+        let candidate = find("bots_soul", &format!("bots/{slug}/SOUL.md"));
+        assert_eq!(candidate["status"], "candidate", "{slug}");
+        assert_eq!(
+            candidate["source_git_blob_sha"],
+            review(slug)["source_git_blob_sha"]
+        );
+        assert_eq!(
+            candidate["source_raw_sha256"],
+            sha256_hex(contents.as_bytes())
+        );
+    }
     for slug in [
         "worker",
         "wrong-id",
@@ -1587,6 +1826,7 @@ fn check_queen_asset_intake(policy_pin: &str) {
         "alias",
         "binary",
         "bad-metadata",
+        "conflict-leading",
     ] {
         let record = find("bots_soul", &format!("bots/{slug}/SOUL.md"));
         assert_eq!(record["status"], "held", "{slug}");
@@ -1620,18 +1860,44 @@ fn check_queen_asset_intake(policy_pin: &str) {
         assert!(record["source_git_blob_sha"].is_string(), "{path}");
         assert!(!serialized.contains(path), "{path}");
     }
-    let scope_digest = sha256_hex(b"Host:Path");
-    let scope_outcome = report["data"]["scopes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|scope| scope["scope_sha256"] == scope_digest)
-        .unwrap();
-    assert_eq!(scope_outcome["source_paths"], json!([]));
-    assert_eq!(
-        scope_outcome["source_path_sha256s"],
-        json!([sha256_hex(b"bots/queen-synth/memory/Host:Path")])
-    );
+    let scopes = report["data"]["scopes"].as_array().unwrap();
+    let malformed_scope_digest = sha256_hex(b"Host:Path");
+    for (field, key, directory) in [
+        (
+            "scope_sha256",
+            malformed_scope_digest.as_str(),
+            "bots/queen-synth/memory/Host:Path",
+        ),
+        ("scope", "aux", device_memory_scope),
+    ] {
+        let scope = scopes.iter().find(|scope| scope[field] == key).unwrap();
+        assert_eq!(scope["outcome"]["status"], "held", "{directory}");
+        assert_eq!(scope["source_paths"], json!([]), "{directory}");
+        assert_eq!(
+            scope["source_path_sha256s"],
+            json!([sha256_hex(directory.as_bytes())]),
+            "{directory}"
+        );
+    }
+    for (key, directory) in reserved_memory {
+        let scope = scopes.iter().find(|scope| scope["scope"] == key).unwrap();
+        assert!(
+            scope["source_paths"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(directory))
+        );
+        assert_eq!(
+            find("bot_memories_historical", &format!("{directory}/MEMORY.md"))["reason"],
+            "curated_memory_deferred"
+        );
+        if key == "_general" {
+            assert_eq!(
+                scope["source_path_sha256s"],
+                json!([sha256_hex(device_bot_scope.as_bytes())])
+            );
+        }
+    }
     for (slug, _) in conflicting {
         let outcome = find("bots_soul", &format!("bots/{slug}/SOUL.md"));
         assert_eq!(outcome["status"], "held", "{slug}");
@@ -1647,6 +1913,10 @@ fn check_queen_asset_intake(policy_pin: &str) {
     }
     assert_eq!(
         find("navigation_only", "bots/queen-synth/MEMORY.md")["reason"],
+        "navigation_only"
+    );
+    assert_eq!(
+        find("navigation_only", "bots/clean/MEMORY.md")["reason"],
         "navigation_only"
     );
     for path in [
@@ -1666,7 +1936,11 @@ fn check_queen_asset_intake(policy_pin: &str) {
     }
     for private in [
         "Synthetic Private Display",
+        "Identity Steward",
+        "Role-specific review duties",
         "Host:Path",
+        device_bot_scope,
+        device_memory_scope,
         "sentinel",
         "memory/_general/MEMORY.md)",
     ] {
@@ -2738,10 +3012,18 @@ fn check_prepared_queen_plan(pin: &str) {
         fs::remove_file(source.join("hive.yml")).unwrap();
     }
     let exact_soul = "---\r\ndescription: \"Synthetic identity.\"\r\n---\r\n# Queen\r\n\r\n## Identity\r\n\r\n- ID: queen-example\r\n- Name: Source name sentinel\r\n- Layer: 1 — Manager\r\n\r\n## Purpose\r\n\r\nExact café sentinel.\r\n";
-    let other_soul = exact_soul.replace("queen-example", "other-queen");
+    let other_soul = exact_soul
+        .replace("queen-example", "other-queen")
+        .replace("# Queen", "# Role Coordinator")
+        .replace("- Name: Source name sentinel", "- Name: Role Coordinator");
     let worker_soul = exact_soul
         .replace("queen-example", "worker")
         .replace("1 — Manager", "2 — Coordinator");
+    let conflicting_title = exact_soul
+        .replace("queen-example", "conflicting-title")
+        .replace("# Queen", "# **Role** Coordinator");
+    let conflicting_role =
+        exact_soul.replace("queen-example", "conflicting-role") + "\r\n**Role**: Coordinator\r\n";
     let write = |path: &str, content: &str| {
         let path = source.join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2750,6 +3032,8 @@ fn check_prepared_queen_plan(pin: &str) {
     write("bots/queen-example/SOUL.md", exact_soul);
     write("bots/other-queen/SOUL.md", &other_soul);
     write("bots/worker/SOUL.md", &worker_soul);
+    write("bots/conflicting-title/SOUL.md", &conflicting_title);
+    write("bots/conflicting-role/SOUL.md", &conflicting_role);
     write("bots/queen-example/README.md", "Routing sentinel");
     write("bots/queen-example/AGENTS.md", "Harness sentinel");
     write(
@@ -2795,8 +3079,15 @@ fn check_prepared_queen_plan(pin: &str) {
         "policy_pin": pin,
         "workspace_id": workspace,
         "scopes": [],
-        "queen_assets": [reviewed("queen-example"), reviewed("other-queen"), reviewed("worker")],
-        "queen_preparation": [queen, other, worker],
+        "queen_assets": [
+            reviewed("queen-example"), reviewed("other-queen"), reviewed("worker"),
+            reviewed("conflicting-title"), reviewed("conflicting-role"),
+        ],
+        "queen_preparation": [
+            queen, other, worker,
+            preparation("conflicting-title", &conflicting_title, id(6)),
+            preparation("conflicting-role", &conflicting_role, id(7)),
+        ],
     });
     let run = |mapping: &Value, status| {
         fs::write(&mapping_file, serde_json::to_vec(mapping).unwrap()).unwrap();
@@ -2832,7 +3123,16 @@ fn check_prepared_queen_plan(pin: &str) {
         })
     );
     assert_eq!(prepared[1]["status"], "prepared");
-    assert_eq!(prepared[2]["reason"], "invalid_soul_or_slug");
+    for (index, slug) in [
+        (2, "worker"),
+        (3, "conflicting-title"),
+        (4, "conflicting-role"),
+    ] {
+        assert_eq!(
+            prepared[index],
+            json!({"status": "held", "slug": slug, "reason": "invalid_soul_or_slug"})
+        );
+    }
     assert_eq!(
         data["queen_assets"]["navigation_only"][0]["reason"],
         "navigation_only"

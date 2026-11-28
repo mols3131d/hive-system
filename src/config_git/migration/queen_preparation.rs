@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
-use super::queen_assets::portable_slug;
+use super::is_portable_bot_memory_locator;
 use crate::config_git::is_full_lowercase_oid;
 use crate::dolt::is_uuid_v7;
 use crate::error::{ErrorCode, HiveError};
@@ -26,7 +26,7 @@ impl QueenMapping {
     }
 
     fn valid(&self) -> bool {
-        portable_slug(&self.slug)
+        is_portable_bot_memory_locator(&self.slug, None)
             && is_full_lowercase_oid(&self.source_git_blob_sha)
             && self.source_raw_sha256.len() == 64
             && self
