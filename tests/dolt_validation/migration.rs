@@ -900,7 +900,28 @@ fn migration_cli_with_path(
     status: i32,
     search_path: &std::ffi::OsStr,
 ) -> Value {
-    let result = Command::new(env!("CARGO_BIN_EXE_hive"))
+    migration_cli_at(
+        Path::new(env!("CARGO_BIN_EXE_hive")),
+        home,
+        config,
+        action,
+        args,
+        status,
+        search_path,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn migration_cli_at(
+    binary: &Path,
+    home: &Path,
+    config: &Path,
+    action: &str,
+    args: &[&str],
+    status: i32,
+    search_path: &std::ffi::OsStr,
+) -> Value {
+    let result = Command::new(binary)
         .current_dir(home)
         .env_clear()
         .env("PATH", search_path)
@@ -935,6 +956,8 @@ fn installed_cli_stages_only_eligible_tasks_with_exact_history_and_links() {
 
     const POLICY: &str = "c66b3c50150e18426485d134de92c6b311dac125";
     const TITLE: &str = "Synthetic café '); DROP TABLE issues; --";
+    const REVIEWED_TITLE: &str = "Reviewed synthetic release café";
+    const FALLBACK_TITLE: &str = "Reviewed synthetic prerequisite";
     const ACTOR: &str = "synthetic:release-reviewer";
     const RESOLUTION: &str = "Synthetic release result and closure.";
     const CRITERIA: &str = "- [ ] Verify synthetic output.";
@@ -997,12 +1020,27 @@ fn installed_cli_stages_only_eligible_tasks_with_exact_history_and_links() {
         "# {TITLE}\r\n\r\nCreated: {CREATED}\r\nUpdated: {UPDATED}\r\nClosed: {CLOSED}\r\n\
          Closed by: {ACTOR}\r\nOutcome: {RESOLUTION}\r\n{CRITERIA}\r\n\r\n{SCOPE_ACCEPTANCE}\r\n"
     );
+    let overlong = "x".repeat(256);
+    let fallback_body = body.replacen(TITLE, &overlong, 1);
+    let record_body = |work_id: &str| {
+        if work_id == "checked-prerequisite" {
+            fallback_body.as_str()
+        } else {
+            body.as_str()
+        }
+    };
     for (scope_lifecycle, work_id, fields) in fixtures {
         let path = source.join(format!("tasks/{scope_lifecycle}/{work_id}/README.md"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let description = if work_id == "checked-prerequisite" {
+            &overlong
+        } else {
+            "Synthetic Task record"
+        };
+        let body = record_body(work_id);
         fs::write(
             path,
-            format!("---\ndescription: Synthetic Task record\n{fields}---\n{body}"),
+            format!("---\ndescription: {description}\n{fields}---\n{body}"),
         )
         .unwrap();
     }
@@ -1018,10 +1056,6 @@ fn installed_cli_stages_only_eligible_tasks_with_exact_history_and_links() {
     let operations = id(AREA_USERDATA);
     let workspace = id(1);
     let key = |scope: &str, work_id: &str| json!({"scope":scope,"work_id":work_id});
-    let range = |value: &str| {
-        let start = body.find(value).unwrap();
-        json!({"start": start, "end": start + value.len()})
-    };
     let mut reviews = Vec::new();
     for (scope_lifecycle, work_id, fields) in fixtures {
         let (scope, _) = scope_lifecycle.split_once('/').unwrap();
@@ -1036,6 +1070,11 @@ fn installed_cli_stages_only_eligible_tasks_with_exact_history_and_links() {
                 &format!("HEAD:tasks/{scope_lifecycle}/{work_id}/README.md"),
             ],
         );
+        let body = record_body(work_id);
+        let range = |value: &str| {
+            let start = body.find(value).unwrap();
+            json!({"start": start, "end": start + value.len()})
+        };
         let mut review = json!({
             "legacy_key":key(scope,work_id), "source_git_blob_sha":oid,
             "area_id":if scope=="_general" {&general} else {&operations},
@@ -1050,6 +1089,8 @@ fn installed_cli_stages_only_eligible_tasks_with_exact_history_and_links() {
         }
         match work_id {
             "release-parent" => {
+                review["issue_type"] = json!("epic");
+                review["title"] = json!({"mode":"override","value":REVIEWED_TITLE});
                 review["relations"]["prerequisites"] =
                     json!([key("_general", "checked-prerequisite")]);
                 review["relations"]["children"] = json!([{
@@ -1059,7 +1100,19 @@ fn installed_cli_stages_only_eligible_tasks_with_exact_history_and_links() {
             "optional-child" => {
                 review["relations"]["parent"] = key("_hive-userdata", "release-parent")
             }
-            "todo-item" | "working-claimed" => review["acceptance_criteria"] = range(CRITERIA),
+            "checked-prerequisite" => {
+                review["issue_type"] = json!("feature");
+                review["title"] = json!({"mode":"fallback","value":FALLBACK_TITLE});
+            }
+            "todo-item" | "working-claimed" => {
+                review["issue_type"] = json!(if work_id == "todo-item" {
+                    "bug"
+                } else {
+                    "epic"
+                });
+                review["acceptance_criteria"] = range(CRITERIA);
+            }
+
             _ => {}
         }
         reviews.push(review);
@@ -1121,6 +1174,8 @@ fn installed_cli_stages_only_eligible_tasks_with_exact_history_and_links() {
         let json: Value = serde_json::from_slice(&output.stdout).unwrap();
         for private in [
             TITLE,
+            REVIEWED_TITLE,
+            FALLBACK_TITLE,
             ACTOR,
             CRITERIA,
             RESOLUTION,
@@ -1233,7 +1288,8 @@ fn installed_cli_stages_only_eligible_tasks_with_exact_history_and_links() {
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["rows"].clone()
     };
     let rows = sql(&format!(
-        "SELECT id, number, status, parent_id, priority, SHA2(CAST(body AS BINARY), 256) AS body_hash, \
+        "SELECT id, number, status, parent_id, priority, type AS issue_type, SHA2(CAST(body AS BINARY), 256) AS body_hash, \
+        SHA2(CAST(title AS BINARY), 256) AS title_hash, \
         SHA2(CAST(acceptance_criteria AS BINARY), 256) AS criteria_hash, \
         SHA2(CAST(closed_by_ref AS BINARY), 256) AS actor_hash, \
         SHA2(CAST(resolution_note AS BINARY), 256) AS resolution_hash, \
@@ -1242,11 +1298,24 @@ fn installed_cli_stages_only_eligible_tasks_with_exact_history_and_links() {
         DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s.%f') AS updated_at FROM issues AS OF '{confirmed}' ORDER BY number"
     ));
     let statuses = ["backlog", "done", "cancelled", "todo", "done"];
+    let types = ["task", "feature", "task", "bug", "epic"];
     assert_eq!(rows.as_array().unwrap().len(), statuses.len());
     for (index, &status) in statuses.iter().enumerate() {
         assert_eq!(rows[index]["number"], index + 1);
         assert_eq!(rows[index]["status"], status);
-        assert_eq!(rows[index]["body_hash"], sha256_hex(body.as_bytes()));
+        assert_eq!(rows[index]["issue_type"], types[index]);
+        let title = match index {
+            1 => FALLBACK_TITLE,
+            4 => REVIEWED_TITLE,
+            _ => TITLE,
+        };
+        let stored_body = if index == 1 {
+            fallback_body.as_str()
+        } else {
+            body.as_str()
+        };
+        assert_eq!(rows[index]["title_hash"], sha256_hex(title.as_bytes()));
+        assert_eq!(rows[index]["body_hash"], sha256_hex(stored_body.as_bytes()));
         assert_eq!(rows[index]["created_at"], "2026-04-01 10:01:02.345678");
         assert_eq!(rows[index]["updated_at"], "2026-04-03 09:00:00.000000");
         if matches!(status, "done" | "cancelled") {
@@ -1274,6 +1343,11 @@ fn installed_cli_stages_only_eligible_tasks_with_exact_history_and_links() {
         .filter(|row| row["kind"] == "task")
         .collect::<Vec<_>>();
     assert_eq!(issue_map.len(), 5);
+    assert_eq!(issue_map[4]["target_issue_type"], "epic");
+    assert_eq!(
+        issue_map[4]["target_title_sha256"],
+        sha256_hex(REVIEWED_TITLE.as_bytes())
+    );
     assert_eq!(
         issue_map[4]["cancelled_child_scope_acceptance"][0]["sha256"],
         sha256_hex(SCOPE_ACCEPTANCE.as_bytes())
@@ -3537,6 +3611,373 @@ fn cli_migration_plan_intakes_qualified_tasks_and_holds_unverified_evidence() {
             .find(|task| task["source_path"] == path)
             .unwrap();
         assert_eq!(task["outcome"], expected, "{path}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_migration_plan_binds_reviewed_type_and_title_on_both_pins() {
+    reviewed_type_and_title_matrix(Path::new(env!("CARGO_BIN_EXE_hive")), false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires installed Hive at HIVE_STAGING_INSTALLED_BIN, pinned Dolt and native Git"]
+fn installed_cli_requires_named_task_titles_and_string_types_on_both_pins() {
+    let binary = std::env::var_os("HIVE_STAGING_INSTALLED_BIN").unwrap();
+    reviewed_type_and_title_matrix(Path::new(&binary), true);
+}
+
+#[cfg(target_os = "linux")]
+fn reviewed_type_and_title_matrix(binary: &Path, verify_staging: bool) {
+    const TARGET_POLICY: &str = "c66b3c50150e18426485d134de92c6b311dac125";
+    const EARLIER_PIN: &str = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";
+    const REVIEWED: &str = "Reviewed synthetic résumé";
+    const CREATED: &str = "2026-04-01T09:00:00Z";
+    const UPDATED: &str = "2026-04-02T09:00:00Z";
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let source = root.path().join("source");
+    let config = root.path().join("config");
+    let manifest = root.path().join("manifest.json");
+    let target = root.path().join("inactive");
+    let search_path = std::env::var_os("PATH").unwrap();
+    fs::create_dir(&home).unwrap();
+    init_git(
+        &source,
+        &home,
+        "Synthetic operator",
+        "operator@sample.invalid",
+    );
+    fs::write(
+        source.join("hive.yml"),
+        "version: 1\ncoordination:\n  mode: local\n",
+    )
+    .unwrap();
+    let long = "x".repeat(256);
+    let dates = format!("\nCreated: {CREATED}\nUpdated: {UPDATED}\n");
+    let scope = "_general";
+    let area = id(AREA_GENERAL);
+    let workspace = id(1);
+    let plain = "description: Synthetic description\n";
+    let long_title = format!("{plain}title: {long}\n");
+    let fallback = format!("description: {long}\n");
+    let null_title = format!("{plain}title: null\n");
+    let tagged = format!("{plain}tags: [synthetic]\n");
+    let claimed = format!(
+        "{plain}status: review\nclaim: {{id: synthetic-claim, holder: synthetic-holder}}\n"
+    );
+    let fixtures = [
+        ("backlog", "default", plain, "# Source title\n", None, None),
+        ("backlog", "explicit-task", plain, "", Some("task"), None),
+        (
+            "backlog",
+            "fallback",
+            &fallback,
+            "",
+            Some("feature"),
+            Some("fallback"),
+        ),
+        (
+            "backlog",
+            "override",
+            &long_title,
+            "# Source alternative\n",
+            Some("bug"),
+            Some("override"),
+        ),
+        (
+            "backlog",
+            "long-title",
+            &long_title,
+            "# Source alternative\n",
+            None,
+            None,
+        ),
+        (
+            "backlog",
+            "long-fallback",
+            &long_title,
+            "",
+            None,
+            Some("fallback"),
+        ),
+        (
+            "backlog",
+            "conflicting-fallback",
+            plain,
+            "# First\n# Second\n",
+            None,
+            Some("fallback"),
+        ),
+        (
+            "backlog",
+            "conflicting-override",
+            plain,
+            "# First\n# Second\n",
+            None,
+            Some("override"),
+        ),
+        (
+            "backlog",
+            "existing-fallback",
+            plain,
+            "# Source title\n",
+            None,
+            Some("fallback"),
+        ),
+        (
+            "backlog",
+            "invalid-reviewed-title",
+            plain,
+            "",
+            None,
+            Some("override"),
+        ),
+        (
+            "backlog",
+            "wrong-blob",
+            &long_title,
+            "",
+            Some("bug"),
+            Some("override"),
+        ),
+        (
+            "backlog",
+            "wrong-area",
+            &long_title,
+            "",
+            Some("bug"),
+            Some("override"),
+        ),
+        (
+            "backlog",
+            "null-title",
+            &null_title,
+            "",
+            Some("bug"),
+            Some("override"),
+        ),
+        (
+            "backlog",
+            "tagged",
+            &tagged,
+            "",
+            Some("feature"),
+            Some("override"),
+        ),
+        (
+            "active",
+            "claimed",
+            &claimed,
+            "",
+            Some("epic"),
+            Some("override"),
+        ),
+    ];
+    for (lifecycle, name, header, start, _, _) in fixtures {
+        let readme = source.join(format!("tasks/{scope}/{lifecycle}/{name}/README.md"));
+        fs::create_dir_all(readme.parent().unwrap()).unwrap();
+        fs::write(readme, format!("---\n{header}---\n{start}{dates}")).unwrap();
+    }
+    for pin in [POLICY_PIN, EARLIER_PIN] {
+        if pin == EARLIER_PIN {
+            fs::remove_file(source.join("hive.yml")).unwrap();
+        }
+        fs::write(source.join("AGENTS.md"), format!("hive-system@{pin}\n")).unwrap();
+        git(&source, &home, &["add", "-A"]);
+        git(
+            &source,
+            &home,
+            &["commit", "-qm", "Synthetic reviewed title and type"],
+        );
+        let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+        let mut reviews = Vec::new();
+        for (lifecycle, name, _, start, kind, mode) in fixtures {
+            let body = format!("{start}{dates}");
+            let range = |value: &str| {
+                let start = body.find(value).unwrap();
+                json!({"start": start, "end":start + value.len()})
+            };
+            let oid = git_text(
+                &source,
+                &home,
+                &[
+                    "rev-parse",
+                    &format!("HEAD:tasks/{scope}/{lifecycle}/{name}/README.md"),
+                ],
+            );
+            let mut review = json!({
+                "legacy_key":{"scope":scope,"work_id":name}, "source_git_blob_sha":oid,
+                "area_id":area, "relations":"no_edges",
+                "created_at":range(CREATED), "updated_at":range(UPDATED)
+            });
+            if let Some(kind) = kind {
+                review["issue_type"] = json!(kind);
+            }
+            if let Some(mode) = mode {
+                let value = if name == "invalid-reviewed-title" {
+                    "bad\ntitle"
+                } else {
+                    REVIEWED
+                };
+                review["title"] = json!({"mode":mode,"value":value});
+            }
+            if name == "wrong-blob" {
+                review["source_git_blob_sha"] = json!("1".repeat(oid.len()));
+            }
+            if name == "wrong-area" {
+                review["area_id"] = json!(id(AREA_USERDATA));
+            }
+            reviews.push(review);
+        }
+        let mapping = json!({
+            "version":1, "source_commit":commit, "policy_pin":pin, "workspace_id":workspace,
+            "scopes":[{"scope":scope, "decision":{"kind":"area","area":{"id":area,"slug":"general","name":"General"}}}],
+            "task_reviews":reviews
+        });
+        let args = [
+            "--source",
+            source.to_str().unwrap(),
+            "--source-commit",
+            &commit,
+            "--workspace-id",
+            &workspace,
+            "--mapping-file",
+            manifest.to_str().unwrap(),
+            "--tasks",
+        ];
+        let invoke = |mapping: &Value, action, args: &[&str], exit| {
+            fs::write(&manifest, serde_json::to_vec(mapping).unwrap()).unwrap();
+            migration_cli_at(binary, &home, &config, action, args, exit, &search_path)
+        };
+        let plan = |mapping: &Value, exit| invoke(mapping, "migration-plan", &args, exit);
+        let stage = |mapping: &Value, exit| {
+            let mut stage_args = args.to_vec();
+            stage_args.extend([
+                "--target",
+                target.to_str().unwrap(),
+                "--policy-revision",
+                TARGET_POLICY,
+                "--mode",
+                "dry-run",
+            ]);
+            let report = invoke(mapping, "migration-stage", &stage_args, exit);
+            assert!(!target.exists());
+            report
+        };
+        let report = plan(&mapping, 0);
+        let tasks = report["data"]["task_intake"]["tasks"].as_array().unwrap();
+        let outcome = |name: &str| {
+            &tasks
+                .iter()
+                .find(|row| row["legacy_key"]["work_id"] == name)
+                .unwrap()["outcome"]
+        };
+        for (name, title_source, title, issue_type) in [
+            ("default", "heading", "Source title", Value::Null),
+            (
+                "explicit-task",
+                "description",
+                "Synthetic description",
+                Value::Null,
+            ),
+            ("fallback", "reviewed_fallback", REVIEWED, json!("feature")),
+            ("override", "reviewed_override", REVIEWED, json!("bug")),
+            (
+                "conflicting-override",
+                "reviewed_override",
+                REVIEWED,
+                Value::Null,
+            ),
+        ] {
+            let row = outcome(name);
+            assert_eq!(row["status"], "prepared", "{pin} {name}");
+            assert_eq!(row["provenance"]["title_source"], title_source);
+            assert_eq!(
+                row["provenance"]["title_sha256"],
+                sha256_hex(title.as_bytes())
+            );
+            assert_eq!(row["provenance"]["issue_type"], issue_type);
+            assert!(row["provenance"].get("title").is_none());
+        }
+        for (name, reason) in [
+            ("long-title", "missing_or_conflicting_title"),
+            ("long-fallback", "missing_or_conflicting_title"),
+            ("conflicting-fallback", "missing_or_conflicting_title"),
+            ("existing-fallback", "missing_or_conflicting_title"),
+            ("invalid-reviewed-title", "missing_or_conflicting_title"),
+            ("wrong-blob", "task_review_binding_mismatch"),
+            ("wrong-area", "task_review_binding_mismatch"),
+            ("null-title", "unsupported_task_metadata"),
+            ("tagged", "unverified_task_labels"),
+            (
+                "claimed",
+                if pin == POLICY_PIN {
+                    "execution_needs_reconciliation"
+                } else {
+                    "invalid_legacy_state"
+                },
+            ),
+        ] {
+            assert_eq!(outcome(name)["status"], "held", "{pin} {name}");
+            assert!(
+                outcome(name)["reason_codes"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(reason)),
+                "{pin} {name}"
+            );
+        }
+        let report_text = report.to_string();
+        for private in [
+            REVIEWED,
+            "Source title",
+            "Source alternative",
+            "synthetic-holder",
+            &long,
+        ] {
+            assert!(!report_text.contains(private), "{pin}");
+        }
+        if verify_staging {
+            let staged = stage(&mapping, 0);
+            let data = &staged["data"];
+            assert_eq!(data["counts"]["tasks"]["imported"], 5);
+            assert_eq!(data["checks"]["transaction"], "rolled_back");
+            let id_map = data["id_map"].as_array().unwrap();
+            let digest = sha256_hex(REVIEWED.as_bytes());
+            for kind in ["feature", "bug"] {
+                assert!(id_map.iter().any(|row| {
+                    row["target_issue_type"] == kind && row["target_title_sha256"] == digest
+                }));
+            }
+            assert!(!staged.to_string().contains(REVIEWED));
+        }
+        for (field, invalid) in [
+            ("issue_type", json!({"feature":null})),
+            ("title", json!(["override", REVIEWED])),
+        ] {
+            let mut malformed = mapping.clone();
+            malformed["task_reviews"][0][field] = invalid;
+            assert_eq!(
+                plan(&malformed, 2)["error"]["code"],
+                "INVALID_CONFIG",
+                "{pin} {field}"
+            );
+            if verify_staging {
+                assert_eq!(
+                    stage(&malformed, 2)["error"]["code"],
+                    "INVALID_CONFIG",
+                    "{pin} {field}"
+                );
+            }
+        }
+        for invalid_type in [json!("Epic"), Value::Null] {
+            let mut malformed = mapping.clone();
+            malformed["task_reviews"][0]["issue_type"] = invalid_type;
+            assert_eq!(plan(&malformed, 2)["error"]["code"], "INVALID_CONFIG");
+        }
+        assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
     }
 }
 

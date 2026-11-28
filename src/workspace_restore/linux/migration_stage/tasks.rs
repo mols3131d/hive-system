@@ -229,9 +229,9 @@ impl<'a> TaskImport<'a> {
             writeln!(
                 input,
                 "INSERT INTO issues (id, number, area_id, parent_id, title, body, acceptance_criteria, type, status, priority, revision, created_at, updated_at, closed_at, closed_by_ref, resolution_note) \
-                 VALUES ({}, {}, {}, {}, {}, {}, {}, 'task', {}, {priority}, {}, {}, {}, {closed_at}, {actor}, {resolution});",
+                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {priority}, {}, {}, {}, {closed_at}, {actor}, {resolution});",
                 sql_text(&task.id), task.number, sql_text(task.task.area_id), nullable_text(parent),
-                sql_text(fields.title), sql_text(fields.body), nullable_text(fields.criteria), sql_text(task.task.status),
+                sql_text(fields.title), sql_text(fields.body), nullable_text(fields.criteria), sql_text(fields.issue_type), sql_text(task.task.status),
                 sql_text(&task.revision), sql_text(&sql_time(fields.created_at)), sql_text(&sql_time(fields.updated_at)),
             ).map_err(io_error)?;
         }
@@ -321,6 +321,8 @@ impl<'a> TaskImport<'a> {
                 row["issue_number"] = json!(task.number);
                 row["target_body_sha256"] = stored["body_sha256"].clone();
                 row["target_status"] = json!(task.task.status);
+                row["target_issue_type"] = stored["issue_type"].clone();
+                row["target_title_sha256"] = stored["title_sha256"].clone();
                 row["area_id"] = json!(task.task.area_id);
                 if let Some(parent) = task.parent {
                     row["parent_issue_id"] = json!(self.tasks[parent].id);
@@ -357,8 +359,8 @@ impl AssignedTask<'_> {
         let fields = &self.task.fields;
         let mut row = json!({
             "id": self.id, "number": self.number, "area_id": self.task.area_id,
-            "status": self.task.status, "issue_type": "task", "revision": self.revision, "unheld": 1,
-            "title_sha256": sha256(fields.title), "body_sha256": fields.body_sha256,
+            "status": self.task.status, "issue_type": fields.issue_type, "revision": self.revision, "unheld": 1,
+            "title_sha256": fields.title_sha256, "body_sha256": fields.body_sha256,
             "created_at": sql_time(fields.created_at), "updated_at": sql_time(fields.updated_at),
         });
         if let Some(parent) = self.parent {

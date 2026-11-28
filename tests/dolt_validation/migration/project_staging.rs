@@ -294,7 +294,13 @@ fn installed_cli_stages_explicit_cross_area_project_memberships() {
     assert_eq!(project_only["coverage"], "scopes_and_projects");
     assert_eq!(project_only["counts"]["projects"]["imported"], 3);
     assert_eq!(project_only["counts"]["project_issues"]["imported"], 0);
-    assert!(project_only["counts"].get("tasks").is_none());
+    assert_eq!(project_only["counts"]["tasks"]["imported"], 0);
+    assert!(
+        project_only["reconciliation"]["inventory_only_surfaces"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("tasks"))
+    );
     assert_eq!(project_only["target"]["issue_number_next_value"], 1);
     assert!(!target.exists());
 

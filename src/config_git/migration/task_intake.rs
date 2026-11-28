@@ -81,6 +81,7 @@ pub(super) struct Record {
 struct Classification {
     candidate: Result<CandidateStatus, Reason>,
     execution_needs_reconciliation: bool,
+    title_review_status: Option<CandidateStatus>,
 }
 
 pub(super) fn read_records(
@@ -122,6 +123,7 @@ pub(super) fn read_records(
             classification: Classification {
                 candidate: Err(Reason::MissingTaskEntrypoint),
                 execution_needs_reconciliation: false,
+                title_review_status: None,
             },
         };
         if let Some(blob) = inventory.entries.get(&readme)
@@ -503,7 +505,7 @@ impl Record {
         if let ScopeOutcome::Excluded { reason } = scope {
             return Ok(Outcome::Excluded { reason: *reason });
         }
-        let reason_codes = self.hold_reasons(scope, !unique);
+        let mut reason_codes = self.hold_reasons(scope, !unique);
         let hold = |reason_codes| Outcome::Held {
             reason_codes,
             candidate_status: None,
@@ -516,8 +518,12 @@ impl Record {
         let binding = self.blob_oid.as_deref().map_or(Ok(None), |oid| {
             reviews.for_preparation(self.key(), oid, &area.id)
         });
-        match self.classification.candidate {
-            Ok(status) if reason_codes.is_empty() => self.candidate_outcome(
+        match (
+            self.classification.candidate,
+            reason_codes.as_slice(),
+            binding,
+        ) {
+            (Ok(status), [], _) => self.candidate_outcome(
                 status,
                 &area.id,
                 binding,
@@ -525,6 +531,25 @@ impl Record {
                 git,
                 check_labels_at_staging,
             ),
+            (_, [Reason::MissingOrConflictingTitle], Ok(Some(review)))
+                if review.has_title()
+                    && let Some(status) = self.classification.title_review_status =>
+            {
+                self.candidate_outcome(
+                    status,
+                    &area.id,
+                    binding,
+                    source_bodies,
+                    git,
+                    check_labels_at_staging,
+                )
+            }
+            (_, [Reason::MissingOrConflictingTitle], Err(reason))
+                if self.classification.title_review_status.is_some() =>
+            {
+                reason_codes.push(reason);
+                Ok(hold(reason_codes))
+            }
             _ => Ok(hold(reason_codes)),
         }
     }
@@ -630,6 +655,7 @@ fn classify(bytes: &[u8], lifecycle: Lifecycle, claims_supported: bool) -> Class
     let mut classification = Classification {
         candidate: Err(Reason::UnsupportedTaskMetadata),
         execution_needs_reconciliation: false,
+        title_review_status: None,
     };
     let Some((header, body)) = split_record(bytes) else {
         return classification;
@@ -667,7 +693,13 @@ fn classify(bytes: &[u8], lifecycle: Lifecycle, claims_supported: bool) -> Class
     if !metadata.description.trim().is_empty() {
         classification.candidate = if state.is_ok() || classification.execution_needs_reconciliation
         {
-            validate_metadata(&metadata, body, lifecycle).and(state)
+            validate_metadata(&metadata, lifecycle).and_then(|()| {
+                if resolve_title(metadata.title.as_deref(), &metadata.description, body).is_err() {
+                    classification.title_review_status = state.ok();
+                    return Err(Reason::MissingOrConflictingTitle);
+                }
+                state
+            })
         } else {
             state
         };
@@ -709,11 +741,7 @@ fn classify_state(
     Ok(candidate)
 }
 
-fn validate_metadata(
-    metadata: &Frontmatter,
-    body: &str,
-    lifecycle: Lifecycle,
-) -> Result<(), Reason> {
+fn validate_metadata(metadata: &Frontmatter, lifecycle: Lifecycle) -> Result<(), Reason> {
     if metadata.priority.as_ref().is_some_and(|priority| {
         lifecycle == Lifecycle::Archive
             || !matches!(priority.as_str(), Some("high" | "normal" | "low"))
@@ -730,9 +758,6 @@ fn validate_metadata(
         {
             return Err(Reason::UnsupportedTaskMetadata);
         }
-    }
-    if resolve_title(metadata.title.as_deref(), &metadata.description, body).is_none() {
-        return Err(Reason::MissingOrConflictingTitle);
     }
     Ok(())
 }
@@ -767,20 +792,28 @@ pub(super) enum TitleSource {
     FrontmatterTitle,
     Heading,
     Description,
+    ReviewedFallback,
+    ReviewedOverride,
+}
+
+pub(super) enum TitleProblem {
+    Unavailable,
+    NeedsOverride,
+}
+
+pub(super) fn valid_title(value: &str) -> bool {
+    !value.trim().is_empty() && value.chars().count() <= 255 && !value.chars().any(char::is_control)
 }
 
 pub(super) fn resolve_title<'a>(
     title: Option<&'a str>,
     description: &'a str,
     body: &'a str,
-) -> Option<(&'a str, TitleSource)> {
-    let valid = |value: &str| {
-        !value.trim().is_empty()
-            && value.chars().count() <= 255
-            && !value.chars().any(char::is_control)
-    };
-    if let Some(title) = title.filter(|title| valid(title)) {
-        return Some((title, TitleSource::FrontmatterTitle));
+) -> Result<(&'a str, TitleSource), TitleProblem> {
+    if let Some(title) = title {
+        return valid_title(title)
+            .then_some((title, TitleSource::FrontmatterTitle))
+            .ok_or(TitleProblem::NeedsOverride);
     }
     let is_h1 = |event: &Event<'_>| {
         matches!(
@@ -794,7 +827,7 @@ pub(super) fn resolve_title<'a>(
     let mut events = Parser::new(body).into_offset_iter();
     let first_heading = events.next().filter(|(event, _)| is_h1(event));
     if events.any(|(event, _)| is_h1(&event)) {
-        return None;
+        return Err(TitleProblem::NeedsOverride);
     }
     let heading = if let Some((_, range)) = first_heading {
         // Only a single leading unindented ATX H1 can supply the title.
@@ -805,11 +838,15 @@ pub(super) fn resolve_title<'a>(
                 .iter()
                 .any(|(_, definition)| definition.span.start < range.start)
         {
-            return None;
+            return Err(TitleProblem::NeedsOverride);
         }
-        let line = body[range].split(['\r', '\n']).next()?.strip_prefix('#')?;
+        let line = body[range]
+            .split(['\r', '\n'])
+            .next()
+            .and_then(|line| line.strip_prefix('#'))
+            .ok_or(TitleProblem::NeedsOverride)?;
         if !line.is_empty() && !line.starts_with([' ', '\t']) {
-            return None;
+            return Err(TitleProblem::NeedsOverride);
         }
         let value = line.trim();
         let unclosed = value.trim_end_matches('#');
@@ -822,7 +859,8 @@ pub(super) fn resolve_title<'a>(
         None
     };
     heading
-        .filter(|heading| valid(heading))
+        .filter(|heading| valid_title(heading))
         .map(|heading| (heading, TitleSource::Heading))
-        .or_else(|| valid(description).then_some((description, TitleSource::Description)))
+        .or_else(|| valid_title(description).then_some((description, TitleSource::Description)))
+        .ok_or(TitleProblem::Unavailable)
 }

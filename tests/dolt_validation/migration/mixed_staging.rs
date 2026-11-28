@@ -11,6 +11,7 @@ mod post_import;
 fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     const POLICY: &str = "c66b3c50150e18426485d134de92c6b311dac125";
     const PROJECT_NAME: &str = "Synthetic reviewed delivery";
+    const REVIEWED_TITLE: &str = "Synthetic recovered Issue title";
     const LABEL: &str = "synthetic-ready-label";
     const REPO_URL: &str = "https://forge.example/synthetic/mixed";
     const RECORD_REF: &str = "https://forge.example/synthetic/history";
@@ -77,7 +78,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         (
             TASK,
             format!(
-                "---\ndescription: Synthetic Task record\npriority: high\ntags: [\"\u{a0}{LABEL}\u{2003}\"]\n---\n{task_body}"
+                "---\ndescription: Synthetic Task record\ntitle: \" \"\npriority: high\ntags: [\"\u{a0}{LABEL}\u{2003}\"]\n---\n{task_body}"
             ),
         ),
         (
@@ -142,7 +143,8 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
             "project_evidence":project_evidence
         }}],
         "task_reviews":[{"legacy_key":{"scope":"synthetic-app","work_id":"ready"},"source_git_blob_sha":oid(TASK),
-            "area_id":area, "created_at":range(CREATED),"updated_at":range(UPDATED),"relations":"no_edges"}],
+            "area_id":area, "created_at":range(CREATED),"updated_at":range(UPDATED),"relations":"no_edges",
+            "issue_type":"bug","title":{"mode":"override","value":REVIEWED_TITLE}}],
         "resource_bindings":{"version":1, "bindings":[
             {"scope":"synthetic-app","area_id":area,"resource":{"id":resource,"kind":"git-repo","name":"Synthetic Repo"},
              "evidence_path":README,"evidence_blob_oid":oid(README)},
@@ -572,6 +574,7 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
         "Reviewed Synthetic Queen",
         "sample-holder",
         LABEL,
+        REVIEWED_TITLE,
         PROJECT_NAME,
         root.to_str().unwrap(),
     ] {
@@ -674,6 +677,11 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     assert_eq!(labels.len(), 1);
     let label = &labels[0];
     assert_eq!(issue["target_id"], issue["issue_id"]);
+    assert_eq!(issue["target_issue_type"], "bug");
+    assert_eq!(
+        issue["target_title_sha256"],
+        sha256_hex(REVIEWED_TITLE.as_bytes())
+    );
     assert_eq!(issue["source_git_blob_sha"], oid(TASK));
     assert_eq!(
         issue["target_body_sha256"],
@@ -681,9 +689,9 @@ fn installed_cli_stages_mixed_reviewed_surfaces_in_one_inactive_target() {
     );
     assert_eq!(
         sql(&format!(
-            "SELECT id, number, area_id, status, priority, body FROM issues AS OF '{db}'"
+            "SELECT id, number, area_id, status, priority, type, title, body FROM issues AS OF '{db}'"
         )),
-        json!([{"id":issue["issue_id"], "number":1, "area_id":area, "status":"backlog", "priority":0, "body":task_body}])
+        json!([{"id":issue["issue_id"], "number":1, "area_id":area, "status":"backlog", "priority":0, "type":"bug", "title":REVIEWED_TITLE, "body":task_body}])
     );
     assert_eq!(
         sql(&format!("SELECT id, name FROM labels AS OF '{db}'")),
