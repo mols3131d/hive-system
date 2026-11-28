@@ -11,7 +11,7 @@ Hive is independent of IDEs, coding-agent runtimes and vendors, model providers,
 
 This repository owns the system and reusable assets. Actual records belong in a separate, user-controlled workspace.
 
-**Status** The Rust CLI provides v1 configuration and context inspection plus read-only committed Dolt validation and explicit Issue inspection under contract 2. Broader v2 workflows and Hive Skill remain in development. See [development setup](docs/development/README.md) to build and test the CLI.
+**Status** The Rust CLI provides v1 configuration and context inspection. Contract 2 provides scoped reads, guarded Issue workflows, private Queen conversation operations and local backup and restore. The optional Hive workflow Skill ships as a Rulesync source for developer dogfooding. Native host acceptance is tracked in [#14](https://github.com/mols3131d/hive-system/issues/14). See [development setup](docs/development/README.md) to build and test the CLI.
 
 ## Developer dogfooding
 
