@@ -4,7 +4,9 @@ use std::io::Write;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
-use super::{Installed, Path, Value, io_error, json, new_uuid_v7, sql_text, unverified};
+use super::{
+    Installed, Path, Value, io_error, json, new_uuid_v7, sql_text, tasks::TaskImport, unverified,
+};
 use crate::config_git::migration::prepared_records::{
     ArtifactKind, DirectiveStatus, Fields, Intake, PreparedRecord,
 };
@@ -14,11 +16,17 @@ use crate::error::HiveError;
 pub(super) struct Expected {
     directives: BTreeMap<String, Value>,
     artifacts: BTreeMap<String, Value>,
+    issue_links: BTreeMap<String, String>,
+    area_links: BTreeMap<String, String>,
 }
 
 impl Expected {
     pub(super) fn counts(&self) -> (usize, usize) {
         (self.directives.len(), self.artifacts.len())
+    }
+
+    pub(super) fn link_count(&self) -> usize {
+        self.issue_links.len() + self.area_links.len()
     }
 
     pub(super) fn transaction_checks(&self) -> impl Iterator<Item = (String, Vec<Value>)> + use<> {
@@ -61,7 +69,7 @@ impl Expected {
             (SELECT COUNT(*) FROM artifacts{snapshot}) AS artifacts,
             ((SELECT COUNT(*) FROM artifact_areas{snapshot}) + (SELECT COUNT(*) FROM artifact_projects{snapshot}) +
              (SELECT COUNT(*) FROM artifact_issues{snapshot}) + (SELECT COUNT(*) FROM artifact_resources{snapshot})) AS artifact_links"),
-            vec![json!({"directives": directives, "artifacts": artifacts, "artifact_links": 0})])
+            vec![json!({"directives": directives, "artifacts": artifacts, "artifact_links": self.link_count()})])
     }
 
     fn checks(&self, snapshot: &str) -> impl Iterator<Item = (String, Vec<Value>)> + use<> {
@@ -80,6 +88,10 @@ impl Expected {
                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS created_at,
                 DATE_FORMAT(substantive_updated_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS substantive_updated_at,
                 archived_at, archive_reason FROM artifacts{snapshot} ORDER BY id"), self.artifacts.values().cloned().collect()),
+            (format!("SELECT artifact_id, issue_id FROM artifact_issues{snapshot} ORDER BY artifact_id, issue_id"),
+                self.issue_links.iter().map(|(artifact, issue)| json!({"artifact_id": artifact, "issue_id": issue})).collect()),
+            (format!("SELECT artifact_id, area_id FROM artifact_areas{snapshot} ORDER BY artifact_id, area_id"),
+                self.area_links.iter().map(|(artifact, area)| json!({"artifact_id": artifact, "area_id": area})).collect()),
         ].into_iter()
     }
 }
@@ -87,6 +99,7 @@ impl Expected {
 pub(super) fn append(
     sql: &mut impl Write,
     records: &[PreparedRecord],
+    tasks: Option<&TaskImport<'_>>,
     now: OffsetDateTime,
 ) -> Result<Expected, HiveError> {
     let mut expected = Expected::default();
@@ -142,6 +155,32 @@ pub(super) fn append(
                     created_at, substantive_updated_at) VALUES ({id}, {}, {title}, {body}, {}, {}, {revision}, {}, {});",
                     sql_text(kind), sql_text(&fields.author_ref), sql_text(&fields.source_ref),
                     sql_time(&fields.created_at), sql_time(&fields.substantive_updated_at)).map_err(io_error)?;
+                if let Some(work) = &fields.work {
+                    let link = &work.issue_link;
+                    let issue = tasks.and_then(|tasks| tasks.issue_id(link)).ok_or_else(|| {
+                        unverified("A prepared work-scoped Artifact has no eligible Issue in this transaction.")
+                    })?;
+                    writeln!(
+                        sql,
+                        "INSERT INTO artifact_issues (artifact_id, issue_id) VALUES ({id}, {});",
+                        sql_text(issue)
+                    )
+                    .map_err(io_error)?;
+                    expected
+                        .issue_links
+                        .insert(record.id.clone(), issue.to_owned());
+                    if let Some(area_id) = &link.joined_area_id {
+                        writeln!(
+                            sql,
+                            "INSERT INTO artifact_areas (artifact_id, area_id) VALUES ({id}, {});",
+                            sql_text(area_id)
+                        )
+                        .map_err(io_error)?;
+                        expected
+                            .area_links
+                            .insert(record.id.clone(), area_id.clone());
+                    }
+                }
                 expected.artifacts.insert(record.id.clone(), row);
             }
         }
@@ -183,7 +222,7 @@ fn in_insert_order(records: &[PreparedRecord]) -> Result<Vec<&PreparedRecord>, H
     Ok(ordered)
 }
 
-pub(super) fn add_report(report: &mut Value, mut intake: Intake) {
+pub(super) fn add_report(report: &mut Value, mut intake: Intake, expected: &Expected) {
     report["coverage"] = json!("scopes_directives_artifacts");
     if let Some(counts) = intake.report["counts"].as_object() {
         for (surface, counts) in counts {
@@ -204,6 +243,22 @@ pub(super) fn add_report(report: &mut Value, mut intake: Intake) {
                 {
                     record.insert(digest_field.to_owned(), json!(path));
                 }
+            }
+            if let Some(issue) = record["outcome"]["target_id"]
+                .as_str()
+                .and_then(|id| expected.issue_links.get(id))
+            {
+                let link = record.get_mut("outcome").expect("prepared outcome")["provenance"]["issue_link"]
+                    .as_object_mut().expect("prepared Artifact link");
+                if let Some(key) = link.remove("legacy_key") {
+                    let scope = key["scope"].as_str().expect("prepared Task scope");
+                    let work = key["work_id"].as_str().expect("prepared Task work ID");
+                    link.insert(
+                        "legacy_key_sha256".to_owned(),
+                        json!(digest(&format!("{scope}\0{work}"))),
+                    );
+                }
+                link.insert("issue_id".to_owned(), json!(issue));
             }
             let section = match record["outcome"]["status"].as_str() {
                 Some("prepared") => "id_map",

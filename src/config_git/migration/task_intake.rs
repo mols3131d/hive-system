@@ -179,6 +179,8 @@ pub(crate) struct StagingTask<'a> {
     pub(crate) key: (&'a str, &'a str),
     pub(crate) area_id: &'a str,
     pub(crate) status: &'static str,
+    pub(crate) source_path: &'a str,
+    pub(crate) source_git_blob_sha: &'a str,
     pub(crate) locator: Value,
     pub(crate) fields: StagingFields<'a>,
 }
@@ -260,6 +262,8 @@ impl TaskPlan<'_> {
                     key: record.key(),
                     area_id,
                     status: candidate_status.as_str(),
+                    source_path: &record.path,
+                    source_git_blob_sha: oid,
                     locator: record.staging_locator(),
                     fields: provenance.staging_fields(&self.source_bodies[oid]),
                 })

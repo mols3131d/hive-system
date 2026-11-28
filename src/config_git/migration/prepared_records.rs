@@ -4,6 +4,8 @@ use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 
 use super::reviewed_records::sha256;
+pub(crate) use super::work_artifact::IssueLink;
+use super::work_artifact::WorkScope;
 
 pub(crate) use super::directive_artifact_intake::{ArtifactKind, DirectiveStatus};
 
@@ -47,6 +49,7 @@ pub(crate) struct ArtifactFields {
     pub(crate) source_ref: String,
     pub(crate) created_at: String,
     pub(crate) substantive_updated_at: String,
+    pub(crate) work: Option<Box<WorkScope>>,
 }
 
 // Only the portable evidence is serializable. The content and raw references
@@ -71,7 +74,8 @@ impl Serialize for Fields {
                 }
                 evidence
             }
-            Self::Artifact(row) => json!({
+            Self::Artifact(row) => {
+                let mut evidence = json!({
                 "source_ref_sha256": sha256(&row.source_ref),
                 "author_ref_sha256": sha256(&row.author_ref),
                 "created_at": row.created_at,
@@ -79,7 +83,15 @@ impl Serialize for Fields {
                 "scope": "standalone",
                 "archived_at": null,
                 "archive_reason": null,
-            }),
+                });
+                if let Some(work) = &row.work {
+                    evidence["scope"] = json!("work_scoped");
+                    evidence["issue_link"] = json!(work.issue_link);
+                    evidence["created_at"] = json!(work.created_at);
+                    evidence["substantive_updated_at"] = json!(work.substantive_updated_at);
+                }
+                evidence
+            }
         };
         evidence.serialize(serializer)
     }

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -8,6 +8,7 @@ use super::directive_artifact_intake::{ArtifactKind, Candidate, DirectiveStatus}
 use super::directive_history::{DirectiveHistory, Edges};
 use super::prepared_records::{ArtifactFields, DirectiveFields, Fields};
 use super::scope_plan::portable_reference;
+use super::work_artifact::{TaskContext, WorkArtifactReview};
 use super::{Inventory, Reason};
 use crate::cli::is_slug;
 use crate::dolt::is_uuid_v7;
@@ -19,6 +20,7 @@ pub(super) struct Review {
     source_path: String,
     source_git_blob_sha: String,
     pub(super) target_id: String,
+    #[serde(deserialize_with = "super::json_object::deserialize")]
     provenance: Provenance,
 }
 
@@ -35,6 +37,7 @@ enum Provenance {
         approval_and_validity: AbsenceReview,
     },
     DirectiveHistory(DirectiveHistory),
+    WorkScopedArtifact(WorkArtifactReview),
     StandaloneArtifact {
         artifact_kind: ArtifactKind,
         source_ref: String,
@@ -48,9 +51,15 @@ enum Provenance {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum AbsenceReview {
+pub(super) enum AbsenceReview {
     None,
     Unresolved,
+}
+
+pub(super) fn deserialize_present<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<Review>>, D::Error> {
+    super::json_object::deserialize_vec(deserializer).map(Some)
 }
 
 pub(super) fn bind<'a>(
@@ -84,6 +93,25 @@ pub(super) fn bind<'a>(
 }
 
 impl Review {
+    pub(super) fn is_work_scoped(&self) -> bool {
+        matches!(self.provenance, Provenance::WorkScopedArtifact(_))
+    }
+
+    pub(super) fn prepare_work_scoped(
+        &self,
+        candidate: &Candidate,
+        body: &str,
+        parent_bundle: &str,
+        tasks: &TaskContext<'_>,
+    ) -> Result<Fields, Reason> {
+        let (Provenance::WorkScopedArtifact(review), Candidate::Artifact { kind, .. }) =
+            (&self.provenance, candidate)
+        else {
+            return Err(Reason::UnsupportedReviewedRecord);
+        };
+        review.prepare(*kind, body, parent_bundle, tasks)
+    }
+
     pub(super) fn directive_edges(&self) -> Option<&Edges> {
         match &self.provenance {
             Provenance::DirectiveHistory(history) => Some(&history.supersession),
@@ -176,6 +204,7 @@ impl Review {
                     author_ref: author_ref.clone(),
                     created_at: created_at.clone(),
                     substantive_updated_at: substantive_updated_at.clone(),
+                    work: None,
                 }))
             }
             _ => Err(Reason::UnsupportedReviewedRecord),

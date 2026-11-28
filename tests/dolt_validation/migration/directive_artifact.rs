@@ -6,6 +6,9 @@ use super::{
 #[path = "directive_history.rs"]
 mod directive_history;
 
+#[path = "work_artifact.rs"]
+mod work_artifact;
+
 #[test]
 fn cli_migration_plan_prepares_only_exact_reviewed_records_under_both_pins() {
     const LEGACY_PIN: &str = "0fd0f8dbe632d14094a93599cb1b5f653789ac9c";

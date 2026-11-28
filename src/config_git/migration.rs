@@ -23,6 +23,7 @@ mod reviewed_records;
 mod task_graph;
 mod task_intake;
 mod task_provenance;
+mod work_artifact;
 pub(crate) use queen_preparation::PreparedQueen;
 pub(crate) use task_intake::StagingTask;
 mod scope_plan;
@@ -139,6 +140,7 @@ enum Reason {
     UnverifiedArtifactRetention,
     UnresolvedParentTask,
     MissingParentTaskEntrypoint,
+    ParentTaskQuarantined,
     UnsupportedReviewedRecord,
     UnresolvedArtifactLinks,
 }
