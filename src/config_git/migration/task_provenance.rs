@@ -1,7 +1,7 @@
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
-use pulldown_cmark::{Event, Options, Parser, Tag};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -367,23 +367,46 @@ fn acceptance_paragraphs(body: &str) -> HashSet<BodyRange> {
 // can be written in free prose or kept in a referenced source. Refuse known
 // criteria markers in the README even when the review omitted a body range.
 fn has_criteria_indicators(body: &str) -> bool {
-    Parser::new_ext(body, Options::ENABLE_TASKLISTS).any(|event| match event {
-        Event::TaskListMarker(_) => true,
-        Event::Text(text) | Event::Code(text) | Event::Html(text) | Event::InlineHtml(text) => {
-            let text = text.to_ascii_lowercase();
-            text.contains("acceptance criteria")
-                || text.contains("completion criteria")
-                || text.contains("definition of done")
-                || text.lines().any(|line| {
-                    let line = line.trim();
-                    line == "acceptance"
-                        || line.starts_with("acceptance:")
-                        || line == "criteria"
-                        || line.starts_with("criteria:")
-                })
+    let mut inline = None;
+    for event in Parser::new_ext(body, Options::ENABLE_TASKLISTS) {
+        match event {
+            Event::TaskListMarker(_) => return true,
+            Event::Start(Tag::Heading { .. } | Tag::Paragraph) => inline = Some(String::new()),
+            Event::End(TagEnd::Heading(_) | TagEnd::Paragraph) => {
+                if inline.take().is_some_and(|text| criteria_marker(&text)) {
+                    return true;
+                }
+            }
+            Event::Text(text) | Event::Code(text) => match &mut inline {
+                Some(inline) => inline.push_str(&text),
+                None if criteria_marker(&text) => return true,
+                None => {}
+            },
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some(inline) = &mut inline {
+                    inline.push('\n');
+                }
+            }
+            Event::Html(text) | Event::InlineHtml(text) if criteria_marker(&text) => return true,
+            _ => {}
         }
-        _ => false,
-    })
+    }
+    false
+}
+
+fn criteria_marker(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.contains("acceptance criteria")
+        || normalized.contains("completion criteria")
+        || normalized.contains("definition of done")
+        || text.lines().any(|line| {
+            let line = line.trim();
+            line == "acceptance"
+                || line.starts_with("acceptance:")
+                || line == "criteria"
+                || line.starts_with("criteria:")
+        })
 }
 
 #[derive(Serialize)]

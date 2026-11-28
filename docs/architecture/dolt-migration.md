@@ -304,7 +304,7 @@ The planner checks acyclicity across the combined dependent-to-prerequisite and 
 
 Both decisions are bound by the Task review's exact key, committed blob, Area, source commit, policy pin, and intended workspace. Omit optional fields instead of supplying null. A structurally valid title decision with an invalid value or an inapplicable fallback holds as `missing_or_conflicting_title`. A title or type selection supplies no date, execution, closure, criteria, label, or relation evidence.
 
-The backlog decision uses the same exact Task key, blob, Area, source commit, policy pin, and intended workspace as the Task review. Omit `acceptance_criteria` entirely when declaring absence. An explicit null or any supplied range, including an invalid or unselectable range, prevents fallback. A Task with recognizable criteria in its committed README also holds as `inapplicable_todo_fallback`. The planner conservatively treats Markdown checkboxes and recognizable labels or headings such as “Acceptance”, “Acceptance Criteria”, “Completion Criteria”, and “Definition of Done” as criteria indicators. The review must establish absence across the Task's original evidence, including any applicable references. The decision preserves the historical dates, body, and relation and label checks. Claimed Tasks, other legacy statuses, and Tasks missing required provenance remain held. The plan and staged ID map record the redacted `todo_fallback` decision and backlog target status. The legacy lifecycle stays active in the source locator. No criteria are fabricated.
+The backlog decision uses the same exact Task key, blob, Area, source commit, policy pin, and intended workspace as the Task review. Omit `acceptance_criteria` entirely when declaring absence. An explicit null or any supplied range, including an invalid or unselectable range, prevents fallback. A Task with recognizable criteria in its committed README also holds as `inapplicable_todo_fallback`. The planner conservatively treats Markdown checkboxes and recognizable labels or headings such as “Acceptance”, “Acceptance Criteria”, “Completion Criteria”, and “Definition of Done” as criteria indicators. It checks rendered heading and paragraph text across inline formatting and normalizes Unicode whitespace. Criteria markers in code remain a conservative hold. The review must establish absence across the Task's original evidence, including any applicable references. The decision preserves the historical dates, body, and relation and label checks. Claimed Tasks, other legacy statuses, and Tasks missing required provenance remain held. The plan and staged ID map record the redacted `todo_fallback` decision and backlog target status. The legacy lifecycle stays active in the source locator. No criteria are fabricated.
 
 An omitted review keeps the original provenance holds. Repeated reviews for the same key hold as `conflicting_task_review`, and a stale blob or different mapped Area holds as `task_review_binding_mismatch`. Unsupported keys and malformed review identifiers invalidate the mapping input. The read-only plan holds tagged Tasks as `unverified_task_labels` pending the target collation check in disposable staging.
 
@@ -517,22 +517,23 @@ Every dry-run and staged import must emit a machine-readable JSON report (plus o
 ### Minimum Report Fields
 
 1. **Provenance header:**
-   - `source`: logical workspace label, `source_commit` (exact v1 Git SHA), `source_clean` (`true` required), pinned v1 policy revision (`AGENTS.md`), `hive.yml` version and coordination mode (or `absent`).
-   - `target`: `workspace_id`, Dolt version, `schema_version` (`1`), `migration_digest` (SHA-256 of `0001_initial.sql`), `base_dolt_commit`, `confirmed_dolt_commit` (or `null` on rollback), `asset_git_commit` (for `assets/bots/<slug>/SOUL.md`), `issue_number_next_value`.
+   - `source`: logical `workspace_label` when present in the pinned v1 source, otherwise `null`, `source_commit` (exact v1 Git SHA), `source_clean` (`true` required), pinned v1 policy revision (`AGENTS.md`), `hive_yml_version` (`null` when absent) and `hive_yml_mode` (or `absent`).
+   - `target`: `workspace_id`, Dolt version, `schema_version` (`1`), `migration_digest` (SHA-256 of `0001_initial.sql`), `base_dolt_commit`, `confirmed_dolt_commit` (or `null` on rollback), `asset_git_commit` (for `assets/bots/<slug>/SOUL.md`), and `issue_number_next_value` for the retained target state. When Tasks are selected, `projected_issue_number_next_value` records the counter exercised in the transaction, including when dry-run rolls it back.
    - `mode`: `dry_run` or `staged_import`, `observed_at` (UTC).
 2. **Surface counts (reconciled inventory):** For each surface (`scopes`, `tasks`, `directives`, `artifacts_work_scoped`, `artifacts_standalone`, `bots_soul`, `bot_memories_historical`, `navigation_only`), report `inventoried`, `imported`, `held`, and `excluded_non_record`, satisfying `inventoried == imported + held + excluded_non_record`. Break down `tasks` by v1 lifecycle directory (`backlog`, `active`, `archive`) and v2 target status (`backlog`, `todo`, `done`, `cancelled`).
 3. **Content hashes:** For every imported record (`issues`, `directives`, `artifacts`, `assets/bots/<slug>/SOUL.md`), record:
-   - `source_path` and `source_git_blob_sha`,
+   - `source_path` or its SHA-256 digest in `source_path_sha256`, and `source_git_blob_sha`,
    - `source_raw_sha256` (exact v1 UTF-8 file bytes),
    - `target_body_sha256` over the exact Dolt body bytes after the documented metadata extraction. For Soul record the SHA-256 of the committed file and compare it with the source file bytes. Keep the original Soul frontmatter in storage and strip it only during runtime context rendering.
-4. **Legacy ID map:** Deterministic table mapping each qualified v1 key to its v2 target identifier(s):
+4. **Legacy ID map:** Deterministic table mapping each qualified v1 key or its `legacy_key_sha256` digest to its v2 target identifier(s):
    - Scope `<project-id>` -> `area_id` (and optional `project_id` / `resource_id` list),
    - Task `(<project-id>, <work-id>)` -> `issue_id` (UUIDv7) and `issue_number`,
    - Directive `directives/<project-id>/<slug>` -> `directive_id`,
    - Artifact `<v1-artifact-path>` -> `artifact_id` (or `resource_id` for external/binary reference),
    - Bot `<bot-id>` -> `bot_id`, `slug`, and `assets/bots/<slug>/SOUL.md` blob SHA.
-5. **Hold (quarantine) ledger:** Exact `source_path`, `source_commit`, qualified legacy key, typed `reason_code`, and required operator reconciliation action.
-6. **Post-import invariant checks:** Schema/constraint validation pass, combined completion-obligation graph acyclicity pass, `done` Issue completion-obligation checks (all direct prerequisites `done`, all immediate children terminal, plus recorded historical cancelled-child scope proof), `issue_claims` count `== 0`, `workspace_counters.next_value == max(issues.number) + 1` (or `1`), retention timestamps preserved (`substantive_updated_at`, `closed_at`), and source Git `HEAD`/clean-status unchanged. Full `#10` read-only Dolt validation inspects **committed** snapshots only, not uncommitted SQL transaction state: run it on a staged import only after committing the staged transaction to the isolated, inactive copy and before any promotion decision (an open rolled-back dry-run transaction runs SQL/transaction-level checks only and requires a corresponding committed disposable copy for full `#10` validation).
+5. **Hold (quarantine) ledger:** Source path, `source_commit`, qualified legacy key, typed `reason_code`, and required operator reconciliation action. Use source path and legacy key digests for private or nonportable locators. Resolve these digests against the exact `source_commit`.
+6. **Evidence basis:** `reconciliation.counts_and_id_map_basis` identifies the rolled-back transaction or confirmed commit. `reconciliation.asset_commit_basis` identifies the verified disposable or published asset commit.
+7. **Post-import invariant checks:** Schema/constraint validation pass, combined completion-obligation graph acyclicity pass, `done` Issue completion-obligation checks (all direct prerequisites `done`, all immediate children terminal, plus recorded historical cancelled-child scope proof), `issue_claims` count `== 0`, `workspace_counters.next_value == max(issues.number) + 1` (or `1`), retention timestamps preserved (`substantive_updated_at`, `closed_at`), and source Git `HEAD`/clean-status unchanged. Full `#10` read-only Dolt validation inspects **committed** snapshots only, not uncommitted SQL transaction state: run it on a staged import only after committing the staged transaction to the isolated, inactive copy and before any promotion decision (an open rolled-back dry-run transaction runs SQL/transaction-level checks only and requires a corresponding committed disposable copy for full `#10` validation).
 
 ### Synthetic Report Excerpt (Illustrative)
 
@@ -543,13 +544,20 @@ Every dry-run and staged import must emit a machine-readable JSON report (plus o
     "source_commit": "0000000000000000000000000000000000000001",
     "source_clean": true,
     "policy_pin": "v1-synthetic-pin",
-    "hive_yml_mode": "local"
+    "hive_yml_mode": "local",
+    "workspace_label": null
   },
   "target": {
     "workspace_id": "01900000-0000-7000-8000-000000000001",
     "schema_version": 1,
-    "issue_number_next_value": 3,
+    "confirmed_dolt_commit": null,
+    "issue_number_next_value": 1,
+    "projected_issue_number_next_value": 3,
     "active_claims": 0
+  },
+  "reconciliation": {
+    "counts_and_id_map_basis": "rolled_back_transaction",
+    "asset_commit_basis": "verified_disposable_commit"
   },
   "counts": {
     "tasks": { "inventoried": 8, "imported": 2, "held": 6, "excluded_non_record": 0 },
@@ -558,7 +566,7 @@ Every dry-run and staged import must emit a machine-readable JSON report (plus o
   "id_map": [
     {
       "kind": "task",
-      "legacy_key": "synthetic/planned",
+      "legacy_key_sha256": "<sha256>",
       "target_id": "01900000-0000-7000-8000-000000000011",
       "issue_number": 1,
       "source_raw_sha256": "<sha256>",
@@ -567,8 +575,8 @@ Every dry-run and staged import must emit a machine-readable JSON report (plus o
   ],
   "holds": [
     {
-      "legacy_key": "synthetic/running",
-      "source_path": "tasks/synthetic/active/running/README.md",
+      "legacy_key_sha256": "<sha256>",
+      "source_path_sha256": "<sha256>",
       "reason_code": "execution_needs_reconciliation"
     }
   ]

@@ -58,7 +58,12 @@ fn check_fallback(binary: &Path, pin: &str, installed: bool) {
     }
     let todo = "status: todo\n";
     let fixtures = [
-        ("a-reviewed", "active", todo, ""),
+        (
+            "a-reviewed",
+            "active",
+            todo,
+            "```text\nSynthetic example output\n```\n",
+        ),
         (
             "b-tagged",
             "active",
@@ -74,6 +79,36 @@ fn check_fallback(binary: &Path, pin: &str, installed: bool) {
             "active",
             todo,
             "## Acceptance\n\nThe result must be reproducible.\n",
+        ),
+        (
+            "formatted-definition",
+            "active",
+            todo,
+            "## Definition of **Done**\n\nThe output must be reproducible.\n",
+        ),
+        (
+            "nbsp-acceptance",
+            "active",
+            todo,
+            "## Acceptance\u{00a0}Criteria\n\nThe output must be reproducible.\n",
+        ),
+        (
+            "formatted-paragraph",
+            "active",
+            todo,
+            "The **completion** criteria are listed below.\n\nThe output must be reproducible.\n",
+        ),
+        (
+            "inline-code-marker",
+            "active",
+            todo,
+            "`Completion Criteria`:\n\nThe output must be reproducible.\n",
+        ),
+        (
+            "fenced-marker",
+            "active",
+            todo,
+            "```markdown\n## Definition of Done\nThe output must be reproducible.\n```\n",
         ),
         (
             "available-checklist",
@@ -249,6 +284,11 @@ fn check_fallback(binary: &Path, pin: &str, installed: bool) {
         ("missing-relations", "unresolved_task_relations"),
         ("unresolved-relations", "unresolved_task_relations"),
         ("available-body", "inapplicable_todo_fallback"),
+        ("formatted-definition", "inapplicable_todo_fallback"),
+        ("nbsp-acceptance", "inapplicable_todo_fallback"),
+        ("formatted-paragraph", "inapplicable_todo_fallback"),
+        ("inline-code-marker", "inapplicable_todo_fallback"),
+        ("fenced-marker", "inapplicable_todo_fallback"),
         ("available-checklist", "inapplicable_todo_fallback"),
         ("available-range", "inapplicable_todo_fallback"),
         ("invalid-range", "inapplicable_todo_fallback"),
@@ -363,6 +403,30 @@ fn check_fallback(binary: &Path, pin: &str, installed: bool) {
             .filter(|row| row["kind"] == "task")
             .collect();
         assert_eq!(task_rows.len(), 3);
+        for name in [
+            "formatted-definition",
+            "nbsp-acceptance",
+            "formatted-paragraph",
+        ] {
+            let digest = sha256_hex(format!("tasks/_general/active/{name}/README.md").as_bytes());
+            let hold = data["holds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["source_path_sha256"] == digest)
+                .unwrap();
+            assert!(
+                hold["reason_codes"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("inapplicable_todo_fallback"))
+            );
+            assert!(
+                task_rows
+                    .iter()
+                    .all(|row| row["source_path_sha256"] != digest)
+            );
+        }
         for (offset, (name, status)) in [
             ("a-reviewed", "backlog"),
             ("b-tagged", "backlog"),
