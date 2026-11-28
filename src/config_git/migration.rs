@@ -11,6 +11,7 @@ use super::*;
 use crate::config_file::{Coordination, ScopedDirectory};
 
 mod scope_plan;
+mod task_graph;
 mod task_intake;
 mod task_provenance;
 pub(crate) use scope_plan::plan;

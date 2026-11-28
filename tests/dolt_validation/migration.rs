@@ -2003,6 +2003,423 @@ fn cli_migration_plan_prepares_only_exact_reviews_of_independent_tasks() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cli_migration_plan_prepares_terminal_provenance_and_checks_combined_graph() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let config = temp.path().join("config");
+    let source = temp.path().join("source");
+    init_git(
+        &source,
+        &home,
+        "Synthetic operator",
+        "operator@sample.invalid",
+    );
+    fs::write(
+        source.join("AGENTS.md"),
+        format!("hive-system@{POLICY_PIN}\n"),
+    )
+    .unwrap();
+    fs::write(
+        source.join("hive.yml"),
+        "version: 1\ncoordination:\n  mode: local\n",
+    )
+    .unwrap();
+
+    let actor = "synthetic:release-reviewer";
+    let outcome = "Approved synthetic verification and archived the release checklist.";
+    let acceptance = "The release reviewer accepted cancellation of the workspace widget before closing the launch.";
+    let created = "2026-04-01T10:00:00Z";
+    let updated = "2026-04-03T11:00:00+01:00";
+    let closed = "2026-04-02T10:00:00Z";
+    let body = format!(
+        "# Synthetic release check\n\nCreated: {created}\nClosed: {closed}\n\
+         Updated: {updated}\nClosed by: {actor}\nOutcome: {outcome}\n"
+    );
+    let parent_body = format!("{body}\n## Historical scope review\n\n{acceptance}\n");
+    let cancelled_body =
+        format!("{body}\nCancellation: workspace widget superseded by the plan.\n");
+    let todo_criteria = "- [ ] Verify the replacement workspace widget.";
+    let todo_body = format!("{body}\n## Acceptance\n\n{todo_criteria}\n");
+    let claim = "claim: {id: synthetic-assignment, holder: synthetic-holder}\n";
+    let fixtures = [
+        (
+            "_general/active/widget",
+            "done",
+            "priority: low\n",
+            parent_body.as_str(),
+        ),
+        (
+            "_hive-userdata/archive/widget",
+            "cancelled",
+            "",
+            cancelled_body.as_str(),
+        ),
+        (
+            "_general/archive/prepare-release",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        ("_general/archive/verify-release", "done", "", body.as_str()),
+        ("_general/archive/follow-up", "done", "", body.as_str()),
+        (
+            "_general/archive/missing-scope-acceptance",
+            "done",
+            "",
+            parent_body.as_str(),
+        ),
+        (
+            "_general/archive/child-without-approval",
+            "cancelled",
+            "",
+            cancelled_body.as_str(),
+        ),
+        ("_general/archive/held-closure", "done", "", body.as_str()),
+        (
+            "_general/archive/uses-held-prerequisite",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/transitively-held",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/missing-prerequisite",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/uses-cancelled-prerequisite",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/independent-cancellation",
+            "cancelled",
+            "",
+            cancelled_body.as_str(),
+        ),
+        (
+            "_general/archive/unfinished-parent",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/active/unfinished-child",
+            "todo",
+            "",
+            todo_body.as_str(),
+        ),
+        (
+            "_general/archive/incomplete-parent-list",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        ("_general/archive/unlisted-child", "done", "", body.as_str()),
+        ("_general/archive/cycle-parent", "done", "", body.as_str()),
+        ("_general/archive/cycle-child", "done", "", body.as_str()),
+        (
+            "_general/archive/depends-on-cycle",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        ("_general/active/claimed-done", "done", claim, body.as_str()),
+        (
+            "_general/archive/claimed-cancelled",
+            "cancelled",
+            claim,
+            cancelled_body.as_str(),
+        ),
+        (
+            "_general/active/pending-review",
+            "review",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/active/claimed-todo",
+            "todo",
+            claim,
+            todo_body.as_str(),
+        ),
+        (
+            "_general/archive/uses-claimed-prerequisite",
+            "done",
+            "",
+            body.as_str(),
+        ),
+        (
+            "_general/archive/bad-closure-order",
+            "done",
+            "",
+            body.as_str(),
+        ),
+    ];
+    for (bundle, state, fields, body) in fixtures {
+        let file = source.join(format!("tasks/{bundle}/README.md"));
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            file,
+            format!(
+                "---\ndescription: Synthetic release task\nstatus: {state}\n{fields}---\n{body}"
+            ),
+        )
+        .unwrap();
+    }
+    git(&source, &home, &["add", "."]);
+    git(
+        &source,
+        &home,
+        &["commit", "-qm", "Synthetic terminal and graph evidence"],
+    );
+    let commit = git_text(&source, &home, &["rev-parse", "HEAD"]);
+    let workspace = id(1);
+    let general = id(AREA_GENERAL);
+    let userdata = id(AREA_USERDATA);
+    let key = |scope: &str, name: &str| json!({"scope": scope, "work_id": name});
+    let local = |name: &str| key("_general", name);
+    let range = |body: &str, evidence: &str| {
+        let start = body.find(evidence).unwrap();
+        json!({"start": start, "end": start + evidence.len()})
+    };
+    let child = |key: Value| json!({"legacy_key": key});
+    let reviews: Vec<_> = fixtures.iter().map(|(bundle, state, _, body)| {
+        let (scope, rest) = bundle.split_once('/').unwrap();
+        let (_, name) = rest.split_once('/').unwrap();
+        let area = if scope == "_general" { &general } else { &userdata };
+        let mut relations = json!({"parent": null, "prerequisites": [], "children": []});
+        match (scope, name) {
+            ("_general", "widget") => {
+                relations["prerequisites"] = json!([local("verify-release"), local("prepare-release")]);
+                relations["children"] = json!([{
+                    "legacy_key": key("_hive-userdata", "widget"),
+                    "scope_acceptance": range(body, acceptance),
+                }]);
+            }
+            ("_hive-userdata", "widget") => relations["parent"] = local("widget"),
+            (_, "follow-up") => relations["prerequisites"] = json!([local("widget")]),
+            (_, "missing-scope-acceptance") => {
+                relations["children"] = json!([child(local("child-without-approval"))]);
+            }
+            (_, "child-without-approval") => relations["parent"] = local("missing-scope-acceptance"),
+            (_, "uses-held-prerequisite") => relations["prerequisites"] = json!([local("held-closure")]),
+            (_, "transitively-held") => relations["prerequisites"] = json!([local("uses-held-prerequisite")]),
+            (_, "missing-prerequisite") => relations["prerequisites"] = json!([local("unrecorded")]),
+            (_, "uses-cancelled-prerequisite") => {
+                relations["prerequisites"] = json!([local("independent-cancellation")]);
+            }
+            (_, "unfinished-parent") => relations["children"] = json!([child(local("unfinished-child"))]),
+            (_, "unfinished-child") => relations["parent"] = local("unfinished-parent"),
+            (_, "unlisted-child") => relations["parent"] = local("incomplete-parent-list"),
+            (_, "cycle-parent") => relations["children"] = json!([child(local("cycle-child"))]),
+            (_, "cycle-child") => {
+                relations["parent"] = local("cycle-parent");
+                relations["prerequisites"] = json!([local("cycle-parent")]);
+            }
+            (_, "depends-on-cycle") => relations["prerequisites"] = json!([local("cycle-parent")]),
+            (_, "uses-claimed-prerequisite") => relations["prerequisites"] = json!([local("claimed-done")]),
+            _ => {}
+        }
+        let mut review = json!({
+            "legacy_key": key(scope, name),
+            "source_git_blob_sha": git_text(&source, &home, &["rev-parse", &format!("HEAD:tasks/{bundle}/README.md")]),
+            "area_id": area,
+            "relations": relations,
+            "created_at": range(body, created),
+            "updated_at": range(body, updated),
+        });
+            if matches!(*state, "done" | "cancelled") {
+            review["closure"] = json!({
+                "closed_at": range(body, closed),
+                "closed_by_ref": range(body, actor),
+                "resolution_note": range(body, outcome),
+            });
+        }
+            if name == "held-closure" {
+                review["closure"].as_object_mut().unwrap().remove("closed_by_ref");
+            }
+        if name == "bad-closure-order" {
+            review["created_at"] = range(body, updated);
+        }
+        if *state == "todo" {
+            review["acceptance_criteria"] = range(body, todo_criteria);
+        }
+        review
+    }).collect();
+    let mut mapping = json!({
+        "version": 1, "source_commit": commit, "policy_pin": POLICY_PIN, "workspace_id": workspace,
+        "scopes": [
+            {"scope": "_general", "decision": {"kind":"area","area":{"id":general,"slug":"general","name":"General"}}},
+            {"scope": "_hive-userdata", "decision": {"kind":"area","area":{"id":userdata,"slug":"operations","name":"Operations"}}}
+        ],
+        "task_reviews": reviews,
+    });
+    let file = temp.path().join("review.json");
+    let args = [
+        "--source",
+        source.to_str().unwrap(),
+        "--source-commit",
+        &commit,
+        "--workspace-id",
+        &workspace,
+        "--mapping-file",
+        file.to_str().unwrap(),
+        "--tasks",
+    ];
+    let plan = |mapping: &Value| {
+        fs::write(&file, serde_json::to_vec(mapping).unwrap()).unwrap();
+        migration_cli(&home, &config, "migration-plan", &args, 0)["data"]["task_intake"].clone()
+    };
+    let index = fs::read(source.join(".git/index")).unwrap();
+    let report = plan(&mapping);
+    assert_eq!(report, plan(&mapping));
+    let rows = |report: &Value| -> BTreeMap<String, Value> {
+        report["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let k = &row["legacy_key"];
+                let key = format!(
+                    "{}/{}",
+                    k["scope"].as_str().unwrap(),
+                    k["work_id"].as_str().unwrap()
+                );
+                (key, row["outcome"].clone())
+            })
+            .collect()
+    };
+    let outcomes = rows(&report);
+    assert_eq!(
+        report["counts"],
+        json!({
+            "inventoried": fixtures.len(), "prepared": 6, "held": fixtures.len() - 6, "excluded": 0
+        })
+    );
+    let parent = &outcomes["_general/widget"];
+    assert_eq!(parent["status"], "prepared");
+    assert_eq!(parent["candidate_status"], "done");
+    assert_eq!(parent["provenance"]["priority"], 2);
+    assert_eq!(
+        parent["provenance"]["closure"],
+        json!({
+            "closed_at": {"value": closed, "body_range": range(&parent_body, closed)},
+            "closed_by_ref": {"sha256": sha256_hex(actor.as_bytes()), "body_range": range(&parent_body, actor)},
+            "resolution_note": {"sha256": sha256_hex(outcome.as_bytes()), "body_range": range(&parent_body, outcome)},
+        })
+    );
+    assert_eq!(
+        parent["provenance"]["relations"],
+        json!({
+            "parent": null,
+            "prerequisites": [local("prepare-release"), local("verify-release")],
+            "children": [{
+                "legacy_key": key("_hive-userdata", "widget"),
+                "scope_acceptance": {"sha256": sha256_hex(acceptance.as_bytes()),
+                    "body_range": range(&parent_body, acceptance)}
+            }],
+        })
+    );
+    let child = &outcomes["_hive-userdata/widget"];
+    assert_eq!(child["status"], "prepared");
+    assert_eq!(child["candidate_status"], "cancelled");
+    assert_eq!(child["provenance"]["priority"], Value::Null);
+    assert_eq!(child["provenance"]["relations"]["parent"], local("widget"));
+    assert_eq!(outcomes["_general/follow-up"]["status"], "prepared");
+    assert_eq!(
+        outcomes["_general/independent-cancellation"]["status"],
+        "prepared"
+    );
+    for name in [
+        "missing-scope-acceptance",
+        "uses-held-prerequisite",
+        "transitively-held",
+        "missing-prerequisite",
+        "uses-cancelled-prerequisite",
+        "unfinished-parent",
+        "incomplete-parent-list",
+        "unlisted-child",
+        "cycle-parent",
+        "cycle-child",
+        "depends-on-cycle",
+        "uses-claimed-prerequisite",
+    ] {
+        assert_eq!(
+            outcomes[&format!("_general/{name}")]["reason_codes"],
+            json!(["unresolved_completion_obligation"]),
+            "{name}"
+        );
+    }
+    for (name, reason) in [
+        ("child-without-approval", "unresolved_task_relations"),
+        ("unfinished-child", "unresolved_task_relations"),
+        ("held-closure", "incomplete_historical_provenance"),
+        ("bad-closure-order", "incomplete_historical_provenance"),
+        ("claimed-done", "invalid_legacy_state"),
+        ("claimed-cancelled", "invalid_legacy_state"),
+        ("pending-review", "missing_typed_submission_evidence"),
+        ("claimed-todo", "execution_needs_reconciliation"),
+    ] {
+        assert_eq!(
+            outcomes[&format!("_general/{name}")]["reason_codes"],
+            json!([reason]),
+            "{name}"
+        );
+    }
+    for raw in [
+        actor,
+        outcome,
+        acceptance,
+        todo_criteria,
+        "synthetic-holder",
+        "issue_number",
+    ] {
+        assert!(!report.to_string().contains(raw), "report exposed {raw}");
+    }
+
+    // A malformed range removes preparation of the whole parent/child
+    // relationship and any dependent, while independent prerequisites survive.
+    mapping["task_reviews"][0]["relations"]["children"][0]["scope_acceptance"] =
+        json!({"start": 0, "end": 0});
+    let invalid_proof = rows(&plan(&mapping));
+    for name in [
+        "_general/widget",
+        "_hive-userdata/widget",
+        "_general/follow-up",
+    ] {
+        assert_eq!(invalid_proof[name]["status"], "held");
+    }
+    assert_eq!(
+        invalid_proof["_general/verify-release"]["status"],
+        "prepared"
+    );
+    mapping["task_reviews"][0]["relations"]
+        .as_object_mut()
+        .unwrap()
+        .remove("children");
+    let incomplete_review = rows(&plan(&mapping));
+    assert_eq!(
+        incomplete_review["_general/widget"]["reason_codes"],
+        json!(["unresolved_completion_obligation"])
+    );
+    assert_eq!(fs::read(source.join(".git/index")).unwrap(), index);
+    assert_eq!(git_text(&source, &home, &["rev-parse", "HEAD"]), commit);
+    assert!(git(&source, &home, &["status", "--porcelain"]).is_empty());
+    assert!(!config.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn cli_migration_plan_rejects_unbound_inputs_and_unverified_source() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");

@@ -159,9 +159,10 @@ pub(crate) fn plan(
             let records =
                 task_intake::read_records(inventory, &|| reader.command(), claims_supported)?;
             report["task_intake"] =
-                task_intake::report(records, &outcomes, &mapping.task_reviews, &|| {
+                task_intake::prepare(records, &outcomes, &mapping.task_reviews, &|| {
                     reader.command()
-                })?;
+                })?
+                .report();
         }
         Ok(report)
     })
