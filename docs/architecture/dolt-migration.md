@@ -130,6 +130,25 @@ V1 workspaces record their pinned system policy revision in workspace `AGENTS.md
 - **No invented v2 formats:** V2 workspace descriptor, user config, local binding, and private conversation metadata schemas are owned by the separate v2 workspace-layout contract (`#18` / `#20`). Migration tooling must consume that reviewed contract rather than defining ad hoc descriptor or binding files.
 - **Cutover gate:** Updating a workspace's policy pin or switching active authority from v1 to v2 is never performed by dry-run or import; it requires separate explicit operator approval after old writers and executions are verified stopped.
 
+#### Source preflight
+
+On Linux, run the source preflight against a disposable, authorized v1 copy with a standalone local Git object store. Supply the absolute worktree root and its full lowercase commit ID explicitly.
+
+```sh
+hive --contract 2 --json workspace migration-preflight \
+  --source "$source_root" --source-commit "$source_commit"
+```
+
+The command verifies that HEAD matches the selected commit and checks for staged, modified, and untracked entries before and after inventory. It refuses linked worktrees, alternate object stores, submodules, tracked symlinks, and index flags that can hide worktree changes. It reads the policy pin and coordination mode through the v1 compatibility rules from the selected commit. `hive_yml` is null for the supported older pin that predates tracked coordination configuration. A committed remote mode describes the configuration only.
+
+Preflight checks a private copy of the source index against the verified commit. It preserves the index modification time on the copy so Git detects same-size edits made within the index timestamp window. It requires a standalone Git index of at most 16 MiB and refuses indexes that depend on a separate shared index file. The only ignore rules for untracked files come from per-directory `.gitignore` files and a private copy of `.git/info/exclude`. Git gives per-directory rules priority over the copied exclude file. When present, `.git/info` must be a directory and `.git/info/exclude` must be a regular file of at most 64 KiB. Both paths must be free of symlinks.
+
+Preflight walks the selected commit's snapshot. It verifies each tree and blob against its Git object ID through an isolated local reader before reporting success. It rejects an unavailable, unreadable, or mismatched object and supports loose and packed SHA-1 and SHA-256 objects.
+
+A successful `source_preflight` report gives the Git tree ID, SHA-256 of the raw root tree, committed file and directory counts, total blob size, and committed Rulesync presence. The catalog SHA-256 covers path-sorted entries encoded as path, mode, object ID, and size (or `-` for a directory), each terminated by a NUL byte. The catalog limits are 4 MiB of encoded entries and 10,000 paths. Inventory accepts at most 1 MiB per tree and 64 MiB of decoded tree and blob contents combined. Reused trees count once per path and reused blobs count once per object ID toward the verification budget. The reported total blob size counts each file path. The report omits source paths, record bodies, and remote aliases.
+
+This slice covers source selection and inventory. Per-record raw digests, mapping, holds, target validation, rollback, and staged import remain required for A15.
+
 ### 6. Issue Counters and Number Non-Reuse
 
 V1 identifies tasks by `(<project-id>, <work-id>)` with no workspace-wide numeric sequence. V2 assigns each imported Issue a fresh lowercase UUIDv7 (`issues.id`) and an immutable positive workspace-wide `issues.number` (`BIGINT UNSIGNED > 0`), backed by `workspace_counters` (`name = 'issue_number'`, `next_value`).

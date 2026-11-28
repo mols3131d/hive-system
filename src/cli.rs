@@ -965,6 +965,15 @@ pub(crate) enum WorkspaceAction {
         #[command(flatten)]
         endpoint: DoltTargetArgs,
     },
+    /// Inspect a pinned local v1 Git source for migration.
+    MigrationPreflight {
+        /// Absolute path to a standalone v1 Git worktree.
+        #[arg(long, value_name = "DIR")]
+        source: PathBuf,
+        /// Full lowercase Git commit ID matching the source HEAD.
+        #[arg(long, value_name = "OID")]
+        source_commit: String,
+    },
     #[command(flatten)]
     Runtime(WorkspaceCommand),
 }
@@ -1919,7 +1928,7 @@ fn retry_workspace_conflict(
         return None;
     }
     cli.find_subcommand("workspace")?;
-    // Accept repeated target options only to recover contract and output flags.
+    // Accept repeated selection options only to recover contract and output flags.
     // Workspace commands take no positional values. A standalone -- ends options, while
     // attached values stay intact for Clap. Keep the original parse error.
     let end = args
@@ -1932,9 +1941,8 @@ fn retry_workspace_conflict(
         .mut_subcommand("workspace", |workspace| {
             workspace.mut_subcommands(|leaf| {
                 leaf.mut_args(|arg| match arg.get_id().as_str() {
-                    "target" | "workspace_id" | "database" | "port" | "dolt_bin" => {
-                        arg.action(ArgAction::Append)
-                    }
+                    "target" | "source" | "source_commit" | "workspace_id" | "database"
+                    | "port" | "dolt_bin" => arg.action(ArgAction::Append),
                     _ => arg,
                 })
             })
@@ -3518,6 +3526,16 @@ impl Command {
                         );
                     }
                     Ok(())
+                }
+                Self::Workspace(WorkspaceAction::MigrationPreflight { .. })
+                    if common.workspace.is_some()
+                        || common.project.is_some()
+                        || common.project_root.is_some()
+                        || !matches!(common.view, View::WorkingTree) =>
+                {
+                    Err(
+                        "Migration preflight accepts only --source, --source-commit, and output selection.",
+                    )
                 }
                 Self::Backup(BackupCommand::Create { .. }) => {
                     if common.workspace.is_none()
