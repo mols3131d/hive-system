@@ -92,6 +92,86 @@ fn cli_migration_plan_inventories_directives_and_artifacts_read_only() {
     for (path, bytes) in files {
         write(path, bytes);
     }
+    let malformed_labels = [
+        (
+            "directives/_general/map-status.md",
+            "status: {active: null}",
+            "invalid_directive_status",
+        ),
+        (
+            "directives/_general/null-status.md",
+            "status: null",
+            "invalid_directive_status",
+        ),
+        (
+            "directives/_general/null-kind.md",
+            "status: proposed\nkind: null",
+            "unsupported_directive_metadata",
+        ),
+        (
+            "artifacts/map-kind.md",
+            "kind: {report: null}",
+            "unclassified_artifact_kind",
+        ),
+        (
+            "artifacts/map-status.md",
+            "kind: report\nstatus: {closed: null}",
+            "invalid_artifact_status",
+        ),
+        (
+            "artifacts/null-kind.md",
+            "kind: null",
+            "unclassified_artifact_kind",
+        ),
+        (
+            "artifacts/null-status.md",
+            "kind: report\nstatus: null",
+            "invalid_artifact_status",
+        ),
+        (
+            "artifacts/null-title.md",
+            "kind: report\ntitle: null",
+            "unsupported_artifact_metadata",
+        ),
+        (
+            "artifacts/null-tags.md",
+            "kind: report\ntags: null",
+            "unsupported_artifact_metadata",
+        ),
+    ];
+    for (path, fields, _) in malformed_labels {
+        write(
+            path,
+            format!("---\ndescription: Synthetic fixture\n{fields}\n---\n").as_bytes(),
+        );
+    }
+    let heading_cases = [
+        (
+            "artifacts/fenced-comment.md",
+            "# Synthetic title\n\n```sh\n# Synthetic shell comment\n```\n",
+            true,
+        ),
+        (
+            "artifacts/setext-title.md",
+            "Intro paragraph\n\nSynthetic **title**\n===\n\n> # Nested heading\n\n# Synthetic title\n",
+            true,
+        ),
+        (
+            "artifacts/fenced-heading-only.md",
+            "```md\n# Synthetic shell comment\n```\n",
+            false,
+        ),
+    ];
+    for (path, body, _) in heading_cases {
+        write(
+            path,
+            format!(
+                "---\ndescription: {}\nkind: 'report'\n---\n{body}",
+                "a".repeat(256)
+            )
+            .as_bytes(),
+        );
+    }
     write("artifacts/oversize.md", &vec![b'a'; 256 * 1024 + 1]);
     write(
         "artifacts/oversize-header.md",
@@ -369,11 +449,28 @@ fn cli_migration_plan_inventories_directives_and_artifacts_read_only() {
         held(path, &[reason]);
         assert!(outcome(path).get("candidate").is_none());
     }
+    for (path, _, reason) in malformed_labels {
+        held(path, &[reason]);
+        assert!(outcome(path).get("candidate").is_none());
+    }
+    for (path, _, has_heading) in heading_cases {
+        if has_heading {
+            held(path, &artifact_holds);
+            assert_eq!(
+                outcome(path)["candidate"],
+                json!({"record_type": "artifact", "kind": "report", "legacy_status": null})
+            );
+        } else {
+            held(path, &["missing_or_conflicting_title"]);
+            assert!(outcome(path).get("candidate").is_none());
+        }
+    }
 
     let json = report.to_string();
     for private in [
         "synthetic-private-description",
         "Synthetic private heading",
+        "Synthetic shell comment",
         "Synthetic private direction.",
         "synthetic-unverified-approval",
         "synthetic-unverified-replacement",
